@@ -36,7 +36,7 @@ jobs:
           path: fmt.patch
           if-no-files-found: ignore
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -51,13 +51,7 @@ jobs:
       - name: git version
         run: git --version
       - name: Test
-        run: cargo test --workspace --no-fail-fast
-      - name: Upload the resolved lockfile
-        if: always() && matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-lock
-          path: Cargo.lock
+        run: cargo test --workspace --locked --no-fail-fast
 
   mount-test:
     name: one-file-system on a real mount (linux)
@@ -73,7 +67,7 @@ jobs:
       - name: Test
         env:
           DC_TEST_MOUNT_DIR: ${{ runner.temp }}/mnttest/mnt
-        run: cargo test -p disk-cleaner-core --test mount -- --nocapture
+        run: cargo test -p disk-cleaner-core --locked --test mount -- --nocapture
 
   licenses:
     name: cargo deny licenses

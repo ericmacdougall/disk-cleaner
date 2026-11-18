@@ -153,8 +153,15 @@ pub struct Plan {
     pub items: Vec<PlanItem>,
 }
 
+/// Real path of `p`, without the `\\?\` prefix Windows canonicalization adds (process working
+/// directories are reported without it).
 fn canon(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let text = real.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+        _ => real,
+    }
 }
 
 fn under_active(path: &Path, active: &[PathBuf]) -> Option<String> {
@@ -220,11 +227,7 @@ fn judge(scan: &ScanResult, idx: usize, opts: &PlanOptions) -> (ProjectState, St
         );
     }
     if let Some(p) = process_in(scan, idx, &opts.process) {
-        return (
-            ProjectState::Active,
-            format!("in use: {p}"),
-            days,
-        );
+        return (ProjectState::Active, format!("in use: {p}"), days);
     }
     let window = opts.active_window_days;
     match (last, days) {
@@ -233,13 +236,17 @@ fn judge(scan: &ScanResult, idx: usize, opts: &PlanOptions) -> (ProjectState, St
             if age <= (window as i64).saturating_mul(86_400) {
                 (
                     ProjectState::Active,
-                    format!("newest activity {d} day(s) ago, within the {window}-day active window"),
+                    format!(
+                        "newest activity {d} day(s) ago, within the {window}-day active window"
+                    ),
                     days,
                 )
             } else {
                 (
                     ProjectState::Idle,
-                    format!("newest activity {d} day(s) ago, outside the {window}-day active window"),
+                    format!(
+                        "newest activity {d} day(s) ago, outside the {window}-day active window"
+                    ),
                     days,
                 )
             }
@@ -335,12 +342,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     }
 }
 
-fn decide(
-    scan: &ScanResult,
-    idx: usize,
-    state: ProjectState,
-    why: &str,
-) -> (Action, String, u64) {
+fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Action, String, u64) {
     let node = &scan.nodes[idx];
     if state == ProjectState::Active {
         return (Action::Keep, format!("active: {why}"), 0);
@@ -368,7 +370,9 @@ fn decide(
                 ),
                 _ => (
                     Action::RemoveRegenerable,
-                    format!("{what} is rebuilt by the project's tooling; owning project idle: {why}"),
+                    format!(
+                        "{what} is rebuilt by the project's tooling; owning project idle: {why}"
+                    ),
                     node.bytes_total,
                 ),
             }

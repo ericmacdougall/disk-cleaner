@@ -403,7 +403,12 @@ fn neg12_malformed_config_is_an_error_never_a_silent_fallback() {
         // Named explicitly, even when the flag would override the value.
         for extra in [
             vec!["--config", cfg.to_str().unwrap()],
-            vec!["--config", cfg.to_str().unwrap(), "--active-window-days", "30"],
+            vec![
+                "--config",
+                cfg.to_str().unwrap(),
+                "--active-window-days",
+                "30",
+            ],
         ] {
             let o = plan_json(&scan_file, &home, &extra);
             assert!(!o.status.success(), "accepted {bad:?}");
@@ -414,7 +419,10 @@ fn neg12_malformed_config_is_an_error_never_a_silent_fallback() {
         // And at the default location.
         write(&default_config_under(&home), bad);
         let o = plan_json(&scan_file, &home, &[]);
-        assert!(!o.status.success(), "default-location config {bad:?} accepted");
+        assert!(
+            !o.status.success(),
+            "default-location config {bad:?} accepted"
+        );
         assert!(String::from_utf8_lossy(&o.stderr).contains("config.toml"));
         fs::remove_file(default_config_under(&home)).unwrap();
     }

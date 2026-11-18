@@ -160,7 +160,11 @@ fn neg11_default_window_keeps_a_repo_touched_six_days_ago_but_a_shorter_window_d
     let p = plan(&s, &default);
     assert_eq!(p.items[0].action, Action::Keep);
     assert_eq!(p.items[0].state, ProjectState::Active);
-    assert!(p.items[0].state_reason.contains("7-day"), "{}", p.items[0].state_reason);
+    assert!(
+        p.items[0].state_reason.contains("7-day"),
+        "{}",
+        p.items[0].state_reason
+    );
     assert_eq!(p.active_window_days, 7);
 
     let p = plan(&s, &opts(vec![], 3, now));
@@ -177,7 +181,10 @@ fn last_commit_alone_can_make_a_project_active() {
     n.newest_mtime = Some(now - 90 * DAY);
     n.repo.as_mut().unwrap().last_commit_time = Some(now - 2 * DAY);
     let s = synthetic(vec![n]);
-    assert_eq!(plan(&s, &opts(vec![], 7, now)).items[0].action, Action::Keep);
+    assert_eq!(
+        plan(&s, &opts(vec![], 7, now)).items[0].action,
+        Action::Keep
+    );
 }
 
 #[test]
@@ -236,11 +243,11 @@ fn real_process_check_does_not_panic_and_reports_a_status() {
     // This test process runs somewhere; if cwds are readable, one is inside the current dir.
     if let Ok(cwd) = std::env::current_dir() {
         if !st.cwds().is_empty() {
-            let real = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+            let real = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
             assert!(
-                st.inside(&real).is_some(),
+                st.inside(&real).is_some() || st.inside(&cwd).is_some(),
                 "the test process itself should be seen in {}",
-                real.display()
+                cwd.display()
             );
         }
     }

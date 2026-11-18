@@ -449,19 +449,17 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             .follow_links(false)
             .sort(false)
             .process_read_dir(move |_depth, _path, _state, children| {
-                for child in children.iter_mut() {
-                    if let Ok(entry) = child {
-                        match std::fs::symlink_metadata(entry.path()) {
-                            Ok(md) => {
-                                let mut m = meta_from(&md);
-                                if one_fs && entry.file_type.is_dir() && m.dev != root_dev {
-                                    entry.read_children = None;
-                                    m.mount_skipped = true;
-                                }
-                                entry.client_state = m;
+                for entry in children.iter_mut().flatten() {
+                    match std::fs::symlink_metadata(entry.path()) {
+                        Ok(md) => {
+                            let mut m = meta_from(&md);
+                            if one_fs && entry.file_type.is_dir() && m.dev != root_dev {
+                                entry.read_children = None;
+                                m.mount_skipped = true;
                             }
-                            Err(_) => entry.client_state = EntryMeta::default(),
+                            entry.client_state = m;
                         }
+                        Err(_) => entry.client_state = EntryMeta::default(),
                     }
                 }
             });

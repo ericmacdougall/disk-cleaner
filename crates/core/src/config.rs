@@ -100,7 +100,10 @@ mod tests {
     #[test]
     fn default_is_seven_days() {
         assert_eq!(Config::default().active_window_days, 7);
-        assert_eq!(parse("", Path::new("c.toml")).unwrap().active_window_days, 7);
+        assert_eq!(
+            parse("", Path::new("c.toml")).unwrap().active_window_days,
+            7
+        );
     }
 
     #[test]
@@ -126,7 +129,9 @@ mod tests {
 
     #[test]
     fn explicit_missing_file_is_an_error() {
-        let dir = std::env::temp_dir().join("dc-config-test-missing-xyz").join("nope.toml");
+        let dir = std::env::temp_dir()
+            .join("dc-config-test-missing-xyz")
+            .join("nope.toml");
         assert!(load(Some(&dir)).is_err());
     }
 }
