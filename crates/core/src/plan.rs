@@ -336,7 +336,13 @@ fn orphan_submodule_gitdir(scan: &ScanResult, idx: usize) -> Option<String> {
         .iter()
         .enumerate()
         .filter(|(j, n)| n.class.is_git() && inside(*j))
-        .filter_map(|(_, n)| n.repo.as_ref()?.git_dir.as_ref().map(|g| canon(Path::new(g))))
+        .filter_map(|(_, n)| {
+            n.repo
+                .as_ref()?
+                .git_dir
+                .as_ref()
+                .map(|g| canon(Path::new(g)))
+        })
         .collect();
     dirs.iter()
         .find(|d| !owned.iter().any(|o| *o == canon(Path::new(d.as_str()))))

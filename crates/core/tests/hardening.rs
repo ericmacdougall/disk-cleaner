@@ -464,7 +464,11 @@ fn n1_submodule_config_filter_is_never_executed_by_the_outer_status() {
 
     let marker = tmp.path().join("pwned-by-submodule-filter");
     append(
-        &outer.join(".git").join("modules").join("sub").join("config"),
+        &outer
+            .join(".git")
+            .join("modules")
+            .join("sub")
+            .join("config"),
         &format!(
             "[filter \"evil\"]\n\tclean = \"sh -c 'touch {}; cat'\"\n",
             marker.display()
@@ -538,7 +542,10 @@ fn core_worktree_pointing_elsewhere_is_refused() {
     let repo = pushed_repo(&root, &remotes, "app");
     let elsewhere = tmp.path().join("elsewhere");
     fs::create_dir_all(&elsewhere).unwrap();
-    git(&repo, &["config", "core.worktree", elsewhere.to_str().unwrap()]);
+    git(
+        &repo,
+        &["config", "core.worktree", elsewhere.to_str().unwrap()],
+    );
     let res = scan_with(&root, network_everywhere());
     let f = facts_of(&res, &repo);
     assert!(all_unknown(&f), "facts about another directory: {f:?}");

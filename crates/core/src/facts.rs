@@ -267,8 +267,7 @@ fn check_module_configs(git: &crate::git::Git, cwd: &Path, modules: &Path) -> Re
                                 ],
                             )
                             .map_err(|e| note("submodule config", &e))?;
-                        let keys: Vec<String> =
-                            out.lines().map(|l| l.trim().to_string()).collect();
+                        let keys: Vec<String> = out.lines().map(|l| l.trim().to_string()).collect();
                         unsafe_key(&keys, "a submodule's config")?;
                     }
                     Ok(_) => return Err("a submodule config is not a regular file".into()),
@@ -676,7 +675,12 @@ mod tests {
     fn lfs_keys_are_not_allowed() {
         // An LFS repo defines filter.lfs.* (a program) and is reported unknown; lfs.* itself
         // is not allowlisted either.
-        for k in ["lfs.url", "lfs.concurrenttransfers", "filter.lfs.clean", "lfs.x.url"] {
+        for k in [
+            "lfs.url",
+            "lfs.concurrenttransfers",
+            "filter.lfs.clean",
+            "lfs.x.url",
+        ] {
             assert!(!config_key_is_safe(k), "{k}");
         }
         assert!(config_key_is_safe("remote.origin.url"));
