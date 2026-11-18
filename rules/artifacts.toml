@@ -1,0 +1,397 @@
+# Artifact and cache rules for disk-cleaner. This file is data: extend it without touching code.
+#
+# [[rule]] fields
+#   name          directory name; a name with "/" matches the trailing path components
+#   markers       entries (files or directories) that must exist beside the directory or in
+#                 any ancestor inside the scan root. "*.ext" matches by suffix. Empty list
+#                 means the name alone is enough (use only for names that are never anything else).
+#   class         "regenerable" (rebuilt by the project's tooling) or "cache" (re-downloaded)
+#   scan_outputs  true for build output directories: they are searched for output files
+#                 (video, archives, model weights...) and are not offered for removal if any
+#                 are found. Dependency directories (node_modules, venv) leave this false.
+#   note          one line shown to the user
+#
+# Ambiguous names (dist, build, out, target, bin, obj, coverage, Library, deps) always carry markers.
+
+# ---- Node / JavaScript -------------------------------------------------------------------
+[[rule]]
+name = "node_modules"
+markers = ["package.json"]
+class = "regenerable"
+note = "npm, pnpm and yarn dependencies; restored by an install"
+
+[[rule]]
+name = ".next"
+markers = ["package.json"]
+class = "regenerable"
+scan_outputs = true
+note = "Next.js build output and cache"
+
+[[rule]]
+name = ".nuxt"
+markers = ["package.json"]
+class = "regenerable"
+scan_outputs = true
+note = "Nuxt build output"
+
+[[rule]]
+name = ".output"
+markers = ["nuxt.config.ts", "nuxt.config.js"]
+class = "regenerable"
+scan_outputs = true
+note = "Nuxt/Nitro build output"
+
+[[rule]]
+name = ".turbo"
+markers = ["package.json", "turbo.json"]
+class = "cache"
+note = "Turborepo cache"
+
+[[rule]]
+name = ".svelte-kit"
+markers = ["package.json"]
+class = "regenerable"
+scan_outputs = true
+note = "SvelteKit build output"
+
+[[rule]]
+name = ".parcel-cache"
+markers = ["package.json"]
+class = "cache"
+note = "Parcel cache"
+
+[[rule]]
+name = ".angular"
+markers = ["angular.json"]
+class = "cache"
+note = "Angular CLI cache"
+
+[[rule]]
+name = ".nyc_output"
+markers = ["package.json"]
+class = "regenerable"
+note = "nyc coverage data"
+
+[[rule]]
+name = "dist"
+markers = ["package.json", "pyproject.toml", "setup.py"]
+class = "regenerable"
+scan_outputs = true
+note = "build output"
+
+[[rule]]
+name = "build"
+markers = ["package.json", "build.gradle", "build.gradle.kts", "CMakeLists.txt", "setup.py", "pubspec.yaml"]
+class = "regenerable"
+scan_outputs = true
+note = "build output"
+
+[[rule]]
+name = "out"
+markers = ["package.json", "tsconfig.json", "build.gradle", "build.gradle.kts"]
+class = "regenerable"
+scan_outputs = true
+note = "build output"
+
+[[rule]]
+name = "coverage"
+markers = ["package.json", "pyproject.toml", ".coveragerc"]
+class = "regenerable"
+scan_outputs = true
+note = "test coverage reports"
+
+# ---- Rust --------------------------------------------------------------------------------
+[[rule]]
+name = "target"
+markers = ["Cargo.toml"]
+class = "regenerable"
+scan_outputs = true
+note = "Cargo build output"
+
+[[rule]]
+name = ".cargo/registry"
+markers = []
+class = "cache"
+note = "Cargo crate registry cache"
+
+[[rule]]
+name = ".cargo/git"
+markers = []
+class = "cache"
+note = "Cargo git dependency checkouts"
+
+# ---- JVM ---------------------------------------------------------------------------------
+[[rule]]
+name = "target"
+markers = ["pom.xml", "build.sbt"]
+class = "regenerable"
+scan_outputs = true
+note = "Maven or sbt build output"
+
+[[rule]]
+name = ".gradle"
+markers = ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]
+class = "regenerable"
+note = "Gradle project cache"
+
+[[rule]]
+name = ".gradle/caches"
+markers = []
+class = "cache"
+note = "Gradle user cache"
+
+[[rule]]
+name = ".m2/repository"
+markers = []
+class = "cache"
+note = "Maven local repository"
+
+# ---- Python ------------------------------------------------------------------------------
+[[rule]]
+name = ".venv"
+markers = ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile"]
+class = "regenerable"
+note = "Python virtual environment"
+
+[[rule]]
+name = "venv"
+markers = ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile"]
+class = "regenerable"
+note = "Python virtual environment"
+
+[[rule]]
+name = "__pycache__"
+markers = []
+class = "regenerable"
+note = "Python bytecode"
+
+[[rule]]
+name = ".pytest_cache"
+markers = []
+class = "cache"
+note = "pytest cache"
+
+[[rule]]
+name = ".mypy_cache"
+markers = []
+class = "cache"
+note = "mypy cache"
+
+[[rule]]
+name = ".ruff_cache"
+markers = []
+class = "cache"
+note = "ruff cache"
+
+[[rule]]
+name = ".tox"
+markers = ["tox.ini", "pyproject.toml", "setup.cfg"]
+class = "regenerable"
+note = "tox environments"
+
+[[rule]]
+name = "htmlcov"
+markers = [".coveragerc", "pyproject.toml", "setup.cfg"]
+class = "regenerable"
+note = "coverage.py HTML report"
+
+[[rule]]
+name = ".cache/pip"
+markers = []
+class = "cache"
+note = "pip download cache"
+
+[[rule]]
+name = ".cache/uv"
+markers = []
+class = "cache"
+note = "uv cache"
+
+# ---- .NET --------------------------------------------------------------------------------
+[[rule]]
+name = "bin"
+markers = ["*.csproj", "*.fsproj", "*.vbproj"]
+class = "regenerable"
+scan_outputs = true
+note = ".NET build output"
+
+[[rule]]
+name = "obj"
+markers = ["*.csproj", "*.fsproj", "*.vbproj"]
+class = "regenerable"
+note = ".NET intermediate output"
+
+[[rule]]
+name = ".nuget/packages"
+markers = []
+class = "cache"
+note = "NuGet package cache"
+
+# ---- Apple / Xcode -----------------------------------------------------------------------
+[[rule]]
+name = "Pods"
+markers = ["Podfile"]
+class = "regenerable"
+note = "CocoaPods dependencies"
+
+[[rule]]
+name = "DerivedData"
+markers = ["*.xcodeproj", "*.xcworkspace"]
+class = "regenerable"
+scan_outputs = true
+note = "Xcode build output"
+
+[[rule]]
+name = "Library/Developer/Xcode/DerivedData"
+markers = []
+class = "cache"
+note = "Xcode build products"
+
+[[rule]]
+name = "Library/Developer/CoreSimulator/Caches"
+markers = []
+class = "cache"
+note = "Simulator caches"
+
+[[rule]]
+name = ".build"
+markers = ["Package.swift"]
+class = "regenerable"
+scan_outputs = true
+note = "SwiftPM build output"
+
+# ---- Infrastructure, Dart, Unity, other --------------------------------------------------
+[[rule]]
+name = ".terraform"
+markers = ["*.tf"]
+class = "regenerable"
+note = "Terraform providers and modules"
+
+[[rule]]
+name = ".dart_tool"
+markers = ["pubspec.yaml"]
+class = "regenerable"
+note = "Dart tool cache"
+
+[[rule]]
+name = "Library"
+markers = ["ProjectSettings"]
+class = "regenerable"
+note = "Unity import cache"
+
+[[rule]]
+name = "Temp"
+markers = ["ProjectSettings"]
+class = "regenerable"
+note = "Unity temporary files"
+
+[[rule]]
+name = ".stack-work"
+markers = ["stack.yaml"]
+class = "regenerable"
+scan_outputs = true
+note = "Haskell Stack build output"
+
+[[rule]]
+name = "_build"
+markers = ["mix.exs", "dune-project"]
+class = "regenerable"
+scan_outputs = true
+note = "Elixir or OCaml build output"
+
+[[rule]]
+name = "deps"
+markers = ["mix.exs"]
+class = "regenerable"
+note = "Elixir dependencies"
+
+# ---- User-level caches -------------------------------------------------------------------
+[[rule]]
+name = ".npm"
+markers = []
+class = "cache"
+note = "npm cache"
+
+[[rule]]
+name = ".pnpm-store"
+markers = []
+class = "cache"
+note = "pnpm content-addressable store"
+
+[[rule]]
+name = ".cache/ms-playwright"
+markers = []
+class = "cache"
+note = "Playwright browsers"
+
+[[rule]]
+name = "Library/Caches/ms-playwright"
+markers = []
+class = "cache"
+note = "Playwright browsers"
+
+[[rule]]
+name = ".cache/puppeteer"
+markers = []
+class = "cache"
+note = "Puppeteer browsers"
+
+[[rule]]
+name = "Library/Caches/Homebrew"
+markers = []
+class = "cache"
+note = "Homebrew downloads"
+
+[[rule]]
+name = ".cache/go-build"
+markers = []
+class = "cache"
+note = "Go build cache"
+
+[[rule]]
+name = "Library/Caches/go-build"
+markers = []
+class = "cache"
+note = "Go build cache"
+
+[[rule]]
+name = ".cache/pre-commit"
+markers = []
+class = "cache"
+note = "pre-commit environments"
+
+# ---- Output files ------------------------------------------------------------------------
+# Files with these extensions are produced work, not artifacts. Found inside a build output
+# directory they are listed individually and the directory is not offered for removal.
+[outputs]
+extensions = [
+    # video
+    "mp4", "mov", "mkv", "avi", "webm", "m4v", "wmv", "flv",
+    # audio
+    "mp3", "wav", "flac", "aac", "m4a", "ogg", "opus", "aiff",
+    # image projects
+    "psd", "psb", "ai", "xcf", "kra", "blend", "sketch", "indd", "afdesign",
+    # archives and disk images
+    "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "zst", "iso", "dmg",
+    # model weights
+    "safetensors", "ckpt", "pt", "pth", "onnx", "gguf", "h5", "tflite",
+    # virtual machine disks
+    "vmdk", "vdi", "vhd", "vhdx", "qcow2",
+    # database dumps and local databases
+    "sql", "dump", "bak", "sqlite", "sqlite3", "mdb",
+]
+
+# ---- Loose code --------------------------------------------------------------------------
+# A directory outside any repo that holds one of these manifests, or source files directly,
+# is "loose code": the user is asked what to do with it.
+[loose_code]
+manifests = [
+    "package.json", "Cargo.toml", "pyproject.toml", "setup.py", "requirements.txt", "Pipfile",
+    "go.mod", "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "Gemfile",
+    "composer.json", "pubspec.yaml", "mix.exs", "CMakeLists.txt", "Makefile", "Package.swift",
+    "*.csproj", "*.fsproj", "*.sln", "*.xcodeproj",
+]
+source_extensions = [
+    "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "kt", "c", "cc", "cpp", "h", "hpp",
+    "cs", "rb", "php", "swift", "m", "scala", "sh", "lua", "ex", "exs", "dart", "zig",
+]

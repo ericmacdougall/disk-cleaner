@@ -1,0 +1,132 @@
+//! Shared test helpers. Every fixture is synthetic and built in a temporary directory with real
+//! `git` commands.
+#![allow(dead_code)]
+
+use disk_cleaner_core::{scan, FactsConfig, Node, ScanOptions, ScanResult};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Run git in `dir`, panic with stderr on failure, return trimmed stdout.
+pub fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("git must be installed to run these tests");
+    assert!(
+        out.status.success(),
+        "git {:?} failed in {}: {}",
+        args,
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+pub fn write(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, content).unwrap();
+}
+
+/// `git init` with a fixed branch name and local identity, plus one commit.
+pub fn init_repo(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "-q", "-b", "main"]);
+    git(dir, &["config", "user.name", "Test"]);
+    git(dir, &["config", "user.email", "test@example.invalid"]);
+    git(dir, &["config", "commit.gpgsign", "false"]);
+    write(&dir.join("README.md"), "hello\n");
+    git(dir, &["add", "README.md"]);
+    git(dir, &["commit", "-q", "-m", "init"]);
+}
+
+/// Create an empty bare repository to act as a remote.
+pub fn init_bare(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "-q", "--bare", "-b", "main"]);
+}
+
+/// Wire `repo` to a bare remote at `remote` as `origin` and push `main`.
+pub fn push_to_remote(repo: &Path, remote: &Path) {
+    git(repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(repo, &["push", "-q", "origin", "main"]);
+}
+
+pub fn commit_file(repo: &Path, name: &str, content: &str) {
+    write(&repo.join(name), content);
+    git(repo, &["add", name]);
+    git(repo, &["commit", "-q", "-m", name]);
+}
+
+/// Facts config that treats every remote (even a local bare repo) as a network location, so
+/// tests can model a pushed repo without a network. Production uses `is_network_url`.
+pub fn network_everywhere() -> FactsConfig {
+    FactsConfig::default().with_network_predicate(|_| true)
+}
+
+pub fn scan_with(root: &Path, facts: FactsConfig) -> ScanResult {
+    let mut opts = ScanOptions::new(vec![root.to_path_buf()]);
+    opts.facts = facts;
+    opts.git_jobs = 2;
+    scan(&opts).expect("scan")
+}
+
+pub fn scan_plain(root: &Path) -> ScanResult {
+    scan_with(root, FactsConfig::default())
+}
+
+/// Find the node whose path equals `path`.
+pub fn node<'a>(res: &'a ScanResult, path: &Path) -> &'a Node {
+    let want = path.to_string_lossy();
+    res.nodes
+        .iter()
+        .find(|n| n.path == want)
+        .unwrap_or_else(|| {
+            let have: Vec<&str> = res.nodes.iter().map(|n| n.path.as_str()).collect();
+            panic!("no node for {want}; nodes: {have:?}")
+        })
+}
+
+pub fn node_index(res: &ScanResult, path: &Path) -> usize {
+    let want = path.to_string_lossy();
+    res.nodes.iter().position(|n| n.path == want).expect("node")
+}
+
+pub fn has_node(res: &ScanResult, path: &Path) -> bool {
+    let want = path.to_string_lossy();
+    res.nodes.iter().any(|n| n.path == want)
+}
+
+pub fn write_bytes(path: &Path, len: usize) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, vec![7u8; len]).unwrap();
+}
+
+/// Scan root and remote live side by side so the remote is not part of the scan.
+pub fn workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let scan_root = tmp.path().join("scan");
+    let remotes = tmp.path().join("remotes");
+    fs::create_dir_all(&scan_root).unwrap();
+    fs::create_dir_all(&remotes).unwrap();
+    (tmp, scan_root, remotes)
+}
+
+/// A year and a bit past `now`, so everything counts as idle for any sane threshold.
+pub fn far_future() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    now + 3 * 365 * 86_400
+}

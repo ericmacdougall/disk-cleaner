@@ -1,0 +1,85 @@
+name: ci
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lint:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Save a formatting patch when the check fails
+        if: failure()
+        run: |
+          cargo fmt --all
+          git diff > fmt.patch || true
+      - name: Upload the formatting patch
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fmt-patch
+          path: fmt.patch
+          if-no-files-found: ignore
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: git version
+        run: git --version
+      - name: Test
+        run: cargo test --workspace
+      - name: Upload the resolved lockfile
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock
+          path: Cargo.lock
+
+  mount-test:
+    name: one-file-system on a real mount (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Mount a tmpfs inside a scan root
+        run: |
+          mkdir -p "$RUNNER_TEMP/mnttest/mnt"
+          sudo mount -t tmpfs -o size=16m tmpfs "$RUNNER_TEMP/mnttest/mnt"
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/mnttest/mnt"
+      - name: Test
+        env:
+          DC_TEST_MOUNT_DIR: ${{ runner.temp }}/mnttest/mnt
+        run: cargo test -p disk-cleaner-core --test mount -- --nocapture
+
+  licenses:
+    name: cargo deny licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

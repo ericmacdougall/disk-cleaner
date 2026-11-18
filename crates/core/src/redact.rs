@@ -1,0 +1,103 @@
+//! Credential stripping for anything that came from git or a remote URL.
+//!
+//! Principle 6: secrets stay local. Every string read from git is passed through here
+//! before it is stored, so a token embedded in a remote URL never reaches a scan file,
+//! the terminal or a log.
+
+/// Remove embedded credentials from one URL.
+///
+/// For `http`, `https`, `ftp` and any URL with a `user:password` part, the whole userinfo is
+/// removed. A bare user name on an `ssh` URL (`ssh://git@host/x`) is not a credential and is kept.
+/// Text that is not a `scheme://` URL (scp-style `git@host:path`, local paths) is returned as is.
+pub fn strip_url_credentials(url: &str) -> String {
+    let idx = match url.find("://") {
+        Some(i) => i,
+        None => return url.to_string(),
+    };
+    let (scheme_part, rest) = url.split_at(idx + 3);
+    // Everything before a query or fragment may hold userinfo. A password that contains an
+    // unescaped '/' must not leak its tail, so look for the last '@' before '?' or '#'.
+    let limit = rest.find(['?', '#']).unwrap_or(rest.len());
+    let at = match rest[..limit].rfind('@') {
+        Some(a) => a,
+        None => return url.to_string(),
+    };
+    let userinfo = &rest[..at];
+    let remainder = &rest[at + 1..];
+    let scheme = scheme_part
+        .trim_end_matches("://")
+        .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '+')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let ssh_like = matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git");
+    if ssh_like && !userinfo.contains(':') && !userinfo.chars().any(char::is_whitespace) {
+        return url.to_string();
+    }
+    format!("{scheme_part}{remainder}")
+}
+
+/// Strip credentials from every URL-looking token in free text (git error output).
+pub fn redact_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for piece in text.split_inclusive(char::is_whitespace) {
+        let token_end = piece.trim_end_matches(char::is_whitespace).len();
+        let (token, ws) = piece.split_at(token_end);
+        if token.contains("://") {
+            out.push_str(&strip_url_credentials(token));
+        } else {
+            out.push_str(token);
+        }
+        out.push_str(ws);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_user_and_token_from_https() {
+        let s = strip_url_credentials("https://user:s3cr3t-token@example.invalid/x.git");
+        assert_eq!(s, "https://example.invalid/x.git");
+    }
+
+    #[test]
+    fn strips_token_only_userinfo_on_https() {
+        let s = strip_url_credentials("https://ghp_abcdef@example.invalid/x.git");
+        assert_eq!(s, "https://example.invalid/x.git");
+    }
+
+    #[test]
+    fn keeps_plain_ssh_user() {
+        let s = strip_url_credentials("ssh://git@example.invalid/x.git");
+        assert_eq!(s, "ssh://git@example.invalid/x.git");
+    }
+
+    #[test]
+    fn strips_ssh_password() {
+        let s = strip_url_credentials("ssh://git:pw@example.invalid/x.git");
+        assert_eq!(s, "ssh://example.invalid/x.git");
+    }
+
+    #[test]
+    fn password_with_slash_does_not_leak_tail() {
+        let s = strip_url_credentials("https://user:pa/ss@example.invalid/x.git");
+        assert!(!s.contains("pa/ss") && !s.contains("user"));
+    }
+
+    #[test]
+    fn leaves_scp_and_paths_alone() {
+        assert_eq!(strip_url_credentials("git@host:o/r.git"), "git@host:o/r.git");
+        assert_eq!(strip_url_credentials("/srv/r.git"), "/srv/r.git");
+    }
+
+    #[test]
+    fn redacts_inside_error_text() {
+        let t = "fatal: unable to access 'https://u:tok@example.invalid/r.git/': failed\nnext";
+        let r = redact_text(t);
+        assert!(!r.contains("tok"), "{r}");
+        assert!(r.contains("next"));
+    }
+}
