@@ -15,14 +15,7 @@ fn facts_of(res: &ScanResult, path: &Path) -> Facts {
 }
 
 fn action_for(res: &ScanResult, path: &Path) -> Action {
-    let p = plan(
-        res,
-        &PlanOptions {
-            active: vec![],
-            idle_days: 30,
-            now: far_future(),
-        },
-    );
+    let p = plan(res, &PlanOptions::new(7, far_future()));
     p.items
         .iter()
         .find(|i| i.path == path.to_string_lossy())
@@ -224,14 +217,7 @@ fn neg6_token_in_remote_url_is_absent_from_all_output() {
     assert_eq!(remotes[0].url, "https://example.invalid/x.git");
     assert!(remotes[0].network);
     // The plan echoes facts, never URLs, but check its JSON as well.
-    let p = plan(
-        &res,
-        &PlanOptions {
-            active: vec![],
-            idle_days: 1,
-            now: far_future(),
-        },
-    );
+    let p = plan(&res, &PlanOptions::new(1, far_future()));
     assert!(!serde_json::to_string(&p).unwrap().contains("ghp-SECRET"));
 }
 

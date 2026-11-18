@@ -1,10 +1,13 @@
-//! Dry-run plan from a scan (design sections 3, 4 and 6). Nothing here touches the disk.
+//! Dry-run plan from a scan (design sections 3, 4 and 6). Nothing here changes anything on disk.
 //!
 //! The plan is advice: per classified directory an action, a plain-language reason and the
-//! bytes that would be reclaimed. There is no built-in age: `idle_days` and the active set are
-//! inputs. A repo whose facts are not all `Yes` never gets a removing action.
+//! bytes that would be reclaimed. There is no built-in age: the active window and the active
+//! paths are inputs. A project is active when an `--active` path covers it, when its newest
+//! activity is inside the window, or when a running process has its working directory inside it.
+//! A repo whose facts are not all `Yes` never gets a removing action.
 
 use crate::model::*;
+use crate::procs::ProcessCheck;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -52,15 +55,41 @@ impl Action {
     }
 }
 
-/// Inputs of the plan. Both thresholds are the user's.
+/// Whether a project was judged active, idle, or could not be judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectState {
+    Active,
+    Idle,
+    Unknown,
+}
+
+/// Inputs of the plan. All three are the user's.
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
     /// Paths the user says are active. Anything under one, or enclosing one, is kept.
     pub active: Vec<PathBuf>,
-    /// A project is idle when its newest activity is at least this many days old.
-    pub idle_days: u64,
+    /// A project is active when its newest activity is at most this many days old.
+    pub active_window_days: u64,
+    /// Where the window came from (`default`, a config file path, `--active-window-days`).
+    pub window_source: String,
     /// Current time, unix seconds (an input so plans are reproducible).
     pub now: i64,
+    /// Working directories of running processes.
+    pub process: ProcessCheck,
+}
+
+impl PlanOptions {
+    /// No active paths, no running processes known, window from the caller.
+    pub fn new(active_window_days: u64, now: i64) -> PlanOptions {
+        PlanOptions {
+            active: Vec::new(),
+            active_window_days,
+            window_source: "input".to_string(),
+            now,
+            process: ProcessCheck::none_running(),
+        }
+    }
 }
 
 /// One line of the plan.
@@ -71,14 +100,17 @@ pub struct PlanItem {
     pub path: String,
     pub class: Class,
     pub action: Action,
-    /// Plain-language reason.
+    /// Was the project judged active, idle or unknown, and why.
+    pub state: ProjectState,
+    pub state_reason: String,
+    /// Plain-language reason for the action.
     pub reason: String,
     /// Bytes freed if the action completes (0 for keep and ask).
     pub reclaimable_bytes: u64,
     pub bytes_total: u64,
-    /// Days since the newest activity evidence, when there is any.
+    /// Whole days since the newest activity evidence, when there is any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_days: Option<u64>,
+    pub days_since_activity: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<Facts>,
 }
@@ -108,10 +140,21 @@ pub struct Plan {
     pub dry_run: bool,
     pub generated_at: i64,
     pub scan_generated_at: i64,
-    pub idle_days: u64,
+    /// The window used to decide activity.
+    pub active_window_days: u64,
+    /// Where the window came from.
+    pub window_source: String,
+    /// `ok`, `partial` or `unknown`: could running processes be inspected?
+    pub process_check: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_check_note: Option<String>,
     pub active: Vec<String>,
     pub totals: PlanTotals,
     pub items: Vec<PlanItem>,
+}
+
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 fn under_active(path: &Path, active: &[PathBuf]) -> Option<String> {
@@ -121,12 +164,23 @@ fn under_active(path: &Path, active: &[PathBuf]) -> Option<String> {
         .map(|a| a.to_string_lossy().into_owned())
 }
 
-/// The active path that protects node `idx`: a direct hit, or a hit on a classified directory
-/// that encloses it (an active project keeps its regenerable directories too).
+/// The active path that covers node `idx` or a classified directory enclosing it.
 fn active_for(scan: &ScanResult, idx: usize, active: &[PathBuf]) -> Option<String> {
     let node = &scan.nodes[idx];
     under_active(Path::new(&node.path), active)
         .or_else(|| node.parent.and_then(|p| active_for(scan, p, active)))
+}
+
+/// A running process's working directory inside node `idx` or an enclosing classified directory.
+fn process_in(scan: &ScanResult, idx: usize, process: &ProcessCheck) -> Option<String> {
+    let node = &scan.nodes[idx];
+    let raw = Path::new(&node.path);
+    let real = canon(raw);
+    process
+        .inside(raw)
+        .or_else(|| process.inside(&real))
+        .map(|c| format!("{} (working directory of a running process)", c.display()))
+        .or_else(|| node.parent.and_then(|p| process_in(scan, p, process)))
 }
 
 fn max_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
@@ -150,12 +204,52 @@ fn activity(scan: &ScanResult, idx: usize) -> Option<i64> {
     max_opt(node.newest_mtime, commit)
 }
 
-fn idle_days_of(last: Option<i64>, now: i64) -> Option<u64> {
-    last.map(|t| (now.saturating_sub(t).max(0) / 86_400) as u64)
-}
-
 fn join_names(names: &[&str]) -> String {
     names.join(", ")
+}
+
+/// Judge one node: active (path, process or recent activity), idle or unknown, with the reason.
+fn judge(scan: &ScanResult, idx: usize, opts: &PlanOptions) -> (ProjectState, String, Option<u64>) {
+    let last = activity(scan, idx);
+    let days = last.map(|t| (opts.now.saturating_sub(t).max(0) / 86_400) as u64);
+    if let Some(a) = active_for(scan, idx, &opts.active) {
+        return (
+            ProjectState::Active,
+            format!("covered by the active path {a}"),
+            days,
+        );
+    }
+    if let Some(p) = process_in(scan, idx, &opts.process) {
+        return (
+            ProjectState::Active,
+            format!("in use: {p}"),
+            days,
+        );
+    }
+    let window = opts.active_window_days;
+    match (last, days) {
+        (Some(t), Some(d)) => {
+            let age = opts.now.saturating_sub(t).max(0);
+            if age <= (window as i64).saturating_mul(86_400) {
+                (
+                    ProjectState::Active,
+                    format!("newest activity {d} day(s) ago, within the {window}-day active window"),
+                    days,
+                )
+            } else {
+                (
+                    ProjectState::Idle,
+                    format!("newest activity {d} day(s) ago, outside the {window}-day active window"),
+                    days,
+                )
+            }
+        }
+        _ => (
+            ProjectState::Unknown,
+            "no activity evidence (no files and no commits found)".to_string(),
+            None,
+        ),
+    }
 }
 
 /// Build a dry-run plan from a scan.
@@ -165,30 +259,28 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         if matches!(node.class, Class::Output | Class::Other) {
             continue;
         }
-        let last = activity(scan, idx);
-        let idle = idle_days_of(last, opts.now);
-        let is_idle = idle.map(|d| d >= opts.idle_days);
-        let facts = node.repo.as_ref().map(|r| r.facts);
-
-        let (action, reason, reclaim) = if let Some(a) = active_for(scan, idx, &opts.active) {
-            (
-                Action::Keep,
-                format!("active: under or containing the active path {a}"),
-                0,
-            )
-        } else {
-            decide(scan, idx, idle, is_idle, opts)
-        };
+        let (state, state_reason, days) = judge(scan, idx, opts);
+        let (mut action, mut reason, mut reclaim) = decide(scan, idx, state, &state_reason);
+        if action.removes() {
+            if let ProcessCheck::Unknown { reason: why } = &opts.process {
+                // Cannot prove nothing is using it: a person decides.
+                reason = format!("{reason}; but running processes could not be inspected ({why})");
+                action = Action::Ask;
+                reclaim = 0;
+            }
+        }
         items.push(PlanItem {
             node: idx,
             path: node.path.clone(),
             class: node.class,
             action,
+            state,
+            state_reason,
             reason,
             reclaimable_bytes: reclaim,
             bytes_total: node.bytes_total,
-            idle_days: idle,
-            facts,
+            days_since_activity: days,
+            facts: node.repo.as_ref().map(|r| r.facts),
         });
     }
 
@@ -229,7 +321,10 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         dry_run: true,
         generated_at: opts.now,
         scan_generated_at: scan.generated_at,
-        idle_days: opts.idle_days,
+        active_window_days: opts.active_window_days,
+        window_source: opts.window_source.clone(),
+        process_check: opts.process.status().to_string(),
+        process_check_note: opts.process.note(),
         active: opts
             .active
             .iter()
@@ -243,15 +338,13 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
 fn decide(
     scan: &ScanResult,
     idx: usize,
-    idle: Option<u64>,
-    is_idle: Option<bool>,
-    opts: &PlanOptions,
+    state: ProjectState,
+    why: &str,
 ) -> (Action, String, u64) {
     let node = &scan.nodes[idx];
-    let idle_txt = match idle {
-        Some(d) => format!("{d} days"),
-        None => "unknown".to_string(),
-    };
+    if state == ProjectState::Active {
+        return (Action::Keep, format!("active: {why}"), 0);
+    }
     match node.class {
         Class::Regenerable | Class::Cache => {
             let what = node.rule.as_deref().unwrap_or("artifact");
@@ -267,26 +360,15 @@ fn decide(
                     0,
                 );
             }
-            match is_idle {
-                None => (
+            match state {
+                ProjectState::Unknown => (
                     Action::Ask,
-                    "no activity evidence for the owning project".to_string(),
+                    format!("cannot judge the owning project: {why}"),
                     0,
                 ),
-                Some(false) => (
-                    Action::Keep,
-                    format!(
-                        "owning project was active {idle_txt} ago, less than the {} day idle threshold",
-                        opts.idle_days
-                    ),
-                    0,
-                ),
-                Some(true) => (
+                _ => (
                     Action::RemoveRegenerable,
-                    format!(
-                        "{what} is rebuilt by the project's tooling; owning project idle {idle_txt} (threshold {})",
-                        opts.idle_days
-                    ),
+                    format!("{what} is rebuilt by the project's tooling; owning project idle: {why}"),
                     node.bytes_total,
                 ),
             }
@@ -302,49 +384,35 @@ fn decide(
                     )
                 }
             };
-            match is_idle {
-                None => (
+            if state == ProjectState::Unknown {
+                return (Action::Ask, format!("cannot judge activity: {why}"), 0);
+            }
+            if facts.any_unknown() {
+                (
                     Action::Ask,
-                    "no activity evidence (no files and no commits found)".to_string(),
-                    0,
-                ),
-                Some(false) => (
-                    Action::Keep,
                     format!(
-                        "active {idle_txt} ago, less than the {} day idle threshold",
-                        opts.idle_days
+                        "idle ({why}) but cannot prove it is safe: unknown {}",
+                        join_names(&facts.unknown())
                     ),
                     0,
-                ),
-                Some(true) => {
-                    if facts.any_unknown() {
-                        (
-                            Action::Ask,
-                            format!(
-                                "cannot prove it is safe: unknown {}",
-                                join_names(&facts.unknown())
-                            ),
-                            0,
-                        )
-                    } else if !facts.all_yes() {
-                        (
-                            Action::RecoverThenArchive,
-                            format!(
-                                "idle {idle_txt}, but not fully saved elsewhere ({}); recover first, then archive",
-                                join_names(&facts.failing())
-                            ),
-                            node.bytes_total,
-                        )
-                    } else {
-                        (
-                            Action::Archive,
-                            format!(
-                                "idle {idle_txt}; every commit is on a network remote, nothing unsaved, no dependents"
-                            ),
-                            node.bytes_total,
-                        )
-                    }
-                }
+                )
+            } else if !facts.all_yes() {
+                (
+                    Action::RecoverThenArchive,
+                    format!(
+                        "idle ({why}), but not fully saved elsewhere ({}); recover first, then archive",
+                        join_names(&facts.failing())
+                    ),
+                    node.bytes_total,
+                )
+            } else {
+                (
+                    Action::Archive,
+                    format!(
+                        "idle ({why}); every commit is on a network remote, nothing unsaved, no dependents"
+                    ),
+                    node.bytes_total,
+                )
             }
         }
         Class::BareRepo => {

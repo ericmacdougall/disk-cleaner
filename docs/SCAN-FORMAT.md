@@ -5,7 +5,7 @@ refuses a scan with a different version. All sizes are bytes. All times are unix
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 
 Produce a scan with `disk-cleaner scan <path>... --out scan.json` (or `--json` for stdout) and a
-plan with `disk-cleaner plan --scan scan.json --idle-days N [--active PATH]... [--json]`. Both are
+plan with `disk-cleaner plan --scan scan.json [--active-window-days N] [--config FILE] [--active PATH]... [--json]`. Both are
 read-only. Nothing in this phase deletes, moves or modifies anything; `--out` writes only the file
 you name.
 
@@ -111,24 +111,53 @@ Remote URLs have embedded credentials removed (`https://user:token@host/x` is st
 
 ## Plan file
 
-`schema_version`, `dry_run` (always `true`), `generated_at`, `scan_generated_at`, `idle_days`,
-`active`, `totals` and `items`.
+`schema_version`, `dry_run` (always `true`), `generated_at`, `scan_generated_at`,
+`active_window_days`, `window_source`, `process_check` (`ok`, `partial` or `unknown`),
+`process_check_note`, `active`, `totals` and `items`.
 
-Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `reason` (plain
-language), `reclaimable_bytes`, `bytes_total`, `idle_days` (days since the newest activity
-evidence, if any) and `facts`.
+Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `state` (`active`,
+`idle` or `unknown`), `state_reason` (why it was judged so), `reason` (plain language),
+`reclaimable_bytes`, `bytes_total`, `days_since_activity` (if there is any evidence) and `facts`.
+
+### The active window
+
+One setting decides activity: `active_window_days`, default **7**. It is read from
+`<platform config dir>/disk-cleaner/config.toml` (`$XDG_CONFIG_HOME` or `~/.config` on Linux,
+`~/Library/Application Support` on macOS, `%APPDATA%` on Windows), or from the file named by
+`--config`, and overridden per run by `plan --active-window-days N`. The file is TOML:
+
+```toml
+active_window_days = 7
+```
+
+A missing default file means the default. A file that exists but is malformed, has an unknown key
+or a non-integer or negative value is an error; there is no fallback to a shorter window. A
+`--config` file must exist. The config is validated even when the flag overrides it.
+
+A project is **active** when any of these holds:
+
+1. an `--active PATH` covers it, or an active path lies inside it (or inside the project that owns a
+   regenerable directory);
+2. its newest activity, the later of `newest_mtime` (non-regenerable, non-`.git` files) and
+   `last_commit_time`, is at most `active_window_days` old (exactly at the edge counts as active);
+3. a running process has its working directory inside it.
+
+Process information comes from `sysinfo`. `process_check` is `ok` when every process's working
+directory was readable, `partial` when some (usually other users') were not, and `unknown` when none
+could be read. When `unknown`, a removing action is never proposed: it becomes `ask` and says so.
+With no evidence at all the state is `unknown`.
 
 `action` is one of `keep`, `remove-regenerable`, `recover-then-archive`, `archive`,
-`backup-then-remove` and `ask`. The plan never contains an age of its own: `--idle-days` is required
-and `--active` paths are the user's. Rules, in order:
+`backup-then-remove` and `ask`. The plan has no age of its own beyond the window and the
+`--active` paths, which are the user's. Rules, in order:
 
-1. Under an active path, or enclosing one, or inside an active project: `keep`.
-2. Regenerable and cache: contains output files, or no activity evidence: `ask`; owning project newer
-   than `idle_days`: `keep`; otherwise `remove-regenerable`.
-3. Repo and worktree: no activity evidence: `ask`; newer than `idle_days`: `keep`; any fact `unknown`:
-   `ask`; any fact `no`: `recover-then-archive`; every fact `yes`: `archive`.
+1. Active: `keep`.
+2. Regenerable and cache: contains output files, or state unknown: `ask`; otherwise
+   `remove-regenerable`.
+3. Repo and worktree: state unknown: `ask`; any fact `unknown`: `ask`; any fact `no`:
+   `recover-then-archive`; every fact `yes`: `archive`.
 4. Bare repo: `keep` when something depends on it, otherwise `ask`.
-5. Loose code: always `ask`.
+5. Loose code: `ask`.
 
 Activity evidence is the newest of `newest_mtime` and `last_commit_time`; a regenerable directory
 uses its owning project. `totals.reclaimable_bytes` does not count an item nested inside another

@@ -4,19 +4,18 @@ mod common;
 
 use common::*;
 use disk_cleaner_core::{
-    plan, Action, Class, Facts, Node, Plan, PlanOptions, RepoInfo, ScanOptionsRecord, ScanResult,
-    Totals, Tri, SCHEMA_VERSION,
+    plan, running_cwds, Action, Class, Facts, Node, Plan, PlanOptions, ProcessCheck, ProjectState,
+    RepoInfo, ScanOptionsRecord, ScanResult, Totals, Tri, DEFAULT_ACTIVE_WINDOW_DAYS,
+    SCHEMA_VERSION,
 };
 use std::path::{Path, PathBuf};
 
 const DAY: i64 = 86_400;
 
-fn opts(active: Vec<PathBuf>, idle_days: u64, now: i64) -> PlanOptions {
-    PlanOptions {
-        active,
-        idle_days,
-        now,
-    }
+fn opts(active: Vec<PathBuf>, window_days: u64, now: i64) -> PlanOptions {
+    let mut o = PlanOptions::new(window_days, now);
+    o.active = active;
+    o
 }
 
 fn action_of(p: &Plan, path: &Path) -> Action {
@@ -133,9 +132,10 @@ fn idle_threshold_is_an_input_not_a_constant() {
         plan(&s, &opts(vec![], 99, now)).items[0].action,
         Action::Archive
     );
+    // Exactly at the window edge still counts as active.
     assert_eq!(
         plan(&s, &opts(vec![], 100, now)).items[0].action,
-        Action::Archive
+        Action::Keep
     );
     assert_eq!(
         plan(&s, &opts(vec![], 101, now)).items[0].action,
@@ -145,6 +145,105 @@ fn idle_threshold_is_an_input_not_a_constant() {
         plan(&s, &opts(vec![], 365, now)).items[0].action,
         Action::Keep
     );
+}
+
+#[test]
+fn neg11_default_window_keeps_a_repo_touched_six_days_ago_but_a_shorter_window_does_not() {
+    let now = 1_000 * DAY;
+    let mut n = repo_node("/r", Class::Repo, all_yes());
+    n.newest_mtime = Some(now - 6 * DAY);
+    n.repo.as_mut().unwrap().last_commit_time = Some(now - 6 * DAY);
+    let s = synthetic(vec![n]);
+
+    let default = opts(vec![], DEFAULT_ACTIVE_WINDOW_DAYS, now);
+    assert_eq!(DEFAULT_ACTIVE_WINDOW_DAYS, 7);
+    let p = plan(&s, &default);
+    assert_eq!(p.items[0].action, Action::Keep);
+    assert_eq!(p.items[0].state, ProjectState::Active);
+    assert!(p.items[0].state_reason.contains("7-day"), "{}", p.items[0].state_reason);
+    assert_eq!(p.active_window_days, 7);
+
+    let p = plan(&s, &opts(vec![], 3, now));
+    assert_ne!(p.items[0].action, Action::Keep);
+    assert_eq!(p.items[0].state, ProjectState::Idle);
+    assert_eq!(p.items[0].action, Action::Archive);
+    assert!(p.items[0].state_reason.contains("3-day"));
+}
+
+#[test]
+fn last_commit_alone_can_make_a_project_active() {
+    let now = 1_000 * DAY;
+    let mut n = repo_node("/r", Class::Repo, all_yes());
+    n.newest_mtime = Some(now - 90 * DAY);
+    n.repo.as_mut().unwrap().last_commit_time = Some(now - 2 * DAY);
+    let s = synthetic(vec![n]);
+    assert_eq!(plan(&s, &opts(vec![], 7, now)).items[0].action, Action::Keep);
+}
+
+#[test]
+fn a_running_process_inside_a_project_makes_it_and_its_regenerable_dirs_active() {
+    let now = 1_000 * DAY;
+    let mut repo = repo_node("/work/r", Class::Repo, all_yes());
+    repo.newest_mtime = Some(now - 90 * DAY);
+    let mut nm = Node::new("/work/r/node_modules", Class::Regenerable);
+    nm.parent = Some(0);
+    nm.bytes_total = 100;
+    let s = synthetic(vec![repo, nm]);
+
+    // Control: nothing running, both idle.
+    let p = plan(&s, &opts(vec![], 7, now));
+    assert_eq!(p.items[0].action, Action::Archive);
+    assert_eq!(p.items[1].action, Action::RemoveRegenerable);
+
+    let mut o = opts(vec![], 7, now);
+    o.process = ProcessCheck::Ok {
+        cwds: vec![PathBuf::from("/work/r/src/deep")],
+    };
+    let p = plan(&s, &o);
+    assert_eq!(p.items[0].action, Action::Keep);
+    assert_eq!(p.items[1].action, Action::Keep);
+    assert!(p.items[0].state_reason.contains("running process"));
+    assert_eq!(p.process_check, "ok");
+}
+
+#[test]
+fn unknown_process_check_is_recorded_and_blocks_removal() {
+    let now = 1_000 * DAY;
+    let mut repo = repo_node("/work/r", Class::Repo, all_yes());
+    repo.newest_mtime = Some(now - 90 * DAY);
+    let mut nm = Node::new("/work/r/node_modules", Class::Regenerable);
+    nm.parent = Some(0);
+    nm.bytes_total = 100;
+    let s = synthetic(vec![repo, nm]);
+    let mut o = opts(vec![], 7, now);
+    o.process = ProcessCheck::Unknown {
+        reason: "denied".to_string(),
+    };
+    let p = plan(&s, &o);
+    assert_eq!(p.process_check, "unknown");
+    assert_eq!(p.process_check_note.as_deref(), Some("denied"));
+    for it in &p.items {
+        assert_eq!(it.action, Action::Ask, "{}", it.path);
+        assert_eq!(it.reclaimable_bytes, 0);
+    }
+    assert_eq!(p.totals.reclaimable_bytes, 0);
+}
+
+#[test]
+fn real_process_check_does_not_panic_and_reports_a_status() {
+    let st = running_cwds();
+    assert!(matches!(st.status(), "ok" | "partial" | "unknown"));
+    // This test process runs somewhere; if cwds are readable, one is inside the current dir.
+    if let Ok(cwd) = std::env::current_dir() {
+        if !st.cwds().is_empty() {
+            let real = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+            assert!(
+                st.inside(&real).is_some(),
+                "the test process itself should be seen in {}",
+                real.display()
+            );
+        }
+    }
 }
 
 #[test]
@@ -170,8 +269,8 @@ fn loose_code_is_always_ask_unless_active() {
     );
     assert_eq!(
         plan(&s, &opts(vec![], 1, 0)).items[0].action,
-        Action::Ask,
-        "recent loose code is still ask, never silently kept or removed"
+        Action::Keep,
+        "recently touched loose code is active, so it is left alone"
     );
     let active = vec![PathBuf::from("/code")];
     assert_eq!(

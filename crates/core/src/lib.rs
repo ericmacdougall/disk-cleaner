@@ -6,20 +6,24 @@
 
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod error;
 pub mod facts;
 pub mod git;
 pub mod model;
 pub mod plan;
+pub mod procs;
 pub mod redact;
 pub mod rules;
 pub mod scan;
 
+pub use config::{Config, ConfigSource, DEFAULT_ACTIVE_WINDOW_DAYS};
 pub use error::{Error, Result};
 pub use facts::{is_network_url, FactsConfig};
 pub use git::{Git, GitError};
 pub use model::*;
-pub use plan::{plan, Action, Plan, PlanItem, PlanOptions};
+pub use plan::{plan, Action, Plan, PlanItem, PlanOptions, ProjectState};
+pub use procs::{running_cwds, ProcessCheck};
 pub use rules::RuleSet;
 pub use scan::{scan, ScanOptions};
 

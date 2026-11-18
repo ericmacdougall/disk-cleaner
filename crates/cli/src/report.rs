@@ -143,9 +143,14 @@ pub fn plan_summary(p: &Plan) -> String {
     let mut o = String::new();
     let _ = writeln!(
         o,
-        "Dry-run plan (nothing is changed). Idle threshold: {} days.",
-        p.idle_days
+        "Dry-run plan (nothing is changed). Active window: {} days (from {}).",
+        p.active_window_days, p.window_source
     );
+    let _ = write!(o, "Running-process check: {}", p.process_check);
+    if let Some(n) = &p.process_check_note {
+        let _ = write!(o, " ({n})");
+    }
+    let _ = writeln!(o);
     if !p.active.is_empty() {
         let _ = writeln!(o, "Active paths: {}", p.active.join(", "));
     }
@@ -181,6 +186,7 @@ pub fn plan_summary(p: &Plan) -> String {
             it.class.as_str(),
             it.path
         );
+        let _ = writeln!(o, "      {:?}: {}", it.state, it.state_reason);
         let _ = writeln!(o, "      {}", it.reason);
     }
     o

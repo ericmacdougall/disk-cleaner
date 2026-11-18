@@ -6,7 +6,8 @@ mod report;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use disk_cleaner_core::{
-    plan, read_scan, scan, write_json, FactsConfig, Git, PlanOptions, ScanOptions,
+    config, plan, read_scan, running_cwds, scan, write_json, ConfigSource, FactsConfig, Git,
+    PlanOptions, ScanOptions,
 };
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -69,9 +70,13 @@ struct PlanArgs {
     /// A path the user says is active. Repeatable. Everything under it is kept.
     #[arg(long = "active", value_name = "PATH")]
     active: Vec<PathBuf>,
-    /// Projects idle at least this many days may be cleaned. There is no default.
+    /// A project is active when touched within this many days (overrides the config file;
+    /// the built-in default is 7).
     #[arg(long, value_name = "DAYS")]
-    idle_days: u64,
+    active_window_days: Option<u64>,
+    /// Config file (default: <platform config dir>/disk-cleaner/config.toml).
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
     /// Print the plan as JSON.
     #[arg(long)]
     json: bool,
@@ -126,10 +131,22 @@ fn run_plan(a: PlanArgs) -> Result<()> {
     for p in &a.active {
         active.push(std::path::absolute(p).with_context(|| format!("bad --active {p:?}"))?);
     }
+    // The config is always loaded and validated, even when a flag overrides it, so a broken
+    // file is reported instead of being ignored.
+    let (cfg, source) = config::load(a.config.as_deref()).context("invalid configuration")?;
+    let (window, window_source) = match (a.active_window_days, source) {
+        (Some(n), _) => (n, "--active-window-days".to_string()),
+        (None, ConfigSource::File(p)) => {
+            (cfg.active_window_days, format!("config {}", p.display()))
+        }
+        (None, ConfigSource::Default) => (cfg.active_window_days, "default".to_string()),
+    };
     let opts = PlanOptions {
         active,
-        idle_days: a.idle_days,
+        active_window_days: window,
+        window_source,
         now,
+        process: running_cwds(),
     };
     let p = plan(&scan_result, &opts);
     if a.json {

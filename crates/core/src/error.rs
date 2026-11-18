@@ -27,6 +27,9 @@ pub enum Error {
     /// The rules file is invalid.
     #[error("invalid rules: {0}")]
     Rules(String),
+    /// The config file is missing (when named explicitly) or malformed.
+    #[error("config file {path}: {message}")]
+    Config { path: PathBuf, message: String },
     /// The scan file was written with a schema this build does not understand.
     #[error("scan file has schema_version {found}, this build reads {expected}")]
     Schema { found: u32, expected: u32 },
