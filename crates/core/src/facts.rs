@@ -206,7 +206,10 @@ fn local_config_keys(git: &crate::git::Git, path: &Path) -> Result<Vec<String>, 
             .map_err(|e| note("config", &e))
     };
     let mut keys = list(&["--local"])?;
-    if keys.iter().any(|k| k.eq_ignore_ascii_case("extensions.worktreeconfig")) {
+    if keys
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case("extensions.worktreeconfig"))
+    {
         keys.extend(list(&["--worktree"])?);
     }
     Ok(keys)
@@ -347,7 +350,12 @@ pub fn collect_repo_info(
                     // local tag cannot be shown to exist on the remote without `ls-remote`.
                     match git.run(
                         path,
-                        &["for-each-ref", "--count=1", "--format=%(refname)", "refs/tags"],
+                        &[
+                            "for-each-ref",
+                            "--count=1",
+                            "--format=%(refname)",
+                            "refs/tags",
+                        ],
                     ) {
                         Ok(tags) if tags.trim().is_empty() => Tri::Yes,
                         Ok(_) => {

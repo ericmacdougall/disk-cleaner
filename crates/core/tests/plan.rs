@@ -491,8 +491,15 @@ fn f8_archive_is_not_counted_as_ready_and_remote_facts_are_labelled_unverified()
     let s = synthetic(vec![repo_node("/r", Class::Repo, all_yes())]);
     let p = plan(&s, &opts(vec![], 7, 365 * DAY));
     assert_eq!(p.items[0].action, Action::Archive);
-    assert_eq!(p.totals.ready_bytes, 0, "no recovery step cannot be claimed from local refs");
-    assert!(p.items[0].reason.contains("unverified"), "{}", p.items[0].reason);
+    assert_eq!(
+        p.totals.ready_bytes, 0,
+        "no recovery step cannot be claimed from local refs"
+    );
+    assert!(
+        p.items[0].reason.contains("unverified"),
+        "{}",
+        p.items[0].reason
+    );
     let v = serde_json::to_value(&p).unwrap();
     assert_eq!(v["remote_facts_verified"], false);
 }

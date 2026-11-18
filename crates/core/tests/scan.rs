@@ -79,7 +79,14 @@ fn ambiguous_names_need_their_own_marker() {
 fn marker_beside_the_directory_counts_in_a_workspace_package() {
     let (_tmp, root, _) = workspace();
     write(&root.join("mono").join("package.json"), "{}");
-    write(&root.join("mono").join("packages").join("a").join("package.json"), "{}");
+    write(
+        &root
+            .join("mono")
+            .join("packages")
+            .join("a")
+            .join("package.json"),
+        "{}",
+    );
     write_bytes(
         &root
             .join("mono")

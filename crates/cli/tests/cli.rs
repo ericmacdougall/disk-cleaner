@@ -138,7 +138,10 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
     // node_modules is neither ignored nor tracked here, so it needs a person's decision and
     // the repo that encloses it asks too; it must never be archived.
     let action = repo_item["action"].as_str().unwrap();
-    assert!(action == "ask" || action == "recover-then-archive", "{action}");
+    assert!(
+        action == "ask" || action == "recover-then-archive",
+        "{action}"
+    );
 
     for text in [&human, &json, &plan_text, &plan_json] {
         assert!(!text.contains("cli-SECRET-tok-77"), "token leaked");
@@ -487,7 +490,10 @@ fn f5_active_path_that_does_not_exist_is_an_error() {
     let (tmp, scan_file, _nm, home) = idle_fixture();
     let nope = tmp.path().join("scan").join("prooj");
     let o = plan_json(&scan_file, &home, &["--active", nope.to_str().unwrap()]);
-    assert!(!o.status.success(), "a mistyped --active must not be accepted");
+    assert!(
+        !o.status.success(),
+        "a mistyped --active must not be accepted"
+    );
     assert!(String::from_utf8_lossy(&o.stderr).contains("prooj"));
     assert!(stdout(&o).trim().is_empty());
 }
@@ -497,7 +503,11 @@ fn f5_active_path_that_matches_nothing_scanned_is_an_error() {
     let (tmp, scan_file, _nm, home) = idle_fixture();
     let elsewhere = tmp.path().join("elsewhere");
     fs::create_dir_all(&elsewhere).unwrap();
-    let o = plan_json(&scan_file, &home, &["--active", elsewhere.to_str().unwrap()]);
+    let o = plan_json(
+        &scan_file,
+        &home,
+        &["--active", elsewhere.to_str().unwrap()],
+    );
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("elsewhere"));
 }
@@ -532,7 +542,10 @@ fn f16_control_characters_in_paths_are_escaped_in_human_output() {
             "a path forged a line"
         );
     }
-    assert!(human_plan.contains("FORGED-LINE"), "the path is still shown, escaped");
+    assert!(
+        human_plan.contains("FORGED-LINE"),
+        "the path is still shown, escaped"
+    );
 }
 
 fn snapshot_git_state(repo: &Path) -> Vec<(PathBuf, Vec<u8>)> {
@@ -583,12 +596,35 @@ fn scan_with_git_enabled_leaves_the_index_refs_and_objects_byte_identical() {
         scan_file.to_str().unwrap(),
     ]));
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
     assert_eq!(v["options"]["git_facts"], true);
-    let o = run(bin().args(["plan", "--scan", scan_file.to_str().unwrap(), "--active-window-days", "1"]));
+    let o = run(bin().args([
+        "plan",
+        "--scan",
+        scan_file.to_str().unwrap(),
+        "--active-window-days",
+        "1",
+    ]));
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
 
-    assert_eq!(before, snapshot_git_state(&repo), ".git changed during scan");
+    let after = snapshot_git_state(&repo);
+    let mut diffs: Vec<String> = Vec::new();
+    for (p, bytes) in &before {
+        match after.iter().find(|(q, _)| q == p) {
+            None => diffs.push(format!("removed {}", p.display())),
+            Some((_, b2)) if b2 != bytes => {
+                diffs.push(format!("changed {} ({} -> {} bytes)", p.display(), bytes.len(), b2.len()))
+            }
+            _ => {}
+        }
+    }
+    for (p, _) in &after {
+        if !before.iter().any(|(q, _)| q == p) {
+            diffs.push(format!("created {}", p.display()));
+        }
+    }
+    assert!(diffs.is_empty(), ".git changed during scan: {diffs:?}");
     // Only the scan file was created, and it is outside the scanned tree.
     assert_eq!(working_before.len(), listing(&root).len());
 }

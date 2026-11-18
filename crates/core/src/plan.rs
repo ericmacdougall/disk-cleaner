@@ -459,9 +459,10 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         process_check: opts.process.status().to_string(),
         process_check_note: opts.process.note(),
         remote_facts_verified: false,
-        remote_facts_note: "remote facts come from local remote-tracking refs, which can be stale; \
+        remote_facts_note:
+            "remote facts come from local remote-tracking refs, which can be stale; \
                             they are unverified until apply re-checks them with git ls-remote"
-            .to_string(),
+                .to_string(),
         active: opts
             .active
             .iter()

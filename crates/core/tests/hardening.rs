@@ -73,7 +73,10 @@ fn f1_gpg_program_via_log_show_signature_is_never_executed() {
     );
     let file = tmp.path().join("commit-object");
     fs::write(&file, obj).unwrap();
-    let sha = git(&repo, &["hash-object", "-t", "commit", "-w", file.to_str().unwrap()]);
+    let sha = git(
+        &repo,
+        &["hash-object", "-t", "commit", "-w", file.to_str().unwrap()],
+    );
     git(&repo, &["update-ref", "refs/heads/main", &sha]);
     append(
         &repo.join(".git").join("config"),
@@ -110,8 +113,14 @@ fn f1_timeout_kills_the_whole_process_group() {
             }
         }
     }
-    assert!(matches!(outcome, Some(Err(GitError::Timeout(_)))), "{outcome:?}");
-    let pid = fs::read_to_string(&pidfile).expect("child pid").trim().to_string();
+    assert!(
+        matches!(outcome, Some(Err(GitError::Timeout(_)))),
+        "{outcome:?}"
+    );
+    let pid = fs::read_to_string(&pidfile)
+        .expect("child pid")
+        .trim()
+        .to_string();
     std::thread::sleep(Duration::from_millis(600));
     let alive = std::process::Command::new("kill")
         .args(["-0", &pid])
@@ -119,7 +128,9 @@ fn f1_timeout_kills_the_whole_process_group() {
         .map(|s| s.success())
         .unwrap_or(false);
     // Never leave the sleeper behind, whatever the outcome.
-    let _ = std::process::Command::new("kill").args(["-KILL", &pid]).status();
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid])
+        .status();
     assert!(!alive, "a grandchild of git survived the timeout");
 }
 
@@ -131,7 +142,11 @@ fn f1_ordinary_repo_config_is_not_rejected() {
     git(&repo, &["config", "pull.rebase", "true"]);
     git(&repo, &["config", "branch.main.description", "x"]);
     let res = scan_with(&root, network_everywhere());
-    assert!(facts_of(&res, &repo).all_yes(), "{:?}", facts_of(&res, &repo));
+    assert!(
+        facts_of(&res, &repo).all_yes(),
+        "{:?}",
+        facts_of(&res, &repo)
+    );
 }
 
 // ---------------------------------------------------------------- F2
@@ -230,7 +245,11 @@ fn f3b_submodule_with_a_stash_and_local_branch_stops_the_outer_repo_from_being_a
     let res = scan_with(&root, network_everywhere());
     assert_eq!(facts_of(&res, &sub).stash_empty, Tri::No);
     // The reviewer's case: the outer repo itself looks perfectly clean.
-    assert!(facts_of(&res, &outer).all_yes(), "{:?}", facts_of(&res, &outer));
+    assert!(
+        facts_of(&res, &outer).all_yes(),
+        "{:?}",
+        facts_of(&res, &outer)
+    );
     assert_eq!(
         action_for(&res, &outer),
         Action::Ask,
@@ -259,18 +278,34 @@ fn f4_marker_must_be_in_the_parent_directory() {
     let (_tmp, root, _) = workspace();
     write(&root.join("mono").join("package.json"), "{}");
     write_bytes(
-        &root.join("mono").join("src").join("build").join("hand-written.js"),
+        &root
+            .join("mono")
+            .join("src")
+            .join("build")
+            .join("hand-written.js"),
         100,
     );
     write_bytes(
-        &root.join("mono").join("packages").join("a").join("node_modules").join("x.js"),
+        &root
+            .join("mono")
+            .join("packages")
+            .join("a")
+            .join("node_modules")
+            .join("x.js"),
         100,
     );
     let res = scan_plain(&root);
-    assert!(!has_node(&res, &root.join("mono").join("src").join("build")));
     assert!(!has_node(
         &res,
-        &root.join("mono").join("packages").join("a").join("node_modules")
+        &root.join("mono").join("src").join("build")
+    ));
+    assert!(!has_node(
+        &res,
+        &root
+            .join("mono")
+            .join("packages")
+            .join("a")
+            .join("node_modules")
     ));
 }
 
@@ -299,7 +334,10 @@ fn f4_build_directory_in_loose_code_is_asked_not_removed() {
     write(&root.join("proj").join("package.json"), "{}");
     write_bytes(&root.join("proj").join("build").join("only-copy.js"), 100);
     let res = scan_plain(&root);
-    assert_eq!(action_for(&res, &root.join("proj").join("build")), Action::Ask);
+    assert_eq!(
+        action_for(&res, &root.join("proj").join("build")),
+        Action::Ask
+    );
 }
 
 #[test]
@@ -320,9 +358,16 @@ fn f4_a_git_clone_inside_a_dependency_directory_makes_it_ask() {
 #[test]
 fn f4_outputs_in_the_design_table_are_found_in_build_directories() {
     let (_tmp, root, _) = workspace();
-    for (i, file) in ["frame.png", "data.parquet", "model.bin", "app.db", "paper.pdf", "scan.EXR"]
-        .iter()
-        .enumerate()
+    for (i, file) in [
+        "frame.png",
+        "data.parquet",
+        "model.bin",
+        "app.db",
+        "paper.pdf",
+        "scan.EXR",
+    ]
+    .iter()
+    .enumerate()
     {
         let proj = root.join(format!("p{i}"));
         write(&proj.join("package.json"), "{}");
@@ -343,7 +388,11 @@ fn f6_unreadable_subdirectory_makes_the_enclosing_directory_ask() {
     use std::os::unix::fs::PermissionsExt;
     let (_tmp, root, _) = workspace();
     write(&root.join("app").join("package.json"), "{}");
-    let locked = root.join("app").join("node_modules").join("pkg").join("hidden");
+    let locked = root
+        .join("app")
+        .join("node_modules")
+        .join("pkg")
+        .join("hidden");
     write(&locked.join("x.js"), "1");
     write_bytes(&root.join("app").join("node_modules").join("ok.js"), 10);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
