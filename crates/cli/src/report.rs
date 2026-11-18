@@ -66,7 +66,7 @@ pub fn scan_summary(s: &ScanResult) -> String {
 
     let mut repos: Vec<&disk_cleaner_core::Node> =
         s.nodes.iter().filter(|n| n.class.is_git()).collect();
-    repos.sort_by(|a, b| b.bytes_total.cmp(&a.bytes_total));
+    repos.sort_by_key(|n| std::cmp::Reverse(n.bytes_total));
     if !repos.is_empty() {
         let _ = writeln!(o, "\nRepos and worktrees ({}):", repos.len());
         for n in repos.iter().take(25) {
@@ -104,7 +104,7 @@ pub fn scan_summary(s: &ScanResult) -> String {
         .iter()
         .filter(|n| matches!(n.class, Class::Regenerable | Class::Cache))
         .collect();
-    regen.sort_by(|a, b| b.bytes_total.cmp(&a.bytes_total));
+    regen.sort_by_key(|n| std::cmp::Reverse(n.bytes_total));
     if !regen.is_empty() {
         let _ = writeln!(o, "\nRegenerable and cache directories ({}):", regen.len());
         for n in regen.iter().take(15) {
