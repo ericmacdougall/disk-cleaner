@@ -36,6 +36,7 @@ jobs:
           path: fmt.patch
           if-no-files-found: ignore
       - name: Clippy
+        if: always()
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:

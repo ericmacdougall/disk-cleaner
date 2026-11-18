@@ -613,9 +613,12 @@ fn scan_with_git_enabled_leaves_the_index_refs_and_objects_byte_identical() {
     for (p, bytes) in &before {
         match after.iter().find(|(q, _)| q == p) {
             None => diffs.push(format!("removed {}", p.display())),
-            Some((_, b2)) if b2 != bytes => {
-                diffs.push(format!("changed {} ({} -> {} bytes)", p.display(), bytes.len(), b2.len()))
-            }
+            Some((_, b2)) if b2 != bytes => diffs.push(format!(
+                "changed {} ({} -> {} bytes)",
+                p.display(),
+                bytes.len(),
+                b2.len()
+            )),
             _ => {}
         }
     }
