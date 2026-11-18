@@ -88,6 +88,26 @@ mod tests {
     }
 
     #[test]
+    fn f10_userinfo_containing_query_or_fragment_characters_is_stripped() {
+        for url in [
+            "https://user:pa?ss@host.invalid/x.git",
+            "https://user:pa#ss@host.invalid/x.git",
+            "https://tok?en@host.invalid/x.git",
+        ] {
+            let s = strip_url_credentials(url);
+            assert_eq!(s, "https://host.invalid/x.git", "{url}");
+        }
+    }
+
+    #[test]
+    fn f10_query_strings_and_fragments_are_dropped_from_stored_urls() {
+        let s = strip_url_credentials("https://host.invalid/x.git?access_token=abc123");
+        assert_eq!(s, "https://host.invalid/x.git");
+        let s = strip_url_credentials("https://host.invalid/x.git#secret-frag");
+        assert_eq!(s, "https://host.invalid/x.git");
+    }
+
+    #[test]
     fn leaves_scp_and_paths_alone() {
         assert_eq!(
             strip_url_credentials("git@host:o/r.git"),
