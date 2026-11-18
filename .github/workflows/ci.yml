@@ -51,9 +51,9 @@ jobs:
       - name: git version
         run: git --version
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
       - name: Upload the resolved lockfile
-        if: matrix.os == 'ubuntu-latest'
+        if: always() && matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4
         with:
           name: cargo-lock

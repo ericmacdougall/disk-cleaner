@@ -89,7 +89,10 @@ mod tests {
 
     #[test]
     fn leaves_scp_and_paths_alone() {
-        assert_eq!(strip_url_credentials("git@host:o/r.git"), "git@host:o/r.git");
+        assert_eq!(
+            strip_url_credentials("git@host:o/r.git"),
+            "git@host:o/r.git"
+        );
         assert_eq!(strip_url_credentials("/srv/r.git"), "/srv/r.git");
     }
 

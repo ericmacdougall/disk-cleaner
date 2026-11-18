@@ -26,7 +26,11 @@ fn git(dir: &Path, args: &[&str]) {
         .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
         .output()
         .expect("git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn write(path: &Path, content: &str) {
@@ -73,11 +77,21 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
     git(&repo, &["commit", "-q", "-m", "init"]);
     git(
         &repo,
-        &["remote", "add", "origin", "https://carol:cli-SECRET-tok-77@example.invalid/x.git"],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://carol:cli-SECRET-tok-77@example.invalid/x.git",
+        ],
     );
     let out_file = tmp.path().join("scan.json");
 
-    let o = run(bin().args(["scan", root.to_str().unwrap(), "--out", out_file.to_str().unwrap()]));
+    let o = run(bin().args([
+        "scan",
+        root.to_str().unwrap(),
+        "--out",
+        out_file.to_str().unwrap(),
+    ]));
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let human = stdout(&o);
     assert!(human.contains("Repos and worktrees"), "{human}");
@@ -87,13 +101,28 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v["schema_version"], 1);
 
-    let o = run(bin().args(["plan", "--scan", out_file.to_str().unwrap(), "--idle-days", "30"])
+    let o = run(bin()
+        .args([
+            "plan",
+            "--scan",
+            out_file.to_str().unwrap(),
+            "--idle-days",
+            "30",
+        ])
         .args(["--now", &far_future()]));
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let plan_text = stdout(&o);
     assert!(plan_text.contains("Dry-run plan"));
 
-    let o = run(bin().args(["plan", "--scan", out_file.to_str().unwrap(), "--idle-days", "30", "--json"])
+    let o = run(bin()
+        .args([
+            "plan",
+            "--scan",
+            out_file.to_str().unwrap(),
+            "--idle-days",
+            "30",
+            "--json",
+        ])
         .args(["--now", &far_future()]));
     let plan_json = stdout(&o);
     let pv: serde_json::Value = serde_json::from_str(&plan_json).unwrap();
@@ -125,7 +154,13 @@ fn scan_json_on_stdout_and_unicode_paths_round_trip_into_the_plan() {
     write(&proj.join("node_modules").join("a.js"), "1");
     let before = listing(&root);
 
-    let o = run(bin().args(["scan", root.to_str().unwrap(), "--json", "--no-git", "--one-file-system"]));
+    let o = run(bin().args([
+        "scan",
+        root.to_str().unwrap(),
+        "--json",
+        "--no-git",
+        "--one-file-system",
+    ]));
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let scan_json = stdout(&o);
     let v: serde_json::Value = serde_json::from_str(&scan_json).unwrap();
@@ -135,13 +170,24 @@ fn scan_json_on_stdout_and_unicode_paths_round_trip_into_the_plan() {
         .iter()
         .map(|n| n["path"].as_str().unwrap().to_string())
         .collect();
-    assert!(paths.contains(&proj.to_string_lossy().into_owned()), "{paths:?}");
+    assert!(
+        paths.contains(&proj.to_string_lossy().into_owned()),
+        "{paths:?}"
+    );
     // Read-only: scanning changed nothing.
     assert_eq!(before, listing(&root));
 
     let scan_file = tmp.path().join("scan.json");
     fs::write(&scan_file, &scan_json).unwrap();
-    let o = run(bin().args(["plan", "--scan", scan_file.to_str().unwrap(), "--idle-days", "1", "--json"])
+    let o = run(bin()
+        .args([
+            "plan",
+            "--scan",
+            scan_file.to_str().unwrap(),
+            "--idle-days",
+            "1",
+            "--json",
+        ])
         .args(["--now", &far_future()]));
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let pv: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
@@ -171,13 +217,26 @@ fn active_flag_keeps_everything_under_it() {
     write(&proj.join("package.json"), "{}");
     write(&proj.join("node_modules").join("a.js"), "1");
     let scan_file = tmp.path().join("scan.json");
-    let o = run(bin().args(["scan", root.to_str().unwrap(), "--no-git", "--out", scan_file.to_str().unwrap()]));
+    let o = run(bin().args([
+        "scan",
+        root.to_str().unwrap(),
+        "--no-git",
+        "--out",
+        scan_file.to_str().unwrap(),
+    ]));
     assert!(o.status.success());
 
     let plan = |active: Option<&Path>| -> serde_json::Value {
         let mut c = bin();
-        c.args(["plan", "--scan", scan_file.to_str().unwrap(), "--idle-days", "1", "--json"])
-            .args(["--now", &far_future()]);
+        c.args([
+            "plan",
+            "--scan",
+            scan_file.to_str().unwrap(),
+            "--idle-days",
+            "1",
+            "--json",
+        ])
+        .args(["--now", &far_future()]);
         if let Some(a) = active {
             c.args(["--active", a.to_str().unwrap()]);
         }

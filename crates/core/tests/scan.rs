@@ -142,10 +142,10 @@ fn dependency_directories_do_not_get_flagged_for_fixture_archives() {
 #[test]
 fn big_outputs_outside_build_dirs_are_listed_small_ones_are_not() {
     let (_tmp, root, _) = workspace();
-    write_bytes(&root.join("media").join("big.mov"), 5000);
+    write_bytes(&root.join("media").join("big.mov"), 20_000);
     write_bytes(&root.join("media").join("small.mov"), 100);
     let mut opts = ScanOptions::new(vec![root.clone()]);
-    opts.min_output_bytes = 4096;
+    opts.min_output_bytes = 8192;
     let res = scan(&opts).unwrap();
     assert!(res.outputs.iter().any(|o| o.path.ends_with("big.mov")));
     assert!(!res.outputs.iter().any(|o| o.path.ends_with("small.mov")));
@@ -160,7 +160,11 @@ fn neg7_symlink_loop_and_hard_links_terminate_and_count_once() {
     let root = tmp.path().join("scan");
     let outside = tmp.path().join("outside");
     write_bytes(&root.join("data").join("a.bin"), MIB as usize);
-    fs::hard_link(root.join("data").join("a.bin"), root.join("data").join("b.bin")).unwrap();
+    fs::hard_link(
+        root.join("data").join("a.bin"),
+        root.join("data").join("b.bin"),
+    )
+    .unwrap();
     // A loop back to an ancestor and a link to a big directory outside the scan.
     symlink(&root, root.join("data").join("loop")).unwrap();
     write_bytes(&outside.join("huge.bin"), 2 * MIB as usize);
@@ -195,7 +199,10 @@ fn unreadable_directory_is_counted_and_reported_not_fatal() {
     }
     assert!(res.totals.unreadable >= 1);
     assert!(res.issues.iter().any(|i| i.path.ends_with("locked")));
-    assert!(res.totals.files >= 1, "the rest of the tree is still scanned");
+    assert!(
+        res.totals.files >= 1,
+        "the rest of the tree is still scanned"
+    );
 }
 
 #[test]
@@ -243,7 +250,17 @@ fn classes_repo_worktree_bare_loose_and_plain() {
     let repo = root.join("main-repo");
     init_repo(&repo);
     let wt = root.join("linked-wt");
-    git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "wt-branch"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "wt-branch",
+        ],
+    );
     let bare = root.join("mirror.git");
     init_bare(&bare);
     write(&root.join("tool").join("package.json"), "{}");

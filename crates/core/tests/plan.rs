@@ -129,9 +129,18 @@ fn idle_threshold_is_an_input_not_a_constant() {
     let s = synthetic(vec![repo_node("/r", Class::Repo, all_yes())]);
     // Last activity at t=0; now is 100 days later.
     let now = 100 * DAY;
-    assert_eq!(plan(&s, &opts(vec![], 99, now)).items[0].action, Action::Archive);
-    assert_eq!(plan(&s, &opts(vec![], 100, now)).items[0].action, Action::Archive);
-    assert_eq!(plan(&s, &opts(vec![], 101, now)).items[0].action, Action::Keep);
+    assert_eq!(
+        plan(&s, &opts(vec![], 99, now)).items[0].action,
+        Action::Archive
+    );
+    assert_eq!(
+        plan(&s, &opts(vec![], 100, now)).items[0].action,
+        Action::Archive
+    );
+    assert_eq!(
+        plan(&s, &opts(vec![], 101, now)).items[0].action,
+        Action::Keep
+    );
     assert_eq!(
         plan(&s, &opts(vec![], 365, now)).items[0].action,
         Action::Keep
@@ -194,7 +203,10 @@ fn neg8_repo_under_an_active_path_is_kept_with_its_huge_node_modules() {
     write(&repo.join(".gitignore"), "node_modules/\n");
     git(&repo, &["add", ".gitignore", "package.json"]);
     git(&repo, &["commit", "-q", "-m", "project files"]);
-    write_bytes(&repo.join("node_modules").join("big").join("x.js"), 2_000_000);
+    write_bytes(
+        &repo.join("node_modules").join("big").join("x.js"),
+        2_000_000,
+    );
     let remote = remotes.join("app.git");
     init_bare(&remote);
     push_to_remote(&repo, &remote);

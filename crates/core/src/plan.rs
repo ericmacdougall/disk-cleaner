@@ -201,7 +201,10 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     }
     let mut totals = PlanTotals::default();
     for it in &items {
-        let slot = totals.by_action.entry(it.action.as_str().to_string()).or_default();
+        let slot = totals
+            .by_action
+            .entry(it.action.as_str().to_string())
+            .or_default();
         slot.items += 1;
         let mut nested = false;
         let mut cur = scan.nodes[it.node].parent;

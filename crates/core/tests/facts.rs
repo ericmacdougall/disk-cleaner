@@ -71,8 +71,8 @@ fn neg1_missing_git_binary_makes_every_fact_unknown_and_plan_asks() {
 
 #[cfg(unix)]
 fn fake_git(dir: &Path, body: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let path = dir.join("fake-git");
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -127,7 +127,7 @@ fn neg1_git_timeout_is_a_typed_error_and_facts_are_unknown() {
 #[test]
 fn neg6_credentials_in_git_error_output_are_redacted() {
     let (tmp, root, remotes) = workspace();
-    let repo = pushed_repo(&root, &remotes, "app");
+    let _repo = pushed_repo(&root, &remotes, "app");
     let script = fake_git(
         tmp.path(),
         "#!/bin/sh\necho \"fatal: unable to access 'https://bob:tok-LEAK-123@example.invalid/x.git/'\" >&2\nexit 128\n",
@@ -314,7 +314,14 @@ fn ac5_linked_worktree_is_tied_to_its_parent_and_parent_has_dependents() {
     let wt = root.join("app-wt");
     git(
         &repo,
-        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "wt-branch"],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            wt.to_str().unwrap(),
+            "-b",
+            "wt-branch",
+        ],
     );
 
     let res = scan_with(&root, network_everywhere());

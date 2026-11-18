@@ -19,7 +19,10 @@ fn one_file_system_does_not_cross_a_mount_point() {
             return;
         }
     };
-    let root = mount.parent().expect("mount dir has a parent").to_path_buf();
+    let root = mount
+        .parent()
+        .expect("mount dir has a parent")
+        .to_path_buf();
     // A 4 MiB file on the other filesystem, 1 KiB on the root filesystem.
     write_bytes(&mount.join("big.bin"), 4 * 1024 * 1024);
     write_bytes(&root.join("small.bin"), 1024);

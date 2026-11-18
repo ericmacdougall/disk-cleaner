@@ -587,21 +587,19 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         .collect();
     if opts.collect_facts && !tasks.is_empty() {
         let jobs = opts.git_jobs.max(1);
-        let gathered: Vec<(usize, RepoInfo)> = match rayon::ThreadPoolBuilder::new()
-            .num_threads(jobs)
-            .build()
-        {
-            Ok(pool) => pool.install(|| {
-                tasks
-                    .par_iter()
+        let gathered: Vec<(usize, RepoInfo)> =
+            match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
+                Ok(pool) => pool.install(|| {
+                    tasks
+                        .par_iter()
+                        .map(|(i, p, c, regen)| (*i, collect_repo_info(&opts.facts, p, *c, regen)))
+                        .collect()
+                }),
+                Err(_) => tasks
+                    .iter()
                     .map(|(i, p, c, regen)| (*i, collect_repo_info(&opts.facts, p, *c, regen)))
-                    .collect()
-            }),
-            Err(_) => tasks
-                .iter()
-                .map(|(i, p, c, regen)| (*i, collect_repo_info(&opts.facts, p, *c, regen)))
-                .collect(),
-        };
+                    .collect(),
+            };
         infos.extend(gathered);
     } else {
         for (i, _, _, _) in &tasks {
