@@ -122,6 +122,48 @@ pub fn workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
     (tmp, scan_root, remotes)
 }
 
+/// A repo with one commit pushed to a bare "remote" outside the scan root.
+pub fn pushed_repo(root: &Path, remotes: &Path, name: &str) -> PathBuf {
+    let repo = root.join(name);
+    init_repo(&repo);
+    let remote = remotes.join(format!("{name}.git"));
+    init_bare(&remote);
+    push_to_remote(&repo, &remote);
+    repo
+}
+
+pub fn facts_of(res: &ScanResult, path: &Path) -> disk_cleaner_core::Facts {
+    node(res, path).repo.as_ref().expect("repo info").facts
+}
+
+/// Plan action for `path` with a 7-day window and a far-future clock (everything is idle).
+pub fn action_for(res: &ScanResult, path: &Path) -> disk_cleaner_core::Action {
+    let p = disk_cleaner_core::plan(res, &disk_cleaner_core::PlanOptions::new(7, far_future()));
+    p.items
+        .iter()
+        .find(|i| i.path == path.to_string_lossy())
+        .unwrap_or_else(|| panic!("no plan item for {}", path.display()))
+        .action
+}
+
+/// Write an executable shell script.
+#[cfg(unix)]
+pub fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join(name);
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&path)
+        .unwrap();
+    f.write_all(body.as_bytes()).unwrap();
+    f.sync_all().unwrap();
+    path
+}
+
 /// A year and a bit past `now`, so everything counts as idle for any sane threshold.
 pub fn far_future() -> i64 {
     let now = std::time::SystemTime::now()

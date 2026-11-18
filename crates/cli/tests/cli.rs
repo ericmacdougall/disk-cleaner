@@ -24,6 +24,13 @@ fn git(dir: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        // No background maintenance after a commit: it briefly creates and removes lock files
+        // and would make the byte-identical .git check flaky.
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "gc.auto")
+        .env("GIT_CONFIG_VALUE_1", "0")
         .output()
         .expect("git");
     assert!(
@@ -135,7 +142,13 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
         .iter()
         .find(|i| i["path"].as_str() == Some(repo_path.as_str()))
         .expect("repo item");
-    assert_eq!(repo_item["action"], "recover-then-archive");
+    // node_modules is neither ignored nor tracked here, so it needs a person's decision and
+    // the repo that encloses it asks too; it must never be archived.
+    let action = repo_item["action"].as_str().unwrap();
+    assert!(
+        action == "ask" || action == "recover-then-archive",
+        "{action}"
+    );
 
     for text in [&human, &json, &plan_text, &plan_json] {
         assert!(!text.contains("cli-SECRET-tok-77"), "token leaked");
@@ -434,6 +447,198 @@ fn neg12_malformed_config_is_an_error_never_a_silent_fallback() {
         &["--config", tmp.path().join("absent.toml").to_str().unwrap()],
     );
     assert!(!o.status.success());
+}
+
+fn idle_fixture() -> (tempfile::TempDir, PathBuf, String, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (scan_file, nm) = scan_with_project_touched(tmp.path(), 100);
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    (tmp, scan_file, nm, home)
+}
+
+fn removable_without_active(scan_file: &Path, home: &Path, nm: &str) {
+    let o = plan_json(scan_file, home, &[]);
+    let a = nm_action(&o, nm);
+    assert!(a == "remove-regenerable" || a == "ask", "control: {a}");
+}
+
+#[test]
+fn f5_active_path_with_dot_dot_still_covers_the_project() {
+    let (tmp, scan_file, nm, home) = idle_fixture();
+    removable_without_active(&scan_file, &home, &nm);
+    // `other/..` is a detour that a lexical prefix comparison cannot see through.
+    fs::create_dir_all(tmp.path().join("scan").join("other")).unwrap();
+    let spelled = tmp
+        .path()
+        .join("scan")
+        .join("other")
+        .join("..")
+        .join("proj");
+    let o = plan_json(&scan_file, &home, &["--active", spelled.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(nm_action(&o, &nm), "keep");
+}
+
+#[cfg(unix)]
+#[test]
+fn f5_active_path_through_a_symlink_still_covers_the_project() {
+    let (tmp, scan_file, nm, home) = idle_fixture();
+    let alias = tmp.path().join("alias");
+    std::os::unix::fs::symlink(tmp.path().join("scan"), &alias).unwrap();
+    let spelled = alias.join("proj");
+    let o = plan_json(&scan_file, &home, &["--active", spelled.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(nm_action(&o, &nm), "keep");
+}
+
+#[test]
+fn f5_active_path_that_does_not_exist_is_an_error() {
+    let (tmp, scan_file, _nm, home) = idle_fixture();
+    let nope = tmp.path().join("scan").join("prooj");
+    let o = plan_json(&scan_file, &home, &["--active", nope.to_str().unwrap()]);
+    assert!(
+        !o.status.success(),
+        "a mistyped --active must not be accepted"
+    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains("prooj"));
+    assert!(stdout(&o).trim().is_empty());
+}
+
+#[test]
+fn f5_active_path_that_matches_nothing_scanned_is_an_error() {
+    let (tmp, scan_file, _nm, home) = idle_fixture();
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let o = plan_json(
+        &scan_file,
+        &home,
+        &["--active", elsewhere.to_str().unwrap()],
+    );
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("elsewhere"));
+}
+
+#[cfg(unix)]
+#[test]
+fn f16_control_characters_in_paths_are_escaped_in_human_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("scan");
+    let proj = root.join("evil\u{1b}[31m\n  archive  FORGED-LINE");
+    write(&proj.join("package.json"), "{}");
+    write(&proj.join("node_modules").join("a.js"), "1");
+    let scan_file = tmp.path().join("scan.json");
+    let o = run(bin().args([
+        "scan",
+        root.to_str().unwrap(),
+        "--no-git",
+        "--out",
+        scan_file.to_str().unwrap(),
+    ]));
+    let human_scan = stdout(&o);
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut c = bin();
+    c.args(["plan", "--scan", scan_file.to_str().unwrap()]);
+    isolate(&mut c, &home);
+    let human_plan = stdout(&run(&mut c));
+    for text in [&human_scan, &human_plan] {
+        assert!(!text.contains('\u{1b}'), "raw escape sequence printed");
+        assert!(
+            !text.contains("\n  archive  FORGED-LINE"),
+            "a path forged a line"
+        );
+    }
+    assert!(
+        human_plan.contains("FORGED-LINE"),
+        "the path is still shown, escaped"
+    );
+}
+
+fn snapshot_git_state(repo: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![repo.join(".git")];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let p = e.path();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "lock") {
+                // Transient lock files of git's own housekeeping are not repository state.
+            } else {
+                out.push((p.clone(), fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn scan_with_git_enabled_leaves_the_index_refs_and_objects_byte_identical() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("scan");
+    let repo = root.join("app");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    write(&repo.join("a.txt"), "one\n");
+    write(&repo.join("b.txt"), "two\n");
+    git(&repo, &["add", "a.txt", "b.txt"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    // Make the index stale (same content, new mtime) so a status that may refresh it would.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(repo.join("a.txt"))
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    let before = snapshot_git_state(&repo);
+    let working_before = listing(&root);
+
+    let scan_file = tmp.path().join("scan.json");
+    let o = run(bin().args([
+        "scan",
+        root.to_str().unwrap(),
+        "--out",
+        scan_file.to_str().unwrap(),
+    ]));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
+    assert_eq!(v["options"]["git_facts"], true);
+    let o = run(bin().args([
+        "plan",
+        "--scan",
+        scan_file.to_str().unwrap(),
+        "--active-window-days",
+        "1",
+    ]));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    let after = snapshot_git_state(&repo);
+    let mut diffs: Vec<String> = Vec::new();
+    for (p, bytes) in &before {
+        match after.iter().find(|(q, _)| q == p) {
+            None => diffs.push(format!("removed {}", p.display())),
+            Some((_, b2)) if b2 != bytes => diffs.push(format!(
+                "changed {} ({} -> {} bytes)",
+                p.display(),
+                bytes.len(),
+                b2.len()
+            )),
+            _ => {}
+        }
+    }
+    for (p, _) in &after {
+        if !before.iter().any(|(q, _)| q == p) {
+            diffs.push(format!("created {}", p.display()));
+        }
+    }
+    assert!(diffs.is_empty(), ".git changed during scan: {diffs:?}");
+    // Only the scan file was created, and it is outside the scanned tree.
+    assert_eq!(working_before.len(), listing(&root).len());
 }
 
 #[test]

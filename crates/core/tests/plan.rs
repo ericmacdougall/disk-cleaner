@@ -359,7 +359,12 @@ fn neg4_build_dir_with_an_output_file_is_never_offered_for_removal() {
     let with_video = root.join("a");
     let without = root.join("b");
     for proj in [&with_video, &without] {
+        // Real repos that ignore out/, so git proves it is generated, untracked output.
+        init_repo(proj);
         write(&proj.join("package.json"), "{}");
+        write(&proj.join(".gitignore"), "out/\n");
+        git(proj, &["add", "package.json", ".gitignore"]);
+        git(proj, &["commit", "-q", "-m", "project"]);
         write_bytes(&proj.join("out").join("bundle.js"), 5000);
     }
     write_bytes(&with_video.join("out").join("render.mp4"), 1024);
@@ -414,6 +419,100 @@ fn totals_do_not_double_count_nested_removals() {
         Action::RemoveRegenerable
     );
     assert_eq!(p.totals.reclaimable_bytes, 10_000);
+}
+
+fn child(path: &str, class: Class, parent: usize) -> Node {
+    let mut n = Node::new(path, class);
+    n.parent = Some(parent);
+    n.bytes_self = 100;
+    n.bytes_total = 100;
+    n.newest_mtime = Some(0);
+    n
+}
+
+#[test]
+fn f3_a_nested_node_that_asks_stops_the_enclosing_repo_from_being_archived() {
+    let now = 365 * DAY;
+    let outer = repo_node("/w/outer", Class::Repo, all_yes());
+    let mut build = child("/w/outer/build", Class::Regenerable, 0);
+    build.contains_outputs = true;
+    let s = synthetic(vec![outer, build]);
+    let p = plan(&s, &opts(vec![], 7, now));
+    assert_eq!(p.items[1].action, Action::Ask);
+    assert_eq!(p.items[0].action, Action::Ask);
+    assert_eq!(p.items[0].reclaimable_bytes, 0);
+    assert_eq!(p.totals.reclaimable_bytes, 0);
+}
+
+#[test]
+fn f3_a_nested_git_node_with_a_fact_not_yes_stops_the_enclosing_repo() {
+    let now = 365 * DAY;
+    let outer = repo_node("/w/outer", Class::Repo, all_yes());
+    let mut f = all_yes();
+    f.stash_empty = Tri::No;
+    let sub = {
+        let mut n = repo_node("/w/outer/sub", Class::Worktree, f);
+        n.parent = Some(0);
+        n
+    };
+    let s = synthetic(vec![outer, sub]);
+    let p = plan(&s, &opts(vec![], 7, now));
+    assert_eq!(p.items[1].action, Action::RecoverThenArchive);
+    assert_eq!(p.items[0].action, Action::Ask);
+}
+
+#[test]
+fn f3_a_recently_active_nested_project_keeps_the_enclosing_repo_out_of_removal() {
+    let now = 365 * DAY;
+    let outer = repo_node("/w/outer", Class::Repo, all_yes());
+    let mut sub = repo_node("/w/outer/sub", Class::Worktree, all_yes());
+    sub.parent = Some(0);
+    sub.newest_mtime = Some(now - DAY);
+    sub.repo.as_mut().unwrap().last_commit_time = Some(now - DAY);
+    let s = synthetic(vec![outer, sub]);
+    let p = plan(&s, &opts(vec![], 7, now));
+    assert_eq!(p.items[1].action, Action::Keep);
+    assert_eq!(p.items[0].action, Action::Ask);
+}
+
+#[test]
+fn f3_a_removable_regenerable_child_does_not_block_the_parent() {
+    let now = 365 * DAY;
+    let outer = repo_node("/w/outer", Class::Repo, all_yes());
+    let nm = child("/w/outer/node_modules", Class::Regenerable, 0);
+    let s = synthetic(vec![outer, nm]);
+    let p = plan(&s, &opts(vec![], 7, now));
+    assert_eq!(p.items[0].action, Action::Archive);
+    assert_eq!(p.items[1].action, Action::RemoveRegenerable);
+}
+
+#[test]
+fn f8_archive_is_not_counted_as_ready_and_remote_facts_are_labelled_unverified() {
+    let s = synthetic(vec![repo_node("/r", Class::Repo, all_yes())]);
+    let p = plan(&s, &opts(vec![], 7, 365 * DAY));
+    assert_eq!(p.items[0].action, Action::Archive);
+    assert_eq!(
+        p.totals.ready_bytes, 0,
+        "no recovery step cannot be claimed from local refs"
+    );
+    assert!(
+        p.items[0].reason.contains("unverified"),
+        "{}",
+        p.items[0].reason
+    );
+    let v = serde_json::to_value(&p).unwrap();
+    assert_eq!(v["remote_facts_verified"], false);
+}
+
+#[test]
+fn f9_an_absurd_window_keeps_everything_instead_of_wrapping() {
+    let mut n = repo_node("/r", Class::Repo, all_yes());
+    n.newest_mtime = Some(0);
+    let s = synthetic(vec![n]);
+    for w in [u64::MAX, u64::MAX / 86_400 + 1, i64::MAX as u64 + 1] {
+        let p = plan(&s, &opts(vec![], w, 365 * DAY));
+        assert_eq!(p.items[0].action, Action::Keep, "window {w}");
+    }
 }
 
 #[test]
