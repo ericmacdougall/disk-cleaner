@@ -564,8 +564,9 @@ fn snapshot_git_state(repo: &Path) -> Vec<(PathBuf, Vec<u8>)> {
             let p = e.path();
             if e.file_type().unwrap().is_dir() {
                 stack.push(p);
-            } else if p.extension().is_some_and(|x| x == "lock") {
-                // Transient lock files of git's own housekeeping are not repository state.
+            } else if p.file_name().is_some_and(|n| n == "maintenance.lock") {
+                // Only git's background-maintenance lock is transient; a leaked index.lock
+                // or any other lock must still fail this test.
             } else {
                 out.push((p.clone(), fs::read(&p).unwrap()));
             }

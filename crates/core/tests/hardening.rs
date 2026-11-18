@@ -428,6 +428,122 @@ fn f7_unpushed_notes_ref_is_not_all_on_remote() {
     assert_ne!(action_for(&res, &repo), Action::Archive);
 }
 
+// ---------------------------------------------------------------- N1, N2 (delta review)
+
+fn add_submodule(outer: &Path, url: &Path, name: &str) {
+    git(
+        outer,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            url.to_str().unwrap(),
+            name,
+        ],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn n1_submodule_config_filter_is_never_executed_by_the_outer_status() {
+    let (tmp, root, remotes) = workspace();
+    let srcs = tmp.path().join("srcs");
+    fs::create_dir_all(&srcs).unwrap();
+    let subsrc = pushed_repo(&srcs, &remotes, "subsrc");
+    write(&subsrc.join(".gitattributes"), "* filter=evil\n");
+    write(&subsrc.join("s.txt"), "one\n");
+    git(&subsrc, &["add", ".gitattributes", "s.txt"]);
+    git(&subsrc, &["commit", "-q", "-m", "attrs"]);
+    git(&subsrc, &["push", "-q", "origin", "main"]);
+    let outer = pushed_repo(&root, &remotes, "outer");
+    add_submodule(&outer, &subsrc, "sub");
+    git(&outer, &["commit", "-q", "-m", "add submodule"]);
+    git(&outer, &["push", "-q", "origin", "main"]);
+
+    let marker = tmp.path().join("pwned-by-submodule-filter");
+    append(
+        &outer.join(".git").join("modules").join("sub").join("config"),
+        &format!(
+            "[filter \"evil\"]\n\tclean = \"sh -c 'touch {}; cat'\"\n",
+            marker.display()
+        ),
+    );
+    // A changed file in the submodule makes a recursive status run the clean filter.
+    write(&outer.join("sub").join("s.txt"), "two\n");
+
+    let res = scan_with(&root, network_everywhere());
+    assert!(!marker.exists(), "a submodule's config ran a program");
+    assert!(
+        all_unknown(&facts_of(&res, &outer)),
+        "{:?}",
+        facts_of(&res, &outer)
+    );
+}
+
+#[test]
+fn n2_in_place_submodule_plus_a_deinited_one_with_a_stash_asks() {
+    let (tmp, root, remotes) = workspace();
+    let srcs = tmp.path().join("srcs");
+    fs::create_dir_all(&srcs).unwrap();
+    let bsrc = pushed_repo(&srcs, &remotes, "bsrc");
+    let outer = pushed_repo(&root, &remotes, "outer");
+    // A is an existing repo added in place: its .git stays a directory.
+    let a = outer.join("A");
+    init_repo(&a);
+    let aremote = remotes.join("aremote.git");
+    init_bare(&aremote);
+    push_to_remote(&a, &aremote);
+    add_submodule(&outer, &aremote, "A");
+    add_submodule(&outer, &bsrc, "B");
+    git(&outer, &["commit", "-q", "-m", "add submodules"]);
+    git(&outer, &["push", "-q", "origin", "main"]);
+    let b = outer.join("B");
+    write(&b.join("README.md"), "work in progress\n");
+    git(&b, &["stash", "push", "-q"]);
+    git(&b, &["checkout", "-q", "-b", "local-only"]);
+    commit_file(&b, "x.txt", "only here");
+    git(&outer, &["submodule", "deinit", "-q", "-f", "B"]);
+    assert!(a.join(".git").is_dir());
+    assert!(outer.join(".git").join("modules").join("B").exists());
+
+    let res = scan_with(&root, network_everywhere());
+    assert_eq!(
+        action_for(&res, &outer),
+        Action::Ask,
+        "B's stash and local branch live in outer/.git/modules/B"
+    );
+}
+
+#[test]
+fn n2_control_two_checked_out_clean_submodules_do_not_block_the_parent() {
+    let (tmp, root, remotes) = workspace();
+    let srcs = tmp.path().join("srcs");
+    fs::create_dir_all(&srcs).unwrap();
+    let s1 = pushed_repo(&srcs, &remotes, "s1");
+    let s2 = pushed_repo(&srcs, &remotes, "s2");
+    let outer = pushed_repo(&root, &remotes, "outer");
+    add_submodule(&outer, &s1, "sub1");
+    add_submodule(&outer, &s2, "sub2");
+    git(&outer, &["commit", "-q", "-m", "add submodules"]);
+    git(&outer, &["push", "-q", "origin", "main"]);
+    let res = scan_with(&root, network_everywhere());
+    assert_eq!(action_for(&res, &outer), Action::Archive);
+}
+
+#[test]
+fn core_worktree_pointing_elsewhere_is_refused() {
+    let (tmp, root, remotes) = workspace();
+    let repo = pushed_repo(&root, &remotes, "app");
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    git(&repo, &["config", "core.worktree", elsewhere.to_str().unwrap()]);
+    let res = scan_with(&root, network_everywhere());
+    let f = facts_of(&res, &repo);
+    assert!(all_unknown(&f), "facts about another directory: {f:?}");
+}
+
 // ---------------------------------------------------------------- F11
 
 #[cfg(unix)]

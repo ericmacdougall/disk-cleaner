@@ -560,6 +560,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lfs_keys_are_not_allowed() {
+        // An LFS repo defines filter.lfs.* (a program) and is reported unknown; lfs.* itself
+        // is not allowlisted either.
+        for k in ["lfs.url", "lfs.concurrenttransfers", "filter.lfs.clean", "lfs.x.url"] {
+            assert!(!config_key_is_safe(k), "{k}");
+        }
+        assert!(config_key_is_safe("remote.origin.url"));
+    }
+
+    #[test]
     fn network_predicate() {
         for u in [
             "https://example.invalid/x.git",
