@@ -24,6 +24,13 @@ fn git(dir: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        // No background maintenance after a commit: it briefly creates and removes lock files
+        // and would make the byte-identical .git check flaky.
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "gc.auto")
+        .env("GIT_CONFIG_VALUE_1", "0")
         .output()
         .expect("git");
     assert!(
@@ -557,6 +564,8 @@ fn snapshot_git_state(repo: &Path) -> Vec<(PathBuf, Vec<u8>)> {
             let p = e.path();
             if e.file_type().unwrap().is_dir() {
                 stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "lock") {
+                // Transient lock files of git's own housekeeping are not repository state.
             } else {
                 out.push((p.clone(), fs::read(&p).unwrap()));
             }
