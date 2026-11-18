@@ -313,6 +313,36 @@ fn judge(scan: &ScanResult, idx: usize, opts: &PlanOptions) -> (ProjectState, St
     }
 }
 
+/// A submodule git directory under this repo's `.git/modules` that no scanned git node inside
+/// the repo uses (matched by identity, not by count). Its stash and branches are deleted with
+/// the repo and nobody has looked at them.
+fn orphan_submodule_gitdir(scan: &ScanResult, idx: usize) -> Option<String> {
+    let dirs = &scan.nodes[idx].repo.as_ref()?.submodule_gitdirs;
+    if dirs.is_empty() {
+        return None;
+    }
+    let inside = |j: usize| -> bool {
+        let mut cur = scan.nodes[j].parent;
+        while let Some(p) = cur {
+            if p == idx {
+                return true;
+            }
+            cur = scan.nodes[p].parent;
+        }
+        false
+    };
+    let owned: Vec<PathBuf> = scan
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(j, n)| n.class.is_git() && inside(*j))
+        .filter_map(|(_, n)| n.repo.as_ref()?.git_dir.as_ref().map(|g| canon(Path::new(g))))
+        .collect();
+    dirs.iter()
+        .find(|d| !owned.iter().any(|o| *o == canon(Path::new(d.as_str()))))
+        .cloned()
+}
+
 /// Build a dry-run plan from a scan.
 pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     let mut items: Vec<PlanItem> = Vec::new();
@@ -336,21 +366,11 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 );
                 action = Action::Ask;
                 reclaim = 0;
-            } else if let Some(n) = node
-                .repo
-                .as_ref()
-                .map(|r| r.submodule_gitdirs)
-                .filter(|&n| {
-                    n > scan
-                        .nodes
-                        .iter()
-                        .filter(|c| c.parent == Some(idx) && c.class.is_git())
-                        .count()
-                })
-            {
+            } else if let Some(orphan) = orphan_submodule_gitdir(scan, idx) {
                 reason = format!(
-                    "{reason}; but {n} submodule git director(ies) under .git/modules are not \
-                     individually checked, and their stash or local branches would be deleted"
+                    "{reason}; but the submodule git directory {orphan} under .git/modules has \
+                     no checked-out, scanned worktree, so its stash or local branches would be \
+                     deleted unseen"
                 );
                 action = Action::Ask;
                 reclaim = 0;

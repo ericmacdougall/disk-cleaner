@@ -187,9 +187,12 @@ pub struct RepoInfo {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependents: Vec<String>,
     /// Git directories of submodules stored under `.git/modules` (their stash and local
-    /// branches are deleted with this repo).
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
-    pub submodule_gitdirs: usize,
+    /// branches are deleted with this repo), as real paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submodule_gitdirs: Vec<String>,
+    /// This node's own git directory (a real path): `<dir>/.git`, or what its `.git` file names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_dir: Option<String>,
     pub sizes: RepoSizes,
 }
 
@@ -229,10 +232,6 @@ pub struct Node {
 }
 
 fn is_zero(n: &u64) -> bool {
-    *n == 0
-}
-
-fn is_zero_usize(n: &usize) -> bool {
     *n == 0
 }
 

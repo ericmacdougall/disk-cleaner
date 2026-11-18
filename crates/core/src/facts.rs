@@ -189,7 +189,7 @@ pub fn config_key_is_safe(key: &str) -> bool {
         "url" => has_subsection && matches!(name, "insteadof" | "pushinsteadof"),
         "extensions" => true,
         "init" | "gc" | "pack" | "receive" | "transfer" | "fetch" | "pull" | "push" | "color"
-        | "advice" | "gui" | "lfs" | "include" | "includeif" => !has_subsection || section == "lfs",
+        | "advice" | "gui" | "include" | "includeif" => !has_subsection,
         "commit" | "tag" => name == "gpgsign",
         _ => false,
     }
@@ -213,6 +213,129 @@ fn local_config_keys(git: &crate::git::Git, path: &Path) -> Result<Vec<String>, 
         keys.extend(list(&["--worktree"])?);
     }
     Ok(keys)
+}
+
+fn unsafe_key(keys: &[String], whose: &str) -> Result<(), String> {
+    match keys.iter().find(|k| !config_key_is_safe(k)) {
+        Some(bad) => {
+            let shown: String = bad.chars().take(80).collect();
+            Err(format!(
+                "{whose} can run programs or is not understood ({shown}); \
+                 no git command was run in this repo"
+            ))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Is every config in the repo, and in every submodule git directory under `modules`, free of
+/// keys that could run a program? `git status` recurses into submodules and honours their config.
+fn check_module_configs(git: &crate::git::Git, cwd: &Path, modules: &Path) -> Result<(), String> {
+    use std::io::ErrorKind::NotFound;
+    match std::fs::symlink_metadata(modules) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return Err("the submodule directory .git/modules is not a directory".into()),
+        Err(e) if e.kind() == NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot read .git/modules: {e}")),
+    }
+    let mut stack = vec![modules.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        visited += 1;
+        if visited > 2000 {
+            return Err("too many submodule directories under .git/modules to check".into());
+        }
+        let is_gitdir = std::fs::symlink_metadata(dir.join("HEAD"))
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        if is_gitdir {
+            for name in ["config", "config.worktree"] {
+                let file = dir.join(name);
+                match std::fs::symlink_metadata(&file) {
+                    Ok(m) if m.is_file() => {
+                        let file_s = file.to_string_lossy().into_owned();
+                        let out = git
+                            .run(
+                                cwd,
+                                &[
+                                    "config",
+                                    "--file",
+                                    file_s.as_str(),
+                                    "--includes",
+                                    "--name-only",
+                                    "--list",
+                                ],
+                            )
+                            .map_err(|e| note("submodule config", &e))?;
+                        let keys: Vec<String> =
+                            out.lines().map(|l| l.trim().to_string()).collect();
+                        unsafe_key(&keys, "a submodule's config")?;
+                    }
+                    Ok(_) => return Err("a submodule config is not a regular file".into()),
+                    Err(e) if e.kind() == NotFound => {}
+                    Err(e) => return Err(format!("cannot read a submodule config: {e}")),
+                }
+            }
+            stack.push(dir.join("modules"));
+        } else {
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(r) => r,
+                Err(e) if e.kind() == NotFound => continue,
+                Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+            };
+            for entry in rd {
+                let entry = entry.map_err(|e| format!("cannot read .git/modules: {e}"))?;
+                let ft = entry
+                    .file_type()
+                    .map_err(|e| format!("cannot read .git/modules: {e}"))?;
+                if ft.is_symlink() {
+                    return Err("a symlink under .git/modules".into());
+                }
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to run git in a repo whose config, or whose submodules' configs, could execute
+/// programs, or whose `core.worktree` points at some other directory.
+fn check_repo_config(git: &crate::git::Git, path: &Path) -> Result<(), String> {
+    let keys = local_config_keys(git, path)?;
+    unsafe_key(&keys, "repo config")?;
+    if keys.iter().any(|k| k.eq_ignore_ascii_case("core.worktree")) {
+        let value = git
+            .run(path, &["config", "--local", "--get", "core.worktree"])
+            .map_err(|e| note("config", &e))?;
+        let gitdir = git
+            .run(path, &["rev-parse", "--absolute-git-dir"])
+            .map_err(|e| note("git dir", &e))?;
+        let v = PathBuf::from(value.trim());
+        let resolved = if v.is_absolute() {
+            v
+        } else {
+            PathBuf::from(gitdir.trim()).join(v)
+        };
+        if canon(&resolved) != canon(path) {
+            return Err(
+                "core.worktree points to a different directory than this one; facts would \
+                 describe another tree"
+                    .into(),
+            );
+        }
+    }
+    let common = git
+        .run(path, &["rev-parse", "--git-common-dir"])
+        .map_err(|e| note("git dir", &e))?;
+    let common = PathBuf::from(common.trim());
+    let common = if common.is_absolute() {
+        common
+    } else {
+        path.join(common)
+    };
+    check_module_configs(git, path, &common.join("modules"))
 }
 
 /// Result of inspecting one repo.
@@ -251,20 +374,8 @@ pub fn collect_repo_info(
     let git = &cfg.git;
     // The repo's own config is untrusted. Refuse to run anything else if it could make git
     // execute a program (filter drivers, gpg.program, ...).
-    match local_config_keys(git, path) {
-        Err(e) => return all_unknown(e, regen_paths),
-        Ok(keys) => {
-            if let Some(bad) = keys.iter().find(|k| !config_key_is_safe(k)) {
-                let shown: String = bad.chars().take(80).collect();
-                return all_unknown(
-                    format!(
-                        "repo config can run programs or is not understood ({shown}); \
-                         no git command was run in it"
-                    ),
-                    regen_paths,
-                );
-            }
-        }
+    if let Err(why) = check_repo_config(git, path) {
+        return all_unknown(why, regen_paths);
     }
     let mut unverified: Vec<(PathBuf, String)> = Vec::new();
     let mut info = RepoInfo::default();
@@ -398,7 +509,9 @@ pub fn collect_repo_info(
             "status",
             "--porcelain",
             "--untracked-files=all",
-            "--ignore-submodules=none",
+            // Each checked-out submodule is its own node with its own config check; a recursive
+            // status would run inside it using its config.
+            "--ignore-submodules=all",
         ];
         facts.tree_clean = match git.run(path, &status_args) {
             Ok(out) if !out.trim().is_empty() => Tri::No,

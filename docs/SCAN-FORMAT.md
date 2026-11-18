@@ -96,7 +96,7 @@ fixture archives. Outside build directories only outputs of at least `min_output
 | `worktrees` | live linked worktrees reported by git (may be outside the scan) |
 | `parent_repo`, `parent_node` | for a linked worktree: its repo as git reports it, and its index in `nodes` if scanned |
 | `dependents` | clones in the scan that borrow objects from this repo (alternates; the file is read only if it is a regular file under 64 KiB, otherwise a warning is recorded) |
-| `submodule_gitdirs` | submodule git directories under `.git/modules` |
+| `submodule_gitdirs`, `git_dir` | submodule git directories under `.git/modules`; this node's own git directory |
 | `sizes` | `total`, `git` (the `.git` directory), `regenerable`, `output` |
 
 Facts (the safe value is always `yes`):
@@ -107,7 +107,7 @@ Facts (the safe value is always `yes`):
 | `head_on_remote` | the worktree's own HEAD, including a detached HEAD, is contained in a remote-tracking ref of a network remote |
 | `all_branches_on_remote` | every local ref (branches, notes, replace refs...; not the stash or HEAD) is contained in a network remote ref, and there are no local tags: tag names are not visible in tracking refs, so a repo with tags is `unknown` until apply runs `git ls-remote` |
 | `stash_empty` | the stash is empty |
-| `tree_clean` | no tracked changes, no untracked files, no submodule changes, and no file marked skip-worktree or assume-unchanged (those hide local edits) |
+| `tree_clean` | no tracked changes and no untracked files in this repo's own tree (submodules are their own nodes), and no file marked skip-worktree or assume-unchanged (those hide local edits) |
 | `no_unique_ignored` | no ignored files outside regenerable and cache directories (`.env`, local databases...) |
 | `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone depends on this object store |
 
@@ -129,9 +129,14 @@ key is outside a small allowlist of plain-data keys (`core.*` format and line-en
 `branch.<n>.remote|merge|rebase|description|pushremote`, `user.name|email|signingkey`,
 `submodule.*.url|path|active|branch|ignore`, `url.*.insteadOf`, `extensions.*`, `commit.gpgsign`,
 `tag.gpgsign`, and simple `init`, `gc`, `pack`, `receive`, `transfer`, `fetch`, `pull`, `push`,
-`color`, `advice`, `gui`, `lfs`, `include` settings) then every fact is `unknown`, a note says
-which key, and no further git command is run in that repo. Repos using Git LFS filters or custom
-merge or diff drivers are therefore reported `unknown`. Git runs with `core.fsmonitor=false`,
+`color`, `advice`, `gui`, `include` settings) then every fact is `unknown`, a note says
+which key, and no further git command is run in that repo. The same check is applied to every
+`<gitdir>/modules/**/config` (bounded walk; a symlink, unreadable file or too many entries also
+counts as unsafe), because git runs a child status inside submodules using their own config; the
+outer status uses `--ignore-submodules=all` since each checked-out submodule is its own node. A
+`core.worktree` that does not resolve to the node's own directory is refused. Repos using Git LFS
+(`filter.lfs.*`, `lfs.*`) or custom merge or diff drivers are therefore reported `unknown`: no `lfs`
+key is allowed. Git runs with `core.fsmonitor=false`,
 `log.showSignature=false`, `core.ignoreStat=false`, `GIT_NO_LAZY_FETCH=1`, in its own process group
 that is killed on timeout.
 
@@ -140,8 +145,9 @@ Remote facts come from local remote-tracking refs, which can be stale (a remote 
 re-check them with `git ls-remote`.
 
 A repo's submodule git data under `.git/modules` (with its stash and local branches) is deleted
-with the repo: `submodule_gitdirs` counts those directories, and the plan asks unless each has a
-scanned nested node.
+with the repo: `submodule_gitdirs` lists those directories (real paths) and `git_dir` is each git
+node's own git directory. The plan asks unless every listed directory is the `git_dir` of a scanned git
+node inside the repo (matched by identity, not by count); the reason names the orphaned directory.
 
 ## Plan file
 
@@ -192,8 +198,8 @@ With no evidence at all the state is `unknown`.
    or state unknown: `ask`; otherwise `remove-regenerable`.
 3. Repo and worktree: state unknown: `ask`; any fact `unknown`: `ask`; any fact `no`:
    `recover-then-archive`; every fact `yes`: `archive` (labelled unverified, see
-   `remote_facts_verified`). A repo whose `.git/modules` hold more submodule git directories than it
-   has scanned nested nodes, or that is incomplete, asks.
+   `remote_facts_verified`). A repo whose `.git/modules` hold a submodule git directory that no scanned
+   git node inside it uses, or that is incomplete, asks.
 4. Bare repo: `keep` when something depends on it, otherwise `ask`.
 5. Loose code: `ask`.
 6. Enclosing: a node that would be removed becomes `ask` when any node inside it is `keep`, `ask` or

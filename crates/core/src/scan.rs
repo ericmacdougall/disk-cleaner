@@ -690,8 +690,9 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     for (i, b) in builds.iter_mut().enumerate() {
         if let Some(mut info) = infos.remove(&i) {
             if b.node.class == Class::Repo {
-                info.submodule_gitdirs = count_module_gitdirs(&b.path.join(".git").join("modules"));
+                info.submodule_gitdirs = list_module_gitdirs(&b.path.join(".git").join("modules"));
             }
+            info.git_dir = node_git_dir(&b.path, b.node.class);
             info.sizes = RepoSizes {
                 total: b.node.bytes_total,
                 git: b.git_bytes,
@@ -769,10 +770,31 @@ fn read_small_regular_file(path: &Path) -> std::result::Result<Option<String>, S
     Ok(Some(buf))
 }
 
-/// Number of git directories under `.git/modules` (submodule object stores, stashes and local
-/// branches). Bounded and never follows symlinks.
-fn count_module_gitdirs(modules: &Path) -> usize {
-    let mut count = 0usize;
+/// This node's own git directory as a real path: `<dir>/.git`, or what its `.git` file names.
+fn node_git_dir(path: &Path, class: Class) -> Option<String> {
+    match class {
+        Class::Repo => Some(canon(&path.join(".git")).to_string_lossy().into_owned()),
+        Class::BareRepo => Some(canon(path).to_string_lossy().into_owned()),
+        Class::Worktree => {
+            let text = read_small_regular_file(&path.join(".git")).ok()??;
+            let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+            let target = PathBuf::from(target);
+            let full = if target.is_absolute() {
+                target
+            } else {
+                path.join(target)
+            };
+            Some(canon(&full).to_string_lossy().into_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Real paths of the git directories under `.git/modules` (submodule object stores, stashes and
+/// local branches). Bounded and never follows symlinks; if the bound is hit a placeholder that
+/// matches no node is added, so the caller asks.
+fn list_module_gitdirs(modules: &Path) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
     let mut visited = 0usize;
     let mut stack = vec![modules.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -783,7 +805,8 @@ fn count_module_gitdirs(modules: &Path) -> usize {
         for entry in entries.flatten() {
             visited += 1;
             if visited > 5000 {
-                return count.max(1);
+                found.push("<more than 5000 entries under .git/modules>".to_string());
+                return found;
             }
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             if !is_dir {
@@ -791,7 +814,7 @@ fn count_module_gitdirs(modules: &Path) -> usize {
             }
             let p = entry.path();
             if p.join("HEAD").is_file() {
-                count += 1;
+                found.push(canon(&p).to_string_lossy().into_owned());
                 // Nested submodules live in this module's own `modules` directory.
                 stack.push(p.join("modules"));
             } else {
@@ -799,7 +822,8 @@ fn count_module_gitdirs(modules: &Path) -> usize {
             }
         }
     }
-    count
+    found.sort();
+    found
 }
 
 /// Tie linked worktrees to their parent repo and mark repos that other clones in the scan
