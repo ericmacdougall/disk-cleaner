@@ -22,7 +22,7 @@ pub use error::{Error, Result};
 pub use facts::{is_network_url, FactsConfig};
 pub use git::{Git, GitError};
 pub use model::*;
-pub use plan::{plan, Action, Plan, PlanItem, PlanOptions, ProjectState};
+pub use plan::{plan, resolve_active, Action, Plan, PlanItem, PlanOptions, ProjectState};
 pub use procs::{running_cwds, ProcessCheck};
 pub use rules::RuleSet;
 pub use scan::{scan, ScanOptions};

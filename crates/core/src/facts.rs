@@ -119,17 +119,151 @@ fn rel_slash(path: &Path, base: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// Is a local config key one that cannot make git run a program of the repo's choosing?
+///
+/// This is an allowlist: a repository we scan may be an unpacked download, and its `.git/config`
+/// is attacker-controlled. Keys (`section.subsection.name`, lowercased section and name) that are
+/// not known to be plain data are refused, and the repo is then not inspected at all.
+pub fn config_key_is_safe(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let (section, rest) = match key.split_once('.') {
+        Some(x) => x,
+        None => return false,
+    };
+    let name = rest.rsplit('.').next().unwrap_or(rest);
+    let has_subsection = rest.contains('.');
+    match section {
+        "core" => matches!(
+            name,
+            "repositoryformatversion"
+                | "filemode"
+                | "bare"
+                | "logallrefupdates"
+                | "ignorecase"
+                | "precomposeunicode"
+                | "symlinks"
+                | "autocrlf"
+                | "eol"
+                | "safecrlf"
+                | "sparsecheckout"
+                | "sparsecheckoutcone"
+                | "worktree"
+                | "longpaths"
+                | "protectntfs"
+                | "protecthfs"
+                | "untrackedcache"
+                | "splitindex"
+                | "commentchar"
+                | "abbrev"
+                | "excludesfile"
+                | "attributesfile"
+                | "quotepath"
+                | "trustctime"
+                | "checkstat"
+                | "preloadindex"
+                | "fscache"
+        ),
+        "remote" => {
+            has_subsection
+                && matches!(
+                    name,
+                    "url"
+                        | "pushurl"
+                        | "fetch"
+                        | "push"
+                        | "tagopt"
+                        | "prune"
+                        | "promisor"
+                        | "partialclonefilter"
+                )
+        }
+        "branch" => {
+            has_subsection
+                && matches!(
+                    name,
+                    "remote" | "merge" | "rebase" | "description" | "pushremote"
+                )
+        }
+        "user" => matches!(name, "name" | "email" | "signingkey" | "useconfigonly"),
+        "submodule" => matches!(name, "url" | "path" | "active" | "branch" | "ignore"),
+        "url" => has_subsection && matches!(name, "insteadof" | "pushinsteadof"),
+        "extensions" => true,
+        "init" | "gc" | "pack" | "receive" | "transfer" | "fetch" | "pull" | "push" | "color"
+        | "advice" | "gui" | "lfs" | "include" | "includeif" => !has_subsection || section == "lfs",
+        "commit" | "tag" => name == "gpgsign",
+        _ => false,
+    }
+}
+
+/// Keys of the repo-local config (including included files), or why they could not be read.
+fn local_config_keys(git: &crate::git::Git, path: &Path) -> Result<Vec<String>, String> {
+    let list = |extra: &[&str]| -> Result<Vec<String>, String> {
+        let mut args = vec!["config"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--includes", "--name-only", "--list"]);
+        git.run(path, &args)
+            .map(|out| out.lines().map(|l| l.trim().to_string()).collect())
+            .map_err(|e| note("config", &e))
+    };
+    let mut keys = list(&["--local"])?;
+    if keys.iter().any(|k| k.eq_ignore_ascii_case("extensions.worktreeconfig")) {
+        keys.extend(list(&["--worktree"])?);
+    }
+    Ok(keys)
+}
+
+/// Result of inspecting one repo.
+pub struct RepoCheck {
+    pub info: RepoInfo,
+    /// Regenerable directories inside the repo that git does not prove are ignored, untracked
+    /// build output: `(path, reason)`.
+    pub unverified_artifacts: Vec<(PathBuf, String)>,
+}
+
+fn all_unknown(reason: String, unverified: &[PathBuf]) -> RepoCheck {
+    let why = reason.clone();
+    RepoCheck {
+        info: RepoInfo {
+            notes: vec![reason],
+            ..RepoInfo::default()
+        },
+        unverified_artifacts: unverified
+            .iter()
+            .map(|p| (p.clone(), format!("cannot verify against git: {why}")))
+            .collect(),
+    }
+}
+
 /// Gather facts for one repo, worktree or bare repo at `path`.
 ///
-/// `regen_paths` are the regenerable and cache directories inside it (from the scan); ignored
-/// files under them do not count as unique.
+/// `regen_paths` are the regenerable and cache directories inside it that the scan found
+/// removable; ignored files under them do not count as unique, and each is checked to be ignored
+/// by git.
 pub fn collect_repo_info(
     cfg: &FactsConfig,
     path: &Path,
     class: Class,
     regen_paths: &[PathBuf],
-) -> RepoInfo {
+) -> RepoCheck {
     let git = &cfg.git;
+    // The repo's own config is untrusted. Refuse to run anything else if it could make git
+    // execute a program (filter drivers, gpg.program, ...).
+    match local_config_keys(git, path) {
+        Err(e) => return all_unknown(e, regen_paths),
+        Ok(keys) => {
+            if let Some(bad) = keys.iter().find(|k| !config_key_is_safe(k)) {
+                let shown: String = bad.chars().take(80).collect();
+                return all_unknown(
+                    format!(
+                        "repo config can run programs or is not understood ({shown}); \
+                         no git command was run in it"
+                    ),
+                    regen_paths,
+                );
+            }
+        }
+    }
+    let mut unverified: Vec<(PathBuf, String)> = Vec::new();
     let mut info = RepoInfo::default();
     let mut facts = Facts::default();
     let mut notes: Vec<String> = Vec::new();
@@ -194,11 +328,42 @@ pub fn collect_repo_info(
     facts.all_branches_on_remote = match &network_names {
         Some(names) if names.is_empty() => Tri::No,
         Some(names) => {
+            // Every local ref (branches, tags, notes, replace refs, ...) except the stash, which
+            // has its own fact. HEAD is judged by `head_on_remote`.
             let pats: Vec<String> = names.iter().map(|n| format!("--remotes={n}")).collect();
-            let mut args: Vec<&str> = vec!["rev-list", "-n", "1", "--branches", "--tags", "--not"];
+            let mut args: Vec<&str> = vec![
+                "rev-list",
+                "-n",
+                "1",
+                "--exclude=refs/stash",
+                "--glob=refs/*",
+                "--not",
+            ];
             args.extend(pats.iter().map(|s| s.as_str()));
             match git.run(path, &args) {
-                Ok(out) => Tri::from_bool(out.trim().is_empty()),
+                Ok(out) if !out.trim().is_empty() => Tri::No,
+                Ok(_) => {
+                    // Tag names (and tag objects) are not visible in remote-tracking refs, so a
+                    // local tag cannot be shown to exist on the remote without `ls-remote`.
+                    match git.run(
+                        path,
+                        &["for-each-ref", "--count=1", "--format=%(refname)", "refs/tags"],
+                    ) {
+                        Ok(tags) if tags.trim().is_empty() => Tri::Yes,
+                        Ok(_) => {
+                            notes.push(
+                                "all_branches_on_remote: the repo has tags, whose presence on the \
+                                 remote cannot be verified from local refs"
+                                    .to_string(),
+                            );
+                            Tri::Unknown
+                        }
+                        Err(e) => {
+                            notes.push(note("all_branches_on_remote", &e));
+                            Tri::Unknown
+                        }
+                    }
+                }
                 Err(e) => {
                     notes.push(note("all_branches_on_remote", &e));
                     Tri::Unknown
@@ -221,9 +386,41 @@ pub fn collect_repo_info(
     if class == Class::BareRepo {
         notes.push("tree_clean and no_unique_ignored: a bare repo has no working tree".into());
     } else {
-        facts.tree_clean = match git.run(path, &["status", "--porcelain", "--untracked-files=all"])
-        {
-            Ok(out) => Tri::from_bool(out.trim().is_empty()),
+        let status_args = [
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ];
+        facts.tree_clean = match git.run(path, &status_args) {
+            Ok(out) if !out.trim().is_empty() => Tri::No,
+            Ok(_) => {
+                // `status` hides edits to files marked skip-worktree or assume-unchanged.
+                match git.run(path, &["ls-files", "-v", "-z"]) {
+                    Ok(listing) => {
+                        let hidden = listing
+                            .split('\0')
+                            .filter(|e| {
+                                matches!(e.chars().next(),
+                                    Some(c) if c.is_ascii_lowercase() || c == 'S')
+                            })
+                            .count();
+                        if hidden == 0 {
+                            Tri::Yes
+                        } else {
+                            notes.push(format!(
+                                "tree_clean: {hidden} file(s) are marked skip-worktree or \
+                                 assume-unchanged, so local edits would be invisible"
+                            ));
+                            Tri::No
+                        }
+                    }
+                    Err(e) => {
+                        notes.push(note("tree_clean", &e));
+                        Tri::Unknown
+                    }
+                }
+            }
             Err(e) => {
                 notes.push(note("tree_clean", &e));
                 Tri::Unknown
@@ -239,14 +436,36 @@ pub fn collect_repo_info(
         ];
         facts.no_unique_ignored = match git.run(path, &ignored_args) {
             Ok(out) => {
-                let regen: Vec<String> = regen_paths
-                    .iter()
-                    .filter_map(|p| rel_slash(p, path))
-                    .collect();
-                let unique: Vec<&str> = out
+                let entries: Vec<&str> = out
                     .split('\0')
                     .map(|e| e.trim_end_matches('/'))
                     .filter(|e| !e.is_empty())
+                    .collect();
+                let mut regen: Vec<String> = Vec::new();
+                for p in regen_paths {
+                    let rel = match rel_slash(p, path) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    // A generated directory is wholly ignored and untracked, so git lists it
+                    // as one ignored entry (or inside one). Anything else may hold source.
+                    let ignored = entries
+                        .iter()
+                        .any(|e| rel == *e || rel.starts_with(&format!("{e}/")));
+                    if ignored {
+                        regen.push(rel);
+                    } else {
+                        unverified.push((
+                            p.clone(),
+                            "git does not show this directory as wholly ignored: it is tracked, \
+                             partly tracked or not ignored, so it may hold source"
+                                .to_string(),
+                        ));
+                    }
+                }
+                let unique: Vec<&str> = entries
+                    .iter()
+                    .copied()
                     .filter(|e| {
                         !regen
                             .iter()
@@ -267,6 +486,12 @@ pub fn collect_repo_info(
             }
             Err(e) => {
                 notes.push(note("no_unique_ignored", &e));
+                for p in regen_paths {
+                    unverified.push((
+                        p.clone(),
+                        "cannot verify against git that this directory is ignored".to_string(),
+                    ));
+                }
                 Tri::Unknown
             }
         };
@@ -316,7 +541,10 @@ pub fn collect_repo_info(
     info.facts = facts;
     info.notes = notes;
     info.remotes = remotes.unwrap_or_default();
-    info
+    RepoCheck {
+        info,
+        unverified_artifacts: unverified,
+    }
 }
 
 #[cfg(test)]

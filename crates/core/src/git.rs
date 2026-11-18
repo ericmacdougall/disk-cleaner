@@ -27,6 +27,30 @@ pub enum GitError {
     Failed { code: Option<i32>, stderr: String },
 }
 
+/// Kill a process and everything it started (its process group on Unix, `taskkill /T` on
+/// Windows). Uses the system tools because this crate forbids unsafe code.
+fn kill_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        let group = format!("-{pid}");
+        let _ = Command::new("kill")
+            .args(["-9", "--", &group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 /// A git binary plus a per-command timeout.
 #[derive(Debug, Clone)]
 pub struct Git {
@@ -75,16 +99,27 @@ impl Git {
             .arg("core.fsmonitor=false")
             .arg("-c")
             .arg("gc.auto=0")
+            .arg("-c")
+            .arg("log.showSignature=false")
+            .arg("-c")
+            .arg("core.ignoreStat=false")
             .args(args)
             .current_dir(cwd)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for var in REDIRECT_VARS {
             cmd.env_remove(var);
+        }
+        // Own process group, so a timeout can kill git and everything it started.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
         }
         let mut child = cmd
             .spawn()
@@ -113,6 +148,7 @@ impl Git {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
                     if Instant::now() >= deadline {
+                        kill_tree(child.id());
                         let _ = child.kill();
                         let _ = child.wait();
                         // Do not join the readers: a grandchild may still hold the pipes.
@@ -121,6 +157,7 @@ impl Git {
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(e) => {
+                    kill_tree(child.id());
                     let _ = child.kill();
                     return Err(GitError::Spawn(redact_text(&e.to_string())));
                 }

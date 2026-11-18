@@ -64,14 +64,23 @@ One entry per classified directory. A directory belongs to its innermost classif
 Classification rules (design section 3): a directory with a `.git` directory is a `repo`; with a
 `.git` file a `worktree`; a directory with `HEAD`, `objects` and `refs` and no `.git` is a `bare-repo`.
 A directory whose name matches a rule in `rules/artifacts.toml` is `regenerable` or `cache` when
-the rule's marker file or directory exists beside it or in an ancestor inside the scan root (a rule
-without markers matches by name alone; ambiguous names such as `build` always have markers). Regenerable
-and cache directories are opaque: nothing inside them is classified, so a repo vendored inside
-`node_modules` is not reported. A directory outside any repo that holds a project manifest or
+the rule's marker file or directory exists in the directory beside it, that is, its parent (a marker
+further up proves nothing; a rule without markers matches by name alone; ambiguous names such as
+`build` always have markers). Regenerable and cache directories are opaque: nothing inside them is
+classified, so a repo vendored inside `node_modules` is not reported as a node; instead the
+directory gets an `ask_reason`. A directory outside any repo that holds a project manifest or
 source files is `loose-code` (a scan root counts only if it holds a manifest).
 
-Build directories (rule `scan_outputs = true`) are searched for output files (video, audio, image
-projects, archives, model weights, VM disks, database dumps) before they are offered for removal.
+A regenerable or cache node carries an `ask_reason`, and is never offered for removal, when: a git
+repository lives inside it; it is a build directory (`scan_outputs`) in loose code, where no git
+history proves it holds no hand-written source; or, inside a repo, git does not show it as wholly
+ignored and untracked (a tracked or partly tracked `build/` may hold source). `unreadable` counts
+entries inside a node that could not be read; such a node is incomplete and is never offered for
+removal.
+
+Build directories (rule `scan_outputs = true`) are searched for output files (video, audio, images,
+documents, archives, datasets, model weights, VM disks, database files and dumps; the extension
+list is in `rules/artifacts.toml`) before they are offered for removal.
 Each is listed in `outputs` whatever its size and the directory is flagged `contains_outputs`.
 Dependency directories such as `node_modules` are not searched, because packages routinely ship
 fixture archives. Outside build directories only outputs of at least `min_output_bytes` are listed.
@@ -86,7 +95,8 @@ fixture archives. Outside build directories only outputs of at least `min_output
 | `head_commit`, `last_commit_time` | HEAD id; newest commit on any ref |
 | `worktrees` | live linked worktrees reported by git (may be outside the scan) |
 | `parent_repo`, `parent_node` | for a linked worktree: its repo as git reports it, and its index in `nodes` if scanned |
-| `dependents` | clones in the scan that borrow objects from this repo (alternates) |
+| `dependents` | clones in the scan that borrow objects from this repo (alternates; the file is read only if it is a regular file under 64 KiB, otherwise a warning is recorded) |
+| `submodule_gitdirs` | submodule git directories under `.git/modules` |
 | `sizes` | `total`, `git` (the `.git` directory), `regenerable`, `output` |
 
 Facts (the safe value is always `yes`):
@@ -95,9 +105,9 @@ Facts (the safe value is always `yes`):
 |---|---|
 | `has_network_remote` | at least one remote that is a network location; a local path, `file://` URL or `.bundle` is not |
 | `head_on_remote` | the worktree's own HEAD, including a detached HEAD, is contained in a remote-tracking ref of a network remote |
-| `all_branches_on_remote` | every local branch and tag is contained in a network remote ref |
+| `all_branches_on_remote` | every local ref (branches, notes, replace refs...; not the stash or HEAD) is contained in a network remote ref, and there are no local tags: tag names are not visible in tracking refs, so a repo with tags is `unknown` until apply runs `git ls-remote` |
 | `stash_empty` | the stash is empty |
-| `tree_clean` | no tracked changes and no untracked files |
+| `tree_clean` | no tracked changes, no untracked files, no submodule changes, and no file marked skip-worktree or assume-unchanged (those hide local edits) |
 | `no_unique_ignored` | no ignored files outside regenerable and cache directories (`.env`, local databases...) |
 | `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone depends on this object store |
 
@@ -107,13 +117,38 @@ refs can be stale; a later phase confirms them against the live remote with `git
 time. `no_dependents` cannot see clones outside the scanned roots.
 
 Remote URLs have embedded credentials removed (`https://user:token@host/x` is stored as
-`https://host/x`) before they are stored, and all git error text is redacted the same way.
+`https://host/x`; everything up to the last `@` counts as userinfo, and query strings and fragments are
+dropped) before they are stored, and all git error text is redacted the same way.
+
+**The repo's own config is untrusted.** A scanned folder may be an unpacked download, and its
+`.git/config` can name programs that git would run (`filter.*.clean`, `gpg.program`, `core.fsmonitor`,
+`core.sshCommand`, ...). Before any other git command the tool lists the config keys
+(`git config --local --includes --name-only --list`, plus the worktree config when enabled). If any
+key is outside a small allowlist of plain-data keys (`core.*` format and line-ending settings,
+`remote.<n>.url|pushurl|fetch|push|tagopt|prune|promisor|partialclonefilter`,
+`branch.<n>.remote|merge|rebase|description|pushremote`, `user.name|email|signingkey`,
+`submodule.*.url|path|active|branch|ignore`, `url.*.insteadOf`, `extensions.*`, `commit.gpgsign`,
+`tag.gpgsign`, and simple `init`, `gc`, `pack`, `receive`, `transfer`, `fetch`, `pull`, `push`,
+`color`, `advice`, `gui`, `lfs`, `include` settings) then every fact is `unknown`, a note says
+which key, and no further git command is run in that repo. Repos using Git LFS filters or custom
+merge or diff drivers are therefore reported `unknown`. Git runs with `core.fsmonitor=false`,
+`log.showSignature=false`, `core.ignoreStat=false`, `GIT_NO_LAZY_FETCH=1`, in its own process group
+that is killed on timeout.
+
+Remote facts come from local remote-tracking refs, which can be stale (a remote changed with
+`set-url` keeps its old refs). The plan therefore labels them unverified; apply (a later phase) must
+re-check them with `git ls-remote`.
+
+A repo's submodule git data under `.git/modules` (with its stash and local branches) is deleted
+with the repo: `submodule_gitdirs` counts those directories, and the plan asks unless each has a
+scanned nested node.
 
 ## Plan file
 
 `schema_version`, `dry_run` (always `true`), `generated_at`, `scan_generated_at`,
 `active_window_days`, `window_source`, `process_check` (`ok`, `partial` or `unknown`),
-`process_check_note`, `active`, `totals` and `items`.
+`process_check_note`, `remote_facts_verified` (always `false` in this phase) and
+`remote_facts_note`, `active`, `totals` and `items`.
 
 Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `state` (`active`,
 `idle` or `unknown`), `state_reason` (why it was judged so), `reason` (plain language),
@@ -137,7 +172,8 @@ or a non-integer or negative value is an error; there is no fallback to a shorte
 A project is **active** when any of these holds:
 
 1. an `--active PATH` covers it, or an active path lies inside it (or inside the project that owns a
-   regenerable directory);
+   regenerable directory). `--active` paths must exist and must lie inside or around something the
+   scan covered, otherwise `plan` fails; both sides are compared as real (symlink-free) paths;
 2. its newest activity, the later of `newest_mtime` (non-regenerable, non-`.git` files) and
    `last_commit_time`, is at most `active_window_days` old (exactly at the edge counts as active);
 3. a running process has its working directory inside it.
@@ -152,14 +188,21 @@ With no evidence at all the state is `unknown`.
 `--active` paths, which are the user's. Rules, in order:
 
 1. Active: `keep`.
-2. Regenerable and cache: contains output files, or state unknown: `ask`; otherwise
-   `remove-regenerable`.
+2. Regenerable and cache: contains output files, has an `ask_reason`, is incomplete (`unreadable`),
+   or state unknown: `ask`; otherwise `remove-regenerable`.
 3. Repo and worktree: state unknown: `ask`; any fact `unknown`: `ask`; any fact `no`:
-   `recover-then-archive`; every fact `yes`: `archive`.
+   `recover-then-archive`; every fact `yes`: `archive` (labelled unverified, see
+   `remote_facts_verified`). A repo whose `.git/modules` hold more submodule git directories than it
+   has scanned nested nodes, or that is incomplete, asks.
 4. Bare repo: `keep` when something depends on it, otherwise `ask`.
 5. Loose code: `ask`.
+6. Enclosing: a node that would be removed becomes `ask` when any node inside it is `keep`, `ask` or
+   `recover-then-archive` (a nested video, a submodule with a stash, a recently active nested
+   project), because everything inside goes with it. A removable regenerable child does not block.
 
 Activity evidence is the newest of `newest_mtime` and `last_commit_time`; a regenerable directory
 uses its owning project. `totals.reclaimable_bytes` does not count an item nested inside another
-removing item twice; `totals.ready_bytes` is the part with no recovery step.
+removing item twice; `totals.ready_bytes` is only `remove-regenerable` bytes: an archive rests on
+remote facts that are unverified until apply re-checks them, so it is never "ready". An absurdly large
+`--active-window-days` saturates (everything with evidence is active) instead of wrapping.
 `backup-then-remove` is reserved for the backup phase and is not emitted yet.

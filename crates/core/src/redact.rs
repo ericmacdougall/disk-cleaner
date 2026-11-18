@@ -15,15 +15,15 @@ pub fn strip_url_credentials(url: &str) -> String {
         None => return url.to_string(),
     };
     let (scheme_part, rest) = url.split_at(idx + 3);
-    // Everything before a query or fragment may hold userinfo. A password that contains an
-    // unescaped '/' must not leak its tail, so look for the last '@' before '?' or '#'.
-    let limit = rest.find(['?', '#']).unwrap_or(rest.len());
-    let at = match rest[..limit].rfind('@') {
-        Some(a) => a,
-        None => return url.to_string(),
+    // A password may contain '/', '?' or '#' unescaped, so everything up to the last '@' is
+    // treated as userinfo. This can over-strip a path that contains '@'; leaking is worse.
+    let (userinfo, remainder) = match rest.rfind('@') {
+        Some(at) => (&rest[..at], &rest[at + 1..]),
+        None => ("", rest),
     };
-    let userinfo = &rest[..at];
-    let remainder = &rest[at + 1..];
+    // Query strings and fragments are never stored: they can carry tokens.
+    let end = remainder.find(['?', '#']).unwrap_or(remainder.len());
+    let remainder = &remainder[..end];
     let scheme = scheme_part
         .trim_end_matches("://")
         .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '+')
@@ -31,8 +31,11 @@ pub fn strip_url_credentials(url: &str) -> String {
         .unwrap_or("")
         .to_ascii_lowercase();
     let ssh_like = matches!(scheme.as_str(), "ssh" | "git+ssh" | "ssh+git");
-    if ssh_like && !userinfo.contains(':') && !userinfo.chars().any(char::is_whitespace) {
-        return url.to_string();
+    let plain_user = !userinfo.is_empty()
+        && !userinfo.contains([':', '?', '#', '/'])
+        && !userinfo.chars().any(char::is_whitespace);
+    if ssh_like && plain_user {
+        return format!("{scheme_part}{userinfo}@{remainder}");
     }
     format!("{scheme_part}{remainder}")
 }

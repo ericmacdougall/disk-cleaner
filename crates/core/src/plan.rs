@@ -127,7 +127,7 @@ pub struct ActionTotal {
 pub struct PlanTotals {
     /// Bytes freed if every removing action completed.
     pub reclaimable_bytes: u64,
-    /// Bytes freed by actions that need no recovery step (`remove-regenerable`, `archive`).
+    /// Bytes freed by `remove-regenerable` (needs no recovery or remote verification step).
     pub ready_bytes: u64,
     pub by_action: BTreeMap<String, ActionTotal>,
 }
@@ -148,6 +148,10 @@ pub struct Plan {
     pub process_check: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_check_note: Option<String>,
+    /// Always false in this phase: remote facts come from local remote-tracking refs, which can
+    /// be stale. Apply must re-check them with `git ls-remote` before removing anything.
+    pub remote_facts_verified: bool,
+    pub remote_facts_note: String,
     pub active: Vec<String>,
     pub totals: PlanTotals,
     pub items: Vec<PlanItem>,
@@ -165,10 +169,56 @@ fn canon(p: &Path) -> PathBuf {
 }
 
 fn under_active(path: &Path, active: &[PathBuf]) -> Option<String> {
+    if active.is_empty() {
+        return None;
+    }
+    // Compare real paths as well as the stored spelling: a scan taken through a symlink or
+    // relative path must still match an `--active` path spelled another way.
+    let real = canon(path);
     active
         .iter()
-        .find(|a| path.starts_with(a) || a.starts_with(path))
+        .find(|a| {
+            let real_a = canon(a);
+            path.starts_with(a)
+                || a.starts_with(path)
+                || real.starts_with(&real_a)
+                || real_a.starts_with(&real)
+        })
         .map(|a| a.to_string_lossy().into_owned())
+}
+
+/// Resolve the user's `--active` paths: each must exist, is made absolute and symlink-free, and
+/// must lie inside or around something the scan covered. A mistyped path must not silently
+/// protect nothing.
+pub fn resolve_active(
+    scan: &ScanResult,
+    raw: &[PathBuf],
+) -> std::result::Result<Vec<PathBuf>, crate::Error> {
+    let covered: Vec<PathBuf> = scan.roots.iter().map(|r| canon(Path::new(r))).collect();
+    let mut out = Vec::new();
+    for p in raw {
+        let real = std::fs::canonicalize(p).map_err(|e| crate::Error::Active {
+            path: p.clone(),
+            message: format!("cannot use this --active path: {e}"),
+        })?;
+        let real = canon(&real);
+        let related = covered
+            .iter()
+            .any(|r| real.starts_with(r) || r.starts_with(&real))
+            || scan
+                .nodes
+                .iter()
+                .any(|n| canon(Path::new(&n.path)).starts_with(&real));
+        if !related {
+            return Err(crate::Error::Active {
+                path: p.clone(),
+                message: "this --active path is not inside or around anything the scan covered"
+                    .to_string(),
+            });
+        }
+        out.push(real);
+    }
+    Ok(out)
 }
 
 /// The active path that covers node `idx` or a classified directory enclosing it.
@@ -233,7 +283,11 @@ fn judge(scan: &ScanResult, idx: usize, opts: &PlanOptions) -> (ProjectState, St
     match (last, days) {
         (Some(t), Some(d)) => {
             let age = opts.now.saturating_sub(t).max(0);
-            if age <= (window as i64).saturating_mul(86_400) {
+            // An absurdly large window saturates instead of wrapping negative.
+            let window_secs = i64::try_from(window)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(86_400);
+            if age <= window_secs {
                 (
                     ProjectState::Active,
                     format!(
@@ -269,6 +323,40 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         let (state, state_reason, days) = judge(scan, idx, opts);
         let (mut action, mut reason, mut reclaim) = decide(scan, idx, state, &state_reason);
         if action.removes() {
+            if let Some(why) = node.ask_reason.as_deref() {
+                reason = format!("{reason}; but it {why}");
+                action = Action::Ask;
+                reclaim = 0;
+            } else if node.unreadable > 0 {
+                reason = format!(
+                    "{reason}; but {} entr{} inside could not be read, so the scan of it is \
+                     incomplete",
+                    node.unreadable,
+                    if node.unreadable == 1 { "y" } else { "ies" }
+                );
+                action = Action::Ask;
+                reclaim = 0;
+            } else if let Some(n) = node
+                .repo
+                .as_ref()
+                .map(|r| r.submodule_gitdirs)
+                .filter(|&n| {
+                    n > scan
+                        .nodes
+                        .iter()
+                        .filter(|c| c.parent == Some(idx) && c.class.is_git())
+                        .count()
+                })
+            {
+                reason = format!(
+                    "{reason}; but {n} submodule git director(ies) under .git/modules are not \
+                     individually checked, and their stash or local branches would be deleted"
+                );
+                action = Action::Ask;
+                reclaim = 0;
+            }
+        }
+        if action.removes() {
             if let ProcessCheck::Unknown { reason: why } = &opts.process {
                 // Cannot prove nothing is using it: a person decides.
                 reason = format!("{reason}; but running processes could not be inspected ({why})");
@@ -289,6 +377,42 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             days_since_activity: days,
             facts: node.repo.as_ref().map(|r| r.facts),
         });
+    }
+
+    // An enclosing directory goes with everything inside it. When a nested node is kept, asked
+    // about, needs recovery, or holds something that cannot be removed, the enclosing node can
+    // not be removed either: it becomes `ask`. Children come after parents, so walk backwards and
+    // let a downgraded node block its own parent in turn.
+    let mut pos: Vec<Option<usize>> = vec![None; scan.nodes.len()];
+    for (k, it) in items.iter().enumerate() {
+        pos[it.node] = Some(k);
+    }
+    for k in (0..items.len()).rev() {
+        let (node_idx, action) = (items[k].node, items[k].action);
+        if !matches!(
+            action,
+            Action::Keep | Action::Ask | Action::RecoverThenArchive
+        ) {
+            continue;
+        }
+        let parent = match scan.nodes[node_idx].parent.and_then(|p| pos[p]) {
+            Some(pk) => pk,
+            None => continue,
+        };
+        if items[parent].action.removes() {
+            let child = items[k].path.clone();
+            let why = match action {
+                Action::Keep => "is kept",
+                Action::Ask => "needs a person's decision",
+                _ => "has unsaved work to recover first",
+            };
+            items[parent].reason = format!(
+                "{}; but the nested {child} {why}, and everything inside goes with this one",
+                items[parent].reason
+            );
+            items[parent].action = Action::Ask;
+            items[parent].reclaimable_bytes = 0;
+        }
     }
 
     // Totals: an item inside another removing item is already counted by the outer one.
@@ -317,7 +441,9 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         if it.action.removes() && !nested {
             slot.reclaimable_bytes += it.reclaimable_bytes;
             totals.reclaimable_bytes += it.reclaimable_bytes;
-            if matches!(it.action, Action::RemoveRegenerable | Action::Archive) {
+            // Only regenerable directories are ready without a recovery or verification step:
+            // an archive rests on remote facts that stay unverified until apply.
+            if it.action == Action::RemoveRegenerable {
                 totals.ready_bytes += it.reclaimable_bytes;
             }
         }
@@ -332,6 +458,10 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         window_source: opts.window_source.clone(),
         process_check: opts.process.status().to_string(),
         process_check_note: opts.process.note(),
+        remote_facts_verified: false,
+        remote_facts_note: "remote facts come from local remote-tracking refs, which can be stale; \
+                            they are unverified until apply re-checks them with git ls-remote"
+            .to_string(),
         active: opts
             .active
             .iter()
@@ -413,7 +543,9 @@ fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Act
                 (
                     Action::Archive,
                     format!(
-                        "idle ({why}); every commit is on a network remote, nothing unsaved, no dependents"
+                        "idle ({why}); local remote-tracking refs say every commit is on a \
+                         network remote, nothing is unsaved and nothing depends on it \
+                         (unverified until apply re-checks the remote with git ls-remote)"
                     ),
                     node.bytes_total,
                 )

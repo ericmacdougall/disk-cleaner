@@ -30,6 +30,9 @@ pub enum Error {
     /// The config file is missing (when named explicitly) or malformed.
     #[error("config file {path}: {message}")]
     Config { path: PathBuf, message: String },
+    /// An `--active` path does not exist or matches nothing that was scanned.
+    #[error("--active {path}: {message}")]
+    Active { path: PathBuf, message: String },
     /// The scan file was written with a schema this build does not understand.
     #[error("scan file has schema_version {found}, this build reads {expected}")]
     Schema { found: u32, expected: u32 },

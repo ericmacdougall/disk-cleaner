@@ -6,7 +6,7 @@
 //! gathers git facts for the repos found. Nothing here writes, moves or deletes anything.
 
 use crate::error::{Error, Result};
-use crate::facts::{collect_repo_info, FactsConfig};
+use crate::facts::{collect_repo_info, FactsConfig, RepoCheck};
 use crate::model::*;
 use crate::rules::{marker_matches, Rule, RuleSet};
 use jwalk::WalkDirGeneric;
@@ -139,11 +139,22 @@ struct Walk {
     outputs_raw: Vec<(PathBuf, u64)>,
     totals: Totals,
     issues: Vec<ScanIssue>,
+    /// Paths of every unreadable entry (bounded), used to mark the nodes that hold them.
+    issue_paths: Vec<PathBuf>,
+    /// More unreadable entries than `MAX_ISSUE_PATHS`: every node counts as incomplete.
+    issue_overflow: bool,
 }
+
+const MAX_ISSUE_PATHS: usize = 100_000;
 
 impl Walk {
     fn issue(&mut self, path: &Path, message: String) {
         self.totals.unreadable += 1;
+        if self.issue_paths.len() < MAX_ISSUE_PATHS {
+            self.issue_paths.push(path.to_path_buf());
+        } else {
+            self.issue_overflow = true;
+        }
         if self.issues.len() < MAX_ISSUES {
             self.issues.push(ScanIssue {
                 path: path.to_string_lossy().into_owned(),
@@ -287,24 +298,22 @@ struct Frame {
     in_git: bool,
 }
 
-fn marker_above(dirs: &[(PathBuf, DirAgg)], path: &Path, markers: &[String]) -> bool {
-    let mut cur = path.parent();
-    while let Some(p) = cur {
-        match dirs.binary_search_by(|(q, _)| q.as_path().cmp(p)) {
-            Ok(k) => {
-                let present = &dirs[k].1.markers;
-                if present
-                    .iter()
-                    .any(|name| markers.iter().any(|m| marker_matches(m, name)))
-                {
-                    return true;
-                }
-            }
-            Err(_) => break,
-        }
-        cur = p.parent();
+/// Is one of the rule's markers in the directory beside `path` (its parent)? A marker further up
+/// proves nothing about this directory: `src/build/` is not `build/` just because the project
+/// root has a `package.json`.
+fn marker_beside(dirs: &[(PathBuf, DirAgg)], path: &Path, markers: &[String]) -> bool {
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return false,
+    };
+    match dirs.binary_search_by(|(q, _)| q.as_path().cmp(parent)) {
+        Ok(k) => dirs[k]
+            .1
+            .markers
+            .iter()
+            .any(|name| markers.iter().any(|m| marker_matches(m, name))),
+        Err(_) => false,
     }
-    false
 }
 
 fn match_rule<'a>(dirs: &[(PathBuf, DirAgg)], i: usize, rules: &'a RuleSet) -> Option<&'a Rule> {
@@ -312,7 +321,11 @@ fn match_rule<'a>(dirs: &[(PathBuf, DirAgg)], i: usize, rules: &'a RuleSet) -> O
     rules
         .candidates(path)
         .into_iter()
-        .find(|r| r.markers.is_empty() || marker_above(dirs, path, &r.markers))
+        .find(|r| r.markers.is_empty() || marker_beside(dirs, path, &r.markers))
+}
+
+fn bare_shape(agg: &DirAgg) -> bool {
+    agg.has_head && agg.has_objects && agg.has_refs
 }
 
 /// Assign every directory to its innermost classified ancestor, creating nodes.
@@ -351,6 +364,16 @@ fn classify(
                             && Some(builds[o].path.as_path()) == path.parent()
                     })
                     .unwrap_or(false);
+            if opaque && (agg.has_git_dir || agg.has_git_file || bare_shape(agg)) {
+                // A git repository inside a "generated" directory (a FetchContent checkout,
+                // a patched dependency): it may hold unpushed work.
+                if let Some(o) = owner {
+                    let rel_path = path.to_string_lossy();
+                    builds[o].node.ask_reason.get_or_insert_with(|| {
+                        format!("contains a git repository ({rel_path}) that may hold unsaved work")
+                    });
+                }
+            }
             if is_git_admin {
                 now_in_git = true;
             } else if !opaque {
@@ -359,7 +382,7 @@ fn classify(
                     found = Some((Class::Repo, None));
                 } else if agg.has_git_file {
                     found = Some((Class::Worktree, None));
-                } else if agg.has_head && agg.has_objects && agg.has_refs {
+                } else if bare_shape(agg) {
                     found = Some((Class::BareRepo, None));
                 } else if let Some(rule) = match_rule(dirs, i, rules) {
                     found = Some((rule.class, Some(rule)));
@@ -373,6 +396,17 @@ fn classify(
                     let mut node = Node::new(path.to_string_lossy().into_owned(), class);
                     node.parent = owner;
                     node.rule = rule.map(|r| r.name.clone());
+                    let parent_is_loose = match owner {
+                        None => true,
+                        Some(o) => builds[o].node.class == Class::LooseCode,
+                    };
+                    if rule.map(|r| r.scan_outputs).unwrap_or(false) && parent_is_loose {
+                        node.ask_reason = Some(
+                            "no git history proves this build-named directory holds only \
+                             generated files and not hand-written source"
+                                .to_string(),
+                        );
+                    }
                     builds.push(Build {
                         node,
                         path: path.clone(),
@@ -433,6 +467,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         outputs_raw: Vec::new(),
         totals: Totals::default(),
         issues: Vec::new(),
+        issue_paths: Vec::new(),
+        issue_overflow: false,
     };
     let mut warnings: Vec<String> = Vec::new();
     if opts.one_file_system && !cfg!(unix) {
@@ -480,6 +516,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         outputs_raw,
         mut totals,
         mut issues,
+        issue_paths,
+        issue_overflow,
         ..
     } = walk;
     issues.truncate(MAX_ISSUES);
@@ -538,6 +576,18 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             .ok()
             .and_then(|k| dirs[k].1.owner)
     };
+    // Entries that could not be read make the node that holds them incomplete.
+    if issue_overflow {
+        for b in builds.iter_mut() {
+            b.node.unreadable += 1;
+        }
+    }
+    for p in &issue_paths {
+        let owner = owner_of(p.as_path()).or_else(|| p.parent().and_then(&owner_of));
+        if let Some(o) = owner {
+            builds[o].node.unreadable += 1;
+        }
+    }
     let mut outputs: Vec<OutputFile> = Vec::new();
     for (path, bytes) in outputs_raw {
         let owner = path.parent().and_then(&owner_of);
@@ -570,6 +620,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
 
     // Phase 3: git facts.
     let mut infos: HashMap<usize, RepoInfo> = HashMap::new();
+    // Only directories that are still believed removable are excluded from the "unique ignored
+    // files" check; one that holds outputs, a nested repo or unreadable parts is not.
     let tasks: Vec<(usize, PathBuf, Class, Vec<PathBuf>)> = builds
         .iter()
         .enumerate()
@@ -577,15 +629,22 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         .map(|(i, b)| {
             let regen: Vec<PathBuf> = builds
                 .iter()
-                .filter(|c| c.node.parent == Some(i) && c.node.class.is_artifact())
+                .filter(|c| {
+                    c.node.parent == Some(i)
+                        && c.node.class.is_artifact()
+                        && !c.node.contains_outputs
+                        && c.node.ask_reason.is_none()
+                        && c.node.unreadable == 0
+                })
                 .map(|c| c.path.clone())
                 .collect();
             (i, b.path.clone(), b.node.class, regen)
         })
         .collect();
+    let mut unverified: Vec<(usize, PathBuf, String)> = Vec::new();
     if opts.collect_facts && !tasks.is_empty() {
         let jobs = opts.git_jobs.max(1);
-        let gathered: Vec<(usize, RepoInfo)> =
+        let gathered: Vec<(usize, RepoCheck)> =
             match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
                 Ok(pool) => pool.install(|| {
                     tasks
@@ -598,18 +657,41 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                     .map(|(i, p, c, regen)| (*i, collect_repo_info(&opts.facts, p, *c, regen)))
                     .collect(),
             };
-        infos.extend(gathered);
+        for (i, check) in gathered {
+            for (p, why) in check.unverified_artifacts {
+                unverified.push((i, p, why));
+            }
+            infos.insert(i, check.info);
+        }
     } else {
-        for (i, _, _, _) in &tasks {
+        for (i, _, _, regen) in &tasks {
             let info = RepoInfo {
                 notes: vec!["git facts were not collected".to_string()],
                 ..RepoInfo::default()
             };
             infos.insert(*i, info);
+            for p in regen {
+                unverified.push((
+                    *i,
+                    p.clone(),
+                    "git facts were not collected, so it is not verified to be ignored".to_string(),
+                ));
+            }
+        }
+    }
+    for (i, p, why) in unverified {
+        if let Some(c) = builds
+            .iter_mut()
+            .find(|c| c.node.parent == Some(i) && c.path == p)
+        {
+            c.node.ask_reason.get_or_insert(why);
         }
     }
     for (i, b) in builds.iter_mut().enumerate() {
         if let Some(mut info) = infos.remove(&i) {
+            if b.node.class == Class::Repo {
+                info.submodule_gitdirs = count_module_gitdirs(&b.path.join(".git").join("modules"));
+            }
             info.sizes = RepoSizes {
                 total: b.node.bytes_total,
                 git: b.git_bytes,
@@ -619,7 +701,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             b.node.repo = Some(info);
         }
     }
-    link_repos(&mut builds);
+    link_repos(&mut builds, &mut warnings);
 
     // Totals by class.
     for b in &builds {
@@ -660,9 +742,69 @@ fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Largest file `read_small_regular_file` will read.
+const MAX_SMALL_FILE: u64 = 64 * 1024;
+
+/// Read a regular file of at most 64 KiB. A missing file is `Ok(None)`. A symlink, FIFO, device
+/// or oversized file is an error: it is never followed or read to the end, so a hostile tree
+/// cannot make the scan block or grow without bound.
+fn read_small_regular_file(path: &Path) -> std::result::Result<Option<String>, String> {
+    use std::io::Read;
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !md.file_type().is_file() {
+        return Err("not a regular file".to_string());
+    }
+    if md.len() > MAX_SMALL_FILE {
+        return Err("file is too large".to_string());
+    }
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut buf = String::new();
+    file.take(MAX_SMALL_FILE)
+        .read_to_string(&mut buf)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(buf))
+}
+
+/// Number of git directories under `.git/modules` (submodule object stores, stashes and local
+/// branches). Bounded and never follows symlinks.
+fn count_module_gitdirs(modules: &Path) -> usize {
+    let mut count = 0usize;
+    let mut visited = 0usize;
+    let mut stack = vec![modules.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > 5000 {
+                return count.max(1);
+            }
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !is_dir {
+                continue;
+            }
+            let p = entry.path();
+            if p.join("HEAD").is_file() {
+                count += 1;
+                // Nested submodules live in this module's own `modules` directory.
+                stack.push(p.join("modules"));
+            } else {
+                stack.push(p);
+            }
+        }
+    }
+    count
+}
+
 /// Tie linked worktrees to their parent repo and mark repos that other clones in the scan
 /// borrow objects from (alternates).
-fn link_repos(builds: &mut [Build]) {
+fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
     let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
     let mut by_objects: HashMap<PathBuf, usize> = HashMap::new();
     for (i, b) in builds.iter().enumerate() {
@@ -697,9 +839,18 @@ fn link_repos(builds: &mut [Build]) {
             Class::BareRepo => b.path.join("objects"),
             _ => continue,
         };
-        let text = match std::fs::read_to_string(objects_dir.join("info").join("alternates")) {
-            Ok(t) => t,
-            Err(_) => continue,
+        let alt_path = objects_dir.join("info").join("alternates");
+        let text = match read_small_regular_file(&alt_path) {
+            Ok(Some(t)) => t,
+            Ok(None) => continue,
+            Err(why) => {
+                warnings.push(format!(
+                    "alternates file {} was not read ({why}); clones borrowing from other repos \
+                     through it are not detected",
+                    alt_path.display()
+                ));
+                continue;
+            }
         };
         for line in text.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {

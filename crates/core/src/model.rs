@@ -186,6 +186,10 @@ pub struct RepoInfo {
     /// Clones inside the scan that borrow objects from this repo (alternates).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependents: Vec<String>,
+    /// Git directories of submodules stored under `.git/modules` (their stash and local
+    /// branches are deleted with this repo).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub submodule_gitdirs: usize,
     pub sizes: RepoSizes,
 }
 
@@ -213,8 +217,23 @@ pub struct Node {
     /// `.git` and nested classified directories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newest_mtime: Option<i64>,
+    /// Entries inside this node (or directly attributed to it) that could not be read. The scan
+    /// of this node is incomplete, so it is never offered for removal.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unreadable: u64,
+    /// Why this node must not be removed without a person looking (regenerable and cache only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<RepoInfo>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 impl Node {
@@ -231,6 +250,8 @@ impl Node {
             output_bytes: 0,
             contains_outputs: false,
             newest_mtime: None,
+            unreadable: 0,
+            ask_reason: None,
             repo: None,
         }
     }

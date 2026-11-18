@@ -19,6 +19,20 @@ pub fn human_bytes(b: u64) -> String {
     }
 }
 
+/// Make text that came from the file system safe to print: control characters (newlines, ANSI
+/// escapes, ...) are shown as `\u{..}` so a directory name cannot forge or hide output lines.
+pub fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn fact_word(t: Tri) -> &'static str {
     match t {
         Tri::Yes => "yes",
@@ -31,7 +45,7 @@ fn fact_word(t: Tri) -> &'static str {
 pub fn scan_summary(s: &ScanResult) -> String {
     let mut o = String::new();
     let t = &s.totals;
-    let _ = writeln!(o, "Scanned {}", s.roots.join(", "));
+    let _ = writeln!(o, "Scanned {}", esc(&s.roots.join(", ")));
     let _ = writeln!(
         o,
         "{} files, {} directories, {} allocated ({} logical)",
@@ -54,7 +68,7 @@ pub fn scan_summary(s: &ScanResult) -> String {
         let _ = writeln!(o, "{} mount point(s) not crossed", t.mount_points_skipped);
     }
     for w in &s.warnings {
-        let _ = writeln!(o, "warning: {w}");
+        let _ = writeln!(o, "warning: {}", esc(w));
     }
 
     let _ = writeln!(o, "\nSpace by class (innermost classified ancestor):");
@@ -74,7 +88,7 @@ pub fn scan_summary(s: &ScanResult) -> String {
                 o,
                 "  [{}] {}  {}",
                 n.class.as_str(),
-                n.path,
+                esc(&n.path),
                 human_bytes(n.bytes_total)
             );
             if let Some(r) = &n.repo {
@@ -117,7 +131,7 @@ pub fn scan_summary(s: &ScanResult) -> String {
                 o,
                 "  {:>10}  {}{}",
                 human_bytes(n.bytes_total),
-                n.path,
+                esc(&n.path),
                 flag
             );
         }
@@ -126,13 +140,13 @@ pub fn scan_summary(s: &ScanResult) -> String {
     if !s.outputs.is_empty() {
         let _ = writeln!(o, "\nOutput files listed ({}):", s.outputs.len());
         for f in s.outputs.iter().take(15) {
-            let _ = writeln!(o, "  {:>10}  {}", human_bytes(f.bytes), f.path);
+            let _ = writeln!(o, "  {:>10}  {}", human_bytes(f.bytes), esc(&f.path));
         }
     }
     if !s.big_files.is_empty() {
         let _ = writeln!(o, "\nBiggest files:");
         for f in s.big_files.iter().take(10) {
-            let _ = writeln!(o, "  {:>10}  {}", human_bytes(f.bytes), f.path);
+            let _ = writeln!(o, "  {:>10}  {}", human_bytes(f.bytes), esc(&f.path));
         }
     }
     o
@@ -152,11 +166,13 @@ pub fn plan_summary(p: &Plan) -> String {
     }
     let _ = writeln!(o);
     if !p.active.is_empty() {
-        let _ = writeln!(o, "Active paths: {}", p.active.join(", "));
+        let _ = writeln!(o, "Active paths: {}", esc(&p.active.join(", ")));
     }
+    let _ = writeln!(o, "Remote facts verified: no ({})", p.remote_facts_note);
     let _ = writeln!(
         o,
-        "Reclaimable if every removing step completes: {} ({} with no recovery step)",
+        "Reclaimable if every removing step completes: {} ({} from regenerable directories, \
+         needing no recovery or remote check)",
         human_bytes(p.totals.reclaimable_bytes),
         human_bytes(p.totals.ready_bytes)
     );
@@ -184,17 +200,23 @@ pub fn plan_summary(p: &Plan) -> String {
             it.action.as_str(),
             human_bytes(it.reclaimable_bytes),
             it.class.as_str(),
-            it.path
+            esc(&it.path)
         );
-        let _ = writeln!(o, "      {:?}: {}", it.state, it.state_reason);
-        let _ = writeln!(o, "      {}", it.reason);
+        let _ = writeln!(o, "      {:?}: {}", it.state, esc(&it.state_reason));
+        let _ = writeln!(o, "      {}", esc(&it.reason));
     }
     o
 }
 
 #[cfg(test)]
 mod tests {
-    use super::human_bytes;
+    use super::{esc, human_bytes};
+
+    #[test]
+    fn escapes_control_characters() {
+        assert_eq!(esc("a\nb\u{1b}[0m"), "a\\u{a}b\\u{1b}[0m");
+        assert_eq!(esc("plain é 日本"), "plain é 日本");
+    }
 
     #[test]
     fn formats_bytes() {

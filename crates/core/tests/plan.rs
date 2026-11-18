@@ -359,7 +359,12 @@ fn neg4_build_dir_with_an_output_file_is_never_offered_for_removal() {
     let with_video = root.join("a");
     let without = root.join("b");
     for proj in [&with_video, &without] {
+        // Real repos that ignore out/, so git proves it is generated, untracked output.
+        init_repo(proj);
         write(&proj.join("package.json"), "{}");
+        write(&proj.join(".gitignore"), "out/\n");
+        git(proj, &["add", "package.json", ".gitignore"]);
+        git(proj, &["commit", "-q", "-m", "project"]);
         write_bytes(&proj.join("out").join("bundle.js"), 5000);
     }
     write_bytes(&with_video.join("out").join("render.mp4"), 1024);

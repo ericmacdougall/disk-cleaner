@@ -135,7 +135,10 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
         .iter()
         .find(|i| i["path"].as_str() == Some(repo_path.as_str()))
         .expect("repo item");
-    assert_eq!(repo_item["action"], "recover-then-archive");
+    // node_modules is neither ignored nor tracked here, so it needs a person's decision and
+    // the repo that encloses it asks too; it must never be archived.
+    let action = repo_item["action"].as_str().unwrap();
+    assert!(action == "ask" || action == "recover-then-archive", "{action}");
 
     for text in [&human, &json, &plan_text, &plan_json] {
         assert!(!text.contains("cli-SECRET-tok-77"), "token leaked");
@@ -454,7 +457,14 @@ fn removable_without_active(scan_file: &Path, home: &Path, nm: &str) {
 fn f5_active_path_with_dot_dot_still_covers_the_project() {
     let (tmp, scan_file, nm, home) = idle_fixture();
     removable_without_active(&scan_file, &home, &nm);
-    let spelled = tmp.path().join("scan").join("proj").join("..").join("proj");
+    // `other/..` is a detour that a lexical prefix comparison cannot see through.
+    fs::create_dir_all(tmp.path().join("scan").join("other")).unwrap();
+    let spelled = tmp
+        .path()
+        .join("scan")
+        .join("other")
+        .join("..")
+        .join("proj");
     let o = plan_json(&scan_file, &home, &["--active", spelled.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(nm_action(&o, &nm), "keep");

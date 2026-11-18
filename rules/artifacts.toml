@@ -2,9 +2,10 @@
 #
 # [[rule]] fields
 #   name          directory name; a name with "/" matches the trailing path components
-#   markers       entries (files or directories) that must exist beside the directory or in
-#                 any ancestor inside the scan root. "*.ext" matches by suffix. Empty list
-#                 means the name alone is enough (use only for names that are never anything else).
+#   markers       entries (files or directories) that must exist beside the directory, that is,
+#                 in its parent. A marker further up does not count. "*.ext" matches by suffix.
+#                 Empty list means the name alone is enough (use only for names that are never
+#                 anything else).
 #   class         "regenerable" (rebuilt by the project's tooling) or "cache" (re-downloaded)
 #   scan_outputs  true for build output directories: they are searched for output files
 #                 (video, archives, model weights...) and are not offered for removal if any
@@ -378,7 +379,13 @@ extensions = [
     # virtual machine disks
     "vmdk", "vdi", "vhd", "vhdx", "qcow2",
     # database dumps and local databases
-    "sql", "dump", "bak", "sqlite", "sqlite3", "mdb",
+    "sql", "dump", "bak", "sqlite", "sqlite3", "mdb", "db", "duckdb",
+    # images and documents
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "exr", "heic", "dng", "raw", "pdf",
+    # datasets and arrays
+    "csv", "tsv", "parquet", "npy", "npz", "jsonl", "arrow", "feather", "hdf5", "nc",
+    # more model weights
+    "bin", "keras", "npz",
 ]
 
 # ---- Loose code --------------------------------------------------------------------------

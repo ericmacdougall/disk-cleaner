@@ -6,8 +6,8 @@ mod report;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use disk_cleaner_core::{
-    config, plan, read_scan, running_cwds, scan, write_json, ConfigSource, FactsConfig, Git,
-    PlanOptions, ScanOptions,
+    config, plan, read_scan, resolve_active, running_cwds, scan, write_json, ConfigSource,
+    FactsConfig, Git, PlanOptions, ScanOptions,
 };
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -127,10 +127,7 @@ fn run_plan(a: PlanArgs) -> Result<()> {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
     });
-    let mut active = Vec::new();
-    for p in &a.active {
-        active.push(std::path::absolute(p).with_context(|| format!("bad --active {p:?}"))?);
-    }
+    let active = resolve_active(&scan_result, &a.active)?;
     // The config is always loaded and validated, even when a flag overrides it, so a broken
     // file is reported instead of being ignored.
     let (cfg, source) = config::load(a.config.as_deref()).context("invalid configuration")?;
