@@ -109,7 +109,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
     let json = fs::read_to_string(&out_file).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["schema_version"], 10);
+    assert_eq!(v["schema_version"], 11);
 
     let o = run(bin()
         .args([
@@ -1355,4 +1355,39 @@ fn r1_a_fully_readable_scan_is_complete_and_adds_no_coverage_sentence() {
     let pv = plan_value(&plan_json(&scan_file, &home, &flag));
     assert_eq!(item_of(&pv, &a)["action"], "backup-then-remove");
     assert_eq!(pv["accepted_incomplete_coverage"], true);
+}
+
+// ---------------------------------------------------------------- Y1, Y5 (preserve obligation)
+
+#[test]
+fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("scan");
+    let a = root.join("a");
+    archivable_repo(&a);
+    let scan_file = tmp.path().join("scan.json");
+    scan_to_file(&root, &scan_file);
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let now = far_future();
+
+    let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
+    assert_eq!(pv["schema_version"], 11);
+    let it = item_of(&pv, &a);
+    assert_eq!(it["action"], "backup-then-remove", "{it}");
+    let pre = &it["preserve"]["git_admin"];
+    assert!(pre["files"].as_u64().unwrap_or(0) > 0, "{it}");
+    assert!(pre["bytes"].as_u64().unwrap_or(0) > 0, "{it}");
+    let gd = a.join(".git").to_string_lossy().into_owned();
+    assert_eq!(pre["git_dirs"][0].as_str(), Some(gd.as_str()), "{it}");
+
+    // The human plan shows it under the item.
+    let mut c = bin();
+    c.args(["plan", "--scan", scan_file.to_str().unwrap(), "--now", &now])
+        .arg("--trust-partial-process-check");
+    isolate(&mut c, &home);
+    let text = stdout(&run(&mut c));
+    assert!(text.contains("backup-then-remove"), "{text}");
+    assert!(text.contains("back up first:"), "{text}");
+    assert!(text.contains(&gd), "{text}");
 }
