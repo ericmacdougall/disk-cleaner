@@ -5,8 +5,9 @@ import { describe, expect, it } from "vitest";
 
 // Read the file itself: vitest sends CSS imports (`?raw` included) through its CSS pipeline,
 // which yields an empty string while CSS processing is off (every token was undefined in
-// CI run 44636050907).
-const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+// CI run 44636050907). The path is relative to apps/desktop, where vitest runs (under jsdom
+// import.meta.url is not a file URL: run 44636823450).
+const css = readFileSync("src/styles.css", "utf8");
 
 function tokens(block: string): Record<string, string> {
   const out: Record<string, string> = {};
