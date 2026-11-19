@@ -562,17 +562,23 @@ directories and inside `.git` directories too) the scan records:
   (inside `node_modules`, inside `.git/modules`, in a repository that is not a node); at most
   20,000;
 - every entry named `commondir`, wherever it is; after the walk one counts when the directory
-  holding it also holds a `HEAD` file, that is, when it belongs to a git directory of any kind:
-  a repository's `.git`, a bare repository, a linked worktree's or submodule's git directory
-  inside another one, a directory with only `HEAD` and `commondir` (which git accepts and the scan
-  classifies as nothing), any of them inside an artifact or in a separately walked root; at most
-  20,000;
+  holding it is named `.git` or also holds an entry named `HEAD` that is not a directory (a file
+  or a symbolic link, which git also accepts), that is, when it belongs to a git directory of any
+  kind: a repository's `.git`, a bare repository, a linked worktree's or submodule's git
+  directory inside another one, a directory with only `HEAD` and `commondir` (which git accepts
+  and the scan classifies as nothing), any of them inside an artifact or in a separately walked
+  root; at most 20,000;
 - every `.git` file that is not itself a scanned checkout (inside a regenerable or cache
-  directory, inside a git directory); a scanned checkout's `.git` file is resolved with its
-  repository (see "Object sharing").
+  directory, inside a git directory). A scanned checkout's `.git` file is resolved with its
+  repository for the object store (see "Object sharing"), and the git directory it names is
+  checked too: one inside another repository's git directory (`git init --separate-git-dir
+  A/.git/sub`) makes that repository `no`, unless the checkout lies inside that repository's
+  own folder (a submodule, which goes with it).
 
-Dependency discovery therefore does not depend on how the borrower was classified: each kind of
-reference is checked for every git directory that holds one.
+Each kind of reference above is checked for every git directory the walk recognises, whatever
+the borrower was classified as. A git directory is recognised only by the entries named above,
+and one the walk does not reach (outside every scan root, or below a directory it cannot read)
+is not found by this pass.
 
 After the walk:
 

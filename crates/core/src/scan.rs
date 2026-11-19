@@ -147,6 +147,9 @@ struct DirAgg {
     /// fifo, device): ambiguous evidence of a repository. Never followed.
     git_odd: bool,
     has_head: bool,
+    /// A direct entry named `HEAD` of any type but a directory: git also accepts a `HEAD` that
+    /// is a symbolic link, so this, not `has_head`, says a `commondir` here is git data.
+    head_any: bool,
     has_objects: bool,
     has_refs: bool,
     has_source: bool,
@@ -466,6 +469,9 @@ impl Walk {
         }
         if name == ".git" && !is_file {
             agg.git_odd = true;
+        }
+        if name == "HEAD" {
+            agg.head_any = true;
         }
         if ft.is_symlink() && agg.first_symlink.is_none() {
             agg.first_symlink = Some(name.clone());
@@ -2070,15 +2076,17 @@ fn link_inbound(ctx: &InboundCtx, refs: &Refs) -> Inbound {
         }
     }
     // `commondir`: the git directory that holds it takes its refs and objects from the directory
-    // it names. Only an entry beside a `HEAD` belongs to a git directory.
+    // it names. An entry belongs to a git directory when it lies beside a `HEAD` of any type
+    // (git accepts a symlinked one) or in a directory named `.git`.
     for cd in &refs.commondirs {
         let Some(gd) = cd.parent() else {
             continue;
         };
-        let in_git_dir = ctx
-            .dirs
-            .binary_search_by(|(q, _)| q.as_path().cmp(gd))
-            .is_ok_and(|k| ctx.dirs[k].1.has_head);
+        let in_git_dir = gd.file_name() == Some(OsStr::new(".git"))
+            || ctx
+                .dirs
+                .binary_search_by(|(q, _)| q.as_path().cmp(gd))
+                .is_ok_and(|k| ctx.dirs[k].1.head_any);
         if !in_git_dir {
             continue;
         }
@@ -2094,7 +2102,12 @@ fn link_inbound(ctx: &InboundCtx, refs: &Refs) -> Inbound {
         }
     }
     // `.git` files: the git directory each names, and the object store it leads to. A scanned
-    // checkout's own `.git` file is resolved with its repository (`link_repos`).
+    // checkout's object store is related to the scanned repositories with its repository
+    // (`link_repos`, which also reports a `.git` file it cannot resolve); the git directory it
+    // names is checked here, so one kept inside another repository's git directory (`git init
+    // --separate-git-dir`) is a reference to that repository. A checkout inside that repository's
+    // own folder (a submodule) goes with it and is not. A git directory outside the scan is left
+    // to `link_repos`, which reports an object store outside the scan.
     for (dir, agg) in ctx.dirs {
         if !agg.has_git_file {
             continue;
@@ -2103,6 +2116,14 @@ fn link_inbound(ctx: &InboundCtx, refs: &Refs) -> Inbound {
             ctx.builds[o].path == *dir && ctx.builds[o].node.class == Class::Worktree
         });
         if checkout {
+            if let Ok((gd, _)) = resolve_gitfile(dir) {
+                let inside_provider = ctx
+                    .gitdir_holding(&gd)
+                    .is_some_and(|n| canon(dir).starts_with(canon(&ctx.builds[n].path)));
+                if !inside_provider && ctx.in_scan(&gd) {
+                    consider(ctx, &mut out, &dir.join(".git"), true, &gd);
+                }
+            }
             continue;
         }
         match resolve_gitfile(dir) {
