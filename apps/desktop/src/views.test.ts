@@ -231,7 +231,7 @@ describe("settings (spec AC-5, NEG-5)", () => {
 
   it("confirming saves exactly the change that was shown, and the form is locked while asking", async () => {
     const b = mockBackend({
-      saveSettings: async (core, _app, confirm) => {
+      saveSettings: async (_core, _app, confirm) => {
         if (!confirm) throw { kind: "needs_confirmation", message: "shortening the active window from 30 to 7 days", old: 30, new: 7 };
         return { report: { outcome: "saved", note: null, replanned: false }, settings: structuredClone(SETTINGS) };
       },
