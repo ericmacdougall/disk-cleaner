@@ -157,10 +157,22 @@ pub fn validate_scan(scan: &ScanResult) -> Result<()> {
         }
     }
     // Sums: checked, so a hostile file cannot wrap a total.
-    checked_total("nodes[].bytes_self", scan.nodes.iter().map(|x| x.bytes_self))?;
-    checked_total("nodes[].bytes_total", scan.nodes.iter().map(|x| x.bytes_total))?;
-    checked_total("nodes[].files_total", scan.nodes.iter().map(|x| x.files_total))?;
-    checked_total("nodes[].output_bytes", scan.nodes.iter().map(|x| x.output_bytes))?;
+    checked_total(
+        "nodes[].bytes_self",
+        scan.nodes.iter().map(|x| x.bytes_self),
+    )?;
+    checked_total(
+        "nodes[].bytes_total",
+        scan.nodes.iter().map(|x| x.bytes_total),
+    )?;
+    checked_total(
+        "nodes[].files_total",
+        scan.nodes.iter().map(|x| x.files_total),
+    )?;
+    checked_total(
+        "nodes[].output_bytes",
+        scan.nodes.iter().map(|x| x.output_bytes),
+    )?;
     checked_total("outputs[].bytes", scan.outputs.iter().map(|x| x.bytes))?;
     checked_total("big_files[].bytes", scan.big_files.iter().map(|x| x.bytes))?;
     Ok(())
