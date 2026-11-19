@@ -113,8 +113,6 @@ fn u1_orig_head_at_an_unpushed_commit_with_reflogs_disabled_is_not_archived() {
     git(&repo, &["init", "-q", "-b", "main"]);
     // Before the first commit: git appends to a reflog that exists whatever this setting says.
     git(&repo, &["config", "core.logAllRefUpdates", "false"]);
-    git(&repo, &["config", "user.name", "Test"]);
-    git(&repo, &["config", "user.email", "test@example.invalid"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
     commit_file(&repo, "README.md", "hello\n");
     let remote = remotes.join("app.git");

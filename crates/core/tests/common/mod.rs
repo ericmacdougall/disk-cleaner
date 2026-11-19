@@ -41,12 +41,12 @@ pub fn write(path: &Path, content: &str) {
     fs::write(path, content).unwrap();
 }
 
-/// `git init` with a fixed branch name and local identity, plus one commit.
+/// `git init` with a fixed branch name, plus one commit. The identity comes from the
+/// environment [`git`] sets, not from the repository config: a per-repository `user.*` setting
+/// is local content the scanner reports (gate d1e3f23, W1).
 pub fn init_repo(dir: &Path) {
     fs::create_dir_all(dir).unwrap();
     git(dir, &["init", "-q", "-b", "main"]);
-    git(dir, &["config", "user.name", "Test"]);
-    git(dir, &["config", "user.email", "test@example.invalid"]);
     git(dir, &["config", "commit.gpgsign", "false"]);
     write(&dir.join("README.md"), "hello\n");
     git(dir, &["add", "README.md"]);
