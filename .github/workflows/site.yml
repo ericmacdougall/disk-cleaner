@@ -1,16 +1,26 @@
 name: Site tests
 
+# The tests also read the root README, ci.yml and the core's model and plan sources to check the page's
+# claims against them, so a change to any of those runs them too.
 on:
   push:
     paths:
       - "site/**"
       - ".github/workflows/site.yml"
       - ".github/workflows/pages.yml"
+      - "README.md"
+      - ".github/workflows/ci.yml"
+      - "crates/core/src/model.rs"
+      - "crates/core/src/plan.rs"
   pull_request:
     paths:
       - "site/**"
       - ".github/workflows/site.yml"
       - ".github/workflows/pages.yml"
+      - "README.md"
+      - ".github/workflows/ci.yml"
+      - "crates/core/src/model.rs"
+      - "crates/core/src/plan.rs"
 
 permissions:
   contents: read

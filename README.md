@@ -5,8 +5,10 @@ safe to remove. It is planned to become a cleaner for Windows, macOS and Linux. 
 PruneDisk; the repository and the command are still called disk-cleaner.
 
 > **Status: early, read-only.** The `scan` and `plan` commands are on the main branch. There is no
-> tagged release, installer or download yet, so you build it from source. No command removes, moves
-> or changes anything: the only file it writes is the one you name with `--out`.
+> tagged release, installer or download page yet, so you build it from source. (Continuous
+> integration also builds unsigned binaries for each platform and keeps them as workflow artifacts
+> for 14 days; they are test builds, not releases.) No command removes, moves or changes anything:
+> the only file it writes is the one you name with `scan --out`.
 
 ## What it does today
 
@@ -26,7 +28,7 @@ no unpushed commit, no rebase or merge is half finished, the layout is plain, an
 holds nothing of its own. A check that fails or times out is unknown, and unknown never counts as
 yes. It prints a summary, or JSON with `--json`, and writes the JSON to a file with `--out`.
 
-`disk-cleaner plan` reads that file and writes a dry-run plan. A project touched within the active
+`disk-cleaner plan` reads that file and prints a dry-run plan, as a summary or as JSON with `--json`. A project touched within the active
 window (`active_window_days`, default 7, set in the config file or with `--active-window-days`), a
 path you mark with `--active`, or a folder a running process works in is kept. For the rest it
 proposes one action per item: `keep`, `remove-regenerable`, `backup-then-remove`,
@@ -66,8 +68,8 @@ None of this exists yet:
 
 Scanning and planning are read-only. The planned apply step will remove nothing unless the tool has
 shown that it is regenerable or exists elsewhere, and has re-checked that at the moment of removal.
-A check that fails or times out counts as "keep". Every removal will be written to a manifest with a
-restore command.
+A check that fails or times out leaves its fact unknown, and an unknown fact never leads the plan to
+propose removal: an idle repo with one is marked `ask`. Every removal will be written to a manifest with a restore command.
 
 ## License
 

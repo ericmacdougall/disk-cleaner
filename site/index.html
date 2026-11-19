@@ -252,9 +252,9 @@ pre code { background: none; padding: 0; font: inherit; }
 <main id="main">
   <section class="hero" aria-labelledby="h-hero">
     <div class="wrap">
-      <p class="status-note"><strong>Early.</strong> Only a read-only command-line scanner and planner exists. It is merged into the main branch but not released. It deletes nothing. There is no desktop app, installer or store listing yet.</p>
+      <p class="status-note"><strong>Early.</strong> Only a read-only command-line scanner and planner exists. It is merged into the main branch but not released. It deletes nothing. Its command and the repository are still called <code>disk-cleaner</code>. There is no desktop app, installer or store listing yet.</p>
       <h1 id="h-hero">Know what is safe to remove.</h1>
-      <p class="lede">PruneDisk is a free, open-source disk analyzer for developer machines. Today a read-only command-line tool scans a disk, works out what each folder is (a git repo, a worktree, a rebuildable folder, a cache) and plans what could be removed, backed up first, or left alone. It deletes nothing. It is being built into a cleaner for Windows, macOS and Linux, which are the target platforms: the project's automated build and tests run on all three, and only macOS has been tested by hand so far.</p>
+      <p class="lede">PruneDisk is a free, open-source disk analyzer for developer machines. Today a read-only command-line tool scans a disk, works out what each folder is (a git repo, a worktree, a rebuildable folder, a cache) and plans what could be removed, backed up first, or left alone. It deletes nothing. It is being built into a cleaner for Windows, macOS and Linux, which are the target platforms: the project's automated build and tests run on all three.</p>
       <div class="cta-row">
         <a class="btn" href="https://github.com/ericmacdougall/disk-cleaner">Follow the project on GitHub</a>
         <a class="btn secondary" href="#status">See what exists today</a>
@@ -332,8 +332,8 @@ pre code { background: none; padding: 0; font: inherit; }
             <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-repo)"></span>repo</th><td role="cell" data-label="What it is">A directory with a <code>.git</code> directory.</td><td role="cell" data-label="Today's plan">Keep while active. When idle: back up then remove, recover first, or ask, depending on the facts below.</td></tr>
             <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-worktree)"></span>worktree</th><td role="cell" data-label="What it is">A linked git worktree.</td><td role="cell" data-label="Today's plan">Like a repo, checked against its own HEAD.</td></tr>
             <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--text)"></span>bare-repo</th><td role="cell" data-label="What it is">A bare git repository.</td><td role="cell" data-label="Today's plan">Keep while a worktree or clone depends on it; otherwise ask.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-regen)"></span>regenerable</th><td role="cell" data-label="What it is"><code>node_modules</code>, <code>target</code>, <code>.venv</code>, <code>.next</code>, <code>DerivedData</code>.</td><td role="cell" data-label="Today's plan"><code>remove-regenerable</code> when the owning project is not active; ask if it holds output files.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-cache)"></span>cache</th><td role="cell" data-label="What it is">Package manager and tool caches.</td><td role="cell" data-label="Today's plan">Treated like a regenerable folder: <code>remove-regenerable</code> unless its project is active. Planned: age and size policies.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-regen)"></span>regenerable</th><td role="cell" data-label="What it is"><code>node_modules</code>, <code>target</code>, <code>.venv</code>, <code>.next</code>, <code>DerivedData</code>.</td><td role="cell" data-label="Today's plan"><code>remove-regenerable</code> when the owning project is idle; ask if its activity cannot be judged or it holds output files.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-cache)"></span>cache</th><td role="cell" data-label="What it is">Package manager and tool caches.</td><td role="cell" data-label="Today's plan">Treated like a regenerable folder: <code>remove-regenerable</code> when its project is idle, otherwise kept or asked. Planned: age and size policies.</td></tr>
             <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-agent)"></span>agent-session</th><td role="cell" data-label="What it is">Coding-agent transcripts, logs and work directories.</td><td role="cell" data-label="Today's plan">Not detected yet. Planned: back up first, remove only after a verified backup and an age threshold.</td></tr>
             <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-output)"></span>output</th><td role="cell" data-label="What it is">Video, audio, images, archives, model weights, datasets.</td><td role="cell" data-label="Today's plan">Keep: listed for analysis only. Planned: never to git; back up, then remove by policy.</td></tr>
             <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-loose)"></span>loose-code</th><td role="cell" data-label="What it is">Source files or a project manifest outside any repo.</td><td role="cell" data-label="Today's plan">Ask: connect a remote, back up, remove, or leave.</td></tr>
@@ -343,7 +343,7 @@ pre code { background: none; padding: 0; font: inherit; }
       </div>
 
       <h3>What it checks before it calls a repo safe</h3>
-      <p>For every repo and worktree the scanner records eleven facts. Each is yes, no or unknown. <strong>Unknown never counts as yes</strong>: a check that fails or times out means keep.</p>
+      <p>For every repo and worktree the scanner records eleven facts. Each is yes, no or unknown. <strong>Unknown never counts as yes</strong>: a check that fails or times out leaves the fact unknown, and an unknown fact never leads the plan to propose removal; for an idle repo it asks you instead.</p>
       <ul class="facts">
         <li>It has at least one network remote. A local path or a bundle file is not a backup.</li>
         <li>The checked-out commit is on a remote branch, including a detached HEAD.</li>
@@ -357,10 +357,10 @@ pre code { background: none; padding: 0; font: inherit; }
         <li>The repository has a plain layout, with nothing unusual in its git directory.</li>
         <li>The git directory holds nothing of its own, such as a custom hook or a setting only this copy has.</li>
       </ul>
-      <p>For an idle repo the plan proposes <code>backup-then-remove</code> when all eleven are yes: back up its git directory, then remove it. When some facts are no and none is unknown, it proposes <code>recover-backup-then-remove</code>: recover the missing work first, then back up and remove. When any fact is unknown, or the repo has dependents, an unusual layout or files of its own in its git directory, it asks you (<code>ask</code>). It always says why. Remote facts come from local remote-tracking refs, which can be stale, so the plan marks them unverified. Re-checking them against the live remote at the moment of removal is planned for the step that applies a plan.</p>
+      <p>For an idle repo the plan proposes <code>backup-then-remove</code> when all eleven are yes: back up its git directory, then remove it. When some facts are no and none is unknown, it proposes <code>recover-backup-then-remove</code>: recover the missing work first, then back up and remove. When any fact is unknown, or the repo has dependents, an unusual layout, files of its own in its git directory, or files git is told to hide edits to (skip-worktree or assume-unchanged), it asks you (<code>ask</code>), even when every fact is yes. It always says why. Remote facts come from local remote-tracking refs, which can be stale, so the plan marks them unverified. Re-checking them against the live remote at the moment of removal is planned for the step that applies a plan.</p>
 
       <div class="grid two">
-        <div class="card"><h3>Plan, then apply</h3><p>Scanning and planning are read-only. A plan is a file you can read and edit. Apply, when it exists, will do exactly that plan.</p></div>
+        <div class="card"><h3>Plan, then apply</h3><p>Scanning and planning are read-only. Today the plan is printed, as a summary or as JSON with <code>--json</code>, which you can save and read. In the design a plan is a file you edit and approve, and apply, when it exists, will do exactly that plan.</p></div>
         <div class="card"><h3>Everything removed will be findable</h3><p>The design writes each removal to a manifest with a restore command. That part is planned, not built.</p></div>
       </div>
     </div>
@@ -376,7 +376,7 @@ pre code { background: none; padding: 0; font: inherit; }
           <thead role="rowgroup"><tr role="row"><th scope="col" role="columnheader">Part</th><th scope="col" role="columnheader">Status</th><th scope="col" role="columnheader">Notes</th></tr></thead>
           <tbody role="rowgroup">
             <tr role="row"><th scope="row" role="rowheader">Design</th><td role="cell" data-label="Status"><span class="badge">Written</span></td><td role="cell" data-label="Notes">Draft design document in the repository.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader">CLI: scan and plan</th><td role="cell" data-label="Status"><span class="badge">Merged, not released</span></td><td role="cell" data-label="Notes">Read-only. On the main branch; no release or download yet. Produces JSON and a readable summary. Deletes nothing.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">CLI: scan and plan</th><td role="cell" data-label="Status"><span class="badge">Merged, not released</span></td><td role="cell" data-label="Notes">Read-only. On the main branch; no release or download page yet. Produces JSON and a readable summary. Deletes nothing.</td></tr>
             <tr role="row"><th scope="row" role="rowheader">Recovery, backup, apply, restore</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Recovery branches, rclone backup connectors, removal with a manifest, restore. Nothing of it is on the main branch yet.</td></tr>
             <tr role="row"><th scope="row" role="rowheader">Desktop app</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Sunburst, treemap and outline views. Nothing of it is on the main branch yet.</td></tr>
             <tr role="row"><th scope="row" role="rowheader">App stores and installers</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Nothing to download yet.</td></tr>
@@ -439,7 +439,7 @@ Items:
   recover-backup-then-remove   88.0 MiB  [repo] ~/projects/example-notes
   ...
       (items that reclaim nothing, states and reasons abridged)</code></pre>
-      <p class="muted">The command is still called <code>disk-cleaner</code> today; it will be renamed <code>prunedisk</code>. The plan only describes what would happen. In the current version no command removes, moves or changes anything. The scanner writes a file only where you give <code>--out</code>.</p>
+      <p class="muted">The command is still called <code>disk-cleaner</code> today; renaming it to <code>prunedisk</code> is planned. The plan only describes what would happen. In the current version no command removes, moves or changes anything. The scanner writes a file only where you give <code>--out</code>.</p>
     </div>
   </section>
 
