@@ -27,9 +27,9 @@ pub use git::{Git, GitError};
 pub use model::*;
 pub use plan::{
     plan, resolve_active, Action, Plan, PlanItem, PlanOptions, Preserve, PreserveGitAdmin,
-    ProjectState,
+    PreserveObjectStore, ProjectState,
 };
-pub use preserve::git_admin_files;
+pub use preserve::{git_admin_files, object_store_files};
 pub use procs::{running_cwds, ProcessCheck};
 pub use rules::RuleSet;
 pub use scan::{scan, ScanOptions};

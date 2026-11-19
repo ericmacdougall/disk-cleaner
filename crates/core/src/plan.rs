@@ -111,6 +111,23 @@ impl PlanOptions {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preserve {
     pub git_admin: PreserveGitAdmin,
+    #[serde(default)]
+    pub object_store: PreserveObjectStore,
+}
+
+/// The git directories' object-store files (see [`crate::preserve`]). They are not copied by
+/// default, as they can be very large; a consumer that applies a plan must refuse to remove the
+/// item unless each of them is either verified as git data whose objects are all on the
+/// re-verified remote, or backed up like [`PreserveGitAdmin`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreserveObjectStore {
+    /// How many files, summed over the item's git directories.
+    pub files: u64,
+    /// Their allocated bytes.
+    pub bytes: u64,
+    /// True only when the scan verified every one of these stores with git
+    /// (`scan --verify-objects`) and the item's facts say every ref is on a network remote.
+    pub verified: bool,
 }
 
 /// The git directories' own files: everything in each git directory that is not an object file
@@ -1118,7 +1135,10 @@ fn preserve_for(
     examples.sort();
     examples.truncate(5);
     out.examples = examples;
-    Ok(Some(Preserve { git_admin: out }))
+    Ok(Some(Preserve {
+        git_admin: out,
+        object_store: PreserveObjectStore::default(),
+    }))
 }
 
 /// Why a repository whose git directory holds files of its own asks: up to five are named.

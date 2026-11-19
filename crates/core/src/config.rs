@@ -41,6 +41,8 @@ pub struct Config {
     /// Most allocated bytes of its own files (everything but object files) one git directory may
     /// hold and still be removed after a backup; more asks.
     pub max_git_admin_bytes: u64,
+    /// Have `scan` verify each repository's object store with git (as `--verify-objects`).
+    pub verify_objects: bool,
 }
 
 impl Default for Config {
@@ -50,6 +52,7 @@ impl Default for Config {
             trust_partial_process_check: false,
             accept_incomplete_coverage: false,
             max_git_admin_bytes: DEFAULT_MAX_GIT_ADMIN_BYTES,
+            verify_objects: false,
         }
     }
 }
@@ -64,6 +67,7 @@ struct RawConfig {
     trust_partial_process_check: Option<bool>,
     accept_incomplete_coverage: Option<bool>,
     max_git_admin_bytes: Option<u64>,
+    verify_objects: Option<bool>,
     /// Read only to refuse it with a message naming its replacement, whatever its value.
     require_full_coverage: Option<toml::Value>,
 }
@@ -108,6 +112,7 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
         max_git_admin_bytes: raw
             .max_git_admin_bytes
             .unwrap_or(DEFAULT_MAX_GIT_ADMIN_BYTES),
+        verify_objects: raw.verify_objects.unwrap_or(false),
     })
 }
 

@@ -60,6 +60,14 @@ struct ScanArgs {
     /// Number of git processes to run at once.
     #[arg(long, default_value_t = 4)]
     git_jobs: usize,
+    /// Verify each repository's object store with git (fsck, verify-pack, commit-graph and
+    /// multi-pack-index verify). Slow on large repositories; the config setting
+    /// `verify_objects = true` does the same.
+    #[arg(long)]
+    verify_objects: bool,
+    /// Config file (default: <platform config dir>/disk-cleaner/config.toml).
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -109,16 +117,17 @@ fn main() -> Result<()> {
 }
 
 fn run_scan(a: ScanArgs) -> Result<()> {
+    let (cfg, _) = config::load(a.config.as_deref()).context("invalid configuration")?;
     let mut opts = ScanOptions::new(a.paths);
     opts.one_file_system = a.one_file_system;
     opts.top_files = a.top_files;
     opts.min_output_bytes = a.min_output_bytes;
     opts.collect_facts = !a.no_git;
     opts.git_jobs = a.git_jobs;
-    opts.facts = FactsConfig::default().with_git(Git::new(
-        "git",
-        Duration::from_secs(a.git_timeout_secs.max(1)),
-    ));
+    let git = Git::new("git", Duration::from_secs(a.git_timeout_secs.max(1)));
+    opts.facts = FactsConfig::default()
+        .with_git(git)
+        .with_verify_objects(a.verify_objects || cfg.verify_objects);
     let result = scan(&opts).context("scan failed")?;
     if let Some(out) = &a.out {
         write_json(out, &result).context("cannot write scan file")?;

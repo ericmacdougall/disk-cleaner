@@ -260,7 +260,26 @@ pub struct RepoInfo {
     /// node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_admin: Option<GitAdminSurvey>,
+    /// The object store's files, which a removal must verify against the remote or back up
+    /// first (see [`crate::preserve`]). `None` when they were not counted: the plan then never
+    /// removes the node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_store: Option<ObjectStoreSurvey>,
     pub sizes: RepoSizes,
+}
+
+/// What [`crate::preserve::survey`] counted of one git directory's object store: the files in
+/// `objects/` whose names are those of object-store files (loose objects, packs and their
+/// indexes and sidecars, multi-pack-indexes, commit-graphs).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectStoreSurvey {
+    /// How many files.
+    pub files: u64,
+    /// Their allocated bytes.
+    pub bytes: u64,
+    /// True only when the scan ran git's own verification of the whole store
+    /// (`scan --verify-objects`) and it accounted for every one of these files.
+    pub verified: bool,
 }
 
 /// What [`crate::preserve::survey`] counted of one git directory's own files: everything in it

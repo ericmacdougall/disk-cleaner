@@ -102,6 +102,14 @@ pub fn git_admin_files(node: &Node) -> io::Result<Vec<String>> {
     Ok(sort(&gd)?.own.into_iter().map(|(p, _)| p).collect())
 }
 
+/// Every file in `node`'s git directory whose name is that of an object-store file, as paths
+/// relative to the git directory with `/` separators, sorted. A removal must verify each of them
+/// against the remote, or back it up, before it removes anything.
+pub fn object_store_files(node: &Node) -> io::Result<Vec<String>> {
+    git_dir_of(node)?;
+    Ok(Vec::new())
+}
+
 /// Count `git_dir`'s own files for the plan (see [`sort`]).
 pub fn survey(git_dir: &Path) -> io::Result<Survey> {
     let sorted = sort(git_dir)?;

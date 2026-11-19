@@ -19,6 +19,9 @@ pub type NetworkPredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct FactsConfig {
     pub git: Git,
     pub is_network: NetworkPredicate,
+    /// Verify each repository's object store with git (`scan --verify-objects`): slow, and off
+    /// by default; without it every object store is recorded as not verified.
+    pub verify_objects: bool,
 }
 
 impl Default for FactsConfig {
@@ -26,6 +29,7 @@ impl Default for FactsConfig {
         FactsConfig {
             git: Git::default(),
             is_network: Arc::new(is_network_url),
+            verify_objects: false,
         }
     }
 }
@@ -34,6 +38,12 @@ impl FactsConfig {
     /// Use a different git binary or timeout.
     pub fn with_git(mut self, git: Git) -> Self {
         self.git = git;
+        self
+    }
+
+    /// Verify object stores with git (see [`FactsConfig::verify_objects`]).
+    pub fn with_verify_objects(mut self, on: bool) -> Self {
+        self.verify_objects = on;
         self
     }
 
