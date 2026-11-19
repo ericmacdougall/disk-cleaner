@@ -1,43 +1,74 @@
 # disk-cleaner
 
-A disk analyzer and cleaner for Windows, macOS and Linux that understands developer machines.
+A disk analyzer for developer machines that understands what each folder is, so it can tell what is
+safe to remove. It is planned to become a cleaner for Windows, macOS and Linux. The product name is
+PruneDisk; the repository and the command are still called disk-cleaner.
 
-> **Status: early.** The design is written and the read-only core is being built. It does not
-> delete anything yet. See [docs/DESIGN.md](docs/DESIGN.md).
+> **Status: early, read-only.** The `scan` and `plan` commands are on the main branch. There is no
+> tagged release, installer or download yet, so you build it from source. No command removes, moves
+> or changes anything: the only file it writes is the one you name with `--out`.
 
-Most disk tools show you a big folder and leave the judgement to you. disk-cleaner knows what the
-folder is:
+## What it does today
 
-- a git repo whose every commit is on the remote, or one with unpushed work and a stash;
-- one of forty linked worktrees an agent left behind;
-- `node_modules`, `target`, `.venv` and other directories that can be rebuilt;
+`disk-cleaner scan` walks one or more directories and classifies them:
+
+- git repos, linked worktrees and bare repos;
+- `node_modules`, `target`, `.venv` and other directories that can be rebuilt (the rules are data, in
+  [rules/artifacts.toml](rules/artifacts.toml));
 - package manager and tool caches;
-- coding-agent transcripts and logs you want kept, but not on this disk;
-- videos, models and other outputs that must survive and do not belong in git;
-- source code sitting outside any repo.
+- source code outside any repo;
+- output files (videos, archives, models and the like), listed one by one.
 
-For each it works out what is safe: remove it, back it up and then remove it, push a recovery
-branch first, or ask you.
+For every repo and worktree it records eleven safety facts, each yes, no or unknown: whether there
+is a network remote, the checked-out commit and every branch are on it, the stash is empty, the tree
+is clean, there are no ignored files that exist only here, nothing depends on it, the reflogs hold
+no unpushed commit, no rebase or merge is half finished, the layout is plain, and the git directory
+holds nothing of its own. A check that fails or times out is unknown, and unknown never counts as
+yes. It prints a summary, or JSON with `--json`, and writes the JSON to a file with `--out`.
 
-## Goals
+`disk-cleaner plan` reads that file and writes a dry-run plan. A project touched within the active
+window (`active_window_days`, default 7, set in the config file or with `--active-window-days`), a
+path you mark with `--active`, or a folder a running process works in is kept. For the rest it
+proposes one action per item: `keep`, `remove-regenerable`, `backup-then-remove`,
+`recover-backup-then-remove` or `ask`, each with a reason in words. The plan is a proposal only;
+nothing applies it yet.
 
-- Outline, sunburst, treemap and biggest-files views, as in TreeSize and Disk Space Analyzer.
-- Repo and worktree awareness, with recovery branches or bundles for anything ambiguous.
-- Backup connectors for Dropbox and cold storage through [rclone](https://rclone.org).
-- Automatic, verified backup of agent sessions and chat logs to your own storage.
-- Age and size policies, with a manifest that makes everything removed easy to find and restore.
-- A CLI with JSON output for servers and remote machines.
+The scan and plan formats, every fact and every rule are described in
+[docs/SCAN-FORMAT.md](docs/SCAN-FORMAT.md). The overall design is in [docs/DESIGN.md](docs/DESIGN.md).
+
+## Build from source
+
+You need a stable Rust toolchain (with `cargo`) and `git` on the `PATH`; the scanner runs `git` to
+read repo facts.
+
+```
+cargo build --release --locked -p disk-cleaner-cli
+./target/release/disk-cleaner scan ~/projects --out scan.json
+./target/release/disk-cleaner plan --scan scan.json
+```
+
+`disk-cleaner --help`, `disk-cleaner scan --help` and `disk-cleaner plan --help` list every option.
+Continuous integration builds and tests it on Linux, macOS and Windows.
+
+## Planned
+
+None of this exists yet:
+
+- applying a plan: recovery of unsaved work, backup to your own storage (through
+  [rclone](https://rclone.org)), removal with a manifest, and restore;
+- detection and backup of coding-agent sessions and logs, and age and size policies for caches and
+  outputs;
+- a desktop app with outline, sunburst, treemap and biggest-files views;
+- installers and releases;
+- renaming the repository and the command to `prunedisk`.
 
 ## Safety model in one paragraph
 
-Scanning and planning are read-only. Nothing is removed unless the tool has shown that it is
-regenerable or exists elsewhere, and has re-checked that at the moment of removal. A check that
-fails or times out counts as "keep". Every removal is written to a manifest with a restore command.
+Scanning and planning are read-only. The planned apply step will remove nothing unless the tool has
+shown that it is regenerable or exists elsewhere, and has re-checked that at the moment of removal.
+A check that fails or times out counts as "keep". Every removal will be written to a manifest with a
+restore command.
 
-## Building
-
-Not yet. The first buildable milestone is the CLI.
-
-## Licence
+## License
 
 MIT. See [LICENSE](LICENSE).
