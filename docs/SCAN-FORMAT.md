@@ -40,10 +40,12 @@ such files were in it, so it is refused. Version 14 removed object verification:
 `repo.object_store.checked` and `preserve.object_store.verified`. This format defines no
 verification of object data, both classes of a git directory are backed up, and a scan file that
 claims a verification is refused as invalid. Version 14 also made every listed output file make
-the artifact holding it ask, whatever the artifact's rule, and lists an output of any size inside
-an artifact unless it sits in an installed package's directory (see "Outputs"), with the node
-field `outputs_unlisted`. A version 13 scan could mark a store verified, or
-leave an output in a dependency directory such as `.venv` unflagged, so it is refused.
+the artifact holding it ask, whatever the artifact's rule, and listed an output of any size directly
+in an artifact's top directory. A version 13 scan could mark a store verified, or leave an output
+in a dependency directory such as `.venv` unflagged, so it is refused. Version 15 lists an output
+of any size anywhere inside an artifact unless it sits in an installed package's directory (see
+"Outputs"), with the node field `outputs_unlisted`; a version 14 scan could leave a small nested
+output (a `.venv/data/model.pt`) unlisted and its directory offered for removal, so it is refused.
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 Such a node therefore gets an `ask_reason` and is never offered for removal (see "File names git
@@ -58,7 +60,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 14 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification, 13 `checked` and the files git never reads, 14 no object verification and outputs in every artifact; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 15 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification, 13 `checked` and the files git never reads, 14 no object verification and outputs in every artifact, 15 small outputs anywhere in an artifact outside installed packages; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots that were walked, as spelled (a kept inner root under the spelling of the root that encloses it); overlapping roots are normalised first (see "Overlapping scan roots") |
@@ -166,7 +168,7 @@ One entry per classified directory. A directory belongs to its innermost classif
 | `files_total` | files in the subtree |
 | `output_bytes` | allocated bytes of output-extension files in the subtree |
 | `contains_outputs` | regenerable or cache directory that holds a listed output file (see "Outputs"); never offered for removal |
-| `outputs_unlisted` | output files that make this directory ask but are not in `outputs` one by one: small ones beyond the first 16 of one directory (omitted when 0) |
+| `outputs_unlisted` | output files that make this directory ask but are not in `outputs` one by one: small ones the scan did not list after the first 16 of one directory (see "Outputs"; omitted when 0) |
 | `newest_mtime` | newest modification time of files attributed to this node, excluding `.git` and nested nodes |
 | `unreadable` | entries inside this node that could not be read (omitted when 0) |
 | `skipped_mounts` | directories inside this node on another file system that `--one-file-system` did not enter (omitted when 0) |
@@ -219,9 +221,10 @@ So `--min-output-bytes` narrows only two cases: outputs inside an installed pack
 and outputs outside every regenerable or cache directory. A 50 MiB `.venv/data/model.pt` or a
 1 KiB `node_modules/.stuff/clip.mp4` is listed at the default threshold; a 1 KiB
 `node_modules/pkg/test/fixture.zip` beside `node_modules/pkg/package.json` is not, because packages
-routinely ship fixture archives, while a 200 MiB `node_modules/pkg/weights.bin` is. At most 16
-small outputs of one directory are listed one by one; the rest are counted in the node's
-`outputs_unlisted`. Every listed output inside a regenerable or cache directory flags that
+routinely ship fixture archives, while a 200 MiB `node_modules/pkg/weights.bin` is. To bound
+memory, the scan may list only the first 16 small outputs of one directory one by one (a
+directory with no build-directory name in its path); any it does not list are counted in
+the node's `outputs_unlisted`, so the plan's count is complete. Every listed output inside a regenerable or cache directory flags that
 directory `contains_outputs`, whatever its rule, so it asks and its reason counts the files and
 names up to three; the rule says what is regenerable, never that an output file is. A flagged
 directory is also left out of its repository's regenerable set, so its ignored files count as

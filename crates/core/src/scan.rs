@@ -1199,13 +1199,22 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         let owner = path.parent().and_then(&owner_of);
         // Nothing inside an artifact becomes a node, so its owner is the artifact itself.
         let artifact = owner.filter(|&o| builds[o].node.class.is_artifact());
-        // Listed: any size inside a build-output directory (`scan_outputs`) or directly in any
-        // artifact's top directory, and anywhere at least the output threshold. A tool that keeps
-        // such a file at the top of its own directory (coverage's `htmlcov/*.png`, a cache's
-        // `*.db`) makes that directory ask: the safe side.
+        // Listed: any size inside a build-output directory (`scan_outputs`), any size anywhere
+        // else in an artifact unless the file sits in an installed package's directory (the
+        // `fixture_prone` exemption's evidence; never at the artifact's top), and anywhere at
+        // least the output threshold. A tool that keeps such a file in its own directory
+        // (coverage's `htmlcov/*.png`, a cache's `*.db`) makes that directory ask: the safe side.
         let in_build_dir = artifact.is_some_and(|o| builds[o].scan_outputs);
-        let at_top = artifact.is_some_and(|o| path.parent() == Some(builds[o].path.as_path()));
-        if in_build_dir || at_top || bytes >= opts.min_output_bytes {
+        let outside_pkg = artifact.is_some_and(|o| {
+            let i = path
+                .parent()
+                .and_then(|d| dirs.binary_search_by(|(q, _)| q.as_path().cmp(d)).ok());
+            match i {
+                Some(i) => !has_package_evidence(&builds[o], &dirs, i),
+                None => true,
+            }
+        });
+        if in_build_dir || outside_pkg || bytes >= opts.min_output_bytes {
             // Every listed output makes the artifact holding it ask, whatever its rule: a rule
             // says what is regenerable, never that an output file is. No installed-package
             // exemption is made here.
