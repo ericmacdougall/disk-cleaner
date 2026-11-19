@@ -702,7 +702,7 @@ data being reported.
 **The repo's own config is untrusted.** A scanned folder may be an unpacked download, and its
 `.git/config` can name programs that git would run (`filter.*.clean`, `gpg.program`, `core.fsmonitor`,
 `core.sshCommand`, ...). Before any other git command the tool lists the config keys
-(`git config --local --includes --name-only --list`, plus the worktree config when enabled). If any
+(`git config --local --includes --name-only --list`, plus `--worktree` when `extensions.worktreeConfig` is set and the git directory's `config.worktree` exists; a missing one has no keys, if git's own scoped listing agrees, and one that is not a regular file is refused). If any
 key is outside a small allowlist of plain-data keys (`core.*` format and line-ending settings,
 `remote.<n>.url|pushurl|fetch|push|tagopt|prune|promisor|partialclonefilter`,
 `branch.<n>.remote|merge|rebase|description|pushremote`, `user.name|email|signingkey`,
