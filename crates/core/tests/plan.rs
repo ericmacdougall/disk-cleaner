@@ -40,6 +40,7 @@ fn synthetic(nodes: Vec<Node>) -> ScanResult {
         issues: vec![],
         warnings: vec![],
         enclosing_repos: vec![],
+        scope: "subtree".to_string(),
     }
 }
 
@@ -54,6 +55,7 @@ fn all_yes() -> Facts {
         no_dependents: Tri::Yes,
         reflog_saved: Tri::Yes,
         no_pending_state: Tri::Yes,
+        plain_layout: Tri::Yes,
     }
 }
 
@@ -68,7 +70,8 @@ fn with_fact(index: usize, v: Tri) -> Facts {
         5 => f.no_unique_ignored = v,
         6 => f.no_dependents = v,
         7 => f.reflog_saved = v,
-        _ => f.no_pending_state = v,
+        8 => f.no_pending_state = v,
+        _ => f.plain_layout = v,
     }
     f
 }
@@ -97,7 +100,7 @@ fn a_repo_with_any_fact_not_yes_never_gets_a_removing_action() {
         );
     }
     for class in [Class::Repo, Class::Worktree] {
-        for index in 0..9 {
+        for index in 0..10 {
             for (v, expected) in [
                 (Tri::No, Action::RecoverThenArchive),
                 (Tri::Unknown, Action::Ask),
@@ -105,6 +108,8 @@ fn a_repo_with_any_fact_not_yes_never_gets_a_removing_action() {
                 let s = synthetic(vec![repo_node("/r", class, with_fact(index, v))]);
                 let p = plan(&s, &opts(vec![], 30, now));
                 let a = p.items[0].action;
+                // An unusual layout (fact 9) is never recovered then archived: it asks.
+                let expected = if index == 9 { Action::Ask } else { expected };
                 assert_eq!(a, expected, "fact {index} = {v:?} on {class:?}");
                 assert!(!matches!(
                     a,

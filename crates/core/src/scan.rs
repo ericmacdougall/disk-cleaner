@@ -866,6 +866,9 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                      git command was run here"
                         .to_string(),
                 ],
+                layout_issue: Some(
+                    "the .git entry is a symlink or special file, not a real directory".to_string(),
+                ),
                 ..RepoInfo::default()
             },
         );
@@ -904,6 +907,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         for (i, _, _, regen) in &tasks {
             let info = RepoInfo {
                 notes: vec!["git facts were not collected".to_string()],
+                layout_issue: Some("git facts were not collected".to_string()),
                 ..RepoInfo::default()
             };
             infos.insert(*i, info);
@@ -941,7 +945,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             b.node.repo = Some(info);
         }
     }
-    link_repos(&mut builds, &mut warnings);
+    link_repos(&mut builds, &roots, &mut warnings);
     link_odd_gits(&mut builds, &odd_dirs, &mut warnings);
 
     // Scan roots inside a repository the scan does not cover: the artifacts there are checked
@@ -981,6 +985,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         issues,
         warnings,
         enclosing_repos,
+        scope: roots_scope(&roots).to_string(),
     })
 }
 
@@ -1201,6 +1206,36 @@ fn link_odd_gits(builds: &mut [Build], odd_dirs: &[PathBuf], warnings: &mut Vec<
     }
 }
 
+/// `volume` when every scan root is a mount point (its device differs from its parent's) or a
+/// file system root, `subtree` otherwise.
+fn roots_scope(roots: &[PathBuf]) -> &'static str {
+    let is_volume = |r: &PathBuf| -> bool {
+        let real = std::fs::canonicalize(r).unwrap_or_else(|_| r.clone());
+        let parent = match real.parent() {
+            Some(p) => p,
+            None => return true,
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match (std::fs::metadata(&real), std::fs::metadata(parent)) {
+                (Ok(a), Ok(b)) => a.dev() != b.dev(),
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            false
+        }
+    };
+    if !roots.is_empty() && roots.iter().all(is_volume) {
+        "volume"
+    } else {
+        "subtree"
+    }
+}
+
 fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
@@ -1399,6 +1434,37 @@ fn kind_of(p: &Path) -> std::result::Result<Kind, String> {
     }
 }
 
+/// The object store a `.git` file leads to, read with bounded reads and no git command:
+/// `gitdir: <path>` (relative to the repo), then that directory's `commondir` file if any, then
+/// `objects`. Everything is canonicalised; anything unreadable is an error.
+fn resolve_gitfile_store(path: &Path) -> std::result::Result<PathBuf, String> {
+    let file = path.join(".git");
+    let text = read_small_regular_file(&file)
+        .map_err(|e| format!("the .git file was not read ({e})"))?
+        .ok_or_else(|| "the .git file is missing".to_string())?;
+    let line = text.lines().next().unwrap_or("").trim_end();
+    let rest = line
+        .strip_prefix("gitdir:")
+        .ok_or_else(|| "the .git file does not name a git directory".to_string())?
+        .trim();
+    let gd = std::fs::canonicalize(path.join(rest))
+        .map_err(|e| format!("the git directory it names cannot be resolved ({e})"))?;
+    let cd = gd.join("commondir");
+    let common = match kind_of(&cd) {
+        Ok(Kind::Missing) => gd.clone(),
+        Ok(Kind::Other) => {
+            let t = read_small_regular_file(&cd)
+                .map_err(|e| format!("the commondir was not read ({e})"))?
+                .unwrap_or_default();
+            std::fs::canonicalize(gd.join(t.lines().next().unwrap_or("")))
+                .map_err(|e| format!("the commondir cannot be resolved ({e})"))?
+        }
+        _ => return Err("the commondir is not a plain file".to_string()),
+    };
+    std::fs::canonicalize(common.join("objects"))
+        .map_err(|e| format!("the object store cannot be resolved ({e})"))
+}
+
 fn add_member(members: &mut HashMap<PathBuf, Vec<usize>>, key: PathBuf, i: usize) {
     let list = members.entry(key).or_default();
     if !list.contains(&i) {
@@ -1416,7 +1482,7 @@ fn add_member(members: &mut HashMap<PathBuf, Vec<usize>>, key: PathBuf, i: usize
 /// symlinked `objects`, `objects/info` or `objects/pack` that leaves the scan) makes the repo
 /// that holds it an "unresolved borrower": every other git node loses a `yes` it can no longer
 /// prove. Symlinks are read as paths; nothing is followed to run git.
-fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
+fn link_repos(builds: &mut [Build], roots: &[PathBuf], warnings: &mut Vec<String>) {
     let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
     for (i, b) in builds.iter().enumerate() {
         if b.node.class.is_git() {
@@ -1429,6 +1495,12 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
     let mut symlinked: Vec<(usize, PathBuf)> = Vec::new();
     let mut via_commondir: Vec<(usize, PathBuf)> = Vec::new();
     let mut part_links: Vec<(usize, PathBuf)> = Vec::new();
+    // Object directories that are a real directory of a scanned repo: the stores that were
+    // inspected as their owner's own.
+    let mut own_keys: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // `.git`-file repos (linked worktrees, submodule checkouts, --separate-git-dir) and the
+    // object store their effective git directory points at.
+    let mut store_users: Vec<(usize, PathBuf)> = Vec::new();
     let mut alt_entries: Vec<(usize, PathBuf, String)> = Vec::new();
     let mut unresolved: Vec<(usize, String)> = Vec::new();
     let mut parent_links: Vec<(usize, usize)> = Vec::new();
@@ -1439,6 +1511,20 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
                     parent_links.push((i, p));
                 }
             }
+        }
+        if b.node.class == Class::Worktree && !b.git_odd {
+            match resolve_gitfile_store(&b.path) {
+                Ok(key) => store_users.push((i, key)),
+                Err(why) => {
+                    warnings.push(diag(&format!(
+                        "{}: {why}; which object store it uses cannot be identified, so no \
+                         other repo in the scan is treated as free of dependents",
+                        b.path.display()
+                    )));
+                    unresolved.push((i, why));
+                }
+            }
+            continue;
         }
         let (objects_dir, git_dir) = match b.node.class {
             Class::Repo if b.git_odd => continue,
@@ -1454,7 +1540,10 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
         // The objects directory itself.
         match kind_of(&objects_dir) {
             Ok(Kind::Dir) => match std::fs::canonicalize(&objects_dir) {
-                Ok(k) => add_member(&mut members, k, i),
+                Ok(k) => {
+                    own_keys.insert(k.clone());
+                    add_member(&mut members, k, i);
+                }
                 Err(e) => bad.push(format!(
                     "{} cannot be resolved ({e})",
                     objects_dir.display()
@@ -1574,17 +1663,83 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
     }
 
     // Phase 2: relate everything to scanned repos.
-    for (i, k) in symlinked.iter().chain(via_commondir.iter()) {
-        if members.get(k).map(|l| l.len()).unwrap_or(0) < 2 {
+    let real_roots: Vec<PathBuf> = roots.iter().map(|r| canon(r)).collect();
+    // Stores reached through a symlink, a commondir or a `.git` file that are not a scanned
+    // repo's own object directory.
+    let mut foreign: Vec<(usize, PathBuf)> = Vec::new();
+    for (i, k) in symlinked
+        .iter()
+        .chain(via_commondir.iter())
+        .chain(store_users.iter())
+    {
+        if !own_keys.contains(k) {
+            foreign.push((*i, k.clone()));
+        }
+    }
+    for (i, k) in &foreign {
+        if !real_roots.iter().any(|r| k.starts_with(r)) {
             let why = format!(
-                "the object directory of {} is reached through a symlink or commondir that \
-                 leads outside the scan",
+                "the object store {} used by {} lies outside the scan",
+                k.display(),
                 builds[*i].path.display()
             );
             warnings.push(diag(&why));
             unresolved.push((*i, why));
         }
     }
+    // Each such store's alternates are inspected once, whoever reaches it.
+    let mut inspected: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut alt_from_stores: Vec<(usize, PathBuf, String)> = Vec::new();
+    for (_, k) in &foreign {
+        if !inspected.insert(k.clone()) {
+            continue;
+        }
+        let users: Vec<usize> = foreign
+            .iter()
+            .filter(|(_, q)| q == k)
+            .map(|(u, _)| *u)
+            .collect();
+        let alt_path = k.join("info").join("alternates");
+        let text = match read_small_regular_file(&alt_path) {
+            Ok(Some(t)) => t,
+            Ok(None) => continue,
+            Err(why) => {
+                warnings.push(diag(&format!(
+                    "alternates file {} was not read ({why}); the repo it borrows objects from \
+                     cannot be identified",
+                    alt_path.display()
+                )));
+                for u in &users {
+                    unresolved.push((*u, alt_path.display().to_string()));
+                }
+                continue;
+            }
+        };
+        for entry in parse_alternates(&text) {
+            let resolved = match entry {
+                Alt::Path(p) => std::fs::canonicalize(k.join(&p)).ok(),
+                Alt::Bad(_) => None,
+            };
+            match resolved {
+                Some(c) => {
+                    for u in &users {
+                        alt_from_stores.push((*u, c.clone(), alt_path.display().to_string()));
+                    }
+                }
+                None => {
+                    warnings.push(diag(&format!(
+                        "an entry of the alternates file {} cannot be interpreted; the repo it \
+                         borrows objects from cannot be identified",
+                        alt_path.display()
+                    )));
+                    for u in &users {
+                        unresolved.push((*u, alt_path.display().to_string()));
+                    }
+                }
+            }
+        }
+    }
+    alt_entries.extend(alt_from_stores);
     let mut shared: Vec<(usize, usize)> = Vec::new();
     for list in members.values() {
         for &a in list {
@@ -1630,6 +1785,14 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
                     c.display()
                 )));
                 unresolved.push((*i, file.clone()));
+            }
+        }
+    }
+    // A `.git`-file repo whose effective object store is a scanned repo's own depends on it.
+    for (w, k) in &store_users {
+        if let Some(list) = members.get(k) {
+            for &p in list.iter().filter(|p| **p != *w) {
+                edges.push((*w, p));
             }
         }
     }

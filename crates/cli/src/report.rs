@@ -174,6 +174,20 @@ pub fn plan_summary(p: &Plan) -> String {
         let _ = write!(o, " ({n})");
     }
     let _ = writeln!(o);
+    if p.scope == "volume" {
+        let _ = writeln!(
+            o,
+            "Scope: volume (every scanned root is a mount point). Dependents were looked for \
+             within the scanned roots only."
+        );
+    } else {
+        let _ = writeln!(
+            o,
+            "Scope: subtree. Dependents (linked worktrees, shared object stores) were looked \
+             for within the scanned folders only; other clones elsewhere were not checked, and \
+             apply re-verifies."
+        );
+    }
     for e in &p.enclosing_repos {
         let _ = writeln!(
             o,

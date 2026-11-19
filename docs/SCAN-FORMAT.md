@@ -1,9 +1,10 @@
 # Scan and plan JSON format
 
-Schema version: **3** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **4** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
-have read a repo as saved without them, so it is refused: scan again). All sizes are bytes. All times are unix seconds (UTC).
+have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
+`plain_layout`, `repo.layout_issue` and the scan field `scope`. All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 
 Produce a scan with `disk-cleaner scan <path>... --out scan.json` (or `--json` for stdout) and a
@@ -15,7 +16,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 3 (3 added `enclosing_repos`; a version 2 scan lacks the checks that fill it, so it is refused) |
+| `schema_version` | integer, currently 4 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots |
@@ -26,6 +27,7 @@ you name.
 | `big_files` | the biggest `top_files` files: `path`, `bytes`, `node` |
 | `issues` | up to 1000 unreadable entries: `path`, `message`; `totals.unreadable` has the full count |
 | `warnings` | notes about limits that applied to this run |
+| `scope` | `volume` when every scan root is a mount point (its device differs from its parent's) or a file system root, otherwise `subtree`. A subtree scan cannot see clones that live elsewhere, so `no_dependents` means "no dependents were found within the scanned roots"; the plan header repeats the scope and, for `subtree`, every archive reason says other clones outside the scanned folders were not checked (disclosure only: the apply phase re-verifies, and the plan is not downgraded to `ask` on scope alone) |
 | `enclosing_repos` | scan roots that lie inside a git repository the scan did not cover: `root`, `repo`, `note`. Before the walk each root is looked at upward for a `.git` directory or file in any ancestor (the real path first, then the spelled one; symlinks are not followed). That repository is not a node and never gets a plan item, but the regenerable and cache directories below the root that no scanned repo encloses are decided by its git exactly as in a full scan: the config allowlist and work-tree checks run on it, and a directory is removable only if git lists it as wholly ignored and untracked. A refused config, a git failure or timeout, `--no-git`, or an ancestor `.git` that is not a plain directory or file makes them ask. The plan header and the human outputs say the repository was not assessed |
 
 A `.git` entry that is neither a regular directory nor a regular file (a symlink, socket, fifo or
@@ -160,7 +162,7 @@ with or without evidence.
 
 | Field | Meaning |
 |---|---|
-| `facts` | the nine safety facts, each `"yes"`, `"no"` or `"unknown"` |
+| `facts` | the ten safety facts, each `"yes"`, `"no"` or `"unknown"` |
 | `notes` | why facts are not `yes` (git errors, ignored paths found); every note passes one redaction function (see below) |
 | `remotes` | `name`, `url` (credentials stripped), `network` |
 | `head_commit`, `last_commit_time` | HEAD id; newest commit on any ref |
@@ -182,6 +184,7 @@ Facts (the safe value is always `yes`):
 | `no_unique_ignored` | no ignored files outside regenerable and cache directories (`.env`, local databases...) |
 | `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone depends on this object store |
 | `reflog_saved` | every commit reachable from any reflog entry (HEAD of this worktree and every ref's reflog) is contained in a network remote's tracking refs. An unpushed commit after `git reset --hard`, an amended or rebased-away commit and a stash's commits are `no`. No network remote is `no`; an unborn HEAD, any git failure or a timeout is `unknown` |
+| `plain_layout` | the repository has the plain layout described under "Plain layout" below. `no` or `unknown` makes the plan `ask` with the reason `unusual repository layout: <first failing check>` (kept in `repo.layout_issue`); it is never `recover-then-archive` or `archive` |
 | `no_pending_state` | no unfinished rebase, merge, cherry-pick, revert or bisect in this worktree's git directory (`rebase-merge`, `rebase-apply`, `sequencer`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_*`) and no local-only content under `.git/lfs/objects` or `.git/annex/objects`. Found by name only. Never `no`: a finding is `unknown` (state that no ref records cannot be recovered into a ref, so a person decides) |
 
 `reflog_saved` is computed with `git rev-list -n 1 --reflog --not --remotes=<network remote>...`, which
@@ -202,6 +205,41 @@ refs can be stale; a later phase confirms them against the live remote with `git
 time. `no_dependents` cannot see clones outside the scanned roots. An alternates file that was not
 read (a symlink, larger than 64 KiB, unreadable) leaves its provider unidentified, so every other
 git node in the scan that had `no_dependents = yes` gets `unknown` instead (a known `no` stays).
+
+**Plain layout.** Closing every unusual git layout by enumerating the bad ones kept missing one,
+so the rule is positive: only a repository whose shape is known may be archived or recovered then
+archived. `plain_layout` is `yes` only if all of these hold, checked in this order by `lstat`,
+directory listing, names, bounded reads and one `for-each-ref` through the hardened runner (nothing
+is followed):
+
+1. `.git` is a real directory. A `.git` file (a linked worktree, a submodule checkout, a
+   `--separate-git-dir` repository) or a symlink is never plain. This is a deliberate Phase 1
+   limit: those repositories, and the main repository of a worktree, always ask.
+2. `HEAD` and `config` are regular files and `refs`, `objects`, `objects/info` and `objects/pack` are
+   directories, all present and none a symlink.
+3. None of `objects/info/alternates`, `objects/info/http-alternates`, `commondir`, `info/grafts`
+   or `annex` exists.
+4. `worktrees/` and `modules/` are absent or empty (so a repository with submodules, checked out
+   or not, always asks).
+5. No unfinished rebase, merge, cherry-pick, revert or bisect and no local-only LFS or annex
+   content (`no_pending_state`).
+6. The config passed the allowlist (a refused config makes every fact `unknown` before this).
+7. Every ref is `refs/stash` or under `refs/heads/`, `refs/tags/` or `refs/remotes/` (so
+   `refs/backup/*`, `refs/replace/*`, `refs/notes/*`, `refs/original/*`, `refs/bisect/*` or a
+   fetched `refs/pull/*` make it not plain), and its target is a commit or an annotated tag whose
+   target is a commit (`for-each-ref --format='%(refname) %(objecttype) %(*objecttype)'`; a blob, a
+   tree, or a tag of a tag is not plain).
+
+A `shallow` file does not make a repository unplain (a shallow clone is complete for what it
+holds); the shape check ignores it. A failure is `no`; a check that cannot be made is `unknown`;
+both ask.
+
+Object stores reached from repos that are not plain: a `.git`-file repo's effective git directory
+is read (`gitdir:` line, that directory's `commondir`, then `objects`, all canonicalised) and a
+symlinked `objects` or `commondir` is resolved as a path. If the resulting store is not a scanned
+repo's own object directory it is inspected once for `info/alternates` (providers inside the scan
+get `no_dependents = no`), and if it lies outside the scanned roots, or cannot be read, the repo is
+an unresolved borrower: every plain repo's `no_dependents = yes` becomes `unknown`.
 
 **Object sharing.** Every user of each canonical object directory is kept, so repos that share
 one (a symlinked `.git/objects`, or a `commondir` file pointing into another repo) all get
@@ -355,7 +393,7 @@ state is `unknown`.
 1. Active: `keep`.
 2. Regenerable and cache: contains output files, has an `ask_reason`, is incomplete (`unreadable`
    or `skipped_mounts`), or state unknown: `ask`; otherwise `remove-regenerable`.
-3. Repo and worktree: state unknown: `ask`; any fact `unknown`: `ask`; any fact `no`:
+3. Repo and worktree: state unknown: `ask`; `plain_layout` not `yes`: `ask` (unusual repository layout); any fact `unknown`: `ask`; any fact `no`:
    `recover-then-archive`; every fact `yes`: `archive` (labelled unverified, see
    `remote_facts_verified`). A repo whose `.git/modules` hold a submodule git directory that no scanned
    git node inside it uses, or that is incomplete (`unreadable` or `skipped_mounts`), asks.

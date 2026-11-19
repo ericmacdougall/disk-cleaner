@@ -164,6 +164,11 @@ pub struct Plan {
     /// Scan roots inside a repository the scan did not cover: that repository was not assessed.
     #[serde(default)]
     pub enclosing_repos: Vec<EnclosingRepo>,
+    /// `volume` when every scanned root is a mount point, else `subtree`. `no_dependents` means
+    /// no dependents were found within the scanned roots; a subtree scan cannot see clones
+    /// elsewhere.
+    #[serde(default = "crate::model::default_scope")]
+    pub scope: String,
     pub active: Vec<String>,
     pub totals: PlanTotals,
     pub items: Vec<PlanItem>,
@@ -606,6 +611,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                             they are unverified until apply re-checks them with git ls-remote"
                 .to_string(),
         enclosing_repos: scan.enclosing_repos.clone(),
+        scope: scan.scope.clone(),
         active: opts
             .active
             .iter()
@@ -613,6 +619,15 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             .collect(),
         totals,
         items,
+    }
+}
+
+/// Disclosure for a scan that covered only folders, not whole volumes.
+fn scope_note(scan: &ScanResult) -> &'static str {
+    if scan.scope == "volume" {
+        ""
+    } else {
+        "; other clones outside the scanned folders were not checked for dependents"
     }
 }
 
@@ -665,6 +680,20 @@ fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Act
             if state == ProjectState::Unknown {
                 return (Action::Ask, format!("cannot judge activity: {why}"), 0);
             }
+            if facts.plain_layout != Tri::Yes {
+                // Only a repository with the plain layout is ever archived: anything else may
+                // keep data in places this tool does not look.
+                let issue = node
+                    .repo
+                    .as_ref()
+                    .and_then(|r| r.layout_issue.clone())
+                    .unwrap_or_else(|| "the layout could not be checked".to_string());
+                return (
+                    Action::Ask,
+                    format!("unusual repository layout: {issue}"),
+                    0,
+                );
+            }
             if facts.any_unknown() {
                 (
                     Action::Ask,
@@ -678,8 +707,10 @@ fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Act
                 (
                     Action::RecoverThenArchive,
                     format!(
-                        "idle ({why}), but not fully saved elsewhere ({}); recover first, then archive",
-                        join_names(&facts.failing())
+                        "idle ({why}), but not fully saved elsewhere ({}); recover first, then \
+                         archive{}",
+                        join_names(&facts.failing()),
+                        scope_note(scan)
                     ),
                     node.bytes_total,
                 )
@@ -689,8 +720,9 @@ fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Act
                     format!(
                         "idle ({why}); local remote-tracking refs say every commit (reflog \
                          entries included) is on a network remote, nothing is unsaved, no \
-                         operation is half done and nothing depends on it \
-                         (unverified until apply re-checks the remote with git ls-remote)"
+                         operation is half done and nothing depends on it{} \
+                         (unverified until apply re-checks the remote with git ls-remote)",
+                        scope_note(scan)
                     ),
                     node.bytes_total,
                 )

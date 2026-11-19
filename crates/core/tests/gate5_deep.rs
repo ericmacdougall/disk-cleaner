@@ -29,6 +29,7 @@ fn chain(len: usize) -> ScanResult {
         issues: vec![],
         warnings: vec![],
         enclosing_repos: vec![],
+        scope: "subtree".to_string(),
     }
 }
 

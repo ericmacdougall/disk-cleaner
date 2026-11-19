@@ -130,6 +130,159 @@ fn rel_slash(path: &Path, base: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// What an entry is, by `lstat`: never followed.
+enum Lk {
+    Missing,
+    Dir,
+    File,
+    Link,
+    Other,
+}
+
+fn lk(p: &Path) -> Result<Lk, String> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => Ok(Lk::Link),
+        Ok(m) if m.is_dir() => Ok(Lk::Dir),
+        Ok(m) if m.is_file() => Ok(Lk::File),
+        Ok(_) => Ok(Lk::Other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Lk::Missing),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Refs a plain repository may have: branches, tags, remote-tracking refs and the stash.
+fn plain_ref_name(name: &str) -> bool {
+    name == "refs/stash"
+        || name.starts_with("refs/heads/")
+        || name.starts_with("refs/tags/")
+        || name.starts_with("refs/remotes/")
+}
+
+/// Does this repository have the plain layout? `Yes` only when every check holds; `No` (with the
+/// first failing check) when one fails; `Unknown` when a check could not be made. All checks are
+/// `lstat`, directory listings, names and bounded reads, plus one `for-each-ref` through the
+/// hardened runner; nothing is followed.
+///
+/// Checks, in order: `.git` is a real directory; `HEAD`, `config`, `refs`, `objects`,
+/// `objects/info` and `objects/pack` exist as the right kind of entry and none is a symlink; none
+/// of `objects/info/alternates`, `objects/info/http-alternates`, `commondir`, `info/grafts` or
+/// `annex` exists; `worktrees` and `modules` are absent or empty; no unfinished operation and no
+/// local-only LFS or annex content ([`pending_state`]); every ref lies under `refs/heads/`,
+/// `refs/tags/`, `refs/remotes/` or is `refs/stash`, and points at a commit or at an annotated tag
+/// whose target is a commit. (The config allowlist runs before any of this.)
+fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
+    macro_rules! no {
+        ($($a:tt)*) => {
+            return (Tri::No, Some(format!($($a)*)))
+        };
+    }
+    let gd = if class == Class::BareRepo {
+        path.to_path_buf()
+    } else {
+        let g = path.join(".git");
+        match lk(&g) {
+            Ok(Lk::Dir) => g,
+            Ok(Lk::Missing) => no!(".git is missing"),
+            Ok(_) => no!(
+                ".git is not a real directory (a linked worktree, submodule checkout, \
+                 --separate-git-dir repository or a symlink: not handled in this phase)"
+            ),
+            Err(e) => return (Tri::Unknown, Some(format!("cannot read .git ({e})"))),
+        }
+    };
+    let mut unknown: Option<String> = None;
+    for (name, want_dir) in [
+        ("HEAD", false),
+        ("config", false),
+        ("refs", true),
+        ("objects", true),
+        ("objects/info", true),
+        ("objects/pack", true),
+    ] {
+        match lk(&gd.join(name)) {
+            Ok(Lk::Missing) => no!("{name} is missing from the git directory"),
+            Ok(Lk::Link) => no!("{name} is a symlink"),
+            Ok(Lk::Dir) if want_dir => {}
+            Ok(Lk::File) if !want_dir => {}
+            Ok(_) => no!("{name} is not the expected kind of entry"),
+            Err(e) => {
+                unknown.get_or_insert(format!("cannot read {name} ({e})"));
+            }
+        }
+    }
+    for name in [
+        "objects/info/alternates",
+        "objects/info/http-alternates",
+        "commondir",
+        "info/grafts",
+        "annex",
+    ] {
+        match lk(&gd.join(name)) {
+            Ok(Lk::Missing) => {}
+            Ok(_) => no!("{name} exists (shared objects, a moved git directory or other local state)"),
+            Err(e) => {
+                unknown.get_or_insert(format!("cannot read {name} ({e})"));
+            }
+        }
+    }
+    for name in ["worktrees", "modules"] {
+        match lk(&gd.join(name)) {
+            Ok(Lk::Missing) => {}
+            Ok(Lk::Dir) => match std::fs::read_dir(gd.join(name)) {
+                Ok(mut rd) => {
+                    if rd.next().is_some() {
+                        no!("{name} is not empty");
+                    }
+                }
+                Err(e) => {
+                    unknown.get_or_insert(format!("cannot read {name} ({e})"));
+                }
+            },
+            Ok(_) => no!("{name} is not a plain directory"),
+            Err(e) => {
+                unknown.get_or_insert(format!("cannot read {name} ({e})"));
+            }
+        }
+    }
+    match pending_state(git, path) {
+        Ok(found) if found.is_empty() => {}
+        Ok(found) => no!(
+            "an unfinished operation or local-only content is present ({})",
+            found.join(", ")
+        ),
+        Err(why) => {
+            unknown.get_or_insert(why);
+        }
+    }
+    match git.run(
+        path,
+        &["for-each-ref", "--format=%(refname) %(objecttype) %(*objecttype)"],
+    ) {
+        Ok(out) => {
+            for line in out.lines() {
+                let mut it = line.split(' ');
+                let name = it.next().unwrap_or("");
+                let ty = it.next().unwrap_or("");
+                let peeled = it.next().unwrap_or("");
+                if !plain_ref_name(name) {
+                    no!("the ref {name} is outside refs/heads, refs/tags, refs/remotes and refs/stash");
+                }
+                match (ty, peeled) {
+                    ("commit", _) | ("tag", "commit") => {}
+                    _ => no!("the ref {name} does not point at a commit (it is a {ty} {peeled})"),
+                }
+            }
+        }
+        Err(e) => {
+            unknown.get_or_insert(note("refs", &e));
+        }
+    }
+    match unknown {
+        Some(why) => (Tri::Unknown, Some(why)),
+        None => (Tri::Yes, None),
+    }
+}
+
 /// Names that, present in a worktree's own git directory, show an operation that is not finished.
 /// Its state (a rebase todo list, conflict resolutions, the commits a sequence still has to apply)
 /// lives in these files and not in any ref, and is deleted with the repo.
@@ -547,6 +700,7 @@ fn all_unknown(reason: String, unverified: &[PathBuf]) -> RepoCheck {
     let why = reason.clone();
     RepoCheck {
         info: RepoInfo {
+            layout_issue: Some(reason.clone()),
             notes: vec![reason],
             ..RepoInfo::default()
         },
@@ -922,6 +1076,9 @@ pub fn collect_repo_info(
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok());
 
+    let (plain, issue) = layout_check(git, path, class);
+    facts.plain_layout = plain;
+    info.layout_issue = issue.map(|i| diag(&i));
     info.facts = facts;
     info.notes = notes.0;
     info.remotes = remotes.unwrap_or_default();

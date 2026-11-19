@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -100,11 +100,16 @@ pub struct Facts {
     /// git-annex content: state that no ref records. Never `No`: when something is found the
     /// fact is `Unknown`, because this tool cannot show it is saved.
     pub no_pending_state: Tri,
+    /// The repository has the plain layout (see `docs/SCAN-FORMAT.md`): a real `.git` directory
+    /// with the expected entries, no alternates, commondir, worktrees, modules, annex or LFS
+    /// content, and only refs under `refs/heads`, `refs/tags`, `refs/remotes` and `refs/stash`
+    /// that point at commits. Only a plain repo may be archived or recovered then archived.
+    pub plain_layout: Tri,
 }
 
 impl Facts {
     /// Every fact paired with its JSON name.
-    pub fn entries(&self) -> [(&'static str, Tri); 9] {
+    pub fn entries(&self) -> [(&'static str, Tri); 10] {
         [
             ("has_network_remote", self.has_network_remote),
             ("head_on_remote", self.head_on_remote),
@@ -115,6 +120,7 @@ impl Facts {
             ("no_dependents", self.no_dependents),
             ("reflog_saved", self.reflog_saved),
             ("no_pending_state", self.no_pending_state),
+            ("plain_layout", self.plain_layout),
         ]
     }
 
@@ -173,6 +179,10 @@ pub struct RepoSizes {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoInfo {
     pub facts: Facts,
+    /// The first layout check that failed or could not be made, when `plain_layout` is not
+    /// `yes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_issue: Option<String>,
     /// Why each non-`Yes` fact is not `Yes` (redacted).
     #[serde(default)]
     pub notes: Vec<String>,
@@ -346,6 +356,14 @@ pub struct ScanResult {
     /// Scan roots that lie inside a git repository the scan did not cover.
     #[serde(default)]
     pub enclosing_repos: Vec<EnclosingRepo>,
+    /// `volume` when every root is a mount point (or a file system root), else `subtree`: other
+    /// clones outside the scanned folders cannot be seen by a subtree scan.
+    #[serde(default = "default_scope")]
+    pub scope: String,
+}
+
+pub fn default_scope() -> String {
+    "subtree".to_string()
 }
 
 /// A scan root inside a repository above it. The repository was not walked or assessed; only the
