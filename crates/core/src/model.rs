@@ -255,7 +255,36 @@ pub struct RepoInfo {
     /// How many such entries were found in all (the examples are the first five).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub local_admin_content_count: u64,
+    /// The git directory's own files, which a removal must back up first (see
+    /// [`crate::preserve`]). `None` when they were not counted: the plan then never removes the
+    /// node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_admin: Option<GitAdminSurvey>,
     pub sizes: RepoSizes,
+}
+
+/// What [`crate::preserve::survey`] counted of one git directory's own files: everything in it
+/// that is not an object file of its object store.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitAdminSurvey {
+    /// How many files (regular files, symlinks and other non-directory entries).
+    pub files: u64,
+    /// Their allocated bytes.
+    pub bytes: u64,
+    /// Up to five of them, sorted, whose names are not ones every clone has (relative to the git
+    /// directory, `/`-separated).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<String>,
+    /// The largest of them, largest first (up to three).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub largest: Vec<AdminFile>,
+}
+
+/// One of a git directory's own files and its allocated bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminFile {
+    pub path: String,
+    pub bytes: u64,
 }
 
 /// A classified directory.

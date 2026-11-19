@@ -44,7 +44,7 @@ fn line_endings_converted_only_by_system_config_read_as_modified() {
     assert_eq!(f.stash_empty, Tri::Yes, "{f:?}");
     // A removing action that starts with recovery, which re-checks the facts before anything
     // is removed; not `archive`.
-    assert_eq!(action_for(&res, &repo), Action::RecoverThenArchive);
+    assert_eq!(action_for(&res, &repo), Action::RecoverBackupThenRemove);
 }
 
 // ---------------------------------------------------------------- G3: unresolved alternates

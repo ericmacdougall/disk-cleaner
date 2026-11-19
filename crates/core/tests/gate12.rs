@@ -153,7 +153,7 @@ fn t1_an_untracked_non_utf8_file_makes_the_tree_not_clean() {
     std::fs::write(a.join(&name), "untracked\n").unwrap();
     let res = scan_with(&root, network_everywhere());
     assert_ne!(facts_of(&res, &a).tree_clean, Tri::Yes);
-    assert_ne!(action_for(&res, &a), Action::Archive);
+    assert_ne!(action_for(&res, &a), Action::BackupThenRemove);
 }
 
 #[cfg(unix)]
@@ -171,7 +171,7 @@ fn t1_an_ignored_non_utf8_file_outside_regenerable_directories_is_unique() {
     std::fs::write(a.join(&name), "secret\n").unwrap();
     let res = scan_with(&root, network_everywhere());
     assert_ne!(facts_of(&res, &a).no_unique_ignored, Tri::Yes);
-    assert_ne!(action_for(&res, &a), Action::Archive);
+    assert_ne!(action_for(&res, &a), Action::BackupThenRemove);
 }
 
 #[cfg(unix)]
@@ -277,6 +277,12 @@ fn saved_repo(path: &str) -> disk_cleaner_core::Node {
             plain_layout: Tri::Yes,
             no_local_admin_content: Tri::Yes,
         },
+        // The scan counted the git directory's own files, as it does for every real `.git`.
+        git_admin: Some(disk_cleaner_core::GitAdminSurvey {
+            files: 12,
+            bytes: 49_152,
+            ..Default::default()
+        }),
         ..RepoInfo::default()
     });
     n

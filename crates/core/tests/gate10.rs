@@ -57,5 +57,5 @@ fn r3_control_precious_objects_set_to_false_changes_nothing() {
 
     let res = scan_with(&root, network_everywhere());
     assert_eq!(facts_of(&res, &a).no_dependents, Tri::Yes);
-    assert_eq!(action_for(&res, &a), Action::Archive);
+    assert_eq!(action_for(&res, &a), Action::BackupThenRemove);
 }

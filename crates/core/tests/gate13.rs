@@ -93,7 +93,7 @@ fn u1_orig_head_at_an_unpushed_commit_with_expired_reflogs_is_not_archived() {
     let it = item(&p, &repo);
     assert_ne!(
         it.action,
-        Action::Archive,
+        Action::BackupThenRemove,
         "B survives only through ORIG_HEAD; archive would delete it: {}",
         it.reason
     );
@@ -129,7 +129,7 @@ fn u1_orig_head_at_an_unpushed_commit_with_reflogs_disabled_is_not_archived() {
     let res = scan_with(&root, network_everywhere());
     let p = plan_of(&res);
     let it = item(&p, &repo);
-    assert_ne!(it.action, Action::Archive, "{}", it.reason);
+    assert_ne!(it.action, Action::BackupThenRemove, "{}", it.reason);
     assert!(
         it.reason.contains("kept only by ORIG_HEAD"),
         "{}",
@@ -168,7 +168,7 @@ fn u1_control_a_pull_leaves_orig_head_and_fetch_head_at_pushed_commits_and_archi
     let res = scan_with(&root, network_everywhere());
     let p = plan_of(&res);
     let it = item(&p, &repo);
-    assert_eq!(it.action, Action::Archive, "{}", it.reason);
+    assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
 }
 
 #[test]
@@ -185,7 +185,7 @@ fn u1_control_orig_head_at_a_pushed_commit_with_expired_reflogs_archives() {
     let res = scan_with(&root, network_everywhere());
     let p = plan_of(&res);
     let it = item(&p, &repo);
-    assert_eq!(it.action, Action::Archive, "{}", it.reason);
+    assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn u1_an_unknown_pseudoref_at_an_unpushed_commit_is_not_archived() {
     let res = scan_with(&root, network_everywhere());
     let p = plan_of(&res);
     let it = item(&p, &repo);
-    assert_ne!(it.action, Action::Archive, "{}", it.reason);
+    assert_ne!(it.action, Action::BackupThenRemove, "{}", it.reason);
     assert!(it.reason.contains("FOO_HEAD"), "{}", it.reason);
 }
 
@@ -246,7 +246,7 @@ fn u1_an_unknown_directory_or_file_at_the_top_of_the_git_directory_makes_the_lay
     let p = plan_of(&res);
     assert_eq!(
         item(&p, &control).action,
-        Action::Archive,
+        Action::BackupThenRemove,
         "{}",
         item(&p, &control).reason
     );
@@ -279,7 +279,7 @@ fn u1_local_only_orig_head_commit_is_named_for_recovery() {
     let res = scan_with(&root, network_everywhere());
     let p = plan_of(&res);
     let it = item(&p, &repo);
-    assert_eq!(it.action, Action::RecoverThenArchive, "{}", it.reason);
+    assert_eq!(it.action, Action::RecoverBackupThenRemove, "{}", it.reason);
     assert!(
         it.reason.contains("kept only by ORIG_HEAD"),
         "recovery must be told to capture ORIG_HEAD: {}",

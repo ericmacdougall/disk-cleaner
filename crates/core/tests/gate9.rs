@@ -149,8 +149,8 @@ fn q1_control_two_unrelated_clean_clones_stay_archivable() {
     write(&dep.join("index.js"), "x\n");
 
     let res = scan_with(&root, network_everywhere());
-    assert_eq!(action_for(&res, &a), Action::Archive);
-    assert_eq!(action_for(&res, &b), Action::Archive);
+    assert_eq!(action_for(&res, &a), Action::BackupThenRemove);
+    assert_eq!(action_for(&res, &b), Action::BackupThenRemove);
     // With the trust flag and a partial process check they are still archivable.
     let mut o = PlanOptions::new(7, far_future());
     o.process = ProcessCheck::Partial {
@@ -161,13 +161,13 @@ fn q1_control_two_unrelated_clean_clones_stay_archivable() {
     let p = plan(&res, &o);
     assert_eq!(
         item(&p, &a).action,
-        Action::Archive,
+        Action::BackupThenRemove,
         "{}",
         item(&p, &a).reason
     );
     assert_eq!(
         item(&p, &b).action,
-        Action::Archive,
+        Action::BackupThenRemove,
         "{}",
         item(&p, &b).reason
     );

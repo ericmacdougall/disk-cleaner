@@ -208,7 +208,7 @@ fn w1_control_a_fresh_clone_is_archivable_on_this_system() {
     let res = scan_with(&root, network_everywhere());
     let p = plan_of(&res);
     let it = item(&p, &clone);
-    assert_eq!(it.action, Action::Archive, "{}\nstock: {inv}", it.reason);
+    assert_eq!(it.action, Action::BackupThenRemove, "{}\nstock: {inv}", it.reason);
 }
 
 /// `git gc` (and auto-gc) runs `update-server-info`, which writes `info/refs`, a listing of the
@@ -228,7 +228,7 @@ fn w1_control_a_garbage_collected_repo_is_archivable_and_a_note_in_info_refs_ask
     let res = scan_with(&root, network_everywhere());
     let p = plan_of(&res);
     let it = item(&p, &gcd);
-    assert_eq!(it.action, Action::Archive, "{}\ngc: {inv}", it.reason);
+    assert_eq!(it.action, Action::BackupThenRemove, "{}\ngc: {inv}", it.reason);
     assert_asks_naming(&res, &noted, "info/refs", &inv);
 }
 
@@ -327,7 +327,7 @@ fn w2_control_orig_head_naming_a_pushed_commit_archives() {
     let res = scan_with(&root, network_everywhere());
     let p = plan_of(&res);
     let it = item(&p, &repo);
-    assert_eq!(it.action, Action::Archive, "{}", it.reason);
+    assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
 }
 
 // ---------------------------------------------------------------- exact pseudoref names

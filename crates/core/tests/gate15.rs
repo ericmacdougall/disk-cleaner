@@ -134,7 +134,7 @@ fn assert_archives(res: &ScanResult, repo: &Path, what: &str) {
     let inv = listing(repo);
     assert_eq!(
         it.action,
-        Action::Archive,
+        Action::BackupThenRemove,
         "after {what}: {}\ngit dir: {inv}",
         it.reason
     );

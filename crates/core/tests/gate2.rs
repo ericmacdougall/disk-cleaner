@@ -69,7 +69,7 @@ fn h2_unpushed_commit_then_reset_to_the_pushed_parent_is_not_fully_saved() {
     assert_eq!(fact(&res, &repo, "reflog_saved"), "no");
     assert_eq!(
         action(&res, &repo),
-        Action::RecoverThenArchive,
+        Action::RecoverBackupThenRemove,
         "the commit is only in the reflog; archive would delete it"
     );
 }
@@ -90,7 +90,7 @@ fn h2_commit_amended_away_is_not_fully_saved() {
         "{f:?}"
     );
     assert_eq!(fact(&res, &repo, "reflog_saved"), "no");
-    assert_ne!(action(&res, &repo), Action::Archive);
+    assert_ne!(action(&res, &repo), Action::BackupThenRemove);
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn h2_control_fresh_clone_has_reflog_saved_and_is_archivable() {
         "{:?}",
         facts_of(&res, &clone)
     );
-    assert_eq!(action(&res, &clone), Action::Archive);
+    assert_eq!(action(&res, &clone), Action::BackupThenRemove);
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn h2_zero_commit_repo_is_never_reflog_saved() {
     let res = scan_with(&root, network_everywhere());
     let v = fact(&res, &repo, "reflog_saved");
     assert!(v == "no" || v == "unknown", "got {v}");
-    assert_ne!(action(&res, &repo), Action::Archive);
+    assert_ne!(action(&res, &repo), Action::BackupThenRemove);
 }
 
 #[cfg(unix)]
@@ -164,7 +164,7 @@ fn h2_linked_worktree_with_a_reset_away_commit_is_not_fully_saved() {
     git(&wt, &["reset", "-q", "--hard", "HEAD~1"]);
     let res = scan_with(&root, network_everywhere());
     assert_eq!(fact(&res, &wt, "reflog_saved"), "no");
-    assert_ne!(action(&res, &wt), Action::Archive);
+    assert_ne!(action(&res, &wt), Action::BackupThenRemove);
 }
 
 #[test]
@@ -272,7 +272,7 @@ fn h3_dotenv_inside_a_build_directory_asks_but_a_template_does_not() {
         Action::RemoveRegenerable,
         "control: a template is not a secret"
     );
-    assert_eq!(action(&res2, &repo2), Action::Archive, "control");
+    assert_eq!(action(&res2, &repo2), Action::BackupThenRemove, "control");
 }
 
 #[test]
@@ -462,5 +462,5 @@ fn sibling_a_control_rr_cache_and_a_quiet_repo_keep_the_fact_yes() {
         );
     });
     assert_eq!(state, "yes");
-    assert_eq!(act, Action::Archive);
+    assert_eq!(act, Action::BackupThenRemove);
 }

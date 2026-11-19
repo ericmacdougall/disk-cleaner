@@ -169,7 +169,7 @@ fn f2_skip_worktree_edit_is_not_a_clean_tree() {
     write(&repo.join("conf.yml"), "password=hunter2\n");
     let res = scan_with(&root, network_everywhere());
     assert_eq!(facts_of(&res, &repo).tree_clean, Tri::No);
-    assert_ne!(action_for(&res, &repo), Action::Archive);
+    assert_ne!(action_for(&res, &repo), Action::BackupThenRemove);
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn f2_assume_unchanged_edit_is_not_a_clean_tree() {
     write(&repo.join("k.txt"), "locally edited\n");
     let res = scan_with(&root, network_everywhere());
     assert_eq!(facts_of(&res, &repo).tree_clean, Tri::No);
-    assert_ne!(action_for(&res, &repo), Action::Archive);
+    assert_ne!(action_for(&res, &repo), Action::BackupThenRemove);
 }
 
 // ---------------------------------------------------------------- F3
@@ -425,7 +425,7 @@ fn f7_unpushed_tag_on_a_pushed_commit_is_not_all_on_remote() {
     git(&repo, &["tag", "v1-local-only"]);
     let res = scan_with(&root, network_everywhere());
     assert_ne!(facts_of(&res, &repo).all_branches_on_remote, Tri::Yes);
-    assert_ne!(action_for(&res, &repo), Action::Archive);
+    assert_ne!(action_for(&res, &repo), Action::BackupThenRemove);
 }
 
 #[test]
@@ -435,7 +435,7 @@ fn f7_unpushed_notes_ref_is_not_all_on_remote() {
     git(&repo, &["notes", "add", "-m", "private review notes"]);
     let res = scan_with(&root, network_everywhere());
     assert_eq!(facts_of(&res, &repo).all_branches_on_remote, Tri::No);
-    assert_ne!(action_for(&res, &repo), Action::Archive);
+    assert_ne!(action_for(&res, &repo), Action::BackupThenRemove);
 }
 
 // ---------------------------------------------------------------- N1, N2 (delta review)

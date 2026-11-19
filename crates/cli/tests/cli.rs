@@ -149,7 +149,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
     // the repo that encloses it asks too; it must never be archived.
     let action = repo_item["action"].as_str().unwrap();
     assert!(
-        action == "ask" || action == "recover-then-archive",
+        action == "ask" || action == "recover-backup-then-remove",
         "{action}"
     );
 
@@ -1280,7 +1280,7 @@ fn r1_t2_unreadable_folder_clone_asks_by_default_and_archives_when_accepted() {
     let accepted = |pv: &serde_json::Value| {
         let it = item_of(pv, &a);
         let reason = it["reason"].as_str().unwrap();
-        assert_eq!(it["action"], "archive", "{reason}");
+        assert_eq!(it["action"], "backup-then-remove", "{reason}");
         assert!(
             reason.contains(
                 "1 folder in this scan could not be read; dependents inside it were not checked"
@@ -1339,7 +1339,7 @@ fn r1_a_fully_readable_scan_is_complete_and_adds_no_coverage_sentence() {
     assert_process_check_usable(&pv);
     let it = item_of(&pv, &a);
     let reason = it["reason"].as_str().unwrap();
-    assert_eq!(it["action"], "archive", "{reason}");
+    assert_eq!(it["action"], "backup-then-remove", "{reason}");
     assert_eq!(pv["coverage_complete"], true);
     assert!(pv["coverage_note"].is_null(), "{}", pv["coverage_note"]);
     assert!(
@@ -1353,6 +1353,6 @@ fn r1_a_fully_readable_scan_is_complete_and_adds_no_coverage_sentence() {
     // The opt-in changes nothing when coverage is complete.
     let flag = ["--now", &now, "--accept-incomplete-coverage"];
     let pv = plan_value(&plan_json(&scan_file, &home, &flag));
-    assert_eq!(item_of(&pv, &a)["action"], "archive");
+    assert_eq!(item_of(&pv, &a)["action"], "backup-then-remove");
     assert_eq!(pv["accepted_incomplete_coverage"], true);
 }

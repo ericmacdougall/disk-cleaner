@@ -19,7 +19,7 @@ fn layout(res: &ScanResult, repo: &Path) -> String {
 fn never_archivable(res: &ScanResult, repo: &Path) -> bool {
     !matches!(
         action_for(res, repo),
-        Action::Archive | Action::RecoverThenArchive | Action::RemoveRegenerable
+        Action::BackupThenRemove | Action::RecoverBackupThenRemove | Action::RemoveRegenerable
     )
 }
 
@@ -64,7 +64,7 @@ mod unix_layouts {
         let _a = repo_linked_to(&root, "a", &objs);
         let _b = repo_linked_to(&root, "b", &objs);
         let res = scan_with(&root, network_everywhere());
-        assert_ne!(action_for(&res, &c), Action::Archive);
+        assert_ne!(action_for(&res, &c), Action::BackupThenRemove);
         assert!(never_archivable(&res, &root.join("a")));
         assert!(never_archivable(&res, &root.join("b")));
     }
@@ -92,7 +92,7 @@ mod unix_layouts {
         let head = git(&p, &["rev-parse", "HEAD"]);
         git(&b, &["cat-file", "-e", &head]);
         let res = scan_with(&root, network_everywhere());
-        assert_ne!(action_for(&res, &p), Action::Archive);
+        assert_ne!(action_for(&res, &p), Action::BackupThenRemove);
         assert_eq!(layout(&res, &b), "no");
         assert_eq!(action_for(&res, &b), Action::Ask);
     }
@@ -319,8 +319,8 @@ fn control_a_fresh_plain_clone_and_a_repo_with_an_annotated_tag_are_plain() {
     assert_eq!(layout(&res, &clone), "yes");
     assert_eq!(layout(&res, &origin), "yes");
     assert_eq!(layout(&res, &tagged), "yes");
-    assert_eq!(action_for(&res, &clone), Action::Archive);
-    assert_eq!(action_for(&res, &origin), Action::Archive);
+    assert_eq!(action_for(&res, &clone), Action::BackupThenRemove);
+    assert_eq!(action_for(&res, &origin), Action::BackupThenRemove);
 }
 
 // ---------------------------------------------------------------- scope disclosure
@@ -338,7 +338,7 @@ fn the_plan_header_records_the_scope_and_archive_reasons_say_clones_were_not_che
         .iter()
         .find(|i| i.path == repo.to_string_lossy())
         .unwrap();
-    assert_eq!(item.action, Action::Archive);
+    assert_eq!(item.action, Action::BackupThenRemove);
     assert!(
         item.reason.contains("outside the scanned folders"),
         "{}",

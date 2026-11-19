@@ -11,7 +11,7 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 fn not_removing(a: Action) -> bool {
-    !matches!(a, Action::Archive | Action::RemoveRegenerable)
+    !matches!(a, Action::BackupThenRemove | Action::RemoveRegenerable)
 }
 
 /// A repo in `root` whose `.git/objects` is a symlink to `target_objects`, with one unpushed
@@ -118,8 +118,8 @@ fn m1_control_two_unrelated_repos_are_unaffected() {
     let a = pushed_repo(&root, &remotes, "a");
     let b = pushed_repo(&root, &remotes, "b");
     let res = scan_with(&root, network_everywhere());
-    assert_eq!(action_for(&res, &a), Action::Archive);
-    assert_eq!(action_for(&res, &b), Action::Archive);
+    assert_eq!(action_for(&res, &a), Action::BackupThenRemove);
+    assert_eq!(action_for(&res, &b), Action::BackupThenRemove);
 }
 
 // ---------------------------------------------------------------- M2

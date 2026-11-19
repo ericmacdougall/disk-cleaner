@@ -133,7 +133,7 @@ fn s1_an_ordinary_untracked_file_is_still_recover_then_archive_in_words() {
     assert_eq!(hidden_entries(&res, &a), 0);
     let p = plan_of(&res);
     let it = item(&p, &a);
-    assert_eq!(it.action, Action::RecoverThenArchive, "{}", it.reason);
+    assert_eq!(it.action, Action::RecoverBackupThenRemove, "{}", it.reason);
     assert!(
         it.reason
             .contains("uncommitted changes or untracked files [tree_clean]"),
@@ -281,6 +281,12 @@ fn repo_node(path: &str, facts: Facts) -> Node {
     n.newest_mtime = Some(0);
     n.repo = Some(RepoInfo {
         facts,
+        // The scan counted the git directory's own files, as it does for every real `.git`.
+        git_admin: Some(disk_cleaner_core::GitAdminSurvey {
+            files: 12,
+            bytes: 49_152,
+            ..Default::default()
+        }),
         ..RepoInfo::default()
     });
     n
@@ -335,7 +341,7 @@ fn s2d_an_archive_reason_says_no_dependents_were_found() {
         &accept,
     );
     let it = &p.items[0];
-    assert_eq!(it.action, Action::Archive, "{}", it.reason);
+    assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
     assert!(
         it.reason.contains("no dependents were found"),
         "{}",
@@ -350,7 +356,7 @@ fn s2d_an_archive_reason_says_no_dependents_were_found() {
         &opts(),
     );
     let it = &p.items[0];
-    assert_eq!(it.action, Action::Archive, "{}", it.reason);
+    assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
     assert!(
         it.reason.contains("no dependents were found"),
         "{}",

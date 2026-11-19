@@ -40,7 +40,7 @@ fn control_fully_pushed_clean_repo_has_every_fact_yes_and_is_archivable() {
     let res = scan_with(&root, network_everywhere());
     let f = facts_of(&res, &repo);
     assert!(f.all_yes(), "facts: {f:?}");
-    assert_eq!(action_for(&res, &repo), Action::Archive);
+    assert_eq!(action_for(&res, &repo), Action::BackupThenRemove);
 }
 
 #[test]
@@ -149,7 +149,7 @@ fn neg2_detached_head_with_unpushed_commit_is_not_on_remote() {
     assert_eq!(f.head_on_remote, Tri::No);
     // A check that only looks at branch tips would call this repo fully pushed.
     assert_eq!(f.all_branches_on_remote, Tri::Yes);
-    assert_ne!(action_for(&res, &repo), Action::Archive);
+    assert_ne!(action_for(&res, &repo), Action::BackupThenRemove);
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn neg2b_a_linked_worktrees_own_head_is_checked() {
     let res = scan_with(&root, network_everywhere());
     assert_eq!(facts_of(&res, &repo).head_on_remote, Tri::Yes);
     assert_eq!(facts_of(&res, &wt).head_on_remote, Tri::No);
-    assert_ne!(action_for(&res, &wt), Action::Archive);
+    assert_ne!(action_for(&res, &wt), Action::BackupThenRemove);
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn neg3_local_directory_remote_is_not_a_network_remote() {
     assert_eq!(f.has_network_remote, Tri::No);
     assert_eq!(f.head_on_remote, Tri::No);
     assert_eq!(f.all_branches_on_remote, Tri::No);
-    assert_ne!(action_for(&res, &repo), Action::Archive);
+    assert_ne!(action_for(&res, &repo), Action::BackupThenRemove);
     let remotes_seen = &node(&res, &repo).repo.as_ref().unwrap().remotes;
     assert_eq!(remotes_seen.len(), 1);
     assert!(!remotes_seen[0].network);
@@ -237,8 +237,8 @@ fn neg9_a_stash_alone_blocks_removal() {
     assert_eq!(f.all_branches_on_remote, Tri::Yes);
     assert_eq!(f.has_network_remote, Tri::Yes);
     let a = action_for(&res, &repo);
-    assert_eq!(a, Action::RecoverThenArchive);
-    assert!(!matches!(a, Action::Archive | Action::RemoveRegenerable));
+    assert_eq!(a, Action::RecoverBackupThenRemove);
+    assert!(!matches!(a, Action::BackupThenRemove | Action::RemoveRegenerable));
 }
 
 #[test]
@@ -290,7 +290,7 @@ fn ignored_unique_files_count_but_regenerable_directories_do_not() {
     let info = node(&res, &repo).repo.as_ref().unwrap();
     assert_eq!(info.facts.no_unique_ignored, Tri::No);
     assert!(info.notes.iter().any(|n| n.contains(".env")));
-    assert_eq!(action_for(&res, &repo), Action::RecoverThenArchive);
+    assert_eq!(action_for(&res, &repo), Action::RecoverBackupThenRemove);
 }
 
 #[test]
@@ -321,7 +321,7 @@ fn ac5_linked_worktree_is_tied_to_its_parent_and_parent_has_dependents() {
     let parent = node(&res, &repo).repo.as_ref().unwrap();
     assert_eq!(parent.facts.no_dependents, Tri::No);
     assert_eq!(parent.worktrees.len(), 1);
-    assert_ne!(action_for(&res, &repo), Action::Archive);
+    assert_ne!(action_for(&res, &repo), Action::BackupThenRemove);
 }
 
 #[test]

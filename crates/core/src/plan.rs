@@ -21,11 +21,11 @@ pub enum Action {
     Keep,
     /// Delete a regenerable or cache directory.
     RemoveRegenerable,
-    /// Save unsaved work to recovery refs or a bundle, re-check, then archive.
-    RecoverThenArchive,
-    /// Every fact is safe: the repo can be archived and removed.
-    Archive,
-    /// Back the item up to storage, verify, then remove it.
+    /// A git node with unsaved work: save it to recovery refs or a bundle, re-check, back up
+    /// the git directory's own files ([`PlanItem::preserve`]), verify that backup, then remove.
+    RecoverBackupThenRemove,
+    /// A git node whose commits are all on a network remote: back up the git directory's own
+    /// files ([`PlanItem::preserve`]), verify that backup, then remove.
     BackupThenRemove,
     /// A person decides.
     Ask,
@@ -37,8 +37,7 @@ impl Action {
         match self {
             Action::Keep => "keep",
             Action::RemoveRegenerable => "remove-regenerable",
-            Action::RecoverThenArchive => "recover-then-archive",
-            Action::Archive => "archive",
+            Action::RecoverBackupThenRemove => "recover-backup-then-remove",
             Action::BackupThenRemove => "backup-then-remove",
             Action::Ask => "ask",
         }
@@ -48,10 +47,7 @@ impl Action {
     pub fn removes(self) -> bool {
         matches!(
             self,
-            Action::RemoveRegenerable
-                | Action::RecoverThenArchive
-                | Action::Archive
-                | Action::BackupThenRemove
+            Action::RemoveRegenerable | Action::RecoverBackupThenRemove | Action::BackupThenRemove
         )
     }
 }
@@ -83,10 +79,14 @@ pub struct PlanOptions {
     /// candidate.
     pub trust_partial_process_check: bool,
     /// The user accepts a scan that could not look everywhere (unreadable folders, mount points
-    /// not entered) as enough to archive: each archive reason then says what was not read. Off by
-    /// default: with incomplete coverage every repository's `no_dependents = yes` becomes
-    /// `unknown`, so it asks.
+    /// not entered) as enough to remove repositories: each such reason then says what was not
+    /// read. Off by default: with incomplete coverage every repository's `no_dependents = yes`
+    /// becomes `unknown`, so it asks.
     pub accept_incomplete_coverage: bool,
+    /// Most allocated bytes of its own files ([`PlanItem::preserve`]) one git directory may hold
+    /// and still be removed after a backup; more asks, naming the largest files (a big file
+    /// dropped into `.git` is the user's data, not git's settings).
+    pub max_git_admin_bytes: u64,
 }
 
 impl PlanOptions {
@@ -100,8 +100,35 @@ impl PlanOptions {
             process: ProcessCheck::none_running(),
             trust_partial_process_check: false,
             accept_incomplete_coverage: false,
+            max_git_admin_bytes: crate::config::DEFAULT_MAX_GIT_ADMIN_BYTES,
         }
     }
+}
+
+/// What must be backed up, and the backup verified, before a removing action removes anything.
+/// Set on every removing item that removes a git node (repo, worktree or bare repo), whether its
+/// own or one nested inside it, and only there.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preserve {
+    pub git_admin: PreserveGitAdmin,
+}
+
+/// The git directories' own files: everything in each git directory that is not an object file
+/// of its object store (see [`crate::preserve`]). A consumer that applies a plan must refuse to
+/// remove the item unless a verified backup of all of them exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreserveGitAdmin {
+    /// The git directories whose files must be saved: the item's own and those of git nodes
+    /// inside it, as the scan spelled them.
+    pub git_dirs: Vec<String>,
+    /// How many files (regular files, symlinks and other non-directory entries).
+    pub files: u64,
+    /// Their allocated bytes.
+    pub bytes: u64,
+    /// Up to five of them, sorted, whose names are not ones every clone has, relative to the
+    /// item's directory with `/` separators (`.git/COMMIT_EDITMSG`, `.git/hooks/custom`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<String>,
 }
 
 /// One line of the plan.
@@ -125,6 +152,9 @@ pub struct PlanItem {
     pub days_since_activity: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<Facts>,
+    /// What must be saved before this item is removed (removing git items only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve: Option<Preserve>,
 }
 
 /// Count and bytes for one action.
@@ -561,6 +591,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 .repo
                 .as_ref()
                 .map(|r| effective_facts(r.facts, strict.is_some())),
+            preserve: None,
         });
     }
 
@@ -582,7 +613,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         let action = own_action[k];
         if !matches!(
             action,
-            Action::Keep | Action::Ask | Action::RecoverThenArchive
+            Action::Keep | Action::Ask | Action::RecoverBackupThenRemove
         ) {
             continue;
         }
@@ -617,7 +648,10 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     // Last, so it is only added to items that are still archived or recovered.
     if let Some(gap) = coverage_reason(&scan.coverage, complete) {
         for it in items.iter_mut() {
-            if matches!(it.action, Action::Archive | Action::RecoverThenArchive) {
+            if matches!(
+                it.action,
+                Action::BackupThenRemove | Action::RecoverBackupThenRemove
+            ) {
                 it.reason.push_str(&gap);
             }
         }
@@ -1159,7 +1193,7 @@ fn decide(
                     .collect::<Vec<_>>()
                     .join("; ");
                 (
-                    Action::RecoverThenArchive,
+                    Action::RecoverBackupThenRemove,
                     format!(
                         "idle ({why}), but not fully saved elsewhere: {unsaved}; recover first, \
                          then archive{}",
@@ -1169,7 +1203,7 @@ fn decide(
                 )
             } else {
                 (
-                    Action::Archive,
+                    Action::BackupThenRemove,
                     format!(
                         "idle ({why}); local remote-tracking refs say every commit (reflog \
                          entries and pseudorefs such as ORIG_HEAD included) is on a network \

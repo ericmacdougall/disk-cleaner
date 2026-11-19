@@ -73,7 +73,7 @@ fn j1_submodule_at_another_commit_than_the_parent_index_is_not_clean() {
     let f = submodule_fixture(true);
     let res = scan_with(&f.root, network_everywhere());
     assert_eq!(tri_of(&res, &f.outer, "tree_clean"), "no");
-    assert_ne!(action_for(&res, &f.outer), Action::Archive);
+    assert_ne!(action_for(&res, &f.outer), Action::BackupThenRemove);
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn j1_staged_gitlink_change_is_not_clean() {
     git(&f.outer, &["add", "sub"]);
     let res = scan_with(&f.root, network_everywhere());
     assert_eq!(tri_of(&res, &f.outer, "tree_clean"), "no");
-    assert_ne!(action_for(&res, &f.outer), Action::Archive);
+    assert_ne!(action_for(&res, &f.outer), Action::BackupThenRemove);
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn j1_plain_directory_with_files_at_a_gitlink_path_is_not_clean() {
     write(&f.outer.join("sub").join("stray.txt"), "not in any repo\n");
     let res = scan_with(&f.root, network_everywhere());
     assert_eq!(tri_of(&res, &f.outer, "tree_clean"), "no");
-    assert_ne!(action_for(&res, &f.outer), Action::Archive);
+    assert_ne!(action_for(&res, &f.outer), Action::BackupThenRemove);
 }
 
 // ---------------------------------------------------------------- J2: core.worktree

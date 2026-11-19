@@ -89,6 +89,12 @@ fn repo_node(path: &str, class: Class, facts: Facts) -> Node {
     n.newest_mtime = Some(0);
     n.repo = Some(RepoInfo {
         facts,
+        // The scan counted the git directory's own files, as it does for every real `.git`.
+        git_admin: Some(disk_cleaner_core::GitAdminSurvey {
+            files: 12,
+            bytes: 49_152,
+            ..Default::default()
+        }),
         ..RepoInfo::default()
     });
     n
@@ -102,13 +108,13 @@ fn a_repo_with_any_fact_not_yes_never_gets_a_removing_action() {
         let s = synthetic(vec![repo_node("/r", class, all_yes())]);
         assert_eq!(
             plan(&s, &opts(vec![], 30, now)).items[0].action,
-            Action::Archive
+            Action::BackupThenRemove
         );
     }
     for class in [Class::Repo, Class::Worktree] {
         for index in 0..11 {
             for (v, expected) in [
-                (Tri::No, Action::RecoverThenArchive),
+                (Tri::No, Action::RecoverBackupThenRemove),
                 (Tri::Unknown, Action::Ask),
             ] {
                 let s = synthetic(vec![repo_node("/r", class, with_fact(index, v))]);
@@ -125,7 +131,7 @@ fn a_repo_with_any_fact_not_yes_never_gets_a_removing_action() {
                 assert_eq!(a, expected, "fact {index} = {v:?} on {class:?}");
                 assert!(!matches!(
                     a,
-                    Action::Archive | Action::RemoveRegenerable | Action::BackupThenRemove
+                    Action::BackupThenRemove | Action::RemoveRegenerable
                 ));
                 assert!(!p.items[0].reason.is_empty());
             }
@@ -152,7 +158,7 @@ fn idle_threshold_is_an_input_not_a_constant() {
     let now = 100 * DAY;
     assert_eq!(
         plan(&s, &opts(vec![], 99, now)).items[0].action,
-        Action::Archive
+        Action::BackupThenRemove
     );
     // Exactly at the window edge still counts as active.
     assert_eq!(
@@ -192,7 +198,7 @@ fn neg11_default_window_keeps_a_repo_touched_six_days_ago_but_a_shorter_window_d
     let p = plan(&s, &opts(vec![], 3, now));
     assert_ne!(p.items[0].action, Action::Keep);
     assert_eq!(p.items[0].state, ProjectState::Idle);
-    assert_eq!(p.items[0].action, Action::Archive);
+    assert_eq!(p.items[0].action, Action::BackupThenRemove);
     assert!(p.items[0].state_reason.contains("3-day"));
 }
 
@@ -221,7 +227,7 @@ fn a_running_process_inside_a_project_makes_it_and_its_regenerable_dirs_active()
 
     // Control: nothing running, both idle.
     let p = plan(&s, &opts(vec![], 7, now));
-    assert_eq!(p.items[0].action, Action::Archive);
+    assert_eq!(p.items[0].action, Action::BackupThenRemove);
     assert_eq!(p.items[1].action, Action::RemoveRegenerable);
 
     let mut o = opts(vec![], 7, now);
@@ -347,7 +353,7 @@ fn neg8_repo_under_an_active_path_is_kept_with_its_huge_node_modules() {
         action_of(&p, &repo.join("node_modules")),
         Action::RemoveRegenerable
     );
-    assert_eq!(action_of(&p, &repo), Action::Archive);
+    assert_eq!(action_of(&p, &repo), Action::BackupThenRemove);
 
     // Active: everything under it is kept, however idle.
     let p = plan(&res, &opts(vec![work.clone()], 30, now));
@@ -435,7 +441,7 @@ fn totals_do_not_double_count_nested_removals() {
     nm.bytes_self = 6_000;
     let s = synthetic(vec![repo, nm]);
     let p = plan(&s, &opts(vec![], 30, 365 * DAY));
-    assert_eq!(action_of(&p, Path::new("/r")), Action::Archive);
+    assert_eq!(action_of(&p, Path::new("/r")), Action::BackupThenRemove);
     assert_eq!(
         action_of(&p, Path::new("/r/node_modules")),
         Action::RemoveRegenerable
@@ -454,7 +460,7 @@ fn g2_a_skipped_mount_inside_a_node_makes_it_and_every_enclosing_node_ask() {
     // Control: fully scanned, both are removable.
     let s = synthetic(vec![repo.clone(), nm.clone()]);
     let p = plan(&s, &opts(vec![], 7, now));
-    assert_eq!(action_of(&p, Path::new("/w/r")), Action::Archive);
+    assert_eq!(action_of(&p, Path::new("/w/r")), Action::BackupThenRemove);
     assert_eq!(
         action_of(&p, Path::new("/w/r/node_modules")),
         Action::RemoveRegenerable
@@ -507,7 +513,7 @@ fn f3_a_nested_git_node_with_a_fact_not_yes_stops_the_enclosing_repo() {
     };
     let s = synthetic(vec![outer, sub]);
     let p = plan(&s, &opts(vec![], 7, now));
-    assert_eq!(p.items[1].action, Action::RecoverThenArchive);
+    assert_eq!(p.items[1].action, Action::RecoverBackupThenRemove);
     assert_eq!(p.items[0].action, Action::Ask);
 }
 
@@ -532,7 +538,7 @@ fn f3_a_removable_regenerable_child_does_not_block_the_parent() {
     let nm = child("/w/outer/node_modules", Class::Regenerable, 0);
     let s = synthetic(vec![outer, nm]);
     let p = plan(&s, &opts(vec![], 7, now));
-    assert_eq!(p.items[0].action, Action::Archive);
+    assert_eq!(p.items[0].action, Action::BackupThenRemove);
     assert_eq!(p.items[1].action, Action::RemoveRegenerable);
 }
 
@@ -540,7 +546,7 @@ fn f3_a_removable_regenerable_child_does_not_block_the_parent() {
 fn f8_archive_is_not_counted_as_ready_and_remote_facts_are_labelled_unverified() {
     let s = synthetic(vec![repo_node("/r", Class::Repo, all_yes())]);
     let p = plan(&s, &opts(vec![], 7, 365 * DAY));
-    assert_eq!(p.items[0].action, Action::Archive);
+    assert_eq!(p.items[0].action, Action::BackupThenRemove);
     assert_eq!(
         p.totals.ready_bytes, 0,
         "no recovery step cannot be claimed from local refs"
@@ -572,5 +578,5 @@ fn plan_is_a_dry_run_and_serializes_with_a_schema_version() {
     assert!(p.dry_run);
     let v: serde_json::Value = serde_json::to_value(&p).unwrap();
     assert_eq!(v["schema_version"], SCHEMA_VERSION);
-    assert_eq!(v["items"][0]["action"], "archive");
+    assert_eq!(v["items"][0]["action"], "backup-then-remove");
 }

@@ -173,7 +173,7 @@ fn q2_a_symlink_anywhere_in_a_git_directory_makes_the_layout_not_plain() {
         .unwrap_or_default();
     assert!(issue.contains("info/exclude"), "{issue}");
     // A link that leaves the scan from inside one repo does not make unrelated repos ask.
-    assert_eq!(action_for(&res, &c), Action::Archive);
+    assert_eq!(action_for(&res, &c), Action::BackupThenRemove);
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn q2_control_links_into_a_working_tree_do_not_block() {
 
     let res = scan_with(&root, network_everywhere());
     assert_eq!(facts_of(&res, &a).no_dependents, Tri::Yes);
-    assert_eq!(action_for(&res, &a), Action::Archive);
+    assert_eq!(action_for(&res, &a), Action::BackupThenRemove);
 }
 
 // ---------------------------------------------------------------- Q3

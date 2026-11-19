@@ -170,6 +170,7 @@ fn run_plan(a: PlanArgs) -> Result<()> {
         trust_partial_process_check: a.trust_partial_process_check
             || cfg.trust_partial_process_check,
         accept_incomplete_coverage: a.accept_incomplete_coverage || cfg.accept_incomplete_coverage,
+        max_git_admin_bytes: cfg.max_git_admin_bytes,
     };
     let p = plan(&scan_result, &opts);
     if a.json {

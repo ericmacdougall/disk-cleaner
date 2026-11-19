@@ -13,18 +13,23 @@ pub mod git;
 mod gitshape;
 pub mod model;
 pub mod plan;
+pub mod preserve;
 pub mod procs;
 pub mod redact;
 pub mod rules;
 pub mod scan;
 pub mod words;
 
-pub use config::{Config, ConfigSource, DEFAULT_ACTIVE_WINDOW_DAYS};
+pub use config::{Config, ConfigSource, DEFAULT_ACTIVE_WINDOW_DAYS, DEFAULT_MAX_GIT_ADMIN_BYTES};
 pub use error::{Error, Result};
 pub use facts::{is_network_url, FactsConfig};
 pub use git::{Git, GitError};
 pub use model::*;
-pub use plan::{plan, resolve_active, Action, Plan, PlanItem, PlanOptions, ProjectState};
+pub use plan::{
+    plan, resolve_active, Action, Plan, PlanItem, PlanOptions, Preserve, PreserveGitAdmin,
+    ProjectState,
+};
+pub use preserve::git_admin_files;
 pub use procs::{running_cwds, ProcessCheck};
 pub use rules::RuleSet;
 pub use scan::{scan, ScanOptions};

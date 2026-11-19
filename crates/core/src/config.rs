@@ -1,6 +1,7 @@
 //! User settings: `active_window_days`, how recent activity must be for a project to count as
-//! active (default 7), and two opt-ins, `trust_partial_process_check` and
-//! `accept_incomplete_coverage`.
+//! active (default 7), `max_git_admin_bytes`, how much of its own content one git directory may
+//! hold and still be removed after a backup (default 64 MiB), and two opt-ins,
+//! `trust_partial_process_check` and `accept_incomplete_coverage`.
 //!
 //! A config file that exists but cannot be understood is an error. It never falls back to a
 //! default, because a silent fallback could shorten the window and make projects look idle.
@@ -11,6 +12,9 @@ use std::path::{Path, PathBuf};
 
 /// Default for `active_window_days`.
 pub const DEFAULT_ACTIVE_WINDOW_DAYS: u64 = 7;
+
+/// Default for `max_git_admin_bytes`: 64 MiB.
+pub const DEFAULT_MAX_GIT_ADMIN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Where a value came from, for reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,9 +34,13 @@ pub struct Config {
     /// Off unless the user turns it on.
     pub trust_partial_process_check: bool,
     /// When the scan could not read some folders or skipped mount points, still offer
-    /// repositories for archiving (each reason says what was not read). Off unless the user turns
-    /// it on: by default every repository's dependents are then unknown and it asks.
+    /// repositories for removal after a backup (each reason says what was not read). Off unless
+    /// the user turns it on: by default every repository's dependents are then unknown and it
+    /// asks.
     pub accept_incomplete_coverage: bool,
+    /// Most allocated bytes of its own files (everything but object files) one git directory may
+    /// hold and still be removed after a backup; more asks.
+    pub max_git_admin_bytes: u64,
 }
 
 impl Default for Config {
@@ -41,6 +49,7 @@ impl Default for Config {
             active_window_days: DEFAULT_ACTIVE_WINDOW_DAYS,
             trust_partial_process_check: false,
             accept_incomplete_coverage: false,
+            max_git_admin_bytes: DEFAULT_MAX_GIT_ADMIN_BYTES,
         }
     }
 }
@@ -54,6 +63,7 @@ struct RawConfig {
     active_window_days: Option<u64>,
     trust_partial_process_check: Option<bool>,
     accept_incomplete_coverage: Option<bool>,
+    max_git_admin_bytes: Option<u64>,
     /// Read only to refuse it with a message naming its replacement, whatever its value.
     require_full_coverage: Option<toml::Value>,
 }
@@ -95,6 +105,9 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
         active_window_days: raw.active_window_days.unwrap_or(DEFAULT_ACTIVE_WINDOW_DAYS),
         trust_partial_process_check: raw.trust_partial_process_check.unwrap_or(false),
         accept_incomplete_coverage: raw.accept_incomplete_coverage.unwrap_or(false),
+        max_git_admin_bytes: raw
+            .max_git_admin_bytes
+            .unwrap_or(DEFAULT_MAX_GIT_ADMIN_BYTES),
     })
 }
 

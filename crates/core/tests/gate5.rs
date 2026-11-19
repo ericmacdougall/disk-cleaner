@@ -129,7 +129,7 @@ mod odd_git {
         assert_eq!(f.no_dependents, disk_cleaner_core::Tri::No, "{f:?}");
         let a = action_for(&res, &store);
         assert!(
-            !matches!(a, Action::Archive | Action::RemoveRegenerable),
+            !matches!(a, Action::BackupThenRemove | Action::RemoveRegenerable),
             "{a:?}"
         );
         let notes = node(&res, &store).repo.as_ref().unwrap().notes.join(" ");
@@ -170,7 +170,7 @@ fn l2_control_without_odd_git_entries_a_pushed_repo_is_still_archivable() {
     let other = pushed_repo(&root, &remotes, "other");
     write(&root.join("proj").join("package.json"), "{}\n");
     let res = scan_with(&root, network_everywhere());
-    assert_eq!(action_for(&res, &other), Action::Archive);
+    assert_eq!(action_for(&res, &other), Action::BackupThenRemove);
 }
 
 // ---------------------------------------------------------------- D3: wording

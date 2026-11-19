@@ -93,7 +93,7 @@ fn one_file_system_does_not_cross_a_mount_point() {
     let (a, why) = plan_item(&full, &nm);
     assert_eq!(a, Action::RemoveRegenerable, "{why}");
     let (a, why) = plan_item(&full, &repo);
-    assert_eq!(a, Action::RecoverThenArchive, "{why}");
+    assert_eq!(a, Action::RecoverBackupThenRemove, "{why}");
 
     // G2: with --one-file-system part of each was never looked at.
     let mut part = ScanOptions::new(vec![root.clone()]);
@@ -183,7 +183,7 @@ fn one_file_system_does_not_cross_a_mount_point() {
         .iter()
         .find(|i| i.path == repo.to_string_lossy())
         .expect("plan item for the repo");
-    assert_eq!(it.action, Action::RecoverThenArchive, "{}", it.reason);
+    assert_eq!(it.action, Action::RecoverBackupThenRemove, "{}", it.reason);
     let sentence = "1 mount point in this scan was not entered (--one-file-system); dependents \
                     inside it were not checked";
     assert!(it.reason.contains(sentence), "{}", it.reason);
