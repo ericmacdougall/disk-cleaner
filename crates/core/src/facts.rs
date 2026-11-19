@@ -658,7 +658,9 @@ fn list_bounded(dir: &Path, label: &str) -> Result<Vec<(String, Lk)>, String> {
     for entry in std::fs::read_dir(dir).map_err(list_err)? {
         let entry = entry.map_err(list_err)?;
         if out.len() == MAX_ADMIN_ENTRIES {
-            return Err(format!("{label} holds more than {MAX_ADMIN_ENTRIES} entries"));
+            return Err(format!(
+                "{label} holds more than {MAX_ADMIN_ENTRIES} entries"
+            ));
         }
         let os_name = entry.file_name();
         let item = match os_name.to_str() {
