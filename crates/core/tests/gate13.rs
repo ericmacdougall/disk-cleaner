@@ -97,7 +97,7 @@ fn u1_orig_head_at_an_unpushed_commit_with_expired_reflogs_is_not_archived() {
         "B survives only through ORIG_HEAD; archive would delete it: {}",
         it.reason
     );
-    assert!(it.reason.contains("ORIG_HEAD"), "{}", it.reason);
+    assert!(it.reason.contains("kept only by ORIG_HEAD"), "{}", it.reason);
     assert_eq!(fact(&res, &repo, "reflog_saved"), "no");
 }
 
@@ -128,7 +128,7 @@ fn u1_orig_head_at_an_unpushed_commit_with_reflogs_disabled_is_not_archived() {
     let p = plan_of(&res);
     let it = item(&p, &repo);
     assert_ne!(it.action, Action::Archive, "{}", it.reason);
-    assert!(it.reason.contains("ORIG_HEAD"), "{}", it.reason);
+    assert!(it.reason.contains("kept only by ORIG_HEAD"), "{}", it.reason);
 }
 
 #[test]
@@ -220,7 +220,8 @@ fn u1_a_garbage_orig_head_asks() {
     let p = plan_of(&res);
     let it = item(&p, &repo);
     assert_eq!(it.action, Action::Ask, "{}", it.reason);
-    assert!(it.reason.contains("ORIG_HEAD"), "{}", it.reason);
+    let want = "ORIG_HEAD at the top of the git directory";
+    assert!(it.reason.contains(want), "{}", it.reason);
 }
 
 #[test]
@@ -248,6 +249,56 @@ fn u1_an_unknown_directory_or_file_at_the_top_of_the_git_directory_makes_the_lay
         assert_eq!(it.action, Action::Ask, "{}", it.reason);
         assert_ne!(fact(&res, repo, "plain_layout"), "yes", "{}", it.reason);
         assert!(it.reason.contains(name), "{}", it.reason);
+    }
+}
+
+// ------------------------------------------- U1 without a network remote (gate delta review)
+
+/// A repository with commits and no remote at all.
+fn local_only(root: &Path, name: &str) -> PathBuf {
+    let repo = root.join(name);
+    init_repo(&repo);
+    repo
+}
+
+#[test]
+fn u1_local_only_orig_head_commit_is_named_for_recovery() {
+    let (_tmp, root, _remotes) = workspace();
+    let repo = local_only(&root, "app");
+    commit_file(&repo, "dropped.txt", "only ORIG_HEAD keeps this\n");
+    git(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+    git(&repo, &["reflog", "expire", "--expire=all", "--all"]);
+    assert_no_reflog(&repo);
+
+    let res = scan_with(&root, network_everywhere());
+    let p = plan_of(&res);
+    let it = item(&p, &repo);
+    assert_eq!(it.action, Action::RecoverThenArchive, "{}", it.reason);
+    assert!(
+        it.reason.contains("kept only by ORIG_HEAD"),
+        "recovery must be told to capture ORIG_HEAD: {}",
+        it.reason
+    );
+    let v = serde_json::to_value(node(&res, &repo).repo.as_ref().unwrap()).unwrap();
+    assert_eq!(v["unsaved_pseudorefs"], serde_json::json!(["ORIG_HEAD"]));
+}
+
+#[test]
+fn u1_local_only_pseudorefs_that_cannot_be_checked_ask() {
+    let (_tmp, root, _remotes) = workspace();
+    let garbage = local_only(&root, "garbage");
+    write(&garbage.join(".git").join("ORIG_HEAD"), "not a commit id\n");
+    let tree = local_only(&root, "tree");
+    let id = git(&tree, &["rev-parse", "HEAD^{tree}"]);
+    write(&tree.join(".git").join("FOO_HEAD"), &format!("{id}\n"));
+
+    let res = scan_with(&root, network_everywhere());
+    let p = plan_of(&res);
+    for (repo, name) in [(&garbage, "ORIG_HEAD"), (&tree, "FOO_HEAD")] {
+        let it = item(&p, repo);
+        assert_eq!(it.action, Action::Ask, "{name}: {}", it.reason);
+        let want = format!("{name} at the top of the git directory");
+        assert!(it.reason.contains(&want), "{}", it.reason);
     }
 }
 
