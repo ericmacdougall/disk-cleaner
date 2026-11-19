@@ -28,14 +28,23 @@ export function summaryLines(s: DevSummary): string[] {
   return lines;
 }
 
+/** "101 to 200": the items a page at `offset` holds out of `count`. */
+function rangeText(offset: number, count: number): string {
+  return `${count === 0 ? 0 : offset + 1} to ${Math.min(count, offset + DEV_PAGE)}`;
+}
+
 export class DevView {
   readonly el: HTMLElement;
   private summary: HTMLElement;
   private groups: HTMLElement;
   private items: HTMLElement;
+  private itemsError: HTMLElement;
   private sessions: HTMLElement;
+  /** The class and offset asked for; after a failed request they go back to `shown`. */
   private cls: string | null = null;
   private offset = 0;
+  /** The class and offset of the page on screen (null before the first page). */
+  private shown: { cls: string; offset: number } | null = null;
   private data: DevSummary | null = null;
   /** Each item request gets a number; only the latest one is shown. */
   private itemsGen = 0;
@@ -49,6 +58,7 @@ export class DevView {
     this.summary = h("div", { class: "dev-summary" });
     this.groups = h("div", { class: "dev-groups", role: "group", "aria-label": "Classes" });
     this.items = h("div", { class: "dev-items" });
+    this.itemsError = h("div", { class: "dev-items-error" });
     this.sessions = h("section", { class: "dev-sessions", "aria-label": "Agent session folders" });
     const apply = h(
       "section",
@@ -61,7 +71,7 @@ export class DevView {
         "Not available: this app is read-only. It never deletes, moves or backs up anything. Export the plan and review it; applying a plan is a separate, later step.",
       ),
     );
-    this.el = h("section", { class: "dev", "aria-label": "Developer view" }, this.summary, this.groups, this.items, this.sessions, apply);
+    this.el = h("section", { class: "dev", "aria-label": "Developer view" }, this.summary, this.groups, this.itemsError, this.items, this.sessions, apply);
   }
 
   async load(): Promise<void> {
@@ -109,7 +119,9 @@ export class DevView {
   }
 
   /** Load the current class and offset. Only the latest request is shown (a late reply of
-   * an older one is dropped), and the range is the one that request asked for. */
+   * an older one is dropped), and the range is the one that request asked for. A failed
+   * request leaves the page on screen, puts the class and offset back to that page (so
+   * Previous, Next and the class buttons agree with what is shown) and offers Try again. */
   private async loadItems(): Promise<void> {
     const cls = this.cls;
     const offset = this.offset;
@@ -121,19 +133,43 @@ export class DevView {
     try {
       list = await this.backend.devPage(this.view, cls, offset, DEV_PAGE);
     } catch (e) {
-      if (gen === this.itemsGen) {
-        this.pagePending = false;
-        this.status(errorMessage(e));
+      if (gen !== this.itemsGen) return;
+      this.pagePending = false;
+      const message = errorMessage(e);
+      this.status(message);
+      if (this.shown) {
+        this.cls = this.shown.cls;
+        this.offset = this.shown.offset;
+        this.renderGroups();
       }
+      replace(
+        this.itemsError,
+        h("p", { role: "alert" }, `Could not load ${g.label} ${rangeText(offset, g.count)}: ${message}`),
+        h(
+          "button",
+          {
+            type: "button",
+            onclick: () => {
+              this.cls = cls;
+              this.offset = offset;
+              this.renderGroups();
+              void this.loadItems();
+            },
+          },
+          "Try again",
+        ),
+      );
       return;
     }
     if (gen !== this.itemsGen) return;
     this.pagePending = false;
+    this.shown = { cls, offset };
+    replace(this.itemsError);
     const pager = h(
       "div",
       { class: "pager" },
       h("button", { type: "button", disabled: offset === 0, onclick: () => void this.pageBy(-DEV_PAGE) }, "Previous"),
-      ` ${g.count === 0 ? 0 : offset + 1} to ${Math.min(g.count, offset + DEV_PAGE)} of ${formatCount(g.count)} `,
+      ` ${rangeText(offset, g.count)} of ${formatCount(g.count)} `,
       h("button", { type: "button", disabled: offset + DEV_PAGE >= g.count, onclick: () => void this.pageBy(DEV_PAGE) }, "Next"),
     );
     replace(
