@@ -1,0 +1,39 @@
+[package]
+name = "prunedisk-desktop"
+description = "PruneDisk desktop app (read-only): size tree, treemap, top files and developer view"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ericmacdougall/disk-cleaner"
+publish = false
+
+# Its own workspace: it needs system webview libraries that the core CI jobs do not install.
+[workspace]
+
+[lib]
+name = "prunedisk_desktop_lib"
+crate-type = ["rlib"]
+
+[features]
+# Test-only hooks for the WebDriver smoke test (open a scan file named by an environment
+# variable at start). Release bundles are built without it.
+e2e = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+command-group = "5"
+disk-cleaner-core = { path = "../../../crates/core" }
+disk-cleaner-view = { path = "../../../crates/view" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = { version = "0.33", default-features = false, features = ["disk", "system"] }
+tauri = { version = "2.12", features = [] }
+tauri-plugin-dialog = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"

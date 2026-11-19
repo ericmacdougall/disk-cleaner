@@ -1,5 +1,8 @@
 [workspace]
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/view", "crates/tui"]
+# The desktop app is its own Cargo workspace (it needs system webview libraries that the core
+# CI jobs do not install). See apps/desktop/README.md.
+exclude = ["apps/desktop/src-tauri"]
 resolver = "2"
 
 [workspace.package]

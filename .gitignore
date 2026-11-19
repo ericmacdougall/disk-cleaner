@@ -5,3 +5,7 @@ dist/
 *.log
 .env*
 /scans/
+
+# Desktop app: generated at build time (icons come from apps/desktop/app-icon.svg)
+apps/desktop/src-tauri/icons/
+apps/desktop/src-tauri/gen/

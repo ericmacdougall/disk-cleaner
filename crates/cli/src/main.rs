@@ -29,6 +29,8 @@ enum Command {
     Scan(ScanArgs),
     /// Turn a scan into a dry-run plan. Nothing is changed.
     Plan(PlanArgs),
+    /// Browse a scan in the terminal: size tree and developer view (read-only).
+    Tui(disk_cleaner_tui::TuiArgs),
 }
 
 #[derive(Args)]
@@ -106,6 +108,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Scan(a) => run_scan(a),
+        Command::Tui(a) => disk_cleaner_tui::run(a),
         Command::Plan(a) => run_plan(a),
     }
 }

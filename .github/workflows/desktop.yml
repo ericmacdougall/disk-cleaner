@@ -1,0 +1,201 @@
+name: desktop
+
+# Terminal view, desktop app checks, read-only guard, smoke tests, performance and unsigned
+# bundles. Everything compiles here: nothing heavy is built on a developer machine.
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lockfiles:
+    name: lockfiles are current
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - name: Resolve the root workspace
+        run: cargo metadata --format-version 1 > /dev/null
+      - name: Resolve the desktop workspace
+        working-directory: apps/desktop/src-tauri
+        run: cargo metadata --format-version 1 > /dev/null
+      - name: Upload the resolved lockfiles
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lockfiles
+          path: |
+            Cargo.lock
+            apps/desktop/src-tauri/Cargo.lock
+          retention-days: 7
+      - name: Fail when a lockfile changed
+        run: |
+          git status --porcelain -- Cargo.lock apps/desktop/src-tauri/Cargo.lock
+          test -z "$(git status --porcelain -- Cargo.lock apps/desktop/src-tauri/Cargo.lock)" || {
+            echo "::error::Cargo.lock is not current; commit the 'lockfiles' artifact of this run"; exit 1; }
+
+  ui-crates:
+    name: view and tui (${{ matrix.os }})
+    needs: lockfiles
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Clippy (view, tui)
+        run: cargo clippy -p disk-cleaner-view -p disk-cleaner-tui --all-targets --locked -- -D warnings
+      - name: Test (view, tui)
+        run: cargo test -p disk-cleaner-view -p disk-cleaner-tui --locked --no-fail-fast
+      - name: Build the disk-cleaner binary with the tui subcommand
+        run: cargo build -p disk-cleaner-cli --locked
+
+  frontend:
+    name: frontend unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  desktop-check:
+    name: desktop backend (linux)
+    needs: lockfiles
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: apps/desktop/src-tauri
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: System libraries for the webview
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential file libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Frontend and icons
+        working-directory: apps/desktop
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npx tauri icon app-icon.svg
+      - name: Clippy (desktop)
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test (desktop)
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked --no-fail-fast
+
+  bundles:
+    name: bundle (${{ matrix.name }})
+    needs: [ui-crates, frontend, desktop-check]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - name: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+          - name: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: apps/desktop/src-tauri
+          key: ${{ matrix.target }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: System libraries for the webview
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential file libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Frontend and icons
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          npm ci --no-audit --no-fund
+          npx tauri icon app-icon.svg
+      - name: Build the unsigned bundle
+        working-directory: apps/desktop
+        shell: bash
+        run: npx tauri build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Stage bundles and checksums
+        shell: bash
+        run: |
+          mkdir -p dist-bundles
+          base="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          find "$base" -maxdepth 2 -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \
+            -o -name '*.AppImage' -o -name '*.deb' \) -exec cp {} dist-bundles/ \;
+          if [ -d "$base/macos" ]; then
+            (cd "$base/macos" && tar -czf "$GITHUB_WORKSPACE/dist-bundles/PruneDisk-${{ matrix.name }}.app.tar.gz" *.app)
+          fi
+          cd dist-bundles
+          ls -la
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum * > SHA256SUMS; else shasum -a 256 * > SHA256SUMS; fi
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: prunedisk-${{ matrix.name }}-unsigned
+          path: dist-bundles/*
+          retention-days: 14
+          if-no-files-found: error
