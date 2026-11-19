@@ -433,10 +433,11 @@ always to the user's own storage):
   user's global config, default `$XDG_CONFIG_HOME/git/ignore`), found with a dedicated
   `ls-files --others --ignored --exclude-from=<that file>` run that reads the pattern file and runs
   no program. SCAN-FORMAT.md requires these to be treated as possibly secret;
-- it is untracked or ignored, smaller than 1 MiB, and its first 64 KiB contain a private key block
-  (`-----BEGIN [A-Z ]*PRIVATE KEY-----`), a URL with a password (`scheme://user:pass@`), or a token
-  with a well-known prefix (`AKIA`, `ASIA`, `ghp_`, `gho_`, `ghs_`, `github_pat_`, `glpat-`,
-  `xoxa-`, `xoxb-`, `xoxp-`, `sk-`, `AIza`);
+- it is untracked or ignored, smaller than 1 MiB, and its first 64 KiB contain the header line of a
+  PEM private key block, a URL that carries a password or token before the host, or a token in one
+  of the documented formats of the common providers (AWS access keys, GitHub and GitLab tokens,
+  Slack tokens, API secret keys of the common model providers, Google API keys); the exact
+  patterns live in the code and its tests, not in this document;
 - it is a file of a git directory (`config`, `FETCH_HEAD`, files under `logs/`, any other) that
   contains a URL whose userinfo holds a password or a token (a bare user name, as in a default Azure
   DevOps clone URL, is not a credential).
@@ -939,8 +940,8 @@ anywhere). A library step hook lets a test act between any two steps; the binary
 - **NEG-14 (AC-14)** A git directory file that cannot be read, a name core cannot enumerate, a fifo
   in the item, a preserve-set file missing from the index: skipped before any upload counts.
 - **NEG-15 (AC-15)** `.env`, `id_ecdsa`, a globally ignored `secrets.local`, an `unusual.txt` holding
-  a private key block, and `https://user:token@host` in `.git/config`, `FETCH_HEAD` and
-  `logs/HEAD`: the item is kept by default and none of the values appears in any stored object,
+  a private key block, and an https URL that carries a user name and token before the host in
+  `.git/config`, `FETCH_HEAD` and `logs/HEAD`: the item is kept by default and none of the values appears in any stored object,
   segment, journal line or output; with `--upload-secrets` they are archived; with
   `--require-encrypted-remote` and a plain remote, exit 1 before any upload.
 - **NEG-16 (AC-16)** An xattr over 64 KiB, or a Windows ADS other than `Zone.Identifier`: item
