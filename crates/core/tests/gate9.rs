@@ -159,8 +159,18 @@ fn q1_control_two_unrelated_clean_clones_stay_archivable() {
     };
     o.trust_partial_process_check = true;
     let p = plan(&res, &o);
-    assert_eq!(item(&p, &a).action, Action::Archive, "{}", item(&p, &a).reason);
-    assert_eq!(item(&p, &b).action, Action::Archive, "{}", item(&p, &b).reason);
+    assert_eq!(
+        item(&p, &a).action,
+        Action::Archive,
+        "{}",
+        item(&p, &a).reason
+    );
+    assert_eq!(
+        item(&p, &b).action,
+        Action::Archive,
+        "{}",
+        item(&p, &b).reason
+    );
 }
 
 // ---------------------------------------------------------------- Q3
@@ -205,7 +215,10 @@ fn q3_a_parent_and_child_root_count_like_the_parent_alone() {
     write_bytes(&app.join("data.bin"), 300_000);
     let loose = root.join("loose");
     write(&loose.join("package.json"), "{}\n");
-    write_bytes(&loose.join("node_modules").join("pkg").join("index.js"), 50_000);
+    write_bytes(
+        &loose.join("node_modules").join("pkg").join("index.js"),
+        50_000,
+    );
     // Settle the index once, so no scan below sees it rewritten.
     git(&app, &["status", "--porcelain"]);
 

@@ -646,8 +646,8 @@ fn dependents_reason(node: &Node) -> String {
         String::new()
     };
     format!(
-        "{} other checkouts use this repository's objects or refs: {shown}{more}; deal with those \
-         first",
+        "{} other checkouts or links use this repository's objects or refs: {shown}{more}; deal \
+         with those first",
         who.len()
     )
 }

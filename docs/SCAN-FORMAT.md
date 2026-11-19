@@ -1,10 +1,13 @@
 # Scan and plan JSON format
 
-Schema version: **4** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **5** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
-`plain_layout`, `repo.layout_issue` and the scan field `scope`. All sizes are bytes. All times are unix seconds (UTC).
+`plain_layout`, `repo.layout_issue` and the scan field `scope`. Version 5 changed no field but
+made `no_dependents` and `plain_layout` stricter (inbound references, symlinks anywhere in a git
+directory, see below): a version 4 scan can say `yes` where version 5 says `no`, so it is refused.
+All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 
 Produce a scan with `disk-cleaner scan <path>... --out scan.json` (or `--json` for stdout) and a
@@ -16,10 +19,10 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 4 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 5 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
-| `roots` | absolute scan roots |
+| `roots` | absolute scan roots that were walked, as spelled; overlapping roots are normalised first (see "Overlapping scan roots") |
 | `options` | `one_file_system`, `top_files`, `min_output_bytes`, `git_facts` |
 | `totals` | see below |
 | `nodes` | classified directories (below) |
@@ -74,6 +77,30 @@ the directory that holds them); `output_bytes` counts them separately.
   holds it (or the mount point itself, when a rule matches it) records it in `skipped_mounts` and is
   never offered for removal; enclosing nodes then ask through the plan's enclosing rule.
 - Unreadable entries are counted and listed in `issues`; the scan continues.
+
+### Overlapping scan roots
+
+Every directory is walked once, however the roots overlap. Before the walk each root is made
+absolute and compared with the others by its real path (`canonicalize`); the walk itself and every
+reported path keep the spelling the user gave.
+
+- A root that is the same directory as an earlier root (`/projects` and `/projects/app/..`, or a
+  symlinked spelling of it) is dropped, with a warning.
+- A root inside another root (`/projects` and `/projects/app`) is dropped, with a warning, when the
+  enclosing root's walk provably reaches it: every directory from the enclosing root down to it can
+  be listed and, with `--one-file-system`, is on the enclosing root's device. The result is then the
+  same as scanning the enclosing root alone: the same totals, nodes, outputs, biggest files and
+  plan bytes.
+- Otherwise the inner root is kept and walked on its own, and the enclosing walk stops at it (it
+  counts that directory's own entry once and does not enter it). This is the `--one-file-system`
+  case: a child root on another device than its ancestor is not covered by the ancestor's walk, so
+  it is still walked, it is counted once, and it is not reported as a skipped mount point. It also
+  covers a directory on the way that cannot be listed.
+
+Dropping a covered inner root, rather than refusing the combination, was chosen because the
+user's intent is unambiguous (the inner root is already part of the scan) and the warning says what
+happened. A root spelled differently only by letter case on a case-insensitive file system may not
+be recognised as the same directory.
 
 ### `nodes`
 
@@ -182,7 +209,7 @@ Facts (the safe value is always `yes`):
 | `stash_empty` | the stash is empty |
 | `tree_clean` | no tracked changes and no untracked files in this repo's own tree (submodules are their own nodes), no file marked skip-worktree or assume-unchanged (those hide local edits), and every submodule gitlink agrees: the index matches HEAD, and each checked-out submodule's HEAD equals the commit the index records (`status --ignore-submodules=all` hides both). A recorded submodule with a missing or empty directory is fine; a directory with files and no `.git` at a gitlink path, an unmerged gitlink or a differing commit is `no`; a submodule whose config fails the allowlist, whose HEAD cannot be read, or more than 200 submodules is `unknown`. The commits are compared with `ls-files -s`, `ls-tree -r HEAD` and `rev-parse --verify HEAD` run in the submodule through the hardened runner; no status runs inside it |
 | `no_unique_ignored` | no ignored files outside regenerable and cache directories (`.env`, local databases...) |
-| `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone depends on this object store |
+| `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone, shared object directory or other reference into this repository's git directory was found (see "Inbound references") |
 | `reflog_saved` | every commit reachable from any reflog entry (HEAD of this worktree and every ref's reflog) is contained in a network remote's tracking refs. An unpushed commit after `git reset --hard`, an amended or rebased-away commit and a stash's commits are `no`. No network remote is `no`; an unborn HEAD, any git failure or a timeout is `unknown` |
 | `plain_layout` | the repository has the plain layout described under "Plain layout" below. `no` or `unknown` makes the plan `ask` with the reason `unusual repository layout: <first failing check>` (kept in `repo.layout_issue`); it is never `recover-then-archive` or `archive` |
 | `no_pending_state` | no unfinished rebase, merge, cherry-pick, revert or bisect in this worktree's git directory (`rebase-merge`, `rebase-apply`, `sequencer`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_*`) and no local-only content under `.git/lfs/objects` or `.git/annex/objects`. Found by name only. Never `no`: a finding is `unknown` (state that no ref records cannot be recovered into a ref, so a person decides) |
@@ -216,7 +243,13 @@ is followed):
    `--separate-git-dir` repository) or a symlink is never plain. This is a deliberate Phase 1
    limit: those repositories, and the main repository of a worktree, always ask.
 2. `HEAD` and `config` are regular files and `refs`, `objects`, `objects/info` and `objects/pack` are
-   directories, all present and none a symlink.
+   directories, all present and none a symlink. Beyond that, no entry anywhere inside the git
+   directory, at any depth, is a symbolic link: a loose-object fanout directory, a pack or index
+   file, a ref, `packed-refs`, a hook or an `info` file that is a symlink puts part of the
+   repository somewhere else (`the git directory contains a symbolic link (objects/ab)`). This is
+   found by the scan's own walk, which already sizes the git directory, not by a second traversal;
+   when the checks above fail too, their finding is reported first. A symlinked hook therefore makes
+   a repository ask.
 3. None of `objects/info/alternates`, `objects/info/http-alternates`, `commondir`, `info/grafts`
    or `annex` exists.
 4. `worktrees/` and `modules/` are absent or empty (so a repository with submodules, checked out
@@ -269,6 +302,61 @@ malformed); other entries are paths as written; a relative entry is resolved aga
 git node; an entry that is malformed, cannot be canonicalised, or names a place outside the scan
 is never dropped: it is unresolved (see above) and a warning says why. Chains are followed
 through scanned repos only: if A borrows from B and B from C, C lists both A and B as dependents.
+
+**Inbound references.** Repositories that depend on a scanned repository are not always nodes
+themselves: a clone inside `node_modules` or another regenerable directory is never classified, and
+a repository can borrow objects through a symlink anywhere in its object store. Enumerating such
+layouts kept missing one, so dependencies are also found from the references themselves, whatever
+holds them. While walking every directory under the scan roots (inside regenerable and cache
+directories and inside `.git` directories too) the scan records:
+
+- every symbolic link: `readlink`, then the target resolved as a path (`canonicalize`; for a
+  dangling link, the real path of its deepest existing ancestor plus the rest). Nothing is opened or
+  traversed through the link and no program is run. Links whose target lies outside every scan root
+  cannot point into a scanned repository and are not kept; at most 200,000 are kept;
+- every `objects/info/alternates` and `objects/info/http-alternates` entry, wherever it is
+  (inside `node_modules`, inside `.git/modules`, in a repository that is not a node); at most
+  20,000;
+- every `.git` directory or `.git` file inside a regenerable or cache directory.
+
+After the walk:
+
+- A reference whose target lies inside the git directory of a scanned repository N (its `.git`
+  directory, or a bare repository), made from outside that git directory, gives N
+  `no_dependents = no`, with a note naming the path that refers in and an entry in `dependents`:
+  the repository whose git directory holds the reference, else the checkout whose `.git` holds it,
+  else the link itself. This covers a symlinked `objects`, a symlinked fanout directory or pack file,
+  a hidden checkout's `.git` symlink, and a convenience link such as `hooks -> A/.git/hooks`. The
+  last is deliberately conservative: a link into a git directory may be how another checkout
+  reaches its objects, and the scan cannot tell the difference, so the repository asks.
+- A reference that is git data (an alternates entry, a `.git` file's `gitdir:`, the `commondir` and
+  object store it leads to, or a symlink inside a git directory or object store) whose target lies
+  in another node is a dependency on that node: a repository there gets `no_dependents = no`, a
+  regenerable or cache directory there gets an `ask_reason`. A symlink outside every git directory
+  that points into a repository's working tree, or into an artifact directory (`node_modules/x ->
+  ../../other-project`), is not a dependency and blocks nothing.
+- The alternates files are parsed with the syntax below; an entry that is malformed, cannot be
+  resolved or lies outside the scan, an unreadable alternates file, a hidden `.git` file or
+  `commondir` that cannot be resolved or leads outside the scan, a symlink that cannot be read, and
+  more links or alternates files than the bounds are unresolved: every git node that had
+  `no_dependents = yes` gets `unknown` and a warning says why. (`http-alternates` holds URLs, which
+  never resolve to a scanned directory, so any entry there is unresolved.)
+- A regenerable or cache directory that holds such a repository still asks, as before.
+
+**Known limits of dependency discovery.**
+
+- Hard links cannot be detected as references. Two object stores that share pack or object files
+  through hard links (`git clone` of a local path without `--no-hardlinks` does this) look like two
+  independent repositories. Their objects survive the removal of either (a hard-linked file stays
+  until its last name is removed), but nothing records that one was created from the other.
+- References from outside the scanned roots are invisible: a clone, symlink or alternates file that
+  lives in a folder the scan did not cover (including a directory the scan could not read, or a mount
+  point `--one-file-system` did not enter) is not seen. A subtree scan says so in its `scope`.
+- More than 200,000 kept symlinks or 20,000 alternates files makes every repository's
+  `no_dependents` `unknown` (safe, but nothing is archived); a large pnpm or git-annex tree can reach
+  it.
+- Resolving a symlink's target as a path touches each directory on the way (as `realpath` does), so
+  a link to an automounted or stale network path can slow the scan; nothing is read through it.
 
 Remote URLs have embedded credentials removed (`https://user:token@host/x` is stored as
 `https://host/x`; everything up to the last `@` counts as userinfo, and query strings and fragments are

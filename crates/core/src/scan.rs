@@ -71,6 +71,20 @@ struct EntryMeta {
     nlink: u64,
     mtime: i64,
     mount_skipped: bool,
+    /// This directory is another scan root, walked on its own: not entered here (index of that
+    /// root in the walk plan).
+    pruned_root: Option<usize>,
+    /// For a symlink: where it leads, read with `readlink` and resolved as a path.
+    link_target: Option<LinkTarget>,
+}
+
+/// Where a symlink leads. The link is read with `readlink` and its target resolved as a path
+/// (`canonicalize`, or for a dangling link the deepest existing ancestor plus the rest); nothing
+/// is opened or traversed through the link.
+#[derive(Debug, Clone)]
+enum LinkTarget {
+    Unreadable,
+    Resolved(PathBuf),
 }
 
 type ClientState = ((), EntryMeta);
@@ -87,6 +101,8 @@ fn meta_from(md: &Metadata) -> EntryMeta {
         nlink: md.nlink(),
         mtime: md.mtime(),
         mount_skipped: false,
+        pruned_root: None,
+        link_target: None,
     }
 }
 
@@ -109,6 +125,8 @@ fn meta_from(md: &Metadata) -> EntryMeta {
         nlink: 1,
         mtime,
         mount_skipped: false,
+        pruned_root: None,
+        link_target: None,
     }
 }
 
@@ -138,6 +156,8 @@ struct DirAgg {
     /// state files), split by whether package fixtures routinely use the name. Names only.
     state_hard: Option<(String, usize)>,
     state_soft: Option<(String, usize)>,
+    /// Name of the first direct entry that is a symlink.
+    first_symlink: Option<String>,
 }
 
 struct Walk {
@@ -155,9 +175,34 @@ struct Walk {
     skipped_paths: Vec<PathBuf>,
     /// More skipped mount points than `MAX_ISSUE_PATHS`: every node counts as incomplete.
     skipped_overflow: bool,
+    /// Real paths of the scan roots that are walked: a symlink whose target lies outside all of
+    /// them cannot point into a scanned repository.
+    canon_roots: Vec<PathBuf>,
+    /// Scan roots (walk-plan index) whose own directory entry was already counted by the walk of
+    /// an enclosing root, which stopped there.
+    pruned_hit: HashSet<usize>,
+    /// What the inbound-reference pass needs (see [`link_inbound`]).
+    refs: Refs,
 }
 
 const MAX_ISSUE_PATHS: usize = 100_000;
+
+/// Most symlinks recorded for the inbound-reference pass; more makes every repo's dependents
+/// unknown.
+const MAX_LINKS: usize = 200_000;
+/// Most alternates files recorded; more makes every repo's dependents unknown.
+const MAX_ALTERNATES: usize = 20_000;
+
+/// References that may lead into a repository's git directory, gathered during the walk.
+#[derive(Default)]
+struct Refs {
+    /// Symlinks (spelled path, target) whose target lies inside a scan root, or could not be read.
+    links: Vec<(PathBuf, LinkTarget)>,
+    links_overflow: bool,
+    /// Every `objects/info/alternates` and `objects/info/http-alternates` entry, whatever its type.
+    alternates: Vec<PathBuf>,
+    alternates_overflow: bool,
+}
 
 impl Walk {
     fn issue(&mut self, path: &Path, message: String) {
@@ -175,7 +220,7 @@ impl Walk {
         }
     }
 
-    fn ingest(&mut self, entry: &jwalk::DirEntry<ClientState>, opts: &ScanOptions) {
+    fn ingest(&mut self, entry: &jwalk::DirEntry<ClientState>, opts: &ScanOptions, root: usize) {
         let path = entry.path();
         let root_meta;
         let meta: &EntryMeta = if entry.depth == 0 {
@@ -197,6 +242,14 @@ impl Walk {
         let rules = &opts.rules;
 
         if ft.is_dir() {
+            if entry.depth == 0 && self.pruned_hit.contains(&root) {
+                // An enclosing root's walk counted this directory and stopped at it.
+                self.aggs.entry(path).or_default();
+                return;
+            }
+            if let Some(r) = meta.pruned_root {
+                self.pruned_hit.insert(r);
+            }
             self.totals.dirs += 1;
             self.totals.allocated_bytes += meta.alloc;
             self.totals.logical_bytes += meta.logical;
@@ -235,6 +288,16 @@ impl Walk {
         self.totals.logical_bytes += logical;
         if ft.is_symlink() {
             self.totals.symlinks += 1;
+            if let Some(t) = &meta.link_target {
+                self.note_link(&path, t);
+            }
+        }
+        if (name == "alternates" || name == "http-alternates") && in_objects_info(&path) {
+            if self.refs.alternates.len() < MAX_ALTERNATES {
+                self.refs.alternates.push(path.clone());
+            } else {
+                self.refs.alternates_overflow = true;
+            }
         }
         let is_file = ft.is_file();
         let is_output = is_file && rules.is_output_file(&name);
@@ -260,6 +323,9 @@ impl Walk {
         if name == ".git" && !is_file {
             agg.git_odd = true;
         }
+        if ft.is_symlink() && agg.first_symlink.is_none() {
+            agg.first_symlink = Some(name.clone());
+        }
         agg.bytes += alloc;
         agg.files += 1;
         if is_output {
@@ -268,6 +334,73 @@ impl Walk {
         if is_file {
             agg.newest = Some(agg.newest.map_or(meta.mtime, |n| n.max(meta.mtime)));
             agg.note_entry(&name, false, rules);
+        }
+    }
+}
+
+impl Walk {
+    /// Keep a symlink for the inbound-reference pass when its target lies inside a scan root (a
+    /// target outside every root cannot be inside a scanned repository) or cannot be read.
+    fn note_link(&mut self, path: &Path, target: &LinkTarget) {
+        let keep = match target {
+            LinkTarget::Unreadable => true,
+            LinkTarget::Resolved(t) => self.canon_roots.iter().any(|r| t.starts_with(r)),
+        };
+        if !keep {
+            return;
+        }
+        if self.refs.links.len() < MAX_LINKS {
+            self.refs.links.push((path.to_path_buf(), target.clone()));
+        } else {
+            self.refs.links_overflow = true;
+        }
+    }
+}
+
+/// Is `path` an entry of an `objects/info` directory?
+fn in_objects_info(path: &Path) -> bool {
+    let info = path.parent();
+    info.and_then(Path::file_name) == Some(OsStr::new("info"))
+        && info.and_then(Path::parent).and_then(Path::file_name) == Some(OsStr::new("objects"))
+}
+
+/// Resolve a symlink's target as a path without opening it: the real path when the target
+/// exists, otherwise the real path of its deepest existing ancestor followed by the rest (after
+/// removing `.` and `..` lexically).
+fn resolve_link_target(link: &Path, raw: &Path) -> PathBuf {
+    let full = match link.parent() {
+        Some(dir) if !raw.is_absolute() => dir.join(raw),
+        _ => raw.to_path_buf(),
+    };
+    if let Ok(c) = std::fs::canonicalize(&full) {
+        return c;
+    }
+    let mut norm = PathBuf::new();
+    for c in full.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => norm.push(other.as_os_str()),
+        }
+    }
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur: &Path = &norm;
+    loop {
+        if let Ok(c) = std::fs::canonicalize(cur) {
+            let mut out = c;
+            for r in rest.iter().rev() {
+                out.push(r);
+            }
+            return out;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(p), Some(n)) => {
+                rest.push(n.to_os_string());
+                cur = p;
+            }
+            _ => return norm,
         }
     }
 }
@@ -326,6 +459,8 @@ struct Build {
     fixture_dirs: Vec<String>,
     git_bytes: u64,
     regen_bytes: u64,
+    /// The first symlink found inside this node's own git directory, relative to it.
+    gitdir_symlink: Option<String>,
 }
 
 /// `path` below `base` with `/` separators (`base` itself is the empty string).
@@ -468,12 +603,21 @@ fn bare_shape(agg: &DirAgg) -> bool {
     agg.has_head && agg.has_objects && agg.has_refs
 }
 
+/// A `.git` entry inside a regenerable or cache directory: never a node, but what it refers to
+/// still counts for dependencies.
+#[derive(Clone, Copy)]
+enum HiddenGit {
+    Dir,
+    File,
+}
+
 /// Assign every directory to its innermost classified ancestor, creating nodes.
 fn classify(
     dirs: &mut [(PathBuf, DirAgg)],
     rules: &RuleSet,
     roots: &HashSet<PathBuf>,
     odd_dirs: &mut Vec<PathBuf>,
+    hidden: &mut Vec<(PathBuf, HiddenGit)>,
 ) -> Vec<Build> {
     let mut builds: Vec<Build> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
@@ -508,6 +652,12 @@ fn classify(
                             && Some(builds[o].path.as_path()) == path.parent()
                     })
                     .unwrap_or(false);
+            if opaque && agg.has_git_dir {
+                hidden.push((path.clone(), HiddenGit::Dir));
+            }
+            if opaque && agg.has_git_file {
+                hidden.push((path.clone(), HiddenGit::File));
+            }
             if opaque && (agg.has_git_dir || agg.has_git_file || bare_shape(agg)) {
                 // A git repository inside a "generated" directory (a FetchContent checkout,
                 // a patched dependency): it may hold unpushed work.
@@ -598,6 +748,7 @@ fn classify(
                         git_odd: agg.git_odd,
                         git_bytes: 0,
                         regen_bytes: 0,
+                        gitdir_symlink: None,
                     });
                     new_owner = Some(idx);
                     if class == Class::BareRepo {
@@ -637,7 +788,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     if opts.roots.is_empty() {
         return Err(Error::NoRoots);
     }
-    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut spelled: Vec<PathBuf> = Vec::new();
     for r in &opts.roots {
         let abs = std::path::absolute(r).map_err(|e| Error::Root {
             path: r.clone(),
@@ -647,10 +798,12 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             path: abs.clone(),
             source: e,
         })?;
-        if !roots.contains(&abs) {
-            roots.push(abs);
-        }
+        spelled.push(abs);
     }
+    let mut warnings: Vec<String> = Vec::new();
+    let one_fs = opts.one_file_system && cfg!(unix);
+    let plan_r = plan_roots(spelled, one_fs, &mut warnings);
+    let roots: Vec<PathBuf> = plan_r.roots.clone();
 
     let mut walk = Walk {
         aggs: HashMap::new(),
@@ -663,29 +816,50 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         issue_overflow: false,
         skipped_paths: Vec::new(),
         skipped_overflow: false,
+        canon_roots: plan_r.canon.clone(),
+        pruned_hit: HashSet::new(),
+        refs: Refs::default(),
     };
-    let mut warnings: Vec<String> = Vec::new();
     if opts.one_file_system && !cfg!(unix) {
         warnings.push("--one-file-system is not supported on this platform and was ignored".into());
     }
 
-    for root in &roots {
+    // Enclosing roots first, so that a nested root knows whether their walk already counted its
+    // own directory entry.
+    for &k in &plan_r.walk_order {
+        let root = &roots[k];
         let root_dev = std::fs::symlink_metadata(root)
             .map(|md| meta_from(&md).dev)
             .unwrap_or(0);
-        let one_fs = opts.one_file_system && cfg!(unix);
+        let prune = Arc::new(plan_r.prune[k].clone());
         let walker = WalkDirGeneric::<ClientState>::new(root)
             .skip_hidden(false)
             .follow_links(false)
             .sort(false)
             .process_read_dir(move |_depth, _path, _state, children| {
                 for entry in children.iter_mut().flatten() {
-                    match std::fs::symlink_metadata(entry.path()) {
+                    let path = entry.path();
+                    match std::fs::symlink_metadata(&path) {
                         Ok(md) => {
                             let mut m = meta_from(&md);
-                            if one_fs && entry.file_type.is_dir() && m.dev != root_dev {
-                                entry.read_children = None;
-                                m.mount_skipped = true;
+                            let is_dir = entry.file_type.is_dir();
+                            if is_dir {
+                                if let Some(&r) = prune.get(&path) {
+                                    // Another scan root, walked on its own.
+                                    entry.read_children = None;
+                                    m.pruned_root = Some(r);
+                                } else if one_fs && m.dev != root_dev {
+                                    entry.read_children = None;
+                                    m.mount_skipped = true;
+                                }
+                            }
+                            if entry.file_type.is_symlink() {
+                                m.link_target = Some(match std::fs::read_link(&path) {
+                                    Ok(raw) => {
+                                        LinkTarget::Resolved(resolve_link_target(&path, &raw))
+                                    }
+                                    Err(_) => LinkTarget::Unreadable,
+                                });
                             }
                             entry.client_state = m;
                         }
@@ -695,7 +869,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             });
         for item in walker {
             match item {
-                Ok(entry) => walk.ingest(&entry, opts),
+                Ok(entry) => walk.ingest(&entry, opts, k),
                 Err(err) => {
                     let p = err.path().map(Path::to_path_buf).unwrap_or_default();
                     walk.issue(&p, err.to_string());
@@ -714,6 +888,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         issue_overflow,
         skipped_paths,
         skipped_overflow,
+        refs,
         ..
     } = walk;
     issues.truncate(MAX_ISSUES);
@@ -723,12 +898,13 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
     let root_set: HashSet<PathBuf> = roots.iter().cloned().collect();
     let mut odd_dirs: Vec<PathBuf> = Vec::new();
-    let mut builds = classify(&mut dirs, &opts.rules, &root_set, &mut odd_dirs);
+    let mut hidden: Vec<(PathBuf, HiddenGit)> = Vec::new();
+    let mut builds = classify(&mut dirs, &opts.rules, &root_set, &mut odd_dirs, &mut hidden);
 
     // Attribute directory aggregates to their owners.
     let mut other_bytes: u64 = 0;
     let mut files_self: Vec<u64> = vec![0; builds.len()];
-    for (_, agg) in dirs.iter() {
+    for (dir, agg) in dirs.iter() {
         match agg.owner {
             Some(o) => {
                 let b = &mut builds[o];
@@ -737,6 +913,14 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 files_self[o] += agg.files;
                 if agg.in_git {
                     b.git_bytes += agg.bytes;
+                    let first = agg.first_symlink.as_ref();
+                    if let Some(name) = first.filter(|_| b.gitdir_symlink.is_none()) {
+                        let gd = match b.node.class {
+                            Class::BareRepo => b.path.clone(),
+                            _ => b.path.join(".git"),
+                        };
+                        b.gitdir_symlink = Some(rel_slash(&dir.join(name), &gd));
+                    }
                 } else if let Some(t) = agg.newest {
                     b.node.newest_mtime = Some(b.node.newest_mtime.map_or(t, |n| n.max(t)));
                 }
@@ -942,11 +1126,28 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 regenerable: b.regen_bytes,
                 output: b.node.output_bytes,
             };
+            // A symlink anywhere in the git directory (a fanout directory, a pack file, a ref,
+            // a hook, an info file) puts part of the repository somewhere else. The structural
+            // check speaks first when it already failed.
+            if let Some(rel) = &b.gitdir_symlink {
+                let issue = diag(&format!(
+                    "the git directory contains a symbolic link ({rel}), so part of this \
+                     repository may live somewhere else"
+                ));
+                if info.facts.plain_layout != Tri::No {
+                    info.facts.plain_layout = Tri::No;
+                    info.layout_issue = Some(issue.clone());
+                }
+                info.notes.push(format!("layout: {issue}"));
+            }
             b.node.repo = Some(info);
         }
     }
     link_repos(&mut builds, &roots, &mut warnings);
     link_odd_gits(&mut builds, &odd_dirs, &mut warnings);
+    let ctx = InboundCtx::new(&builds, &dirs, &roots, &plan_r.canon);
+    let found = link_inbound(&ctx, &refs, &hidden);
+    apply_inbound(&mut builds, found, &mut warnings);
 
     // Scan roots inside a repository the scan does not cover: the artifacts there are checked
     // against that repository's git, exactly as a full-repo scan would.
@@ -1206,6 +1407,482 @@ fn link_odd_gits(builds: &mut [Build], odd_dirs: &[PathBuf], warnings: &mut Vec<
     }
 }
 
+/// The scan roots after normalisation: every directory is walked once however the roots overlap.
+struct RootPlan {
+    /// The roots that are walked, spelled as given (absolute), in the order given.
+    roots: Vec<PathBuf>,
+    /// Their real paths, in the same order.
+    canon: Vec<PathBuf>,
+    /// Per walked root: directories below it, in its spelling, that are other walked roots (index
+    /// into `roots`). Its walk counts such a directory's own entry and does not enter it.
+    prune: Vec<HashMap<PathBuf, usize>>,
+    /// Indexes into `roots`, enclosing roots first.
+    walk_order: Vec<usize>,
+}
+
+/// Normalise the scan roots. Each is compared by its real path: a root that is the same directory
+/// as an earlier one is dropped; a root inside another root is dropped when that root's walk
+/// provably reaches it (every directory on the way can be listed and, with
+/// `--one-file-system`, is on that root's device), with a warning either way. A nested root the
+/// enclosing walk would not reach (another file system, an unlistable directory on the way) is
+/// kept and walked on its own, and the enclosing walk stops at it, so nothing is counted twice and
+/// it is not reported as a skipped mount point. The walk keeps the spelling the user gave, so
+/// reported paths do not change.
+fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -> RootPlan {
+    let mut uniq: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for s in spelled {
+        let c = canon(&s);
+        if let Some((first, _)) = uniq.iter().find(|(_, k)| *k == c) {
+            if *first != s {
+                warnings.push(diag(&format!(
+                    "scan root {} is the same directory as scan root {} and was scanned once",
+                    s.display(),
+                    first.display()
+                )));
+            }
+            continue;
+        }
+        uniq.push((s, c));
+    }
+    // Shallowest first, so an enclosing root is decided before the roots inside it.
+    let mut order: Vec<usize> = (0..uniq.len()).collect();
+    order.sort_by_key(|&i| uniq[i].1.components().count());
+    let mut kept = vec![false; uniq.len()];
+    let mut prune_by: Vec<Vec<(PathBuf, usize)>> = vec![Vec::new(); uniq.len()];
+    for &i in &order {
+        let c = uniq[i].1.clone();
+        let enclosing: Vec<usize> = (0..uniq.len())
+            .filter(|&k| kept[k] && c != uniq[k].1 && c.starts_with(&uniq[k].1))
+            .collect();
+        if let Some(&k) = enclosing
+            .iter()
+            .find(|&&k| walk_reaches(&uniq[k].1, &c, one_fs))
+        {
+            warnings.push(diag(&format!(
+                "scan root {} lies inside scan root {} and was scanned as part of it",
+                uniq[i].0.display(),
+                uniq[k].0.display()
+            )));
+            continue;
+        }
+        kept[i] = true;
+        for k in enclosing {
+            if let Ok(rel) = c.strip_prefix(&uniq[k].1) {
+                let at = uniq[k].0.join(rel);
+                prune_by[k].push((at, i));
+            }
+        }
+    }
+    let walked: Vec<usize> = (0..uniq.len()).filter(|&i| kept[i]).collect();
+    let pos = |i: usize| walked.iter().position(|&k| k == i).unwrap_or(0);
+    RootPlan {
+        roots: walked.iter().map(|&i| uniq[i].0.clone()).collect(),
+        canon: walked.iter().map(|&i| uniq[i].1.clone()).collect(),
+        prune: walked
+            .iter()
+            .map(|&i| {
+                prune_by[i]
+                    .iter()
+                    .map(|(p, j)| (p.clone(), pos(*j)))
+                    .collect::<HashMap<PathBuf, usize>>()
+            })
+            .collect(),
+        walk_order: order.iter().filter(|&&i| kept[i]).map(|&i| pos(i)).collect(),
+    }
+}
+
+/// Does the walk of the root `anc` reach `desc` (both real paths, `desc` strictly inside)? Every
+/// directory on the way must be listable and, with `--one-file-system`, on `anc`'s device, since
+/// the walk stops at any other.
+fn walk_reaches(anc: &Path, desc: &Path, one_fs: bool) -> bool {
+    let Ok(rel) = desc.strip_prefix(anc) else {
+        return false;
+    };
+    let anc_dev = match std::fs::symlink_metadata(anc) {
+        Ok(m) => meta_from(&m).dev,
+        Err(_) => return false,
+    };
+    let mut cur = anc.to_path_buf();
+    for comp in rel.components() {
+        if std::fs::read_dir(&cur).is_err() {
+            return false;
+        }
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.is_dir() => {
+                if one_fs && meta_from(&m).dev != anc_dev {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The real path of a walked path: the real path of its root plus the rest, since the walk only
+/// descends real directories. A path below no root is canonicalised directly.
+fn real_under(roots: &[PathBuf], canon_roots: &[PathBuf], p: &Path) -> PathBuf {
+    let best = roots
+        .iter()
+        .zip(canon_roots)
+        .filter(|(r, _)| p.starts_with(r))
+        .max_by_key(|(r, _)| r.components().count());
+    match best.map(|(r, c)| (p.strip_prefix(r), c)) {
+        Some((Ok(rel), c)) if rel.as_os_str().is_empty() => c.clone(),
+        Some((Ok(rel), c)) => c.join(rel),
+        _ => canon(p),
+    }
+}
+
+/// Most dependents named per repository by the inbound-reference pass; the rest are counted.
+const MAX_NAMED_INBOUND: usize = 20;
+
+/// Lookups for the inbound-reference pass.
+struct InboundCtx<'a> {
+    builds: &'a [Build],
+    dirs: &'a [(PathBuf, DirAgg)],
+    roots: &'a [PathBuf],
+    canon_roots: &'a [PathBuf],
+    /// Real path of every node.
+    nodes: HashMap<PathBuf, usize>,
+    /// Real path of each scanned repository's own git directory (a repo's `.git` directory, or a
+    /// bare repo itself), and its index.
+    gitdirs: HashMap<PathBuf, usize>,
+    /// The same, by node index.
+    gitdir_of: Vec<Option<PathBuf>>,
+    /// The same git directories as spelled in the walk.
+    spelled_gitdirs: HashMap<PathBuf, usize>,
+}
+
+/// Where a reference is: its real path, whether it is inside some git directory or object store,
+/// the node that holds it, and the name to give it as a dependent (the scanned repository whose
+/// git directory holds it, else the checkout whose `.git` holds it, else the path itself).
+struct Loc {
+    real: PathBuf,
+    gitish: bool,
+    owner: Option<usize>,
+    who: String,
+}
+
+impl<'a> InboundCtx<'a> {
+    fn new(
+        builds: &'a [Build],
+        dirs: &'a [(PathBuf, DirAgg)],
+        roots: &'a [PathBuf],
+        canon_roots: &'a [PathBuf],
+    ) -> InboundCtx<'a> {
+        let mut ctx = InboundCtx {
+            builds,
+            dirs,
+            roots,
+            canon_roots,
+            nodes: HashMap::new(),
+            gitdirs: HashMap::new(),
+            gitdir_of: vec![None; builds.len()],
+            spelled_gitdirs: HashMap::new(),
+        };
+        for (i, b) in builds.iter().enumerate() {
+            let real = ctx.real(&b.path);
+            ctx.nodes.insert(real, i);
+            let gd = match b.node.class {
+                Class::Repo if !b.git_odd => Some(b.path.join(".git")),
+                Class::BareRepo => Some(b.path.clone()),
+                _ => None,
+            };
+            if let Some(gd) = gd {
+                let real = ctx.real(&gd);
+                ctx.gitdirs.insert(real.clone(), i);
+                ctx.gitdir_of[i] = Some(real);
+                ctx.spelled_gitdirs.insert(gd, i);
+            }
+        }
+        ctx
+    }
+
+    fn real(&self, p: &Path) -> PathBuf {
+        real_under(self.roots, self.canon_roots, p)
+    }
+
+    /// The scanned repository whose own git directory holds the real path `p`.
+    fn gitdir_holding(&self, p: &Path) -> Option<usize> {
+        p.ancestors().find_map(|a| self.gitdirs.get(a).copied())
+    }
+
+    /// The innermost node that holds the real path `p`.
+    fn node_holding(&self, p: &Path) -> Option<usize> {
+        p.ancestors().find_map(|a| self.nodes.get(a).copied())
+    }
+
+    fn in_scan(&self, p: &Path) -> bool {
+        self.canon_roots.iter().any(|r| p.starts_with(r))
+    }
+
+    fn locate(&self, loc: &Path) -> Loc {
+        let repo = loc
+            .ancestors()
+            .skip(1)
+            .find_map(|a| self.spelled_gitdirs.get(a).copied());
+        let gitish = repo.is_some()
+            || loc.ancestors().skip(1).any(|a| {
+                a.file_name() == Some(OsStr::new(".git"))
+                    || a.file_name() == Some(OsStr::new("objects"))
+            });
+        let who = match repo {
+            Some(m) => self.builds[m].node.path.clone(),
+            None => {
+                // The checkout whose `.git` holds (or is) the reference, else the path itself.
+                let dotgit = loc
+                    .ancestors()
+                    .find(|a| a.file_name() == Some(OsStr::new(".git")));
+                match dotgit.and_then(Path::parent) {
+                    Some(d) => d.to_string_lossy().into_owned(),
+                    None => loc.to_string_lossy().into_owned(),
+                }
+            }
+        };
+        let owner = loc
+            .parent()
+            .and_then(|par| {
+                self.dirs
+                    .binary_search_by(|(q, _)| q.as_path().cmp(par))
+                    .ok()
+            })
+            .and_then(|k| self.dirs[k].1.owner);
+        Loc {
+            real: self.real(loc),
+            gitish,
+            owner,
+            who,
+        }
+    }
+}
+
+/// What the inbound-reference pass found.
+#[derive(Default)]
+struct Inbound {
+    /// (repository, the dependent to name, the path that refers into it)
+    deps: Vec<(usize, String, String)>,
+    /// (regenerable or cache node, why it must ask)
+    asks: Vec<(usize, String)>,
+    /// Why some reference could not be placed: every repository's `no_dependents = yes` becomes
+    /// `unknown`.
+    unresolved: Option<String>,
+}
+
+/// Dependencies found from the references themselves, independently of how the directories that
+/// hold them were classified (design: inbound references). Every symlink the walk met whose target
+/// lies inside a scan root, every alternates file anywhere (inside artifact directories and
+/// `.git/modules` too) and every `.git` directory or file inside an artifact directory is
+/// resolved as a path, never followed to run git or read through:
+///
+/// - a reference whose target lies inside the git directory of a scanned repository N, made from
+///   outside that git directory, gives N `no_dependents = no` naming who refers to it;
+/// - a reference that is git data (an alternates entry, a `.git` file, a `commondir`, or a
+///   symlink inside a git directory or object store) whose target lies elsewhere in a node other
+///   than the one that holds it: a repository there gets `no_dependents = no`, a regenerable or
+///   cache directory there asks;
+/// - git data that cannot be read or resolved, or leads outside the scan, is unresolved.
+fn link_inbound(ctx: &InboundCtx, refs: &Refs, hidden: &[(PathBuf, HiddenGit)]) -> Inbound {
+    let mut out = Inbound::default();
+    if refs.links_overflow {
+        out.unresolved.get_or_insert(format!(
+            "more than {MAX_LINKS} symbolic links lead inside the scanned folders, so not all were \
+             checked for references into a repository"
+        ));
+    }
+    if refs.alternates_overflow {
+        out.unresolved.get_or_insert(format!(
+            "more than {MAX_ALTERNATES} alternates files were found, so not all were read"
+        ));
+    }
+    for (path, target) in &refs.links {
+        match target {
+            LinkTarget::Unreadable => {
+                out.unresolved.get_or_insert(format!(
+                    "the symbolic link {} could not be read",
+                    path.display()
+                ));
+            }
+            LinkTarget::Resolved(t) => consider(ctx, &mut out, path, false, t),
+        }
+    }
+    for file in &refs.alternates {
+        let Some(objects) = file.parent().and_then(Path::parent) else {
+            continue;
+        };
+        let text = match read_small_regular_file(file) {
+            Ok(Some(t)) => t,
+            Ok(None) => continue,
+            Err(why) => {
+                out.unresolved.get_or_insert(format!(
+                    "the alternates file {} was not read ({why})",
+                    file.display()
+                ));
+                continue;
+            }
+        };
+        for entry in parse_alternates(&text) {
+            let target = match entry {
+                Alt::Path(p) => std::fs::canonicalize(objects.join(&p))
+                    .map_err(|e| format!("the entry {} cannot be resolved ({e})", p.display())),
+                Alt::Bad(why) => Err(why),
+            };
+            match target {
+                Ok(t) => consider(ctx, &mut out, file, true, &t),
+                Err(why) => {
+                    out.unresolved.get_or_insert(format!(
+                        "alternates file {}: {why}",
+                        file.display()
+                    ));
+                }
+            }
+        }
+    }
+    for (dir, kind) in hidden {
+        let found: std::result::Result<Vec<(PathBuf, PathBuf)>, String> = match kind {
+            HiddenGit::File => resolve_gitfile(dir).map(|(gd, store)| {
+                let at = dir.join(".git");
+                vec![(at.clone(), gd), (at, store)]
+            }),
+            HiddenGit::Dir => hidden_commondir(dir),
+        };
+        match found {
+            Ok(list) => {
+                for (at, t) in list {
+                    consider(ctx, &mut out, &at, true, &t);
+                }
+            }
+            Err(why) => {
+                out.unresolved.get_or_insert(format!(
+                    "the git repository at {} inside a generated directory could not be \
+                     resolved ({why})",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The `commondir` of a `.git` directory found inside an artifact directory, if it has one.
+fn hidden_commondir(dir: &Path) -> std::result::Result<Vec<(PathBuf, PathBuf)>, String> {
+    let gd = dir.join(".git");
+    let cd = gd.join("commondir");
+    match kind_of(&cd) {
+        Ok(Kind::Missing) => Ok(Vec::new()),
+        Ok(Kind::Other) => {
+            let text = read_small_regular_file(&cd)
+                .map_err(|e| format!("the commondir was not read ({e})"))?
+                .unwrap_or_default();
+            let common = std::fs::canonicalize(gd.join(text.lines().next().unwrap_or("")))
+                .map_err(|e| format!("the commondir cannot be resolved ({e})"))?;
+            Ok(vec![(cd, common)])
+        }
+        Ok(_) => Err("the commondir is not a plain file".to_string()),
+        Err(e) => Err(format!("cannot read the commondir ({e})")),
+    }
+}
+
+/// One reference at the walked path `at` whose target is the real path `target`. `git_data` is
+/// true for references that are git data by nature (alternates entries, `.git` files,
+/// `commondir`), false for a symlink, which counts as git data only inside a git directory or
+/// object store.
+fn consider(ctx: &InboundCtx, out: &mut Inbound, at: &Path, git_data: bool, target: &Path) {
+    let here = ctx.locate(at);
+    let shown = at.to_string_lossy().into_owned();
+    if let Some(n) = ctx.gitdir_holding(target) {
+        let inside_own = ctx.gitdir_of[n]
+            .as_ref()
+            .is_some_and(|gd| here.real.starts_with(gd));
+        if !inside_own {
+            out.deps.push((n, here.who, shown));
+        }
+        return;
+    }
+    if !(git_data || here.gitish) {
+        return;
+    }
+    match ctx.node_holding(target) {
+        Some(x) if Some(x) == here.owner => {}
+        Some(x) => {
+            let class = ctx.builds[x].node.class;
+            if class.is_git() {
+                out.deps.push((x, here.who, shown));
+            } else if class.is_artifact() {
+                out.asks.push((
+                    x,
+                    diag(&format!(
+                        "git data at {} ({shown}) refers into this directory, so it may hold \
+                         objects or files that exist nowhere else",
+                        here.who
+                    )),
+                ));
+            }
+        }
+        None => {
+            if git_data && !ctx.in_scan(target) {
+                out.unresolved.get_or_insert(format!(
+                    "{shown} refers to {}, which lies outside the scan",
+                    target.display()
+                ));
+            }
+        }
+    }
+}
+
+/// Record what [`link_inbound`] found on the nodes.
+fn apply_inbound(builds: &mut [Build], found: Inbound, warnings: &mut Vec<String>) {
+    let mut named: HashMap<usize, usize> = HashMap::new();
+    let mut more: HashMap<usize, usize> = HashMap::new();
+    for (n, who, via) in found.deps {
+        let Some(info) = builds[n].node.repo.as_mut() else {
+            continue;
+        };
+        info.facts.no_dependents = Tri::No;
+        let who = diag(&who);
+        if info.dependents.contains(&who) {
+            continue;
+        }
+        let count = named.entry(n).or_insert(0);
+        if *count < MAX_NAMED_INBOUND {
+            *count += 1;
+            info.notes.push(diag(&format!(
+                "no_dependents: {via} refers into this repository's git directory, so {who} \
+                 depends on it"
+            )));
+            info.dependents.push(who);
+        } else {
+            *more.entry(n).or_insert(0) += 1;
+        }
+    }
+    for (n, k) in more {
+        if let Some(info) = builds[n].node.repo.as_mut() {
+            info.notes.push(format!(
+                "no_dependents: {k} more references into this repository's git directory were \
+                 found"
+            ));
+        }
+    }
+    for (x, why) in found.asks {
+        builds[x].node.ask_reason.get_or_insert(why);
+    }
+    if let Some(why) = found.unresolved {
+        let why = diag(&why);
+        warnings.push(format!(
+            "{why}; no repository in the scan is treated as free of dependents"
+        ));
+        for b in builds.iter_mut() {
+            if let Some(info) = b.node.repo.as_mut() {
+                if info.facts.no_dependents == Tri::Yes {
+                    info.facts.no_dependents = Tri::Unknown;
+                    info.notes.push(format!("no_dependents: {why}"));
+                }
+            }
+        }
+    }
+}
+
 /// `volume` when every scan root is a mount point (its device differs from its parent's) or a
 /// file system root, `subtree` otherwise.
 fn roots_scope(roots: &[PathBuf]) -> &'static str {
@@ -1438,6 +2115,11 @@ fn kind_of(p: &Path) -> std::result::Result<Kind, String> {
 /// `gitdir: <path>` (relative to the repo), then that directory's `commondir` file if any, then
 /// `objects`. Everything is canonicalised; anything unreadable is an error.
 fn resolve_gitfile_store(path: &Path) -> std::result::Result<PathBuf, String> {
+    resolve_gitfile(path).map(|(_, store)| store)
+}
+
+/// [`resolve_gitfile_store`], also returning the git directory the `.git` file names.
+fn resolve_gitfile(path: &Path) -> std::result::Result<(PathBuf, PathBuf), String> {
     let file = path.join(".git");
     let text = read_small_regular_file(&file)
         .map_err(|e| format!("the .git file was not read ({e})"))?
@@ -1461,8 +2143,9 @@ fn resolve_gitfile_store(path: &Path) -> std::result::Result<PathBuf, String> {
         }
         _ => return Err("the commondir is not a plain file".to_string()),
     };
-    std::fs::canonicalize(common.join("objects"))
-        .map_err(|e| format!("the object store cannot be resolved ({e})"))
+    let store = std::fs::canonicalize(common.join("objects"))
+        .map_err(|e| format!("the object store cannot be resolved ({e})"))?;
+    Ok((gd, store))
 }
 
 fn add_member(members: &mut HashMap<PathBuf, Vec<usize>>, key: PathBuf, i: usize) {

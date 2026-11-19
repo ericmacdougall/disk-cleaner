@@ -63,7 +63,11 @@ For each repo and each worktree the scanner records, each as yes / no / unknown:
 - the working tree is clean (tracked changes and untracked files);
 - ignored-but-unique files exist (`.env`, local databases, anything ignored that is not a
   regenerable directory);
-- another clone or worktree depends on this object store (alternates, linked worktrees).
+- another clone or worktree depends on this object store (alternates, linked worktrees). Such
+  dependencies are found from the references themselves during the walk (symlinks and alternates
+  anywhere, `.git` entries inside dependency directories), not only from the repositories that are
+  classified, so a clone hidden inside `node_modules` still protects its provider. Hard links and
+  references from outside the scanned roots cannot be seen (docs/SCAN-FORMAT.md, known limits).
 
 At apply time the remote facts are confirmed against the live remote (`git ls-remote`), because
 remote-tracking refs can be stale.
