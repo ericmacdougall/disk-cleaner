@@ -97,7 +97,11 @@ fn u1_orig_head_at_an_unpushed_commit_with_expired_reflogs_is_not_archived() {
         "B survives only through ORIG_HEAD; archive would delete it: {}",
         it.reason
     );
-    assert!(it.reason.contains("kept only by ORIG_HEAD"), "{}", it.reason);
+    assert!(
+        it.reason.contains("kept only by ORIG_HEAD"),
+        "{}",
+        it.reason
+    );
     assert_eq!(fact(&res, &repo, "reflog_saved"), "no");
 }
 
@@ -128,7 +132,11 @@ fn u1_orig_head_at_an_unpushed_commit_with_reflogs_disabled_is_not_archived() {
     let p = plan_of(&res);
     let it = item(&p, &repo);
     assert_ne!(it.action, Action::Archive, "{}", it.reason);
-    assert!(it.reason.contains("kept only by ORIG_HEAD"), "{}", it.reason);
+    assert!(
+        it.reason.contains("kept only by ORIG_HEAD"),
+        "{}",
+        it.reason
+    );
 }
 
 #[test]

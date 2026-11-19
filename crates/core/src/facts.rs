@@ -707,7 +707,8 @@ impl PseudorefCheck {
 }
 
 /// Check every pseudoref at the top of `gitdir` (this worktree's own git directory): the commit
-/// each names must be contained in a network remote's tracking refs (`names`, not empty), as for
+/// each names must be contained in a network remote's tracking refs (`names`; when it is empty,
+/// every commit is unsaved), as for
 /// the reflogs. `<id>^{commit}` makes an id that is not a commit (a tree, as `AUTO_MERGE` holds,
 /// or a missing object) an error, so it is unchecked instead of passing an empty walk.
 fn pseudoref_check(git: &Git, path: &Path, gitdir: &Path, names: &[String]) -> PseudorefCheck {
@@ -732,8 +733,12 @@ fn pseudoref_check(git: &Git, path: &Path, gitdir: &Path, names: &[String]) -> P
         };
         for id in ids {
             let rev = format!("{id}^{{commit}}");
-            let mut args: Vec<&str> = vec!["rev-list", "-n", "1", rev.as_str(), "--not"];
-            args.extend(pats.iter().map(|s| s.as_str()));
+            let mut args: Vec<&str> = vec!["rev-list", "-n", "1", rev.as_str()];
+            if !pats.is_empty() {
+                // Without a network remote nothing is subtracted: every commit is unsaved.
+                args.push("--not");
+                args.extend(pats.iter().map(|s| s.as_str()));
+            }
             match git.run(path, &args) {
                 Ok(o) if o.trim().is_empty() => {}
                 Ok(_) => {
@@ -1355,29 +1360,38 @@ pub fn collect_repo_info(
     // or rebased-away commit). No ref names them, so every check above can read as saved while
     // the work is recoverable only from the reflog, which goes with the repo.
     facts.reflog_saved = match &network_names {
-        // No network remote can hold anything.
-        Some(names) if names.is_empty() => Tri::No,
-        // An unborn HEAD (no commit yet) is not shown to be saved: HEAD is only unknown when
-        // `rev-parse` failed, and an empty reflog would otherwise read as vacuously saved.
-        Some(names) if info.head_commit.is_some() => {
-            // `rev-list` only reads refs, reflogs and objects (git-rev-list(1)): it takes no lock
-            // and writes nothing. `--reflog` adds every reflog entry (HEAD of this worktree and
-            // all refs of the shared repo) to the revisions; `--not --remotes=<n>` removes
-            // whatever a network remote's tracking refs contain; `-n 1` stops at the first
-            // survivor, and the command timeout bounds the walk (a timeout is `Unknown`).
-            let pats: Vec<String> = names.iter().map(|n| format!("--remotes={n}")).collect();
-            let mut args: Vec<&str> = vec!["rev-list", "-n", "1", "--reflog", "--not"];
-            args.extend(pats.iter().map(|s| s.as_str()));
-            let reflogs = match git.run(path, &args) {
-                Ok(out) => Tri::from_bool(out.trim().is_empty()),
-                Err(e) => {
-                    notes.push(note("reflog_saved", &e));
-                    Tri::Unknown
+        Some(names) => {
+            let reflogs = if names.is_empty() {
+                // No network remote can hold anything.
+                Tri::No
+            } else if info.head_commit.is_none() {
+                // An unborn HEAD (no commit yet) is not shown to be saved: HEAD is only unknown
+                // when `rev-parse` failed, and an empty reflog would otherwise read as vacuously
+                // saved.
+                Tri::Unknown
+            } else {
+                // `rev-list` only reads refs, reflogs and objects (git-rev-list(1)): it takes no
+                // lock and writes nothing. `--reflog` adds every reflog entry (HEAD of this
+                // worktree and all refs of the shared repo) to the revisions; `--not
+                // --remotes=<n>` removes whatever a network remote's tracking refs contain;
+                // `-n 1` stops at the first survivor, and the command timeout bounds the walk (a
+                // timeout is `Unknown`).
+                let pats: Vec<String> = names.iter().map(|n| format!("--remotes={n}")).collect();
+                let mut args: Vec<&str> = vec!["rev-list", "-n", "1", "--reflog", "--not"];
+                args.extend(pats.iter().map(|s| s.as_str()));
+                match git.run(path, &args) {
+                    Ok(out) => Tri::from_bool(out.trim().is_empty()),
+                    Err(e) => {
+                        notes.push(note("reflog_saved", &e));
+                        Tri::Unknown
+                    }
                 }
             };
             // Pseudorefs (`ORIG_HEAD` after a reset, `MERGE_AUTOSTASH`, any other file at the
             // top of the git directory that names a commit) keep a commit alive after every ref
-            // and reflog has let go of it.
+            // and reflog has let go of it. They are checked with or without a network remote,
+            // so that recovery is told which ones to capture and one that cannot be checked
+            // asks.
             let gitdir_args = ["rev-parse", "--absolute-git-dir"];
             let pseudo = match printed_path(git, path, &gitdir_args, "git dir") {
                 Ok(gitdir) => pseudoref_check(git, path, &gitdir, names),
@@ -1406,7 +1420,7 @@ pub fn collect_repo_info(
                 _ => Tri::Yes,
             }
         }
-        _ => Tri::Unknown,
+        None => Tri::Unknown,
     };
 
     // Unfinished operations and local-only content that no ref records.

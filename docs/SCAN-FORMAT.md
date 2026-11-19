@@ -259,8 +259,12 @@ Each pseudoref's object id is read from the file itself (bounded, no git command
 `git rev-list -n 1 <id>^{commit} --not --remotes=<network remote>...`: `^{commit}` makes an id
 that is not a commit an error (`unknown`) instead of an empty walk. A `git pull` or a reset to a
 pushed commit leaves `ORIG_HEAD` and `FETCH_HEAD` at commits a tracking ref contains, so they do not
-change the fact. `ORIG_HEAD` is not cleaned up by `git gc`: when it names a commit that was later
-pruned, the repository asks (`unknown`) until `ORIG_HEAD` is removed or moved.
+change the fact. Without a network remote nothing is subtracted (`--not` is left out): every
+pseudoref commit is unsaved, so `reflog_saved` is `no` and `repo.unsaved_pseudorefs` tells recovery
+which pseudorefs to capture, and one that cannot be checked still makes it `unknown`. A pseudoref
+that names an object the repository no longer has (likely after `git gc` pruned a commit that
+only `ORIG_HEAD` named; not verified here) cannot be checked, so the repository asks until the
+pseudoref is removed or moved.
 
 **Known limit: unreferenced objects.** Objects that no ref, reflog or pseudoref points at
 (dangling commits awaiting garbage collection, including those `git fsck --lost-found` would list)
