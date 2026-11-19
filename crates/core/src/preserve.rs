@@ -227,8 +227,7 @@ fn store_name(parts: &[&str]) -> bool {
         ["objects", d, f] if fanout(d) && loose_object(f) => true,
         ["objects", "pack", "multi-pack-index"] => true,
         ["objects", "pack", f] => {
-            named(f, "pack-", &PACK_STORE_EXTS)
-                || named(f, "multi-pack-index-", &["bitmap", "rev"])
+            named(f, "pack-", &PACK_STORE_EXTS) || named(f, "multi-pack-index-", &["bitmap", "rev"])
         }
         ["objects", "pack", "multi-pack-index.d", f] => {
             named(f, "multi-pack-index-", &["midx", "bitmap", "rev"])
@@ -375,8 +374,9 @@ fn id_ext<'a>(name: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
 /// - `git multi-pack-index verify` when a multi-pack-index exists; its `.bitmap` and `.rev` are
 ///   accounted only when named by its checksum. Incremental layers are accounted when their
 ///   chain lists them, but this version does not verify them, so the store stays unverified.
-/// - `git commit-graph verify` when a commit-graph exists; split graph files are accounted only
-///   when their chain lists them.
+/// - `git commit-graph verify` when a commit-graph exists. git verifies the single
+///   `commit-graph` when there is one and the split chain only otherwise, so split graph files
+///   are accounted only when there is no single file and their chain lists them.
 /// - `git fsck --full --strict --no-dangling --unreachable --no-progress`: every loose object is
 ///   inflated and hashed (no trailing bytes allowed) and every object is checked; any
 ///   unreachable object leaves the store unverified, as it may exist nowhere else.
@@ -393,8 +393,9 @@ pub fn verify(git: &Git, cwd: &Path, git_dir: &Path, store: &[(String, u64)]) ->
             "sha1" => Some(40),
             "sha256" => Some(64),
             other => {
-                v.unverified
-                    .push(format!("git uses an object format this tool does not know ({other})"));
+                v.unverified.push(format!(
+                    "git uses an object format this tool does not know ({other})"
+                ));
                 None
             }
         },
@@ -528,7 +529,11 @@ pub fn verify(git: &Git, cwd: &Path, git_dir: &Path, store: &[(String, u64)]) ->
                 .push(format!("the commit-graph could not be verified ({e})")),
         }
     }
-    if !graphs.is_empty() {
+    if graph.is_some() {
+        // git reads the single commit-graph and opens the split chain only when it is absent
+        // (builtin/commit-graph.c), so no split graph file beside it was read.
+        unaccounted.extend(graphs.iter().map(|(_, r)| r.clone()));
+    } else if !graphs.is_empty() {
         let chain = git_dir
             .join("objects")
             .join("info")

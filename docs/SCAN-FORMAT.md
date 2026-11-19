@@ -858,7 +858,12 @@ Each file of class (b) must then be accounted for by what git verified: a loose 
 repository's hash length (fsck reads every one); a `.pack` and `.idx` pair that `verify-pack`
 accepted; a pack's `.rev`, `.bitmap` and `.mtimes` when that pack verified; a multi-pack-index that
 verified, and its `.bitmap` and `.rev` only when named by its checksum (the file's last 20 or 32
-bytes); a multi-pack-index layer or split commit-graph file only when its chain file lists it.
+bytes); a multi-pack-index layer only when its chain file lists it; a split commit-graph file only
+when its chain file lists it and there is no single `objects/info/commit-graph` (git verifies the
+single file when there is one and never opens the chain then). The sidecars (a pack's `.rev`,
+`.bitmap` and `.mtimes`, a multi-pack-index's `.bitmap` and `.rev`) are accounted for by the
+verified pack or multi-pack-index they belong to, not read: they are regenerable from it, as the
+rule above allows.
 
 - `verified` is `true` only when every command ran and passed, every class-(b) file was accounted
   for, no object is unreachable, and (in the plan) the item's action is `backup-then-remove`, so the

@@ -1076,7 +1076,12 @@ fn preserve_veto(node: &Node, max: u64) -> Option<String> {
                 .to_string(),
         );
     };
-    if node.repo.as_ref().and_then(|r| r.object_store.as_ref()).is_none() {
+    if node
+        .repo
+        .as_ref()
+        .and_then(|r| r.object_store.as_ref())
+        .is_none()
+    {
         return Some(
             "its object store's files were not counted (see the notes), so they could not be \
              verified or backed up first"
