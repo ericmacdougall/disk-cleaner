@@ -153,6 +153,11 @@ pub const STRING_COST: u64 = 32;
 
 /// Bytes charged per array element (a `Value` in a `Vec` that may have doubled).
 pub const ELEMENT_COST: u64 = 64;
+/// Bytes charged per object that is an array element: core turns the parsed `Value` into a
+/// typed scan while the `Value` is still alive, and the largest typed element is a core
+/// `Node` (664 bytes on 64-bit targets). CI run 44606372967 measured exactly one million times
+/// that size on top of the `Value` for a one-million-node scan.
+pub const TYPED_ELEMENT_COST: u64 = std::mem::size_of::<disk_cleaner_core::Node>() as u64;
 /// Bytes per B-tree leaf of a parsed object (11 keys and values of 24 and 32 bytes).
 pub const LEAF_COST: u64 = 640;
 /// Bytes per B-tree internal node.
@@ -238,6 +243,9 @@ pub fn estimate(text: &[u8]) -> Estimate {
             }
             b'{' => {
                 est.objects += 1;
+                if let Some(None) = stack.last() {
+                    cost = cost.saturating_add(TYPED_ELEMENT_COST);
+                }
                 stack.push(Some(0));
             }
             b'[' => {
@@ -353,6 +361,27 @@ mod tests {
         assert_eq!(e.array_elements, 1 + 5);
         // three keys and one string value; the escaped quote does not start a string
         assert_eq!(e.strings, 4);
+    }
+
+    /// Objects in arrays (a scan's nodes) are charged a typed element each; scalars are not.
+    #[test]
+    fn objects_in_arrays_are_charged_their_typed_size() {
+        let objects = estimate(b"[{},{},{}]");
+        let numbers = estimate(b"[0,00,0]");
+        assert!(TYPED_ELEMENT_COST >= 512, "{TYPED_ELEMENT_COST}");
+        assert!(
+            objects.peak_bytes >= numbers.peak_bytes + 3 * (TYPED_ELEMENT_COST + LEAF_COST),
+            "{} vs {}",
+            objects.peak_bytes,
+            numbers.peak_bytes
+        );
+        // An object that is a value of another object is not an element.
+        let text = br#"{"a":{}}"#;
+        let nested = estimate(text);
+        assert_eq!(
+            nested.peak_bytes,
+            BASE_COST + 2 * text.len() as u64 + STRING_COST + 2 * LEAF_COST
+        );
     }
 
     /// Short keys cost an allocation each, far more than their text: a file of many one-letter
