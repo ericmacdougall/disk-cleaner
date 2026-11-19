@@ -239,4 +239,39 @@ mod tests {
         assert_eq!(enc.path, "/home-synthetic/.claude");
         assert!(find(&tree, &builtin(), &[])[0].enclosing.is_none());
     }
+
+    /// A walk started at the session folder itself, or at its parent, names the root by its
+    /// whole path; the layout must still match by the path's trailing components.
+    #[test]
+    fn a_root_named_by_its_full_path_matches_by_trailing_components() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let base = if cfg!(windows) { "C:\\syn" } else { "/syn" };
+        let mut b = TreeBuilder::new(true);
+        let at_folder = dir(&mut b, None, &format!("{base}{sep}.codex{sep}sessions"));
+        file(&mut b, at_folder, "r.jsonl", 4096);
+        let at_parent = dir(&mut b, None, &format!("{base}{sep}u{sep}.claude"));
+        let projects = dir(&mut b, Some(at_parent), "projects");
+        file(&mut b, projects, "s.jsonl", 8192);
+        // Only one trailing component agrees: not a match.
+        let near = dir(&mut b, None, &format!("{base}{sep}other{sep}sessions"));
+        file(&mut b, near, "x.txt", 4096);
+        // A path shorter than the layout: not a match.
+        let short = dir(&mut b, None, "sessions");
+        file(&mut b, short, "y.txt", 4096);
+        let tree = b.finish(Vec::new(), WalkStats::default());
+        let mut found: Vec<String> = find(&tree, &builtin(), &[])
+            .into_iter()
+            .map(|s| s.layout)
+            .collect();
+        found.sort();
+        let mut want: Vec<String> = builtin()
+            .into_iter()
+            .filter(|l| {
+                l.path == vec![".codex", "sessions"] || l.path == vec![".claude", "projects"]
+            })
+            .map(|l| l.name)
+            .collect();
+        want.sort();
+        assert_eq!(found, want);
+    }
 }

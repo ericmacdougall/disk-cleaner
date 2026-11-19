@@ -141,6 +141,7 @@ fn the_developer_view_shows_actions_and_core_totals() {
     let s = screen(&mut app, 160, 40);
     assert!(s.contains("Developer view"), "{s}");
     assert!(s.contains("Dry run: nothing is changed"), "{s}");
+    assert!(!s.contains("today ago") && !s.contains("- ago"), "{s}");
     assert!(s.contains(&reclaim), "{s}");
     assert!(s.contains("Repositories ("), "{s}");
     // Move to the first item: its reason shows below.

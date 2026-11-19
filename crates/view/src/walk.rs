@@ -504,4 +504,20 @@ mod tests {
         assert!(matches!(check_root(&file), Err(WalkError::Root { .. })));
         assert!(check_root(dir.path()).is_ok());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_root_is_refused_with_a_clear_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        match check_root(&link) {
+            Err(WalkError::Root { message, .. }) => {
+                assert!(message.contains("symbolic link"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }
