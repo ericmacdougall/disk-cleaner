@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -205,6 +205,10 @@ pub struct RepoInfo {
     /// Clones inside the scan that borrow objects from this repo (alternates).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependents: Vec<String>,
+    /// The repository sets `extensions.preciousObjects = true`: it declares that other
+    /// repositories borrow its objects (`no_dependents` is then `no`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub precious_objects: bool,
     /// Git directories of submodules stored under `.git/modules` (their stash and local
     /// branches are deleted with this repo), as real paths.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -328,6 +332,27 @@ pub struct Totals {
     pub bytes_by_class: BTreeMap<String, u64>,
 }
 
+/// Where the walk could not look. Links, clones and alternates files inside these places were not
+/// seen, so a repository they depend on can look free of dependents.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Coverage {
+    /// Nothing was unreadable and no mount point was skipped.
+    pub complete: bool,
+    /// Directories whose contents could not be listed (each counted once).
+    pub unreadable_dirs: u64,
+    /// Up to 20 of them.
+    pub unreadable_dir_examples: Vec<String>,
+    /// Other entries that could not be read (metadata or walk errors); see `issues`.
+    pub other_unreadable_entries: u64,
+    /// Directories on another file system that `--one-file-system` did not enter.
+    pub mount_points_skipped: u64,
+    /// Up to 20 of them.
+    pub mount_point_examples: Vec<String>,
+}
+
+/// Most example paths kept per kind in [`Coverage`].
+pub const COVERAGE_EXAMPLES: usize = 20;
+
 /// Options recorded in the scan file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanOptionsRecord {
@@ -360,6 +385,8 @@ pub struct ScanResult {
     /// clones outside the scanned folders cannot be seen by a subtree scan.
     #[serde(default = "default_scope")]
     pub scope: String,
+    /// Where the walk could not look (required: a scan without it is not trusted as complete).
+    pub coverage: Coverage,
 }
 
 pub fn default_scope() -> String {

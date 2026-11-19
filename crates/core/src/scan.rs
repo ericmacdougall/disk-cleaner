@@ -183,6 +183,10 @@ struct Walk {
     pruned_hit: HashSet<usize>,
     /// What the inbound-reference pass needs (see [`link_inbound`]).
     refs: Refs,
+    /// Directories whose listing failed, each once (bounded), for `coverage`.
+    unreadable_dirs: HashSet<PathBuf>,
+    /// Where the walk could not look (counts and examples; `complete` is set at the end).
+    coverage: Coverage,
 }
 
 const MAX_ISSUE_PATHS: usize = 100_000;
@@ -220,6 +224,25 @@ impl Walk {
         }
     }
 
+    /// A directory whose contents could not be listed: anything inside it, links and clones
+    /// included, was never seen.
+    fn unreadable_dir(&mut self, path: &Path) {
+        let new = if self.unreadable_dirs.len() < MAX_ISSUE_PATHS {
+            self.unreadable_dirs.insert(path.to_path_buf())
+        } else {
+            // Too many to tell apart: count every report.
+            true
+        };
+        if new {
+            self.coverage.unreadable_dirs += 1;
+            if self.coverage.unreadable_dir_examples.len() < COVERAGE_EXAMPLES {
+                self.coverage
+                    .unreadable_dir_examples
+                    .push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+
     fn ingest(&mut self, entry: &jwalk::DirEntry<ClientState>, opts: &ScanOptions, root: usize) {
         let path = entry.path();
         let root_meta;
@@ -233,9 +256,11 @@ impl Walk {
         };
         if !meta.ok {
             self.issue(&path, "cannot read metadata".to_string());
+            self.coverage.other_unreadable_entries += 1;
         }
         if let Some(err) = entry.read_children.as_ref().and_then(|rc| rc.error()) {
             self.issue(&path, format!("cannot read directory: {err}"));
+            self.unreadable_dir(&path);
         }
         let ft = entry.file_type;
         let name = entry.file_name.to_string_lossy().into_owned();
@@ -255,6 +280,11 @@ impl Walk {
             self.totals.logical_bytes += meta.logical;
             if meta.mount_skipped {
                 self.totals.mount_points_skipped += 1;
+                if self.coverage.mount_point_examples.len() < COVERAGE_EXAMPLES {
+                    self.coverage
+                        .mount_point_examples
+                        .push(path.to_string_lossy().into_owned());
+                }
                 if self.skipped_paths.len() < MAX_ISSUE_PATHS {
                     self.skipped_paths.push(path.clone());
                 } else {
@@ -819,6 +849,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         canon_roots: plan_r.canon.clone(),
         pruned_hit: HashSet::new(),
         refs: Refs::default(),
+        unreadable_dirs: HashSet::new(),
+        coverage: Coverage::default(),
     };
     if opts.one_file_system && !cfg!(unix) {
         warnings.push("--one-file-system is not supported on this platform and was ignored".into());
@@ -873,6 +905,14 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 Err(err) => {
                     let p = err.path().map(Path::to_path_buf).unwrap_or_default();
                     walk.issue(&p, err.to_string());
+                    let is_dir = std::fs::symlink_metadata(&p)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
+                    if is_dir {
+                        walk.unreadable_dir(&p);
+                    } else {
+                        walk.coverage.other_unreadable_entries += 1;
+                    }
                 }
             }
         }
@@ -889,9 +929,17 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         skipped_paths,
         skipped_overflow,
         refs,
+        mut coverage,
         ..
     } = walk;
     issues.truncate(MAX_ISSUES);
+    coverage.mount_points_skipped = totals.mount_points_skipped;
+    coverage.complete = totals.unreadable == 0
+        && totals.mount_points_skipped == 0
+        && !issue_overflow
+        && !skipped_overflow;
+    coverage.unreadable_dir_examples.sort();
+    coverage.mount_point_examples.sort();
 
     // Phase 2: classification.
     let mut dirs: Vec<(PathBuf, DirAgg)> = aggs.into_iter().collect();
@@ -1193,6 +1241,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         warnings,
         enclosing_repos,
         scope: roots_scope(&roots).to_string(),
+        coverage,
     })
 }
 

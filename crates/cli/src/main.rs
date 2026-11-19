@@ -85,6 +85,11 @@ struct PlanArgs {
     /// `trust_partial_process_check = true`) every removing action becomes `ask` then.
     #[arg(long)]
     trust_partial_process_check: bool,
+    /// When the scan could not read some folders or did not enter some mount points, treat
+    /// every repository's dependents as unknown, so each one asks (same as the config setting
+    /// `require_full_coverage = true`). Without it the plan only says what was not read.
+    #[arg(long)]
+    require_full_coverage: bool,
     /// Override the current time (unix seconds); for reproducible plans and tests.
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -151,6 +156,7 @@ fn run_plan(a: PlanArgs) -> Result<()> {
         process: running_cwds(),
         trust_partial_process_check: a.trust_partial_process_check
             || cfg.trust_partial_process_check,
+        require_full_coverage: a.require_full_coverage || cfg.require_full_coverage,
     };
     let p = plan(&scan_result, &opts);
     if a.json {

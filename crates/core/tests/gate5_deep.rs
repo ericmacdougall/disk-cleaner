@@ -30,6 +30,10 @@ fn chain(len: usize) -> ScanResult {
         warnings: vec![],
         enclosing_repos: vec![],
         scope: "subtree".to_string(),
+        coverage: disk_cleaner_core::Coverage {
+            complete: true,
+            ..Default::default()
+        },
     }
 }
 

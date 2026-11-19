@@ -66,8 +66,12 @@ For each repo and each worktree the scanner records, each as yes / no / unknown:
 - another clone or worktree depends on this object store (alternates, linked worktrees). Such
   dependencies are found from the references themselves during the walk (symlinks and alternates
   anywhere, `.git` entries inside dependency directories), not only from the repositories that are
-  classified, so a clone hidden inside `node_modules` still protects its provider. Hard links and
+  classified, so a clone hidden inside `node_modules` still protects its provider. A repository
+  that sets `extensions.preciousObjects = true` declares such dependents itself. Hard links and
   references from outside the scanned roots cannot be seen (docs/SCAN-FORMAT.md, known limits).
+  Folders the scan could not read and mount points it did not enter are recorded as the scan's
+  coverage and disclosed on every archive decision; `require_full_coverage` makes them block
+  archiving instead.
 
 At apply time the remote facts are confirmed against the live remote (`git ls-remote`), because
 remote-tracking refs can be stale.

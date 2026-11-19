@@ -598,8 +598,13 @@ fn check_module_configs(git: &crate::git::Git, cwd: &Path, modules: &Path) -> Re
 }
 
 /// Refuse to run git in a repo whose config, or whose submodules' configs, could execute
-/// programs, or whose `core.worktree` points at some other directory.
-fn check_repo_config(git: &crate::git::Git, path: &Path, class: Class) -> Result<(), String> {
+/// programs, or whose `core.worktree` points at some other directory. Returns the repo's local
+/// config keys.
+fn check_repo_config(
+    git: &crate::git::Git,
+    path: &Path,
+    class: Class,
+) -> Result<Vec<String>, String> {
     let keys = local_config_keys(git, path)?;
     unsafe_key(&keys, "repo config")?;
     if keys.iter().any(|k| k.eq_ignore_ascii_case("core.worktree")) {
@@ -647,7 +652,8 @@ fn check_repo_config(git: &crate::git::Git, path: &Path, class: Class) -> Result
     } else {
         path.join(common)
     };
-    check_module_configs(git, path, &common.join("modules"))
+    check_module_configs(git, path, &common.join("modules"))?;
+    Ok(keys)
 }
 
 /// Gitlinks (submodule entries, mode 160000) recorded in an `ls-files -s -z` listing:
@@ -812,9 +818,10 @@ pub fn collect_repo_info(
     }
     // The repo's own config is untrusted. Refuse to run anything else if it could make git
     // execute a program (filter drivers, gpg.program, ...).
-    if let Err(why) = check_repo_config(git, path, class) {
-        return all_unknown(why, regen_paths);
-    }
+    let config_keys = match check_repo_config(git, path, class) {
+        Ok(keys) => keys,
+        Err(why) => return all_unknown(why, regen_paths),
+    };
     let mut unverified: Vec<(PathBuf, String)> = Vec::new();
     let mut info = RepoInfo::default();
     let mut facts = Facts::default();
@@ -1156,6 +1163,41 @@ pub fn collect_repo_info(
             Tri::Unknown
         }
     };
+
+    // `extensions.preciousObjects = true` is the repository saying that others borrow its
+    // objects (it stops git from ever deleting them). A linked worktree only shares the setting
+    // of the repository it belongs to; nothing depends on the worktree itself.
+    let declared = config_keys
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case("extensions.preciousobjects"));
+    if declared && info.parent_repo.is_none() {
+        match git.run(
+            path,
+            &[
+                "config",
+                "--type=bool",
+                "--get",
+                "extensions.preciousObjects",
+            ],
+        ) {
+            Ok(v) if v.trim() == "true" => {
+                info.precious_objects = true;
+                facts.no_dependents = Tri::No;
+                notes.push(
+                    "no_dependents: this repository sets extensions.preciousObjects, which \
+                     declares that other repositories borrow its objects"
+                        .to_string(),
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if facts.no_dependents == Tri::Yes {
+                    facts.no_dependents = Tri::Unknown;
+                }
+                notes.push(note("no_dependents (extensions.preciousObjects)", &e));
+            }
+        }
+    }
 
     // Activity evidence: newest commit on any ref.
     info.last_commit_time = git

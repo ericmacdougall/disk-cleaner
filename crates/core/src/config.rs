@@ -1,5 +1,6 @@
-//! User settings. One setting so far: `active_window_days`, how recent activity must be for a
-//! project to count as active (default 7).
+//! User settings: `active_window_days`, how recent activity must be for a project to count as
+//! active (default 7), and two opt-ins, `trust_partial_process_check` and
+//! `require_full_coverage`.
 //!
 //! A config file that exists but cannot be understood is an error. It never falls back to a
 //! default, because a silent fallback could shorten the window and make projects look idle.
@@ -28,6 +29,10 @@ pub struct Config {
     /// Treat a partial process check (some processes unreadable) as sufficient to remove things.
     /// Off unless the user turns it on.
     pub trust_partial_process_check: bool,
+    /// When the scan could not read some folders or skipped mount points, treat every
+    /// repository's dependents as unknown, so none is offered for archiving. Off unless the user
+    /// turns it on.
+    pub require_full_coverage: bool,
 }
 
 impl Default for Config {
@@ -35,6 +40,7 @@ impl Default for Config {
         Config {
             active_window_days: DEFAULT_ACTIVE_WINDOW_DAYS,
             trust_partial_process_check: false,
+            require_full_coverage: false,
         }
     }
 }
@@ -44,6 +50,7 @@ impl Default for Config {
 struct RawConfig {
     active_window_days: Option<u64>,
     trust_partial_process_check: Option<bool>,
+    require_full_coverage: Option<bool>,
 }
 
 /// `<platform config dir>/disk-cleaner/config.toml`, if the platform config dir can be found.
@@ -71,6 +78,7 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
     Ok(Config {
         active_window_days: raw.active_window_days.unwrap_or(DEFAULT_ACTIVE_WINDOW_DAYS),
         trust_partial_process_check: raw.trust_partial_process_check.unwrap_or(false),
+        require_full_coverage: raw.require_full_coverage.unwrap_or(false),
     })
 }
 

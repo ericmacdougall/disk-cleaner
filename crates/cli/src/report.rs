@@ -67,6 +67,23 @@ pub fn scan_summary(s: &ScanResult) -> String {
     if t.mount_points_skipped > 0 {
         let _ = writeln!(o, "{} mount point(s) not crossed", t.mount_points_skipped);
     }
+    let c = &s.coverage;
+    if !c.complete {
+        let _ = writeln!(
+            o,
+            "Coverage incomplete: {} folder(s) could not be read and {} mount point(s) were not \
+             entered; links or clones inside them were not checked",
+            c.unreadable_dirs, c.mount_points_skipped
+        );
+        for e in c
+            .unreadable_dir_examples
+            .iter()
+            .chain(c.mount_point_examples.iter())
+            .take(5)
+        {
+            let _ = writeln!(o, "  not read: {}", esc(e));
+        }
+    }
     for w in &s.warnings {
         let _ = writeln!(o, "warning: {}", esc(w));
     }
@@ -196,6 +213,22 @@ pub fn plan_summary(p: &Plan) -> String {
              its git only",
             esc(&e.root),
             esc(&e.repo)
+        );
+    }
+    match &p.coverage_note {
+        Some(note) => {
+            let _ = writeln!(o, "{note}");
+        }
+        None => {
+            let _ = writeln!(o, "Coverage: complete (every folder was read).");
+        }
+    }
+    if p.required_full_coverage {
+        let _ = writeln!(
+            o,
+            "Full coverage was required by the user (require_full_coverage or \
+             --require-full-coverage): when coverage is incomplete, every repository's \
+             dependents count as unknown and it is not offered for archiving"
         );
     }
     if p.trusted_partial_process_check {

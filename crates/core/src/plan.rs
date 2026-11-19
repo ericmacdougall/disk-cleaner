@@ -81,6 +81,10 @@ pub struct PlanOptions {
     /// enough to remove things. Off by default: an unreadable process may be working inside the
     /// candidate.
     pub trust_partial_process_check: bool,
+    /// The user wants a scan that could not look everywhere (unreadable folders, mount points not
+    /// entered) to block archiving: every repository's `no_dependents = yes` becomes `unknown`.
+    /// Off by default: the plan then only discloses what was not read.
+    pub require_full_coverage: bool,
 }
 
 impl PlanOptions {
@@ -93,6 +97,7 @@ impl PlanOptions {
             now,
             process: ProcessCheck::none_running(),
             trust_partial_process_check: false,
+            require_full_coverage: false,
         }
     }
 }
@@ -169,6 +174,16 @@ pub struct Plan {
     /// elsewhere.
     #[serde(default = "crate::model::default_scope")]
     pub scope: String,
+    /// The scan read every folder and entered every mount point (its `coverage.complete`).
+    pub coverage_complete: bool,
+    /// When coverage is incomplete: one sentence saying what was not read and that links or
+    /// clones there were not checked. Every archive and recover-then-archive reason repeats it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_note: Option<String>,
+    /// The user asked for full coverage (`require_full_coverage` / `--require-full-coverage`):
+    /// with incomplete coverage every repository's `no_dependents = yes` became `unknown`.
+    #[serde(default)]
+    pub required_full_coverage: bool,
     pub active: Vec<String>,
     pub totals: PlanTotals,
     pub items: Vec<PlanItem>,
@@ -440,13 +455,21 @@ fn orphan_submodule_gitdir(scan: &ScanResult, idx: usize) -> Option<String> {
 /// Build a dry-run plan from a scan.
 pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     let ctx = build_ctx(scan, opts);
+    let complete = scan.coverage.complete;
+    // Strict coverage: what was not read, when the user asked for that to block archiving.
+    let strict: Option<String> = if opts.require_full_coverage && !complete {
+        Some(coverage_gaps(&scan.coverage))
+    } else {
+        None
+    };
     let mut items: Vec<PlanItem> = Vec::new();
     for (idx, node) in scan.nodes.iter().enumerate() {
         if matches!(node.class, Class::Output | Class::Other) {
             continue;
         }
         let (state, state_reason, days) = judge(&ctx, idx, opts);
-        let (mut action, mut reason, mut reclaim) = decide(scan, idx, state, &state_reason);
+        let (mut action, mut reason, mut reclaim) =
+            decide(scan, idx, state, &state_reason, strict.as_deref());
         if action.removes() {
             if let Some(why) = node.ask_reason.as_deref() {
                 reason = format!("{reason}; but it {why}");
@@ -517,7 +540,10 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             reclaimable_bytes: reclaim,
             bytes_total: node.bytes_total,
             days_since_activity: days,
-            facts: node.repo.as_ref().map(|r| r.facts),
+            facts: node
+                .repo
+                .as_ref()
+                .map(|r| effective_facts(r.facts, strict.is_some())),
         });
     }
 
@@ -558,6 +584,16 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             );
             items[parent].action = Action::Ask;
             items[parent].reclaimable_bytes = 0;
+        }
+    }
+
+    // Every decision that rests on "nothing depends on it" says where the scan could not look.
+    // Last, so it is only added to items that are still archived or recovered.
+    if let Some(gap) = coverage_reason(&scan.coverage, complete) {
+        for it in items.iter_mut() {
+            if matches!(it.action, Action::Archive | Action::RecoverThenArchive) {
+                it.reason.push_str(&gap);
+            }
         }
     }
 
@@ -612,6 +648,9 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 .to_string(),
         enclosing_repos: scan.enclosing_repos.clone(),
         scope: scan.scope.clone(),
+        coverage_complete: complete,
+        coverage_note: coverage_note(&scan.coverage, complete),
+        required_full_coverage: opts.require_full_coverage,
         active: opts
             .active
             .iter()
@@ -622,9 +661,122 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     }
 }
 
+/// The places the scan could not look, each as (`"<n> folder(s)"`, verb phrase), and how many
+/// there are in all.
+fn gaps(c: &Coverage) -> (Vec<(String, &'static str)>, u64) {
+    let kinds = [
+        (
+            c.unreadable_dirs,
+            "folder",
+            "folders",
+            "could not be read",
+            "could not be read",
+        ),
+        (
+            c.other_unreadable_entries,
+            "other entry",
+            "other entries",
+            "could not be read",
+            "could not be read",
+        ),
+        (
+            c.mount_points_skipped,
+            "mount point",
+            "mount points",
+            "was not entered (--one-file-system)",
+            "were not entered (--one-file-system)",
+        ),
+    ];
+    let mut out = Vec::new();
+    let mut total = 0u64;
+    for (n, one, many, verb_one, verb_many) in kinds {
+        if n > 0 {
+            total = total.saturating_add(n);
+            if n == 1 {
+                out.push((format!("1 {one}"), verb_one));
+            } else {
+                out.push((format!("{n} {many}"), verb_many));
+            }
+        }
+    }
+    (out, total)
+}
+
+fn it_or_them(total: u64) -> &'static str {
+    if total == 1 {
+        "it"
+    } else {
+        "them"
+    }
+}
+
+/// `1 folder could not be read and 2 mount points were not entered (--one-file-system)`.
+fn coverage_gaps(c: &Coverage) -> String {
+    let (parts, _) = gaps(c);
+    if parts.is_empty() {
+        return "the scan did not record where it could not look".to_string();
+    }
+    parts
+        .iter()
+        .map(|(noun, verb)| format!("{noun} {verb}"))
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// The plan header's sentence for an incomplete scan.
+fn coverage_note(c: &Coverage, complete: bool) -> Option<String> {
+    if complete {
+        return None;
+    }
+    let (_, total) = gaps(c);
+    Some(format!(
+        "Coverage is incomplete: {}, so links or clones inside {} were not checked.",
+        coverage_gaps(c),
+        it_or_them(total)
+    ))
+}
+
+/// The ending of every archive and recover-then-archive reason when coverage is incomplete:
+/// `; 1 folder in this scan could not be read; dependents inside it were not checked`.
+fn coverage_reason(c: &Coverage, complete: bool) -> Option<String> {
+    if complete {
+        return None;
+    }
+    let (parts, total) = gaps(c);
+    if parts.is_empty() {
+        return Some(
+            "; the scan did not record where it could not look, so dependents may have been \
+             missed"
+                .to_string(),
+        );
+    }
+    let mut text = String::new();
+    for (k, (noun, verb)) in parts.iter().enumerate() {
+        if k == 0 {
+            text.push_str(&format!("{noun} in this scan {verb}"));
+        } else {
+            text.push_str(&format!(" and {noun} {verb}"));
+        }
+    }
+    Some(format!(
+        "; {text}; dependents inside {} were not checked",
+        it_or_them(total)
+    ))
+}
+
+/// A repository's facts as the plan uses them: under strict coverage an unproven
+/// `no_dependents = yes` is `unknown`.
+fn effective_facts(mut facts: Facts, strict: bool) -> Facts {
+    if strict && facts.no_dependents == Tri::Yes {
+        facts.no_dependents = Tri::Unknown;
+    }
+    facts
+}
+
 /// Why a repository that others depend on asks: up to three of them are named.
 fn dependents_reason(node: &Node) -> String {
     let mut who: Vec<String> = Vec::new();
+    let mut precious = false;
     if let Some(r) = node.repo.as_ref() {
         who.extend(r.dependents.iter().cloned());
         for w in &r.worktrees {
@@ -632,6 +784,19 @@ fn dependents_reason(node: &Node) -> String {
                 who.push(w.clone());
             }
         }
+        precious = r.precious_objects;
+    }
+    if precious {
+        let named = if who.is_empty() {
+            String::new()
+        } else {
+            let shown = who.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            format!(" (known: {shown})")
+        };
+        return format!(
+            "this repository sets extensions.preciousObjects, which declares that other \
+             repositories borrow its objects{named}; deal with those first"
+        );
     }
     if who.is_empty() {
         return "other checkouts or clones use this repository's objects or refs; deal with those \
@@ -652,17 +817,32 @@ fn dependents_reason(node: &Node) -> String {
     )
 }
 
-/// For each unknown fact: what could not be checked and what would settle it.
-fn explain_unknown(node: &Node, facts: &Facts) -> String {
+/// For each unknown fact: what could not be checked and what would settle it. `strict` is what
+/// the scan could not read when full coverage was required.
+fn explain_unknown(node: &Node, facts: &Facts, strict: Option<&str>) -> String {
     let notes = node
         .repo
         .as_ref()
         .map(|r| r.notes.join(" "))
         .unwrap_or_default();
+    // Was `no_dependents` itself unknown in the scan, or only made so by strict coverage?
+    let scanned_unknown = node
+        .repo
+        .as_ref()
+        .map(|r| r.facts.no_dependents == Tri::Unknown)
+        .unwrap_or(true);
     let parts: Vec<String> = facts
         .unknown()
         .into_iter()
         .map(|name| {
+            if let (Some(gap), "no_dependents", false) = (strict, name, scanned_unknown) {
+                return format!(
+                    "full coverage was required (require_full_coverage or \
+                     --require-full-coverage) and {gap}, so links or clones there may depend \
+                     on this repository; make them readable and scan again, or plan without \
+                     that setting"
+                );
+            }
             let text: &str = match name {
                 "has_network_remote" => {
                     "the remotes could not be read (git failed); run the scan again with git working"
@@ -718,7 +898,15 @@ fn scope_note(scan: &ScanResult) -> &'static str {
     }
 }
 
-fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Action, String, u64) {
+/// `strict` is set when the user required full coverage and the scan did not have it: what was
+/// not read.
+fn decide(
+    scan: &ScanResult,
+    idx: usize,
+    state: ProjectState,
+    why: &str,
+    strict: Option<&str>,
+) -> (Action, String, u64) {
     let node = &scan.nodes[idx];
     if state == ProjectState::Active {
         return (Action::Keep, format!("active: {why}"), 0);
@@ -755,7 +943,7 @@ fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Act
         }
         Class::Repo | Class::Worktree => {
             let facts = match node.repo.as_ref() {
-                Some(r) => r.facts,
+                Some(r) => effective_facts(r.facts, strict.is_some()),
                 None => {
                     return (
                         Action::Ask,
@@ -791,7 +979,7 @@ fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Act
                     Action::Ask,
                     format!(
                         "idle ({why}) but cannot prove it is safe: {}",
-                        explain_unknown(node, &facts)
+                        explain_unknown(node, &facts, strict)
                     ),
                     0,
                 )

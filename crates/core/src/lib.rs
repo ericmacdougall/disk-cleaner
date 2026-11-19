@@ -175,5 +175,18 @@ pub fn validate_scan(scan: &ScanResult) -> Result<()> {
     )?;
     checked_total("outputs[].bytes", scan.outputs.iter().map(|x| x.bytes))?;
     checked_total("big_files[].bytes", scan.big_files.iter().map(|x| x.bytes))?;
+    // A scan that says it looked everywhere must not also record places it could not look.
+    let c = &scan.coverage;
+    let gaps = c.unreadable_dirs > 0
+        || c.other_unreadable_entries > 0
+        || c.mount_points_skipped > 0
+        || scan.totals.unreadable > 0
+        || scan.totals.mount_points_skipped > 0;
+    if c.complete && gaps {
+        return Err(invalid(
+            "coverage.complete",
+            "is true but the scan records unreadable entries or skipped mount points",
+        ));
+    }
     Ok(())
 }

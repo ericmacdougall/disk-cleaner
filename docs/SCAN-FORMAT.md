@@ -1,17 +1,20 @@
 # Scan and plan JSON format
 
-Schema version: **5** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **6** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
 `plain_layout`, `repo.layout_issue` and the scan field `scope`. Version 5 changed no field but
 made `no_dependents` and `plain_layout` stricter (inbound references, symlinks anywhere in a git
 directory, see below): a version 4 scan can say `yes` where version 5 says `no`, so it is refused.
+Version 6 added the required scan field `coverage`, `repo.precious_objects` and the plan fields
+`coverage_complete`, `coverage_note` and `required_full_coverage`; a version 5 scan does not say
+where it could not look, so it is refused.
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 
 Produce a scan with `disk-cleaner scan <path>... --out scan.json` (or `--json` for stdout) and a
-plan with `disk-cleaner plan --scan scan.json [--active-window-days N] [--config FILE] [--active PATH]... [--trust-partial-process-check] [--json]`. Both are
+plan with `disk-cleaner plan --scan scan.json [--active-window-days N] [--config FILE] [--active PATH]... [--trust-partial-process-check] [--require-full-coverage] [--json]`. Both are
 read-only. Nothing in this phase deletes, moves or modifies anything; `--out` writes only the file
 you name.
 
@@ -19,7 +22,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 5 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 6 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots that were walked, as spelled; overlapping roots are normalised first (see "Overlapping scan roots") |
@@ -31,6 +34,7 @@ you name.
 | `issues` | up to 1000 unreadable entries: `path`, `message`; `totals.unreadable` has the full count |
 | `warnings` | notes about limits that applied to this run |
 | `scope` | `volume` when every scan root is a mount point (its device differs from its parent's) or a file system root, otherwise `subtree`. A subtree scan cannot see clones that live elsewhere, so `no_dependents` means "no dependents were found within the scanned roots"; the plan header repeats the scope and, for `subtree`, every archive reason says other clones outside the scanned folders were not checked (disclosure only: the apply phase re-verifies, and the plan is not downgraded to `ask` on scope alone) |
+| `coverage` | where the walk could not look, so links, clones and alternates files there were not seen: `complete` (no entry was unreadable and no mount point was skipped), `unreadable_dirs` (directories whose contents could not be listed, each counted once) with up to 20 `unreadable_dir_examples`, `other_unreadable_entries` (entries whose metadata could not be read, and walk errors), and `mount_points_skipped` with up to 20 `mount_point_examples`. See "Incomplete coverage" below |
 | `enclosing_repos` | scan roots that lie inside a git repository the scan did not cover: `root`, `repo`, `note`. Before the walk each root is looked at upward for a `.git` directory or file in any ancestor (the real path first, then the spelled one; symlinks are not followed). That repository is not a node and never gets a plan item, but the regenerable and cache directories below the root that no scanned repo encloses are decided by its git exactly as in a full scan: the config allowlist and work-tree checks run on it, and a directory is removable only if git lists it as wholly ignored and untracked. A refused config, a git failure or timeout, `--no-git`, or an ancestor `.git` that is not a plain directory or file makes them ask. The plan header and the human outputs say the repository was not assessed |
 
 A `.git` entry that is neither a regular directory nor a regular file (a symlink, socket, fifo or
@@ -195,6 +199,7 @@ with or without evidence.
 | `head_commit`, `last_commit_time` | HEAD id; newest commit on any ref |
 | `worktrees` | live linked worktrees reported by git (may be outside the scan) |
 | `parent_repo`, `parent_node` | for a linked worktree: its repo as git reports it, and its index in `nodes` if scanned |
+| `precious_objects` | present and `true` when the repository sets `extensions.preciousObjects = true` (see "Declared dependents") |
 | `dependents` | clones in the scan that borrow objects from this repo (alternates; the file is read only if it is a regular file under 64 KiB, otherwise a warning is recorded and `no_dependents` of the other git nodes becomes `unknown`, see below) |
 | `submodule_gitdirs`, `git_dir` | submodule git directories under `.git/modules`; this node's own git directory |
 | `sizes` | `total`, `git` (the `.git` directory), `regenerable`, `output` |
@@ -209,7 +214,7 @@ Facts (the safe value is always `yes`):
 | `stash_empty` | the stash is empty |
 | `tree_clean` | no tracked changes and no untracked files in this repo's own tree (submodules are their own nodes), no file marked skip-worktree or assume-unchanged (those hide local edits), and every submodule gitlink agrees: the index matches HEAD, and each checked-out submodule's HEAD equals the commit the index records (`status --ignore-submodules=all` hides both). A recorded submodule with a missing or empty directory is fine; a directory with files and no `.git` at a gitlink path, an unmerged gitlink or a differing commit is `no`; a submodule whose config fails the allowlist, whose HEAD cannot be read, or more than 200 submodules is `unknown`. The commits are compared with `ls-files -s`, `ls-tree -r HEAD` and `rev-parse --verify HEAD` run in the submodule through the hardened runner; no status runs inside it |
 | `no_unique_ignored` | no ignored files outside regenerable and cache directories (`.env`, local databases...) |
-| `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone, shared object directory or other reference into this repository's git directory was found (see "Inbound references") |
+| `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone, shared object directory or other reference into this repository's git directory was found (see "Inbound references"), and the repository does not declare `extensions.preciousObjects = true` (see "Declared dependents"). Places the scan could not read are not covered: see "Incomplete coverage" |
 | `reflog_saved` | every commit reachable from any reflog entry (HEAD of this worktree and every ref's reflog) is contained in a network remote's tracking refs. An unpushed commit after `git reset --hard`, an amended or rebased-away commit and a stash's commits are `no`. No network remote is `no`; an unborn HEAD, any git failure or a timeout is `unknown` |
 | `plain_layout` | the repository has the plain layout described under "Plain layout" below. `no` or `unknown` makes the plan `ask` with the reason `unusual repository layout: <first failing check>` (kept in `repo.layout_issue`); it is never `recover-then-archive` or `archive` |
 | `no_pending_state` | no unfinished rebase, merge, cherry-pick, revert or bisect in this worktree's git directory (`rebase-merge`, `rebase-apply`, `sequencer`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_*`) and no local-only content under `.git/lfs/objects` or `.git/annex/objects`. Found by name only. Never `no`: a finding is `unknown` (state that no ref records cannot be recovered into a ref, so a person decides) |
@@ -350,13 +355,51 @@ After the walk:
   independent repositories. Their objects survive the removal of either (a hard-linked file stays
   until its last name is removed), but nothing records that one was created from the other.
 - References from outside the scanned roots are invisible: a clone, symlink or alternates file that
-  lives in a folder the scan did not cover (including a directory the scan could not read, or a mount
-  point `--one-file-system` did not enter) is not seen. A subtree scan says so in its `scope`.
+  lives in a folder the scan did not cover is not seen. A subtree scan says so in its `scope`.
+- References inside a directory the scan could not read, or a mount point `--one-file-system` did
+  not enter, are not seen either. The scan records those places in `coverage`, and the plan
+  discloses them on every decision they could affect (see "Incomplete coverage"); with
+  `require_full_coverage` they make every repository ask instead.
 - More than 200,000 kept symlinks or 20,000 alternates files makes every repository's
   `no_dependents` `unknown` (safe, but nothing is archived); a large pnpm or git-annex tree can reach
   it.
 - Resolving a symlink's target as a path touches each directory on the way (as `realpath` does), so
   a link to an automounted or stale network path can slow the scan; nothing is read through it.
+
+**Declared dependents.** A repository whose config sets `extensions.preciousObjects = true` declares
+that other repositories borrow its objects (git then never deletes any of them). The key is on the
+config allowlist, so the other facts are still computed; its value is read with
+`git config --type=bool --get extensions.preciousObjects`. `true` makes `no_dependents` `no`, sets
+`repo.precious_objects` and adds a note, and the plan asks with a reason naming the setting; a
+value git cannot read makes `no_dependents` `unknown`; `false` changes nothing. A linked worktree
+shares the setting of its repository and is not affected.
+
+**Incomplete coverage.** Links, clones and alternates files inside a directory the scan could not
+read, or inside a mount point `--one-file-system` did not enter, are never seen, so a repository
+they depend on can look free of dependents. By default this does not stop archiving: on a real
+home folder some directories are almost always unreadable (privacy-protected folders, other users'
+files), and blocking every repository on them would leave nothing to archive. Instead the
+incompleteness is attached to each decision it could affect:
+
+- the scan's `coverage` block counts the unreadable directories, other unreadable entries and
+  skipped mount points, with up to 20 example paths of each kind of directory;
+- the plan records `coverage_complete`, and when it is `false` a one-sentence `coverage_note`
+  that the human header prints (`Coverage is incomplete: 3 folders could not be read and 1 mount
+  point was not entered (--one-file-system), so links or clones inside them were not checked.`);
+- every `archive` and `recover-then-archive` reason ends with the same facts, for example
+  `; 3 folders in this scan could not be read; dependents inside them were not checked` (after the
+  subtree-scope sentence when that applies).
+
+An unreadable entry or skipped mount point inside a node still makes that node (and the nodes
+around it) ask, as described under `unreadable` and `skipped_mounts`. `remove-regenerable` and
+`totals.ready_bytes` are not affected: regenerable data has no dependents.
+
+**Strict coverage.** The config setting `require_full_coverage = true` or
+`plan --require-full-coverage` makes incomplete coverage set `no_dependents` from `yes` to
+`unknown` for every repository, worktree and bare repository in the plan (`items[].facts` shows
+the value used), so none is archived or recovered; the reason says that full coverage was
+required and what was not read. The plan records `required_full_coverage: true` and the human
+header says the user asked for it. With complete coverage the setting changes nothing.
 
 Remote URLs have embedded credentials removed (`https://user:token@host/x` is stored as
 `https://host/x`; everything up to the last `@` counts as userinfo, and query strings and fragments are
@@ -440,7 +483,9 @@ node inside the repo (matched by identity, not by count); the reason names the o
 `schema_version`, `dry_run` (always `true`), `generated_at`, `scan_generated_at`,
 `active_window_days`, `window_source`, `process_check` (`ok`, `partial` or `unknown`),
 `process_check_note`, `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
-`remote_facts_note`, `active`, `totals` and `items`.
+`remote_facts_note`, `enclosing_repos`, `scope`, `coverage_complete`, `coverage_note` (only when
+coverage is incomplete), `required_full_coverage` (see "Incomplete coverage" and "Strict
+coverage"), `active`, `totals` and `items`.
 
 Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `state` (`active`,
 `idle` or `unknown`), `state_reason` (why it was judged so), `reason` (plain language),
@@ -456,6 +501,7 @@ One setting decides activity: `active_window_days`, default **7**. It is read fr
 ```toml
 active_window_days = 7
 # trust_partial_process_check = true   # optional, see below; default false
+# require_full_coverage = true         # optional, see "Strict coverage"; default false
 ```
 
 A missing default file means the default. A file that exists but is malformed, has an unknown key
