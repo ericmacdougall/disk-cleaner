@@ -58,8 +58,46 @@ fn main() {
             adversarial(&args[1], mb << 20, &args[3]);
         }
         Some("load") if args.len() >= 2 => load(&args[1], args.iter().any(|a| a == "--plan")),
+        Some("split") if args.len() == 2 => split(&args[1]),
         _ => usage(),
     }
+}
+
+/// Where the parse's memory goes: the peak after `serde_json::Value` alone, then after the
+/// typed conversion that `scan_from_json` does while the `Value` is still alive.
+fn split(path: &str) {
+    let text = std::fs::read_to_string(path).expect("read");
+    let est = estimate(text.as_bytes());
+    let base = rss();
+    let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let value_peak = hwm().saturating_sub(base);
+    let value_rss = rss().saturating_sub(base);
+    let scan: disk_cleaner_core::ScanResult = serde_json::from_value(value).expect("scan");
+    let typed_peak = hwm().saturating_sub(base);
+    let typed_rss = rss().saturating_sub(base);
+    println!(
+        "PERF split file_mib={:.1} values={} objects={} arrays={} keys={} strings={} \
+         array_elements={} nodes={} outputs={} big_files={} node_size={} \
+         value_peak_mib={:.1} value_rss_mib={:.1} typed_peak_mib={:.1} typed_rss_mib={:.1} \
+         estimate_mib={:.1} (peaks exclude the text, {:.1} MiB)",
+        mib(text.len() as u64),
+        est.values,
+        est.objects,
+        est.arrays,
+        est.keys,
+        est.strings,
+        est.array_elements,
+        scan.nodes.len(),
+        scan.outputs.len(),
+        scan.big_files.len(),
+        std::mem::size_of::<disk_cleaner_core::Node>(),
+        mib(value_peak),
+        mib(value_rss),
+        mib(typed_peak),
+        mib(typed_rss),
+        mib(est.peak_bytes),
+        mib(text.len() as u64),
+    );
 }
 
 fn index() {

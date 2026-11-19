@@ -113,22 +113,28 @@ jobs:
           test "${PIPESTATUS[0]}" -eq 0
       - name: Memory, scan load and import estimate (measured peak must not exceed the estimate)
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cargo build --release -p disk-cleaner-view --locked --example perfmem
           B=target/release/examples/perfmem
           W="$RUNNER_TEMP/perf"; mkdir -p "$W"
+          # Every measurement runs; the step fails at the end if any of them failed.
+          failed=0
+          run() { "$@" || { echo "FAILED (exit $?): $*"; failed=1; }; }
           {
-            "$B" index
-            "$B" gen-scan 1000000 "$W/scan-1m.json"
-            "$B" load "$W/scan-1m.json" --plan
+            run "$B" index
+            run "$B" gen-scan 1000000 "$W/scan-1m.json"
+            run "$B" split "$W/scan-1m.json"
+            run "$B" load "$W/scan-1m.json" --plan
             rm -f "$W/scan-1m.json"
             for spec in tiny:112 objects:44 strings:800 nested:120; do
               kind="${spec%%:*}"; size="${spec##*:}"
-              "$B" gen-adversarial "$kind" "$size" "$W/adv-$kind.json"
-              "$B" load "$W/adv-$kind.json"
+              run "$B" gen-adversarial "$kind" "$size" "$W/adv-$kind.json"
+              run "$B" load "$W/adv-$kind.json"
               rm -f "$W/adv-$kind.json"
             done
+            echo "perfmem failures: $failed"
           } 2>&1 | tee perf-mem.txt
+          grep -q '^perfmem failures: 0$' perf-mem.txt
       - name: Job summary
         if: always()
         run: |
