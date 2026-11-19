@@ -151,7 +151,10 @@ fn j2_worktree_config_overriding_core_worktree_makes_every_fact_unknown() {
 #[test]
 fn j2_control_matching_worktree_config_keeps_the_facts_known() {
     let (_tmp, root, repo) = worktree_config_repo(None);
-    git(&repo, &["config", "--worktree", "core.worktree", &slash(&repo)]);
+    git(
+        &repo,
+        &["config", "--worktree", "core.worktree", &slash(&repo)],
+    );
     let res = scan_with(&root, network_everywhere());
     assert_eq!(tri_of(&res, &repo, "has_network_remote"), "yes");
     assert_eq!(tri_of(&res, &repo, "tree_clean"), "yes");
@@ -190,7 +193,11 @@ fn j3_file_directly_in_site_packages_is_not_a_package_file() {
     let (_t, root, proj) = proj_with("pyproject.toml");
     let venv = proj.join(".venv");
     write(
-        &venv.join("lib").join("python3.12").join("site-packages").join("local.db"),
+        &venv
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
+            .join("local.db"),
         "rows",
     );
     let res = scan_plain(&root);
@@ -203,7 +210,10 @@ fn j3_control_fixtures_inside_installed_packages_stay_removable() {
     let nm = proj.join("node_modules");
     write(&nm.join("pkg").join("package.json"), "{}");
     write(
-        &nm.join("pkg").join("test").join("fixtures").join("cert.pem"),
+        &nm.join("pkg")
+            .join("test")
+            .join("fixtures")
+            .join("cert.pem"),
         "x",
     );
     // Scoped package with a nested dependency.
@@ -266,7 +276,11 @@ fn j4_partial_process_check_asks_and_leaves_no_ready_bytes() {
         .find(|i| i.path == nm.to_string_lossy())
         .unwrap();
     assert_eq!(item.action, Action::Ask, "{}", item.reason);
-    assert!(item.reason.contains("could not be inspected"), "{}", item.reason);
+    assert!(
+        item.reason.contains("could not be inspected"),
+        "{}",
+        item.reason
+    );
     assert_eq!(p.totals.ready_bytes, 0);
     assert_eq!(p.totals.reclaimable_bytes, 0);
 }
