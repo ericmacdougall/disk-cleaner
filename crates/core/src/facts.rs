@@ -4,7 +4,7 @@
 //! `Unknown`; it is never promoted to the safe value. Remote URLs lose embedded credentials
 //! before they are stored.
 
-use crate::git::{Git, GitError};
+use crate::git::{path_from_git, rel_git_bytes, single_path, Git, GitError};
 use crate::model::{Class, Facts, Remote, RepoInfo, Tri};
 use crate::redact::{config_key_label, diag, strip_url_credentials};
 use std::path::{Path, PathBuf};
@@ -121,13 +121,81 @@ fn parse_remotes(out: &str, cfg: &FactsConfig) -> Vec<Remote> {
     remotes
 }
 
-fn rel_slash(path: &Path, base: &Path) -> Option<String> {
-    let rel = path.strip_prefix(base).ok()?;
-    let parts: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    Some(parts.join("/"))
+/// Is the `/`-separated path `p` the directory `dir` or inside it? Both are git's bytes.
+fn under(p: &[u8], dir: &[u8]) -> bool {
+    p == dir || (p.starts_with(dir) && p.get(dir.len()) == Some(&b'/'))
+}
+
+/// Text for a message from bytes git printed (a file name): lossy, for display only. Every note
+/// passes through [`diag`] before it is stored.
+fn shown(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// A path for a stored message or list (lossy, redacted); never used to look anything up.
+fn path_label(p: &Path) -> String {
+    diag(&p.to_string_lossy())
+}
+
+/// The worktrees `git worktree list --porcelain` names, as exact paths, main worktree first.
+///
+/// `-z` (git 2.36 and later) separates fields with NUL, so any name is read as it is. An older git
+/// refuses `-z`; then the line format is read, and anything it could have quoted or split (a
+/// quoted path, a line that is not a known attribute) is an error rather than a guess.
+fn worktree_paths(git: &Git, path: &Path) -> Result<Vec<PathBuf>, String> {
+    let field = |f: &[u8]| -> Result<Option<PathBuf>, String> {
+        match f.strip_prefix(b"worktree ") {
+            Some(p) => path_from_git(p)
+                .map(Some)
+                .ok_or_else(|| "a worktree path is not valid on this system".to_string()),
+            None => Ok(None),
+        }
+    };
+    let z = ["worktree", "list", "--porcelain", "-z"];
+    if let Ok(out) = git.run_bytes(path, &z) {
+        let mut found = Vec::new();
+        for f in out.split(|b| *b == 0) {
+            if let Some(p) = field(f)? {
+                found.push(p);
+            }
+        }
+        return Ok(found);
+    }
+    let out = git
+        .run_bytes(path, &["worktree", "list", "--porcelain"])
+        .map_err(|e| note("worktree list", &e))?;
+    const KNOWN: [&[u8]; 6] = [
+        b"HEAD ",
+        b"branch ",
+        b"bare",
+        b"detached",
+        b"locked",
+        b"prunable",
+    ];
+    let mut found = Vec::new();
+    for line in out.split(|b| *b == b'\n') {
+        if line.starts_with(b"worktree \"") {
+            return Err("git quoted a worktree path in its line format".to_string());
+        }
+        if let Some(p) = field(line)? {
+            found.push(p);
+            continue;
+        }
+        let known = line.is_empty() || KNOWN.iter().any(|k| line.starts_with(k));
+        if !known {
+            return Err("git printed a worktree list line that is not understood".to_string());
+        }
+    }
+    Ok(found)
+}
+
+/// The path a command such as `rev-parse --show-toplevel` prints, exactly (see
+/// [`single_path`]), or why it could not be read; a relative one is taken from `path`.
+fn printed_path(git: &Git, path: &Path, args: &[&str], what: &str) -> Result<PathBuf, String> {
+    let out = git.run_bytes(path, args).map_err(|e| note(what, &e))?;
+    let p = single_path(&out)
+        .ok_or_else(|| format!("{what}: git printed a path that is not valid on this system"))?;
+    Ok(if p.is_absolute() { p } else { path.join(p) })
 }
 
 /// What an entry is, by `lstat`: never followed.
@@ -408,18 +476,35 @@ const LOCAL_CONTENT: [&str; 2] = ["lfs/objects", "annex/objects"];
 /// blob would need git's clean filters and line-ending rules, which this crate never runs, so a
 /// raw hash would give false alarms and a filtered one would run repository-chosen programs. A
 /// file that cannot be `lstat`ed is counted too. `listing` is the `-z` output.
-fn hidden_index_entries(root: &Path, listing: &str) -> u64 {
-    listing
-        .split('\0')
-        .filter_map(|e| {
-            let mut chars = e.chars();
-            let tag = chars.next()?;
-            let rel = chars.as_str().strip_prefix(' ')?;
-            let hidden_tag = tag == 'S' || tag.is_ascii_lowercase();
-            (hidden_tag && !rel.is_empty()).then_some(rel)
-        })
-        .filter(|rel| !matches!(lk(&root.join(rel)), Ok(Lk::Missing)))
-        .count() as u64
+///
+/// The names are git's bytes, looked up exactly ([`path_from_git`]); a name that cannot be a path
+/// here is an error, so the check fails instead of missing the file.
+fn hidden_index_entries(root: &Path, listing: &[u8]) -> Result<u64, String> {
+    let mut n = 0u64;
+    for e in listing.split(|b| *b == 0) {
+        let (tag, rest) = match e.split_first() {
+            Some(x) => x,
+            None => continue,
+        };
+        let rel = match rest.strip_prefix(b" ") {
+            Some(r) if !r.is_empty() => r,
+            _ => continue,
+        };
+        let hidden_tag = *tag == b'S' || tag.is_ascii_lowercase();
+        if !hidden_tag {
+            continue;
+        }
+        let rel = path_from_git(rel).ok_or_else(|| {
+            format!(
+                "tree_clean: the index lists a file whose name is not valid on this system ({})",
+                shown(rel)
+            )
+        })?;
+        if !matches!(lk(&root.join(rel)), Ok(Lk::Missing)) {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Does `dir` exist and hold at least one entry? `Err` for anything but a plain directory or a
@@ -440,13 +525,8 @@ fn non_empty_dir(dir: &Path) -> Result<bool, String> {
 /// only (no file is read). `rr-cache` is not listed: it records conflict resolutions that can be
 /// derived again, not work.
 fn pending_state(git: &Git, path: &Path) -> Result<Vec<String>, String> {
-    let absolute = |args: &[&str], what: &str| -> Result<PathBuf, String> {
-        let out = git.run(path, args).map_err(|e| note(what, &e))?;
-        let p = PathBuf::from(out.trim());
-        Ok(if p.is_absolute() { p } else { path.join(p) })
-    };
-    let gitdir = absolute(&["rev-parse", "--absolute-git-dir"], "git dir")?;
-    let common = absolute(&["rev-parse", "--git-common-dir"], "git dir")?;
+    let gitdir = printed_path(git, path, &["rev-parse", "--absolute-git-dir"], "git dir")?;
+    let common = printed_path(git, path, &["rev-parse", "--git-common-dir"], "git dir")?;
     let mut found: Vec<String> = Vec::new();
     for name in IN_PROGRESS {
         // `symlink_metadata` succeeds for any kind of entry, including a symlink or a FIFO.
@@ -600,20 +680,20 @@ fn check_module_configs(git: &crate::git::Git, cwd: &Path, modules: &Path) -> Re
                 let file = dir.join(name);
                 match std::fs::symlink_metadata(&file) {
                     Ok(m) if m.is_file() => {
-                        let file_s = file.to_string_lossy().into_owned();
+                        // The file's own path, exactly (never a lossy spelling of it).
+                        let args: [&std::ffi::OsStr; 6] = [
+                            "config".as_ref(),
+                            "--file".as_ref(),
+                            file.as_os_str(),
+                            "--includes".as_ref(),
+                            "--name-only".as_ref(),
+                            "--list".as_ref(),
+                        ];
                         let out = git
-                            .run(
-                                cwd,
-                                &[
-                                    "config",
-                                    "--file",
-                                    file_s.as_str(),
-                                    "--includes",
-                                    "--name-only",
-                                    "--list",
-                                ],
-                            )
+                            .run_bytes(cwd, &args)
                             .map_err(|e| note("submodule config", &e))?;
+                        let out = String::from_utf8(out)
+                            .map_err(|_| note("submodule config", &GitError::NotUtf8))?;
                         let keys: Vec<String> = out.lines().map(|l| l.trim().to_string()).collect();
                         unsafe_key(&keys, "a submodule's config")?;
                     }
@@ -660,18 +740,17 @@ fn check_repo_config(
         // The effective value: with `extensions.worktreeConfig` a value in `config.worktree`
         // overrides the shared one, and `--local` would not see it. System and global config
         // are switched off, so the only scopes left are the two the allowlist already read.
+        // Both read exactly: the value is a path, and a lossy spelling of it could name another
+        // directory or fail to match this one.
         let value = git
-            .run(path, &["config", "--get", "core.worktree"])
+            .run_bytes(path, &["config", "--get", "core.worktree"])
             .map_err(|e| note("config", &e))?;
-        let gitdir = git
-            .run(path, &["rev-parse", "--absolute-git-dir"])
-            .map_err(|e| note("git dir", &e))?;
-        let v = PathBuf::from(value.trim());
-        let resolved = if v.is_absolute() {
-            v
-        } else {
-            PathBuf::from(gitdir.trim()).join(v)
-        };
+        let v = single_path(&value).ok_or_else(|| {
+            "core.worktree is not a path this system can use; facts would describe another tree"
+                .to_string()
+        })?;
+        let gitdir = printed_path(git, path, &["rev-parse", "--absolute-git-dir"], "git dir")?;
+        let resolved = if v.is_absolute() { v } else { gitdir.join(v) };
         if canon(&resolved) != canon(path) {
             return Err(
                 "core.worktree points to a different directory than this one; facts would \
@@ -682,57 +761,52 @@ fn check_repo_config(
     }
     if class != Class::BareRepo {
         // Whatever the config says, the tree git inspects must be the scanned directory.
-        let top = git
-            .run(path, &["rev-parse", "--show-toplevel"])
-            .map_err(|e| note("work tree", &e))?;
-        if canon(Path::new(top.trim())) != canon(path) {
+        let top = printed_path(git, path, &["rev-parse", "--show-toplevel"], "work tree")?;
+        if canon(&top) != canon(path) {
             return Err(
                 "git's work tree is not the scanned directory; facts would describe another tree"
                     .into(),
             );
         }
     }
-    let common = git
-        .run(path, &["rev-parse", "--git-common-dir"])
-        .map_err(|e| note("git dir", &e))?;
-    let common = PathBuf::from(common.trim());
-    let common = if common.is_absolute() {
-        common
-    } else {
-        path.join(common)
-    };
+    let common = printed_path(git, path, &["rev-parse", "--git-common-dir"], "git dir")?;
     check_module_configs(git, path, &common.join("modules"))?;
     Ok(keys)
 }
 
+/// One entry of a `-z` listing whose metadata (ASCII) ends at the first tab and whose path (git's
+/// bytes) follows: the metadata fields and the path. `None` for a malformed entry.
+fn meta_and_path(e: &[u8]) -> Option<(Vec<&str>, &[u8])> {
+    let tab = e.iter().position(|b| *b == b'\t')?;
+    let meta = std::str::from_utf8(&e[..tab]).ok()?;
+    Some((meta.split(' ').collect(), &e[tab + 1..]))
+}
+
 /// Gitlinks (submodule entries, mode 160000) recorded in an `ls-files -s -z` listing:
-/// `(commit, stage, path)`.
-fn index_gitlinks(out: &str) -> Vec<(String, String, String)> {
-    out.split('\0')
+/// `(commit, stage, path bytes)`.
+fn index_gitlinks(out: &[u8]) -> Vec<(String, String, Vec<u8>)> {
+    out.split(|b| *b == 0)
         .filter_map(|e| {
-            let (meta, p) = e.split_once('\t')?;
-            let mut it = meta.split(' ');
-            if it.next()? != "160000" {
+            let (meta, p) = meta_and_path(e)?;
+            if meta.first() != Some(&"160000") {
                 return None;
             }
-            let sha = it.next()?.to_string();
-            let stage = it.next()?.to_string();
-            Some((sha, stage, p.to_string()))
+            let sha = meta.get(1)?.to_string();
+            let stage = meta.get(2)?.to_string();
+            Some((sha, stage, p.to_vec()))
         })
         .collect()
 }
 
-/// Gitlinks in an `ls-tree -r -z` listing: path to commit.
-fn tree_gitlinks(out: &str) -> std::collections::BTreeMap<String, String> {
-    out.split('\0')
+/// Gitlinks in an `ls-tree -r -z` listing: path bytes to commit.
+fn tree_gitlinks(out: &[u8]) -> std::collections::BTreeMap<Vec<u8>, String> {
+    out.split(|b| *b == 0)
         .filter_map(|e| {
-            let (meta, p) = e.split_once('\t')?;
-            let mut it = meta.split(' ');
-            if it.next()? != "160000" {
+            let (meta, p) = meta_and_path(e)?;
+            if meta.first() != Some(&"160000") {
                 return None;
             }
-            let _kind = it.next()?;
-            Some((p.to_string(), it.next()?.to_string()))
+            Some((p.to_vec(), meta.get(2)?.to_string()))
         })
         .collect()
 }
@@ -746,12 +820,12 @@ fn tree_gitlinks(out: &str) -> std::collections::BTreeMap<String, String> {
 /// config passed the same allowlist as any repo; no status is run inside it.
 fn gitlink_state(git: &Git, path: &Path, has_head: bool) -> Result<Option<String>, String> {
     let listing = git
-        .run(path, &["ls-files", "-s", "-z"])
+        .run_bytes(path, &["ls-files", "-s", "-z"])
         .map_err(|e| note("gitlinks", &e))?;
     let index = index_gitlinks(&listing);
     let head = if has_head {
         let tree = git
-            .run(path, &["ls-tree", "-r", "-z", "HEAD"])
+            .run_bytes(path, &["ls-tree", "-r", "-z", "HEAD"])
             .map_err(|e| note("gitlinks", &e))?;
         tree_gitlinks(&tree)
     } else {
@@ -760,16 +834,20 @@ fn gitlink_state(git: &Git, path: &Path, has_head: bool) -> Result<Option<String
     if index.len() > 200 {
         return Err("more than 200 submodules; their commits were not compared".into());
     }
-    for (sha, stage, sub) in &index {
+    // Paths are compared as git's bytes; `sub` is their spelling for messages only.
+    for (sha, stage, sub_bytes) in &index {
+        let sub = shown(sub_bytes);
         if stage != "0" {
             return Ok(Some(format!("submodule {sub} has an unmerged index entry")));
         }
-        if head.get(sub) != Some(sha) {
+        if head.get(sub_bytes) != Some(sha) {
             return Ok(Some(format!(
                 "the index records submodule {sub} differently from HEAD (a staged change)"
             )));
         }
-        let dir = path.join(sub);
+        let rel = path_from_git(sub_bytes)
+            .ok_or_else(|| format!("submodule {sub}: its path is not valid on this system"))?;
+        let dir = path.join(rel);
         match std::fs::symlink_metadata(&dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("cannot read submodule {sub}: {e}")),
@@ -807,7 +885,8 @@ fn gitlink_state(git: &Git, path: &Path, has_head: bool) -> Result<Option<String
     }
     if let Some(gone) = head.keys().find(|p| !index.iter().any(|(_, _, q)| q == *p)) {
         return Ok(Some(format!(
-            "the index no longer records submodule {gone} (a staged removal)"
+            "the index no longer records submodule {} (a staged removal)",
+            shown(gone)
         )));
     }
     Ok(None)
@@ -1032,8 +1111,9 @@ pub fn collect_repo_info(
     };
 
     // Stash.
-    facts.stash_empty = match git.run(path, &["stash", "list"]) {
-        Ok(out) => Tri::from_bool(out.trim().is_empty()),
+    // Only emptiness is read, as bytes: a stash message need not be valid UTF-8.
+    facts.stash_empty = match git.run_bytes(path, &["stash", "list"]) {
+        Ok(out) => Tri::from_bool(out.iter().all(u8::is_ascii_whitespace)),
         Err(e) => {
             notes.push(note("stash_empty", &e));
             Tri::Unknown
@@ -1044,9 +1124,11 @@ pub fn collect_repo_info(
     if class == Class::BareRepo {
         notes.push("tree_clean and no_unique_ignored: a bare repo has no working tree");
     } else {
+        // Only emptiness is read, as bytes; `-z` so no name is quoted or split.
         let status_args = [
             "status",
             "--porcelain",
+            "-z",
             "--untracked-files=all",
             // Each checked-out submodule is its own node with its own config check; a recursive
             // status would run inside it using its config.
@@ -1055,11 +1137,11 @@ pub fn collect_repo_info(
         // `status` hides edits to files marked skip-worktree or assume-unchanged, and so do
         // `diff`, `add -A` and `stash`: those entries are counted on their own, whatever
         // `status` says, because recovery cannot capture them.
-        let hidden = match git.run(path, &["ls-files", "-v", "-z"]) {
-            Ok(listing) => Ok(hidden_index_entries(path, &listing)),
+        let hidden = match git.run_bytes(path, &["ls-files", "-v", "-z"]) {
+            Ok(listing) => hidden_index_entries(path, &listing),
             Err(e) => Err(note("tree_clean", &e)),
         };
-        facts.tree_clean = match (git.run(path, &status_args), hidden) {
+        facts.tree_clean = match (git.run_bytes(path, &status_args), hidden) {
             (Err(e), _) => {
                 notes.push(note("tree_clean", &e));
                 Tri::Unknown
@@ -1078,7 +1160,7 @@ pub fn collect_repo_info(
                         crate::words::agree(hidden, "it", "them")
                     ));
                 }
-                if !out.trim().is_empty() || hidden > 0 {
+                if !out.iter().all(u8::is_ascii_whitespace) || hidden > 0 {
                     Tri::No
                 } else {
                     // `status` runs with --ignore-submodules=all, which also hides a submodule
@@ -1105,19 +1187,26 @@ pub fn collect_repo_info(
             "--exclude-standard",
             "--directory",
         ];
-        facts.no_unique_ignored = match git.run(path, &ignored_args) {
+        // Entries and regenerable paths are compared as git's bytes, never as decoded text.
+        facts.no_unique_ignored = match git.run_bytes(path, &ignored_args) {
             Ok(out) => {
-                let entries: Vec<&str> = out
-                    .split('\0')
-                    .map(|e| e.trim_end_matches('/'))
+                let entries: Vec<&[u8]> = out
+                    .split(|b| *b == 0)
+                    .map(|mut e| {
+                        while let Some(rest) = e.strip_suffix(b"/") {
+                            e = rest;
+                        }
+                        e
+                    })
                     .filter(|e| !e.is_empty())
                     .collect();
-                let mut regen: Vec<String> = Vec::new();
+                let mut regen: Vec<Vec<u8>> = Vec::new();
                 for p in regen_paths {
-                    let rel = match rel_slash(p, path) {
+                    let rel = match rel_git_bytes(p, path) {
                         Some(r) => r,
                         None => {
-                            // Not below the repo as spelled: git cannot be asked about it.
+                            // Not below the repo as spelled, or not nameable to git here: git
+                            // cannot be asked about it.
                             unverified.push((
                                 p.clone(),
                                 "could not be related to the repository path, so it is not \
@@ -1129,9 +1218,7 @@ pub fn collect_repo_info(
                     };
                     // A generated directory is wholly ignored and untracked, so git lists it
                     // as one ignored entry (or inside one). Anything else may hold source.
-                    let ignored = entries
-                        .iter()
-                        .any(|e| rel == *e || rel.starts_with(&format!("{e}/")));
+                    let ignored = entries.iter().any(|e| under(&rel, e));
                     if ignored {
                         regen.push(rel);
                     } else {
@@ -1143,23 +1230,19 @@ pub fn collect_repo_info(
                         ));
                     }
                 }
-                let unique: Vec<&str> = entries
+                let unique: Vec<&[u8]> = entries
                     .iter()
                     .copied()
-                    .filter(|e| {
-                        !regen
-                            .iter()
-                            .any(|r| *e == r.as_str() || e.starts_with(&format!("{r}/")))
-                    })
+                    .filter(|e| !regen.iter().any(|r| under(e, r)))
                     .collect();
                 if unique.is_empty() {
                     Tri::Yes
                 } else {
-                    let shown: Vec<&str> = unique.iter().take(5).copied().collect();
+                    let examples: Vec<String> = unique.iter().take(5).map(|e| shown(e)).collect();
                     notes.push(format!(
                         "no_unique_ignored: {} outside regenerable directories, e.g. {}",
                         crate::words::count(unique.len() as u64, "ignored path", "ignored paths"),
-                        shown.join(", ")
+                        examples.join(", ")
                     ));
                     Tri::No
                 }
@@ -1178,36 +1261,25 @@ pub fn collect_repo_info(
     }
 
     // Dependents: linked worktrees. (Alternates clones are linked by the scanner.)
-    facts.no_dependents = match git.run(path, &["worktree", "list", "--porcelain"]) {
-        Ok(out) => {
-            let entries: Vec<String> = out
-                .lines()
-                .filter_map(|l| l.strip_prefix("worktree "))
-                .map(|s| s.to_string())
-                .collect();
+    facts.no_dependents = match worktree_paths(git, path) {
+        Ok(entries) => {
             let me = canon(path);
-            let others: Vec<String> = entries
-                .iter()
-                .filter(|e| canon(Path::new(e.as_str())) != me)
-                .cloned()
-                .collect();
-            let main_is_me = entries
-                .first()
-                .map(|e| canon(Path::new(e.as_str())) == me)
-                .unwrap_or(false);
+            let others: Vec<&PathBuf> = entries.iter().filter(|e| canon(e) != me).collect();
+            let main_is_me = entries.first().map(|e| canon(e) == me).unwrap_or(false);
+            // Paths are compared exactly; their lossy spelling is for messages only.
             if class == Class::Worktree && !main_is_me {
                 // A linked worktree: it belongs to the first listed worktree, and nothing
                 // can depend on it.
-                info.parent_repo = entries.first().map(|e| diag(e));
+                info.parent_repo = entries.first().map(|e| path_label(e));
                 Tri::Yes
             } else {
                 let has_none = others.is_empty();
-                info.worktrees = others.iter().map(|o| diag(o)).collect();
+                info.worktrees = others.iter().map(|o| path_label(o)).collect();
                 Tri::from_bool(has_none)
             }
         }
-        Err(e) => {
-            notes.push(note("no_dependents", &e));
+        Err(why) => {
+            notes.push(format!("no_dependents: {why}"));
             Tri::Unknown
         }
     };

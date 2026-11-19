@@ -85,10 +85,15 @@ struct PlanArgs {
     /// `trust_partial_process_check = true`) every removing action becomes `ask` then.
     #[arg(long)]
     trust_partial_process_check: bool,
-    /// When the scan could not read some folders or did not enter some mount points, treat
-    /// every repository's dependents as unknown, so each one asks (same as the config setting
-    /// `require_full_coverage = true`). Without it the plan only says what was not read.
+    /// Accept incomplete coverage: when the scan could not read some folders or did not enter
+    /// some mount points, still offer repositories for archiving, each reason saying what was not
+    /// read (same as the config setting `accept_incomplete_coverage = true`). Without it every
+    /// repository's dependents are unknown then, so each one asks.
     #[arg(long)]
+    accept_incomplete_coverage: bool,
+    /// Retired: strict coverage is now the default. Refused with a message naming
+    /// `--accept-incomplete-coverage`.
+    #[arg(long, hide = true)]
     require_full_coverage: bool,
     /// Override the current time (unix seconds); for reproducible plans and tests.
     #[arg(long, hide = true)]
@@ -130,6 +135,14 @@ fn run_scan(a: ScanArgs) -> Result<()> {
 }
 
 fn run_plan(a: PlanArgs) -> Result<()> {
+    if a.require_full_coverage {
+        anyhow::bail!(
+            "--require-full-coverage is no longer an option: incomplete coverage now makes \
+             repositories ask by default; drop the flag, or pass --accept-incomplete-coverage \
+             (config: accept_incomplete_coverage = true) to archive despite folders the scan \
+             could not read"
+        );
+    }
     let scan_result = read_scan(&a.scan).context("cannot read scan file")?;
     let now = a.now.unwrap_or_else(|| {
         SystemTime::now()
@@ -156,7 +169,7 @@ fn run_plan(a: PlanArgs) -> Result<()> {
         process: running_cwds(),
         trust_partial_process_check: a.trust_partial_process_check
             || cfg.trust_partial_process_check,
-        require_full_coverage: a.require_full_coverage || cfg.require_full_coverage,
+        accept_incomplete_coverage: a.accept_incomplete_coverage || cfg.accept_incomplete_coverage,
     };
     let p = plan(&scan_result, &opts);
     if a.json {

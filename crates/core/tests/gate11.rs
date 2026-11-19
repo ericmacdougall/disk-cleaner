@@ -315,10 +315,25 @@ fn s2d_an_archive_reason_says_no_dependents_were_found() {
         ..Coverage::default()
     };
     let p = plan(
-        &synthetic(vec![repo_node("/w/a", all_yes())], incomplete),
+        &synthetic(vec![repo_node("/w/a", all_yes())], incomplete.clone()),
         &opts(),
     );
     assert_eq!(p.items[0].action, Action::Ask, "{}", p.items[0].reason);
+    let mut accept = opts();
+    accept.accept_incomplete_coverage = true;
+    let p = plan(
+        &synthetic(vec![repo_node("/w/a", all_yes())], incomplete),
+        &accept,
+    );
+    let it = &p.items[0];
+    assert_eq!(it.action, Action::Archive, "{}", it.reason);
+    assert!(
+        it.reason.contains("no dependents were found"),
+        "{}",
+        it.reason
+    );
+    assert!(it.reason.contains("1 folder in this scan could not be read"));
+    assert!(p.accepted_incomplete_coverage);
     let p = plan(
         &synthetic(vec![repo_node("/w/a", all_yes())], complete()),
         &opts(),

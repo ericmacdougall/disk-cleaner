@@ -53,10 +53,9 @@ mod bytes {
                 true
             }
             Err(e) => {
-                assert!(
-                    !cfg!(target_os = "linux"),
-                    "a Linux file system refused a non-UTF-8 name: {e}"
-                );
+                if cfg!(target_os = "linux") {
+                    panic!("a Linux file system refused a non-UTF-8 name: {e}");
+                }
                 eprintln!("SKIPPED: this file system refuses the name {name:?} ({e})");
                 false
             }

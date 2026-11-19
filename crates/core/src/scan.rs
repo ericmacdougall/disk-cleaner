@@ -493,6 +493,11 @@ struct Build {
     gitdir_symlink: Option<String>,
 }
 
+/// The `ask_reason` of a node whose path is not valid UTF-8 (the plan prefixes "it").
+const NOT_UTF8_PATH: &str = "has a path that is not valid UTF-8, so the scan file records it only \
+                             approximately and it cannot be matched exactly against --active \
+                             paths or running processes, or removed by that name";
+
 /// `path` below `base` with `/` separators (`base` itself is the empty string).
 fn rel_slash(path: &Path, base: &Path) -> String {
     path.strip_prefix(base)
@@ -768,6 +773,11 @@ fn classify(
                                 )
                             });
                         }
+                    }
+                    if path.to_str().is_none() {
+                        // The scan file stores paths as UTF-8 text, so this one is stored lossily
+                        // and could not be matched or acted on exactly later.
+                        node.ask_reason.get_or_insert_with(|| NOT_UTF8_PATH.to_string());
                     }
                     builds.push(Build {
                         node,
@@ -2015,10 +2025,15 @@ fn read_small_regular_file(path: &Path) -> std::result::Result<Option<String>, S
 }
 
 /// This node's own git directory as a real path: `<dir>/.git`, or what its `.git` file names.
+///
+/// It is matched against `submodule_gitdirs` as text, so it is `None` when it is not valid UTF-8
+/// (never a lossy spelling that another directory could share): the submodule git directory it
+/// would have matched then counts as unused, and the repository holding it asks.
 fn node_git_dir(path: &Path, class: Class) -> Option<String> {
+    let exact = |p: PathBuf| p.to_str().map(str::to_string);
     match class {
-        Class::Repo => Some(canon(&path.join(".git")).to_string_lossy().into_owned()),
-        Class::BareRepo => Some(canon(path).to_string_lossy().into_owned()),
+        Class::Repo => exact(canon(&path.join(".git"))),
+        Class::BareRepo => exact(canon(path)),
         Class::Worktree => {
             let text = read_small_regular_file(&path.join(".git")).ok()??;
             let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
@@ -2028,7 +2043,7 @@ fn node_git_dir(path: &Path, class: Class) -> Option<String> {
             } else {
                 path.join(target)
             };
-            Some(canon(&full).to_string_lossy().into_owned())
+            exact(canon(&full))
         }
         _ => None,
     }
@@ -2058,7 +2073,13 @@ fn list_module_gitdirs(modules: &Path) -> Vec<String> {
             }
             let p = entry.path();
             if p.join("HEAD").is_file() {
-                found.push(canon(&p).to_string_lossy().into_owned());
+                // Matched as text against scanned git directories: a path that is not valid
+                // UTF-8 is a placeholder that matches none of them, so the repository asks.
+                found.push(match canon(&p).to_str() {
+                    Some(s) => s.to_string(),
+                    None => "<a git directory under .git/modules whose path is not valid UTF-8>"
+                        .to_string(),
+                });
                 // Nested submodules live in this module's own `modules` directory.
                 stack.push(p.join("modules"));
             } else {

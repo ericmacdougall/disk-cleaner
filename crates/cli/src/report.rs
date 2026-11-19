@@ -232,12 +232,18 @@ pub fn plan_summary(p: &Plan) -> String {
             let _ = writeln!(o, "Coverage: complete (every folder was read).");
         }
     }
-    if p.required_full_coverage {
+    if p.accepted_incomplete_coverage {
         let _ = writeln!(
             o,
-            "Full coverage was required by the user (require_full_coverage or \
-             --require-full-coverage): when coverage is incomplete, every repository's \
-             dependents count as unknown and it is not offered for archiving"
+            "Incomplete coverage was accepted by the user (accept_incomplete_coverage or \
+             --accept-incomplete-coverage): repositories may be archived although links or \
+             clones in places the scan could not read were not checked"
+        );
+    } else if !p.coverage_complete {
+        let _ = writeln!(
+            o,
+            "Because coverage is incomplete, no repository is offered for archiving: each one \
+             asks (--accept-incomplete-coverage archives anyway, saying what was not read)"
         );
     }
     if p.trusted_partial_process_check {

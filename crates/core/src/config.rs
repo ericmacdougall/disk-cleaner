@@ -1,6 +1,6 @@
 //! User settings: `active_window_days`, how recent activity must be for a project to count as
 //! active (default 7), and two opt-ins, `trust_partial_process_check` and
-//! `require_full_coverage`.
+//! `accept_incomplete_coverage`.
 //!
 //! A config file that exists but cannot be understood is an error. It never falls back to a
 //! default, because a silent fallback could shorten the window and make projects look idle.
@@ -29,10 +29,10 @@ pub struct Config {
     /// Treat a partial process check (some processes unreadable) as sufficient to remove things.
     /// Off unless the user turns it on.
     pub trust_partial_process_check: bool,
-    /// When the scan could not read some folders or skipped mount points, treat every
-    /// repository's dependents as unknown, so none is offered for archiving. Off unless the user
-    /// turns it on.
-    pub require_full_coverage: bool,
+    /// When the scan could not read some folders or skipped mount points, still offer
+    /// repositories for archiving (each reason says what was not read). Off unless the user turns
+    /// it on: by default every repository's dependents are then unknown and it asks.
+    pub accept_incomplete_coverage: bool,
 }
 
 impl Default for Config {
@@ -40,17 +40,22 @@ impl Default for Config {
         Config {
             active_window_days: DEFAULT_ACTIVE_WINDOW_DAYS,
             trust_partial_process_check: false,
-            require_full_coverage: false,
+            accept_incomplete_coverage: false,
         }
     }
 }
+
+/// The key an earlier version used for the opposite opt-in (strict coverage, now the default).
+const RETIRED_COVERAGE_KEY: &str = "require_full_coverage";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     active_window_days: Option<u64>,
     trust_partial_process_check: Option<bool>,
-    require_full_coverage: Option<bool>,
+    accept_incomplete_coverage: Option<bool>,
+    /// Read only to refuse it with a message naming its replacement, whatever its value.
+    require_full_coverage: Option<toml::Value>,
 }
 
 /// `<platform config dir>/disk-cleaner/config.toml`, if the platform config dir can be found.
@@ -75,10 +80,21 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
         path: origin.to_path_buf(),
         message: e.to_string(),
     })?;
+    if raw.require_full_coverage.is_some() {
+        return Err(Error::Config {
+            path: origin.to_path_buf(),
+            message: format!(
+                "{RETIRED_COVERAGE_KEY} is no longer a setting: incomplete coverage now makes \
+                 repositories ask by default; remove the key, or set \
+                 accept_incomplete_coverage = true (or pass --accept-incomplete-coverage) to \
+                 archive despite folders the scan could not read"
+            ),
+        });
+    }
     Ok(Config {
         active_window_days: raw.active_window_days.unwrap_or(DEFAULT_ACTIVE_WINDOW_DAYS),
         trust_partial_process_check: raw.trust_partial_process_check.unwrap_or(false),
-        require_full_coverage: raw.require_full_coverage.unwrap_or(false),
+        accept_incomplete_coverage: raw.accept_incomplete_coverage.unwrap_or(false),
     })
 }
 

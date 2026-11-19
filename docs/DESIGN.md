@@ -70,8 +70,11 @@ For each repo and each worktree the scanner records, each as yes / no / unknown:
   that sets `extensions.preciousObjects = true` declares such dependents itself. Hard links and
   references from outside the scanned roots cannot be seen (docs/SCAN-FORMAT.md, known limits).
   Folders the scan could not read and mount points it did not enter are recorded as the scan's
-  coverage and disclosed on every archive decision; `require_full_coverage` makes them block
-  archiving instead.
+  coverage, and by default they make every repository's `no_dependents` unknown, so it asks. A
+  clone or link in a place the scan could not read may be the only thing that needs the
+  repository, and disclosing the gap does not make removing it safe. A user who knows what those
+  places hold opts in with `accept_incomplete_coverage` (`--accept-incomplete-coverage`), and each
+  archive decision then says what was not read.
 
 At apply time the remote facts are confirmed against the live remote (`git ls-remote`), because
 remote-tracking refs can be stale.

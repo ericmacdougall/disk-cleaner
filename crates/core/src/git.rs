@@ -1,14 +1,19 @@
 //! The only place that runs `git`.
 //!
-//! Every call goes through [`Git::run`], which returns a typed [`GitError`] for a missing
-//! binary, a timeout or a failed command, so a failure can never be mistaken for empty output
-//! (principle 2: unknown means keep). Only read-only subcommands are issued by callers; the
-//! environment is set so git never takes optional locks and never prompts.
+//! Every call goes through [`Git::run_bytes`] (or [`Git::run`], its text form), which returns a
+//! typed [`GitError`] for a missing binary, a timeout or a failed command, so a failure can never
+//! be mistaken for empty output (principle 2: unknown means keep). Only read-only subcommands are
+//! issued by callers; the environment is set so git never takes optional locks and never prompts.
+//!
+//! Git prints file names as bytes. Output that names paths is read with [`Git::run_bytes`] and
+//! turned into paths with [`path_from_git`], which is exact on Unix and refuses (rather than
+//! guesses) where it cannot be; [`Git::run`] refuses output that is not valid UTF-8. A lossy
+//! decoding is never used to look anything up or to compare.
 
 use crate::redact::redact_text;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,6 +30,64 @@ pub enum GitError {
     /// The command exited with a failure status.
     #[error("git exited with status {code:?}: {stderr}")]
     Failed { code: Option<i32>, stderr: String },
+    /// Text was expected and git printed bytes that are not valid UTF-8 (a ref, remote or file
+    /// name this tool cannot represent exactly).
+    #[error("git printed output that is not valid UTF-8")]
+    NotUtf8,
+}
+
+/// A path git printed, converted exactly: the bytes themselves on Unix; on other platforms (where
+/// git prints UTF-8 and paths are not bytes) the decoded text. `None` when the bytes cannot be a
+/// path here, which the caller must treat as a failed check.
+pub fn path_from_git(bytes: &[u8]) -> Option<PathBuf> {
+    if bytes.is_empty() || bytes.contains(&0) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(OsStr::from_bytes(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes).ok().map(PathBuf::from)
+    }
+}
+
+/// The one path a command such as `rev-parse --show-toplevel` prints: its bytes without the
+/// line ending (exactly one `\n`, or `\r\n` on Windows), never trimmed further, so a name that
+/// ends in a space stays exact. `None` for empty or unterminated output.
+pub fn single_path(out: &[u8]) -> Option<PathBuf> {
+    let line = out.strip_suffix(b"\n")?;
+    #[cfg(windows)]
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    path_from_git(line)
+}
+
+/// `path` relative to `base` in the form git prints it: components joined by `/`, as bytes. Exact
+/// on Unix; elsewhere `None` when a component is not valid UTF-8. `None` too when `path` is not
+/// below `base`.
+pub fn rel_git_bytes(path: &Path, base: &Path) -> Option<Vec<u8>> {
+    let rel = path.strip_prefix(base).ok()?;
+    let mut out: Vec<u8> = Vec::new();
+    for (k, c) in rel.components().enumerate() {
+        if k > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(os_bytes(c.as_os_str())?);
+    }
+    Some(out)
+}
+
+#[cfg(unix)]
+fn os_bytes(s: &OsStr) -> Option<&[u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(s.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn os_bytes(s: &OsStr) -> Option<&[u8]> {
+    s.to_str().map(str::as_bytes)
 }
 
 /// Kill a process and everything it started (its process group on Unix, `taskkill /T` on
@@ -128,7 +191,7 @@ impl Git {
     /// null device (older git ignores `GIT_CONFIG_GLOBAL` but still finds nothing under `HOME`),
     /// and every `GIT_*` variable of the caller is withheld. Only the `-c` values below apply on
     /// top of the repository's own config.
-    pub fn command(&self, cwd: &Path, args: &[&str]) -> Command {
+    pub fn command<S: AsRef<OsStr>>(&self, cwd: &Path, args: &[S]) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.arg("-c")
             .arg("core.fsmonitor=false")
@@ -170,9 +233,20 @@ impl Git {
         cmd
     }
 
-    /// Run `git <args>` in `cwd` and return stdout (lossy UTF-8), isolated from configuration
-    /// the caller did not check (see [`Git::command`]).
+    /// Run `git <args>` in `cwd` and return stdout as text, isolated from configuration the
+    /// caller did not check (see [`Git::command`]). Output that is not valid UTF-8 is
+    /// [`GitError::NotUtf8`], never decoded lossily.
     pub fn run(&self, cwd: &Path, args: &[&str]) -> Result<String, GitError> {
+        String::from_utf8(self.run_bytes(cwd, args)?).map_err(|_| GitError::NotUtf8)
+    }
+
+    /// Run `git <args>` in `cwd` and return stdout as bytes (for output that names paths). The
+    /// arguments may be any OS strings, so a path is passed exactly.
+    pub fn run_bytes<S: AsRef<OsStr>>(
+        &self,
+        cwd: &Path,
+        args: &[S],
+    ) -> Result<Vec<u8>, GitError> {
         let mut cmd = self.command(cwd, args);
         // Own process group, so a timeout can kill git and everything it started.
         #[cfg(unix)]
@@ -226,7 +300,7 @@ impl Git {
         let out = out_reader.join().unwrap_or_default();
         let err = err_reader.join().unwrap_or_default();
         if status.success() {
-            Ok(String::from_utf8_lossy(&out).into_owned())
+            Ok(out)
         } else {
             let stderr: String = redact_text(String::from_utf8_lossy(&err).trim())
                 .chars()
@@ -291,6 +365,28 @@ mod tests {
         ] {
             assert!(args.iter().any(|x| x == a), "{a} missing from {args:?}");
         }
+    }
+
+    #[test]
+    fn a_printed_path_loses_only_its_line_ending() {
+        assert_eq!(single_path(b"/w/a b \n"), Some(PathBuf::from("/w/a b ")));
+        assert_eq!(single_path(b"/w/x\n\n"), Some(PathBuf::from("/w/x\n")));
+        assert_eq!(single_path(b"/w/a"), None);
+        assert_eq!(single_path(b"\n"), None);
+        assert_eq!(path_from_git(b"a\0b"), None);
+        let rel = rel_git_bytes(Path::new("/w/a/b/c"), Path::new("/w/a"));
+        assert_eq!(rel.as_deref(), Some(&b"b/c"[..]));
+        assert_eq!(rel_git_bytes(Path::new("/x"), Path::new("/w")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_printed_path_that_is_not_utf8_is_kept_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt;
+        let p = single_path(b"/w/n\xFFme\n").unwrap();
+        assert_eq!(p.as_os_str().as_bytes(), b"/w/n\xFFme");
+        let base = Path::new("/w");
+        assert_eq!(rel_git_bytes(&p, base).unwrap(), b"n\xFFme".to_vec());
     }
 
     #[test]

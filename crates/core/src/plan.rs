@@ -82,10 +82,11 @@ pub struct PlanOptions {
     /// enough to remove things. Off by default: an unreadable process may be working inside the
     /// candidate.
     pub trust_partial_process_check: bool,
-    /// The user wants a scan that could not look everywhere (unreadable folders, mount points not
-    /// entered) to block archiving: every repository's `no_dependents = yes` becomes `unknown`.
-    /// Off by default: the plan then only discloses what was not read.
-    pub require_full_coverage: bool,
+    /// The user accepts a scan that could not look everywhere (unreadable folders, mount points
+    /// not entered) as enough to archive: each archive reason then says what was not read. Off by
+    /// default: with incomplete coverage every repository's `no_dependents = yes` becomes
+    /// `unknown`, so it asks.
+    pub accept_incomplete_coverage: bool,
 }
 
 impl PlanOptions {
@@ -98,7 +99,7 @@ impl PlanOptions {
             now,
             process: ProcessCheck::none_running(),
             trust_partial_process_check: false,
-            require_full_coverage: false,
+            accept_incomplete_coverage: false,
         }
     }
 }
@@ -178,13 +179,15 @@ pub struct Plan {
     /// The scan read every folder and entered every mount point (its `coverage.complete`).
     pub coverage_complete: bool,
     /// When coverage is incomplete: one sentence saying what was not read and that links or
-    /// clones there were not checked. Every archive and recover-then-archive reason repeats it.
+    /// clones there were not checked. With `accepted_incomplete_coverage` every archive and
+    /// recover-then-archive reason repeats it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_note: Option<String>,
-    /// The user asked for full coverage (`require_full_coverage` / `--require-full-coverage`):
-    /// with incomplete coverage every repository's `no_dependents = yes` became `unknown`.
+    /// The user accepted incomplete coverage (`accept_incomplete_coverage` /
+    /// `--accept-incomplete-coverage`). Without it, incomplete coverage made every repository's
+    /// `no_dependents = yes` `unknown`, so none is archived.
     #[serde(default)]
-    pub required_full_coverage: bool,
+    pub accepted_incomplete_coverage: bool,
     pub active: Vec<String>,
     pub totals: PlanTotals,
     pub items: Vec<PlanItem>,
@@ -455,8 +458,9 @@ fn orphan_submodule_gitdir(scan: &ScanResult, idx: usize) -> Option<String> {
 pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     let ctx = build_ctx(scan, opts);
     let complete = scan.coverage.complete;
-    // Strict coverage: what was not read, when the user asked for that to block archiving.
-    let strict: Option<String> = if opts.require_full_coverage && !complete {
+    // Strict coverage, the default: what was not read, unless the user accepted that it does not
+    // block archiving.
+    let strict: Option<String> = if !opts.accept_incomplete_coverage && !complete {
         Some(coverage_gaps(&scan.coverage))
     } else {
         None
@@ -470,8 +474,10 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             continue;
         }
         let (state, state_reason, days) = judge(&ctx, idx, opts);
-        let (mut action, mut reason, mut reclaim) =
-            decide(scan, idx, state, &state_reason, strict.as_deref());
+        // Decided first on the scan's own facts, so a reason about this node itself (an
+        // unreadable entry or a skipped mount inside it) is the one given; strict coverage then
+        // turns whatever would still be archived into a question.
+        let (mut action, mut reason, mut reclaim) = decide(scan, idx, state, &state_reason, None);
         if action.removes() {
             if let Some(why) = node.ask_reason.as_deref() {
                 reason = format!("{reason}; but it {why}");
@@ -503,6 +509,13 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 );
                 action = Action::Ask;
                 reclaim = 0;
+            }
+        }
+        if let Some(gap) = strict.as_deref() {
+            if matches!(action, Action::Archive | Action::RecoverThenArchive) {
+                // Only a repository is archived; with its unproven `no_dependents` as unknown it
+                // asks, and the reason names what was not read and the opt-in.
+                (action, reason, reclaim) = decide(scan, idx, state, &state_reason, Some(gap));
             }
         }
         own_action.push(action);
@@ -660,7 +673,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         scope: scan.scope.clone(),
         coverage_complete: complete,
         coverage_note: coverage_note(&scan.coverage, complete),
-        required_full_coverage: opts.require_full_coverage,
+        accepted_incomplete_coverage: opts.accept_incomplete_coverage,
         active: opts
             .active
             .iter()
@@ -766,8 +779,8 @@ fn coverage_reason(c: &Coverage, complete: bool) -> Option<String> {
     ))
 }
 
-/// A repository's facts as the plan uses them: under strict coverage an unproven
-/// `no_dependents = yes` is `unknown`.
+/// A repository's facts as the plan uses them: under strict coverage (the default when coverage
+/// is incomplete) an unproven `no_dependents = yes` is `unknown`.
 fn effective_facts(mut facts: Facts, strict: bool) -> Facts {
     if strict && facts.no_dependents == Tri::Yes {
         facts.no_dependents = Tri::Unknown;
@@ -919,7 +932,7 @@ fn dependents_reason(node: &Node) -> String {
 }
 
 /// For each unknown fact: what could not be checked and what would settle it. `strict` is what
-/// the scan could not read when full coverage was required.
+/// the scan could not read, when incomplete coverage was not accepted.
 fn explain_unknown(node: &Node, facts: &Facts, strict: Option<&str>) -> String {
     let notes = node
         .repo
@@ -937,9 +950,9 @@ fn explain_unknown(node: &Node, facts: &Facts, strict: Option<&str>) -> String {
         .into_iter()
         .map(|name| match (strict, name) {
             (Some(gap), "no_dependents") if !scanned_unknown => format!(
-                "full coverage was required (require_full_coverage or --require-full-coverage) \
-                 and {gap}, so links or clones there may depend on this repository; make them \
-                 readable and scan again, or plan without that setting [{name}]"
+                "the scan was incomplete ({gap}), so links or clones there may depend on this \
+                 repository; make them readable and scan again, or accept incomplete coverage \
+                 with --accept-incomplete-coverage [{name}]"
             ),
             (_, "all_branches_on_remote") if notes.contains("has tags") => format!(
                 "this repository has local tags and tag names cannot be checked against the \
@@ -961,8 +974,8 @@ fn scope_note(scan: &ScanResult) -> &'static str {
     }
 }
 
-/// `strict` is set when the user required full coverage and the scan did not have it: what was
-/// not read.
+/// `strict` is set when the scan's coverage was incomplete and the user did not accept that:
+/// what was not read.
 fn decide(
     scan: &ScanResult,
     idx: usize,

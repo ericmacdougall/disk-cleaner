@@ -11,12 +11,17 @@ Version 6 added the required scan field `coverage`, `repo.precious_objects` and 
 `coverage_complete`, `coverage_note` and `required_full_coverage`; a version 5 scan does not say
 where it could not look, so it is refused. Version 7 added `repo.hidden_index_entries` and
 `repo.links_into_git_dir`; a version 6 scan cannot tell an edit git hides from an ordinary
-untracked file, so it is refused.
+untracked file, so it is refused. Version 8 reads the file names git prints byte for byte (a
+version 7 scan could miss a hidden edit to a file whose name is not valid UTF-8, so it is
+refused) and replaced the plan field `required_full_coverage` with `accepted_incomplete_coverage`
+(incomplete coverage now makes repositories ask unless the user accepts it).
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
+Such a node therefore gets an `ask_reason` and is never offered for removal (see "File names git
+prints").
 
 Produce a scan with `disk-cleaner scan <path>... --out scan.json` (or `--json` for stdout) and a
-plan with `disk-cleaner plan --scan scan.json [--active-window-days N] [--config FILE] [--active PATH]... [--trust-partial-process-check] [--require-full-coverage] [--json]`. Both are
+plan with `disk-cleaner plan --scan scan.json [--active-window-days N] [--config FILE] [--active PATH]... [--trust-partial-process-check] [--accept-incomplete-coverage] [--json]`. Both are
 read-only. Nothing in this phase deletes, moves or modifies anything; `--out` writes only the file
 you name.
 
@@ -24,7 +29,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 7 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 8 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots that were walked, as spelled; overlapping roots are normalised first (see "Overlapping scan roots") |
@@ -125,7 +130,7 @@ One entry per classified directory. A directory belongs to its innermost classif
 | `newest_mtime` | newest modification time of files attributed to this node, excluding `.git` and nested nodes |
 | `unreadable` | entries inside this node that could not be read (omitted when 0) |
 | `skipped_mounts` | directories inside this node on another file system that `--one-file-system` did not enter (omitted when 0) |
-| `ask_reason` | why this regenerable or cache node is never offered for removal |
+| `ask_reason` | why this node is never offered for removal (a regenerable or cache node for the reasons below; any node whose path is not valid UTF-8) |
 | `repo` | present for `repo`, `worktree` and `bare-repo` |
 
 Classification rules (design section 3): a directory with a `.git` directory is a `repo`; with a
@@ -365,9 +370,9 @@ After the walk:
 - References from outside the scanned roots are invisible: a clone, symlink or alternates file that
   lives in a folder the scan did not cover is not seen. A subtree scan says so in its `scope`.
 - References inside a directory the scan could not read, or a mount point `--one-file-system` did
-  not enter, are not seen either. The scan records those places in `coverage`, and the plan
-  discloses them on every decision they could affect (see "Incomplete coverage"); with
-  `require_full_coverage` they make every repository ask instead.
+  not enter, are not seen either. The scan records those places in `coverage`, and by default
+  they make every repository ask (see "Incomplete coverage"); with `accept_incomplete_coverage`
+  the plan archives anyway and discloses them on every decision they could affect.
 - More than 200,000 kept symlinks or 20,000 alternates files makes every repository's
   `no_dependents` `unknown` (safe, but nothing is archived); a large pnpm or git-annex tree can reach
   it.
@@ -384,30 +389,55 @@ shares the setting of its repository and is not affected.
 
 **Incomplete coverage.** Links, clones and alternates files inside a directory the scan could not
 read, or inside a mount point `--one-file-system` did not enter, are never seen, so a repository
-they depend on can look free of dependents. By default this does not stop archiving: on a real
-home folder some directories are almost always unreadable (privacy-protected folders, other users'
-files), and blocking every repository on them would leave nothing to archive. Instead the
-incompleteness is attached to each decision it could affect:
+they depend on can look free of dependents. So by default incomplete coverage blocks archiving:
+a dependent the scan could not see may be the only thing that needs the repository, and saying
+so does not make its removal safe; a person who knows what those places hold can accept the gap
+explicitly. What the plan does:
 
 - the scan's `coverage` block counts the unreadable directories, other unreadable entries and
-  skipped mount points, with up to 20 example paths of each kind of directory;
+  skipped mount points (tracking overflows already make every repository's dependents unknown,
+  see the known limits), with up to 20 example paths of each kind of directory;
 - the plan records `coverage_complete`, and when it is `false` a one-sentence `coverage_note`
   that the human header prints (`Coverage is incomplete: 3 folders could not be read and 1 mount
   point was not entered (--one-file-system), so links or clones inside them were not checked.`);
-- every `archive` and `recover-then-archive` reason ends with the same facts, for example
-  `; 3 folders in this scan could not be read; dependents inside them were not checked` (after the
-  subtree-scope sentence when that applies).
+- by default (strict coverage) every repository, worktree and bare repository whose
+  `no_dependents` was `yes` gets `unknown` in the plan (`items[].facts` shows the value used), so
+  none is archived or recovered: it asks, and the reason names what was not read and the opt-in
+  (`the scan was incomplete (3 folders could not be read), so links or clones there may depend on
+  this repository; make them readable and scan again, or accept incomplete coverage with
+  --accept-incomplete-coverage [no_dependents]`). The human header says that no repository is
+  offered for archiving because coverage is incomplete.
 
-An unreadable entry or skipped mount point inside a node still makes that node (and the nodes
-around it) ask, as described under `unreadable` and `skipped_mounts`. `remove-regenerable` and
-`totals.ready_bytes` are not affected: regenerable data has no dependents.
+**Accepting incomplete coverage.** On a real home folder some directories are almost always
+unreadable (privacy-protected folders, other users' files). The config setting
+`accept_incomplete_coverage = true` or `plan --accept-incomplete-coverage` (the same kind of
+opt-in as `--trust-partial-process-check`) restores archiving: `no_dependents` keeps the scan's
+value, and every `archive` and `recover-then-archive` reason ends with what was not read, for
+example `; 3 folders in this scan could not be read; dependents inside them were not checked`
+(after the subtree-scope sentence when that applies). The plan records
+`accepted_incomplete_coverage: true` and the human header says the user accepted incomplete
+coverage. With complete coverage the setting changes nothing. The setting
+`require_full_coverage` and the flag `--require-full-coverage` of earlier versions are refused
+with an error naming the new ones.
 
-**Strict coverage.** The config setting `require_full_coverage = true` or
-`plan --require-full-coverage` makes incomplete coverage set `no_dependents` from `yes` to
-`unknown` for every repository, worktree and bare repository in the plan (`items[].facts` shows
-the value used), so none is archived or recovered; the reason says that full coverage was
-required and what was not read. The plan records `required_full_coverage: true` and the human
-header says the user asked for it. With complete coverage the setting changes nothing.
+Either way, an unreadable entry or skipped mount point inside a node makes that node (and the
+nodes around it) ask, as described under `unreadable` and `skipped_mounts`, and its reason says
+so. `remove-regenerable` and `totals.ready_bytes` are not affected: regenerable data has no
+dependents.
+
+**File names git prints.** Git prints file names as bytes. Every listing whose names are used is
+requested NUL-separated (`ls-files -z`, `ls-tree -z`, `status --porcelain -z`,
+`worktree list --porcelain -z`, falling back to the line format only on a git without it, where
+a quoted or unexpected line makes the fact `unknown`), and every path git prints for the scanner
+to look at (`rev-parse --show-toplevel`, `--absolute-git-dir`, `--git-common-dir`,
+`core.worktree`, the hidden index entries, submodule paths, ignored entries, worktree paths) is
+used byte for byte on Unix. On Windows, where git prints UTF-8, a name that does not decode is a
+failed check (`unknown`). Other git output (refs, remotes, config keys) must be valid UTF-8 or
+the check fails. The repository files the scanner reads itself (`.git` files, `commondir`,
+alternates) must be valid UTF-8 or they are unreadable, which makes dependents `unknown`. A
+lossily decoded name is only ever shown, never looked up or compared. A node whose own path is
+not valid UTF-8 cannot be written exactly to the scan file, so it gets the `ask_reason`
+`has a path that is not valid UTF-8, ...` and is never offered for removal.
 
 Remote URLs have embedded credentials removed (`https://user:token@host/x` is stored as
 `https://host/x`; everything up to the last `@` counts as userinfo, and query strings and fragments are
@@ -492,8 +522,8 @@ node inside the repo (matched by identity, not by count); the reason names the o
 `active_window_days`, `window_source`, `process_check` (`ok`, `partial` or `unknown`),
 `process_check_note`, `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
 `remote_facts_note`, `enclosing_repos`, `scope`, `coverage_complete`, `coverage_note` (only when
-coverage is incomplete), `required_full_coverage` (see "Incomplete coverage" and "Strict
-coverage"), `active`, `totals` and `items`.
+coverage is incomplete), `accepted_incomplete_coverage` (see "Incomplete coverage" and
+"Accepting incomplete coverage"), `active`, `totals` and `items`.
 
 Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `state` (`active`,
 `idle` or `unknown`), `state_reason` (why it was judged so), `reason` (plain language),
@@ -509,7 +539,7 @@ One setting decides activity: `active_window_days`, default **7**. It is read fr
 ```toml
 active_window_days = 7
 # trust_partial_process_check = true   # optional, see below; default false
-# require_full_coverage = true         # optional, see "Strict coverage"; default false
+# accept_incomplete_coverage = true    # optional, see "Accepting incomplete coverage"; default false
 ```
 
 A missing default file means the default. A file that exists but is malformed, has an unknown key

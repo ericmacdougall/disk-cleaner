@@ -169,6 +169,23 @@ fn one_file_system_does_not_cross_a_mount_point() {
     let p = plan(&with_facts, &PlanOptions::new(7, far_future()));
     let p = serde_json::to_value(p).unwrap();
     assert_eq!(p["coverage_complete"], false);
+    assert_eq!(p["accepted_incomplete_coverage"], false);
     let note = p["coverage_note"].as_str().unwrap_or_default();
     assert!(note.contains("1 mount point was not entered"), "{note}");
+
+    // With --accept-incomplete-coverage the repository needs recovery again, and its reason
+    // carries what was not entered.
+    let mut accept = PlanOptions::new(7, far_future());
+    accept.accept_incomplete_coverage = true;
+    let p = plan(&with_facts, &accept);
+    let it = p
+        .items
+        .iter()
+        .find(|i| i.path == repo.to_string_lossy())
+        .expect("plan item for the repo");
+    assert_eq!(it.action, Action::RecoverThenArchive, "{}", it.reason);
+    let sentence = "1 mount point in this scan was not entered (--one-file-system); dependents \
+                    inside it were not checked";
+    assert!(it.reason.contains(sentence), "{}", it.reason);
+    assert!(p.accepted_incomplete_coverage);
 }
