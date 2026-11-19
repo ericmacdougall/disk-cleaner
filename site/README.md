@@ -17,6 +17,18 @@ python3 -m http.server 8765
 
 Open <http://localhost:8765/>. Stop it with Ctrl-C.
 
+## Tests
+
+Standard library only, run from the repository root:
+
+```
+python3 -m unittest discover -s site/tests -v
+```
+
+They check the page structure, accessibility basics, status wording, absence of external requests, the
+brand tokens against the CSS, and the Pages workflows. CI runs them on every change to `site/`, and the
+Pages deploy runs them first.
+
 ## Deploy
 
 `.github/workflows/pages.yml` publishes `site/` to GitHub Pages on every push to `main` that touches
