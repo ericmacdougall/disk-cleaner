@@ -125,6 +125,12 @@ pub fn check_root(path: &Path) -> Result<(), WalkError> {
     }
     match std::fs::symlink_metadata(path) {
         Ok(md) if md.is_dir() => Ok(()),
+        Ok(md) if md.file_type().is_symlink() => Err(WalkError::Root {
+            path: shown,
+            message: "is a symbolic link, which the scan never follows; choose the folder it \
+                      points to"
+                .into(),
+        }),
         Ok(_) => Err(WalkError::Root {
             path: shown,
             message: "is not a folder".into(),

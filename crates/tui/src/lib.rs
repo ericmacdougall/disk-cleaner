@@ -65,9 +65,10 @@ pub fn run(args: TuiArgs) -> anyhow::Result<()> {
         None => {
             let mut roots = Vec::new();
             for p in &args.paths {
-                roots.push(std::path::absolute(p).with_context(|| {
-                    format!("cannot resolve {}", p.display())
-                })?);
+                roots.push(
+                    std::path::absolute(p)
+                        .with_context(|| format!("cannot resolve {}", p.display()))?,
+                );
             }
             for r in &roots {
                 disk_cleaner_view::walk::check_root(r).map_err(|e| anyhow::anyhow!("{e}"))?;

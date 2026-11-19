@@ -53,6 +53,16 @@ pub fn age(mtime: Option<i64>, now: i64) -> String {
     }
 }
 
+/// An age for a sentence: "today", "3 days ago", or "at an unknown time" when unknown or in
+/// the future.
+pub fn ago(mtime: Option<i64>, now: i64) -> String {
+    match age(mtime, now) {
+        s if s == "today" => s,
+        s if s == "-" => "at an unknown time".to_string(),
+        s => format!("{s} ago"),
+    }
+}
+
 /// The current time in unix seconds.
 pub fn now() -> i64 {
     std::time::SystemTime::now()
@@ -79,5 +89,10 @@ mod tests {
         assert_eq!(age(None, 100), "-");
         assert_eq!(age(Some(0), 3 * 86_400), "3 days");
         assert_eq!(age(Some(200), 100), "-");
+        assert_eq!(ago(Some(100), 200), "today");
+        assert_eq!(ago(Some(0), 86_400), "1 day ago");
+        assert_eq!(ago(Some(0), 3 * 86_400), "3 days ago");
+        assert_eq!(ago(None, 100), "at an unknown time");
+        assert_eq!(ago(Some(200), 100), "at an unknown time");
     }
 }

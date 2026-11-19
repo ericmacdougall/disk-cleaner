@@ -51,7 +51,12 @@ fn small_tree() -> disk_cleaner_view::Tree {
     let photos = add(Some(r), "photos", EntryKind::Dir, 4096);
     add(Some(photos), "beach.jpg", EntryKind::File, 5_000_000);
     add(Some(r), "notes.txt", EntryKind::File, 8192);
-    add(Some(r), "evil\u{1b}[2J\u{202E}gpj.exe", EntryKind::File, 4096);
+    add(
+        Some(r),
+        "evil\u{1b}[2J\u{202E}gpj.exe",
+        EntryKind::File,
+        4096,
+    );
     drop(add);
     b.finish(Vec::new(), WalkStats::default())
 }

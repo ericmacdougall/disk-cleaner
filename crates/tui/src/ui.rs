@@ -22,15 +22,27 @@ pub fn allocated_header() -> &'static str {
 }
 
 const HELP: &[(&str, &str)] = &[
-    ("Tab, 1, 2", "switch between the size tree and the developer view"),
+    (
+        "Tab, 1, 2",
+        "switch between the size tree and the developer view",
+    ),
     ("Up, Down, j, k", "move"),
-    ("PgUp, PgDn, Home, End", "move by a page, to the start or the end"),
+    (
+        "PgUp, PgDn, Home, End",
+        "move by a page, to the start or the end",
+    ),
     ("Enter, Right, l", "open the selected folder (drill down)"),
     ("Left, Backspace, h", "go up one folder"),
     ("Space", "expand or collapse the selected folder in place"),
-    ("s", "sort by the next column (allocated, size, files, modified, name)"),
+    (
+        "s",
+        "sort by the next column (allocated, size, files, modified, name)",
+    ),
     ("r", "reverse the sort order"),
-    ("e", "export the plan as JSON to a new file in the current folder"),
+    (
+        "e",
+        "export the plan as JSON to a new file in the current folder",
+    ),
     ("?", "show or hide this help"),
     ("q, Ctrl-C", "quit"),
 ];
@@ -107,7 +119,11 @@ fn progress_text(p: &disk_cleaner_view::walk::Progress) -> String {
     )
 }
 
-fn header_cell(label: &str, key: Option<SortKey>, sort: disk_cleaner_view::table::Sort) -> Cell<'static> {
+fn header_cell(
+    label: &str,
+    key: Option<SortKey>,
+    sort: disk_cleaner_view::table::Sort,
+) -> Cell<'static> {
     let mark = match key {
         Some(k) if k == sort.key => {
             if sort.descending {
@@ -231,9 +247,7 @@ fn dev_summary(app: &App) -> Vec<Line<'static>> {
     let Some(dev) = &app.dev else {
         let text = match &app.analysis {
             AnalysisState::Waiting => "The analysis starts after the size walk.".to_string(),
-            AnalysisState::Running => {
-                "Analysing repositories and building the plan...".to_string()
-            }
+            AnalysisState::Running => "Analysing repositories and building the plan...".to_string(),
             AnalysisState::Failed(e) => format!("The analysis failed: {e}"),
             AnalysisState::Done => String::new(),
         };
@@ -243,8 +257,8 @@ fn dev_summary(app: &App) -> Vec<Line<'static>> {
     let t = &s.plan_totals;
     let mut lines = vec![
         Line::from(format!(
-            "Source: analysis (core scan and plan), scan made {} ago. Dry run: nothing is changed.",
-            units::age(Some(s.scan_generated_at), app.now)
+            "Source: analysis (core scan and plan), scan made {}. Dry run: nothing is changed.",
+            units::ago(Some(s.scan_generated_at), app.now)
         )),
         Line::from(format!(
             "Reclaimable if every removing action completed: {}  (ready now, regenerable only: {})",
@@ -255,7 +269,13 @@ fn dev_summary(app: &App) -> Vec<Line<'static>> {
     let by_action: Vec<String> = t
         .by_action
         .iter()
-        .map(|(a, x)| format!("{a} {} ({})", units::count(x.items), units::bytes(x.reclaimable_bytes)))
+        .map(|(a, x)| {
+            format!(
+                "{a} {} ({})",
+                units::count(x.items),
+                units::bytes(x.reclaimable_bytes)
+            )
+        })
         .collect();
     lines.push(Line::from(format!("By action: {}", by_action.join(", "))));
     lines.push(Line::from(format!(
@@ -283,9 +303,11 @@ fn draw_dev(f: &mut Frame, app: &mut App, area: Rect) {
     ])
     .areas(area);
     f.render_widget(
-        Paragraph::new(summary)
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::ALL).title(" Developer view ")),
+        Paragraph::new(summary).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Developer view "),
+        ),
         top,
     );
     let block = Block::default()
@@ -366,11 +388,11 @@ fn draw_dev(f: &mut Frame, app: &mut App, area: Rect) {
         Some(DevRow::Session(k)) => {
             let s = &app.sessions[*k];
             let mut t = format!(
-                "{}: {} files, {}, newest {} ago. {}.",
+                "{}: {} files, {}, last changed {}. {}.",
                 s.layout,
                 units::count(s.files),
                 units::bytes(s.alloc),
-                units::age(s.newest_mtime, app.now),
+                units::ago(s.newest_mtime, app.now),
                 s.plan_note
             );
             if let Some(e) = &s.enclosing {
@@ -403,7 +425,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         .map(|(k, v)| Line::from(format!("{k:<24}{v}")))
         .collect();
     lines.push(Line::from(""));
-    lines.push(Line::from("Nothing here deletes, moves or backs up anything."));
+    lines.push(Line::from(
+        "Nothing here deletes, moves or backs up anything.",
+    ));
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Keys ")),

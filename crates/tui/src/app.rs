@@ -155,7 +155,11 @@ impl App {
 
     fn refresh_sessions(&mut self) {
         if let Some(t) = &self.tree {
-            let items = self.plan.as_ref().map(|p| p.items.as_slice()).unwrap_or(&[]);
+            let items = self
+                .plan
+                .as_ref()
+                .map(|p| p.items.as_slice())
+                .unwrap_or(&[]);
             self.sessions = sessions::find(t.tree(), &sessions::builtin(), items);
         }
         self.rebuild_dev_rows();
@@ -317,7 +321,10 @@ impl App {
             return Outcome::Quit;
         }
         if self.help {
-            if matches!(k.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
+            if matches!(
+                k.code,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
+            ) {
                 self.help = false;
             }
             return Outcome::Continue;

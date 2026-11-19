@@ -89,15 +89,26 @@ pub struct SessionFolder {
 /// The note every session folder carries.
 pub const NO_PLAN_ACTION: &str = "no plan action yet";
 
-fn matches(tree: &Tree, id: NodeId, layout: &Layout) -> bool {
-    let mut cur = Some(id);
-    for part in layout.path.iter().rev() {
-        match cur {
-            Some(c) if tree.name(c) == part.as_str() => cur = tree.parent(c),
-            _ => return false,
+/// Whether `id`'s path ends with the layout's components. A root's name is the whole path the
+/// walk started from, so the remaining components are compared with its trailing components.
+fn ends_with_layout(tree: &Tree, id: NodeId, layout: &Layout) -> bool {
+    let mut cur = id;
+    let mut parts = layout.path.iter().rev();
+    loop {
+        let Some(part) = parts.next() else {
+            return true;
+        };
+        let Some(parent) = tree.parent(cur) else {
+            let mut tail = Path::new(tree.name(cur)).components().rev();
+            return std::iter::once(part).chain(parts).all(|p| {
+                matches!(tail.next(), Some(std::path::Component::Normal(c)) if c == p.as_str())
+            });
+        };
+        if tree.name(cur) != part.as_str() {
+            return false;
         }
+        cur = parent;
     }
-    true
 }
 
 /// The deepest plan item whose folder holds `path`.
@@ -116,11 +127,7 @@ pub fn find(tree: &Tree, layouts: &[Layout], items: &[PlanItem]) -> Vec<SessionF
         if tree.kind(id) != EntryKind::Dir {
             continue;
         }
-        let name = tree.name(id);
-        let Some(layout) = layouts
-            .iter()
-            .find(|l| l.path.last().is_some_and(|last| last == name) && matches(tree, id, l))
-        else {
+        let Some(layout) = layouts.iter().find(|l| ends_with_layout(tree, id, l)) else {
             continue;
         };
         let real = tree.path(id);
