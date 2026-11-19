@@ -35,7 +35,7 @@ Every directory gets one primary class. Size is attributed to the innermost clas
 
 | Class | Examples | Default disposition |
 |---|---|---|
-| `repo` | directory with a `.git` directory | keep; eligible for archive when idle and fully remote |
+| `repo` | directory with a `.git` directory | keep; eligible for backup-then-remove when idle and fully remote |
 | `worktree` | directory with a `.git` file (linked worktree) | as `repo`, checked against its own HEAD |
 | `bare-repo` | `*.git` with `HEAD`, `objects`, `refs` | never auto-removed while any worktree or clone depends on it |
 | `regenerable` | `node_modules`, `target`, `.venv`, `.next`, `DerivedData`, `Pods`, `__pycache__` | remove when the owning project is not active |
@@ -49,6 +49,9 @@ Rules that follow from the principles:
 
 - A build directory (`dist`, `build`, `out`, `target`) is regenerable only inside a project, and is
   scanned for `output` files first. A rendered video inside `out/` is an output, not an artifact.
+  The same holds for every artifact: a model of any size in `.venv` or `node_modules` outside an
+  installed package's own directory, or above the output threshold anywhere in `.venv` or
+  `node_modules`, makes it ask, naming the file.
 - Artifact rules are data (a rules file), not code, so the community can extend them. Each rule
   names the marker that proves the project type (for example `Cargo.toml` next to `target`).
 
@@ -63,13 +66,49 @@ For each repo and each worktree the scanner records, each as yes / no / unknown:
 - the working tree is clean (tracked changes and untracked files);
 - ignored-but-unique files exist (`.env`, local databases, anything ignored that is not a
   regenerable directory);
-- another clone or worktree depends on this object store (alternates, linked worktrees).
+- another clone or worktree depends on this object store (alternates, linked worktrees). Such
+  dependencies are found from the references themselves during the walk (symlinks and alternates
+  anywhere, `.git` entries inside dependency directories), not only from the repositories that are
+  classified, so a clone hidden inside `node_modules` still protects its provider. A repository
+  that sets `extensions.preciousObjects = true` declares such dependents itself. Hard links and
+  references from outside the scanned roots cannot be seen (docs/SCAN-FORMAT.md, known limits).
+  Folders the scan could not read and mount points it did not enter are recorded as the scan's
+  coverage, and by default they make every repository's `no_dependents` unknown, so it asks. A
+  clone or link in a place the scan could not read may be the only thing that needs the
+  repository, and disclosing the gap does not make removing it safe. A user who knows what those
+  places hold opts in with `accept_incomplete_coverage` (`--accept-incomplete-coverage`), and each
+  removal decision then says what was not read.
 
 At apply time the remote facts are confirmed against the live remote (`git ls-remote`), because
 remote-tracking refs can be stale.
 
 A repo is **safe to remove** only when every fact is the safe value. Anything else is **ambiguous**
 and goes through recovery.
+
+### The preserve obligation
+
+Safe to remove never means removed without a backup. The facts show that every commit is on a
+remote; they cannot show that nothing else in the git directory is unique (a custom hook, a
+recorded rerere resolution, a draft in `COMMIT_EDITMSG`, a note under `logs/`), and judging those
+files one kind at a time never converged. So every plan action that removes a git node is named for
+its contract (`backup-then-remove`, `recover-backup-then-remove`) and carries `preserve`, which
+splits every file of the git directory, by name alone, into exactly one of two obligations:
+
+- `preserve.git_admin`, every file that does not have an object-store name: always backed up
+  (saved with the manifest, the restore record an apply step writes, and read back) before
+  anything is removed;
+- `preserve.object_store`, files under `objects/` named like loose objects, packs and their
+  indexes and sidecars, multi-pack-indexes and commit-graphs: the object data, backed up too
+  before anything is removed. It is counted apart only because it can be large.
+
+No file is exempt because of its name, its first bytes or any check this tool runs: earlier
+versions tried content checks, then an opt-in git verification of the object store, and review
+showed each could pass a file holding someone's notes. This phase defines no verification of
+object data; a later apply phase may define one against the live remote, and `plan` refuses a scan
+file that claims one. A git directory whose own files exceed `max_git_admin_bytes` (64 MiB by default) asks instead, because that
+much is the user's data, not git's settings. No apply phase exists yet; the rule is part of the plan format
+(docs/SCAN-FORMAT.md, "The preserve obligation"), which also lists the existing asks the backup
+makes redundant and keeps them for now.
 
 ### Activity
 
@@ -122,7 +161,7 @@ A policy is a rule set the user enables, for example:
 
 - regenerable directories in projects idle for N days: remove;
 - package caches not accessed for N days, or above N GB: remove;
-- repos idle for N days: recover if ambiguous, then archive and remove;
+- repos idle for N days: recover if ambiguous, then back up the git directory's own files and remove;
 - agent sessions older than N days and not tied to an active project: back up, verify, remove;
 - outputs older than N days: back up, verify, remove.
 
@@ -132,8 +171,9 @@ the rest for review. No default policy is automatic.
 ## 7. Manifest
 
 An append-only JSON Lines file per machine, mirrored to backup storage. One record per removed or
-archived item: path, class, size, hashes or git object ids, the safety facts and when they were
-verified, backup location, and the exact restore command. `disk-cleaner find <text>` searches it;
+backed-up item: path, class, size, hashes or git object ids, the safety facts and when they were
+verified, backup location (for a git node, where its git directory's own files were saved), and
+the exact restore command. `disk-cleaner find <text>` searches it;
 `disk-cleaner restore <id>` puts an item back (re-clone at the recorded commit, fetch a bundle,
 download an archive, or note that it is regenerable and how).
 
