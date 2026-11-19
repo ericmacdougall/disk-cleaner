@@ -777,7 +777,8 @@ fn classify(
                     if path.to_str().is_none() {
                         // The scan file stores paths as UTF-8 text, so this one is stored lossily
                         // and could not be matched or acted on exactly later.
-                        node.ask_reason.get_or_insert_with(|| NOT_UTF8_PATH.to_string());
+                        node.ask_reason
+                            .get_or_insert_with(|| NOT_UTF8_PATH.to_string());
                     }
                     builds.push(Build {
                         node,

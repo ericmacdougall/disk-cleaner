@@ -332,7 +332,9 @@ fn s2d_an_archive_reason_says_no_dependents_were_found() {
         "{}",
         it.reason
     );
-    assert!(it.reason.contains("1 folder in this scan could not be read"));
+    assert!(it
+        .reason
+        .contains("1 folder in this scan could not be read"));
     assert!(p.accepted_incomplete_coverage);
     let p = plan(
         &synthetic(vec![repo_node("/w/a", all_yes())], complete()),

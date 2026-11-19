@@ -242,11 +242,7 @@ impl Git {
 
     /// Run `git <args>` in `cwd` and return stdout as bytes (for output that names paths). The
     /// arguments may be any OS strings, so a path is passed exactly.
-    pub fn run_bytes<S: AsRef<OsStr>>(
-        &self,
-        cwd: &Path,
-        args: &[S],
-    ) -> Result<Vec<u8>, GitError> {
+    pub fn run_bytes<S: AsRef<OsStr>>(&self, cwd: &Path, args: &[S]) -> Result<Vec<u8>, GitError> {
         let mut cmd = self.command(cwd, args);
         // Own process group, so a timeout can kill git and everything it started.
         #[cfg(unix)]
