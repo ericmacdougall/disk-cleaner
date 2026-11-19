@@ -587,6 +587,90 @@ fn r16_guard_a_worktree_outside_the_scan_keeps_its_provider() {
     assert!(not_removing(action_for(&res, &a)));
 }
 
+/// A bare repository (real `objects`, so it is a node) whose `objects/pack` is a symlink to
+/// `a`'s packs (a guard).
+#[test]
+fn r16_guard_a_bare_repository_with_symlinked_packs_holds_its_provider() {
+    let (_tmp, root, remotes) = workspace();
+    let a = pushed_repo(&root, &remotes, "a");
+    git(&a, &["gc", "-q"]);
+    let b = root.join("b.git");
+    fs::create_dir_all(&b).unwrap();
+    git(&b, &["init", "-q", "--bare", "-b", "main"]);
+    let pack = b.join("objects").join("pack");
+    fs::remove_dir_all(&pack).unwrap();
+    symlink(a.join(".git").join("objects").join("pack"), &pack).unwrap();
+    let head = git(&a, &["rev-parse", "HEAD"]);
+    git(
+        &a,
+        &["--git-dir", b.to_str().unwrap(), "cat-file", "-e", &head],
+    );
+    let res = scan_with(&root, network_everywhere());
+    assert!(has_node(&res, &b));
+    assert_held(&res, &a);
+}
+
+/// In a separately walked root: a git directory whose `objects` is a symlink into `a`, and a
+/// checkout whose `.git` file names a git directory whose `commondir` is `a` (guards).
+#[test]
+fn r16_guard_symlink_and_dot_git_file_borrowers_in_a_separately_walked_root() {
+    for kind in ["symlink", "dot-git-file"] {
+        let (_tmp, root, remotes) = workspace();
+        let a = pushed_repo(&root, &remotes, "a");
+        let sub = root.join("sub");
+        if kind == "symlink" {
+            let m = sub.join("m");
+            fs::create_dir_all(&m).unwrap();
+            git(&m, &["init", "-q", "--bare", "-b", "main"]);
+            let objs = m.join("objects");
+            fs::remove_dir_all(&objs).unwrap();
+            symlink(a.join(".git").join("objects"), &objs).unwrap();
+        } else {
+            let g = sub.join("g");
+            commondir_borrower(&g, "../../a/.git", &a, false);
+            write(
+                &sub.join("w").join(".git"),
+                &format!("gitdir: {}\n", g.to_str().unwrap()),
+            );
+        }
+        let res = scan_roots(vec![root.clone(), sub]);
+        assert_held(&res, &a);
+    }
+}
+
+/// A `.git` file that is no scanned checkout: one inside another repository's git directory is
+/// followed like any other (added after the fix: it was not run red), and one inside an
+/// artifact that names nothing makes every provider unknown (a guard).
+#[test]
+fn r16_dot_git_files_that_are_no_checkout_are_followed_or_unresolved() {
+    for kind in ["in-git-dir", "dangling-in-artifact"] {
+        let (_tmp, root, remotes) = workspace();
+        let a = pushed_repo(&root, &remotes, "a");
+        if kind == "in-git-dir" {
+            // The `.git` file names `a`'s git directory itself, so nothing else refers to `a`.
+            let c = root.join("c");
+            init_repo(&c);
+            let gd = a.join(".git");
+            write(
+                &c.join(".git").join("stray").join(".git"),
+                &format!("gitdir: {}\n", gd.to_str().unwrap()),
+            );
+            let res = scan_with(&root, network_everywhere());
+            assert_held(&res, &a);
+        } else {
+            let js = root.join("js");
+            write(&js.join("package.json"), "{}\n");
+            write(
+                &js.join("node_modules").join("x").join(".git"),
+                "gitdir: ../no-such-git-dir\n",
+            );
+            let res = scan_with(&root, network_everywhere());
+            assert_eq!(facts_of(&res, &a).no_dependents, Tri::Unknown);
+            assert!(not_removing(action_for(&res, &a)));
+        }
+    }
+}
+
 // ---------------------------------------------------------------- round 16: controls
 
 #[test]
