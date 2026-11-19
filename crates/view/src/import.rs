@@ -141,9 +141,15 @@ pub struct Estimate {
     pub objects: u64,
     pub arrays: u64,
     pub keys: u64,
+    /// Every string: keys and string values.
+    pub strings: u64,
     pub array_elements: u64,
     pub peak_bytes: u64,
 }
+
+/// Bytes charged per string on top of its text: one heap allocation, which the allocator
+/// rounds up (glibc's smallest chunk is 32 bytes; a string of length L takes at most L + 32).
+pub const STRING_COST: u64 = 32;
 
 /// Bytes charged per array element (a `Value` in a `Vec` that may have doubled).
 pub const ELEMENT_COST: u64 = 64;
@@ -171,7 +177,8 @@ pub fn object_cost(keys: u64) -> u64 {
 
 /// Count the values of a JSON text in one pass (no allocation per value) and estimate the
 /// peak memory of parsing it into `serde_json::Value` and then a scan: twice the text (the text
-/// and its strings) plus the arrays' and objects' own memory. Malformed text gives some
+/// and its strings), each string's allocation overhead, plus the arrays' and objects' own
+/// memory. Malformed text gives some
 /// estimate; core reports the error.
 pub fn estimate(text: &[u8]) -> Estimate {
     // Per open container: Some(keys) for an object, None for an array.
@@ -218,7 +225,11 @@ pub fn estimate(text: &[u8]) -> Estimate {
             }
         }
         match b {
-            b'"' => in_string = true,
+            b'"' => {
+                in_string = true;
+                est.strings += 1;
+                cost = cost.saturating_add(STRING_COST);
+            }
             b'{' | b'[' if stack.len() >= MAX_TRACKED_DEPTH => {
                 // Deeper than any parser accepts (serde_json stops at 128): count it without
                 // growing the stack, charged as a full object.
@@ -340,6 +351,25 @@ mod tests {
         // two objects, one array, five array scalars, three keys, one `false`
         assert_eq!(e.values, 2 + 1 + 5 + 3 + 1);
         assert_eq!(e.array_elements, 1 + 5);
+        // three keys and one string value; the escaped quote does not start a string
+        assert_eq!(e.strings, 4);
+    }
+
+    /// Short keys cost an allocation each, far more than their text: a file of many one-letter
+    /// keys must be charged for every one (CI run 44603834596 measured 2697 MiB against an
+    /// estimate of 1855 MiB before this was counted).
+    #[test]
+    fn every_string_is_charged_its_allocation() {
+        let one = estimate(br#"{"a":1}"#);
+        let many = estimate(br#"{"a":1,"b":2,"c":3,"d":4,"e":5,"f":6,"g":7,"h":8,"i":9,"j":0}"#);
+        assert_eq!(many.strings, 10);
+        let text_growth = 2 * (61 - 7);
+        assert!(
+            many.peak_bytes - one.peak_bytes >= text_growth + 9 * STRING_COST,
+            "{} vs {}",
+            many.peak_bytes,
+            one.peak_bytes
+        );
     }
 
     #[test]

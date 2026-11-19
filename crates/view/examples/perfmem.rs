@@ -117,11 +117,13 @@ fn load(path: &str, plan: bool) {
     let parse_peak = hwm().saturating_sub(base);
     let ok = parsed.is_ok();
     println!(
-        "PERF load file={path} file_mib={:.1} values={} objects={} parse_ok={ok} parse_ms={parse_ms:.0} \
-         estimate_mib={:.1} measured_peak_mib={:.1}",
+        "PERF load file={path} file_mib={:.1} values={} objects={} keys={} strings={} \
+         parse_ok={ok} parse_ms={parse_ms:.0} estimate_mib={:.1} measured_peak_mib={:.1}",
         mib(size),
         est.values,
         est.objects,
+        est.keys,
+        est.strings,
         mib(est.peak_bytes),
         mib(parse_peak)
     );
