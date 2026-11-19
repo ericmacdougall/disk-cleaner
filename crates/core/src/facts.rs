@@ -177,7 +177,10 @@ enum Shape {
     /// entry git itself reads (`HEAD`, `config`, `refs`, `objects`) is missing, a symlink or the
     /// wrong kind, or a `commondir` would send git to another repository. It is false for a
     /// layout that is merely unusual but healthy (a `.git` file, alternates, worktrees, modules).
-    No { issue: String, skip_git: bool },
+    No {
+        issue: String,
+        skip_git: bool,
+    },
     Unknown(String),
 }
 
