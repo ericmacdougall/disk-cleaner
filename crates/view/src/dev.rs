@@ -161,7 +161,7 @@ impl DevView {
             .zip(&items)
             .map(|((class, label), list)| DevGroup {
                 class: class.as_str(),
-                label: *label,
+                label,
                 count: list.len(),
                 class_bytes: scan
                     .totals

@@ -286,6 +286,22 @@ impl TreeView {
         true
     }
 
+    /// Open every folder under the focus (or under every root) in one pass.
+    pub fn expand_all(&mut self) {
+        let top: Vec<NodeId> = match self.focus {
+            Some(f) => self.tree.children(f).to_vec(),
+            None => self.tree.roots().to_vec(),
+        };
+        let mut stack = top;
+        while let Some(id) = stack.pop() {
+            if self.tree.kind(id) == EntryKind::Dir {
+                self.expanded[id as usize] = true;
+                stack.extend_from_slice(self.tree.children(id));
+            }
+        }
+        self.rebuild();
+    }
+
     /// Close a folder's row and every open folder below it.
     pub fn collapse(&mut self, id: NodeId) -> bool {
         if !self.valid(id) || !self.expanded[id as usize] {
@@ -530,6 +546,18 @@ mod tests {
         assert_eq!(v.focus_parent(), Some(1));
         assert_eq!(v.focus(), Some(0));
         assert_eq!(names(&v), vec!["zeta.txt", "alpha", "Beta"]);
+    }
+
+    #[test]
+    fn expand_all_opens_every_folder_in_order() {
+        let mut v = TreeView::new(sample());
+        v.expand_all();
+        assert_eq!(
+            names(&v),
+            vec!["/root", "zeta.txt", "alpha", "a1.bin", "a2.bin", "Beta", "b1.bin"]
+        );
+        assert!(v.collapse(0));
+        assert_eq!(v.row_count(), 1);
     }
 
     #[test]

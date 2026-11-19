@@ -429,9 +429,9 @@ pub fn walk(
         elapsed_ms: acc.stats.elapsed_ms,
         current: String::new(),
     });
-    let mut heap = acc.heap.into_vec();
-    heap.sort_by(|a, b| b.cmp(a));
-    let ids: Vec<(u64, NodeId)> = heap.into_iter().map(|Reverse(x)| x).collect();
+    // Largest first. (The heap holds `Reverse` entries, so sort the unwrapped pairs.)
+    let mut ids: Vec<(u64, NodeId)> = acc.heap.into_iter().map(|Reverse(x)| x).collect();
+    ids.sort_by(|a, b| b.cmp(a));
     let tree = acc.builder.finish(Vec::new(), acc.stats);
     Ok(with_top_files(tree, &ids))
 }

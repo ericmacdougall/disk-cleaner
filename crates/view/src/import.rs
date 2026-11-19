@@ -139,6 +139,7 @@ pub struct Estimate {
     /// Every value: scalars, arrays and objects.
     pub values: u64,
     pub objects: u64,
+    pub arrays: u64,
     pub keys: u64,
     pub array_elements: u64,
     pub peak_bytes: u64,
@@ -150,8 +151,12 @@ pub const ELEMENT_COST: u64 = 64;
 pub const LEAF_COST: u64 = 640;
 /// Bytes per B-tree internal node.
 pub const INTERNAL_COST: u64 = 736;
+/// Bytes per array: a parsed array starts with room for four 32-byte values.
+pub const ARRAY_COST: u64 = 128;
 /// Fixed overhead.
 const BASE_COST: u64 = 4096;
+/// Nesting tracked in full; deeper containers are counted without growing the stack.
+const MAX_TRACKED_DEPTH: usize = 512;
 
 /// Memory for one parsed object with `keys` members, assuming leaves as empty as a B-tree
 /// allows (five keys).
@@ -176,6 +181,7 @@ pub fn estimate(text: &[u8]) -> Estimate {
     let mut in_string = false;
     let mut escape = false;
     let mut in_scalar = false;
+    let mut deep: u64 = 0;
     for &b in text {
         if in_string {
             if escape {
@@ -213,17 +219,28 @@ pub fn estimate(text: &[u8]) -> Estimate {
         }
         match b {
             b'"' => in_string = true,
+            b'{' | b'[' if stack.len() >= MAX_TRACKED_DEPTH => {
+                // Deeper than any parser accepts (serde_json stops at 128): count it without
+                // growing the stack, charged as a full object.
+                deep += 1;
+                cost = cost.saturating_add(LEAF_COST + ARRAY_COST);
+            }
             b'{' => {
                 est.objects += 1;
                 stack.push(Some(0));
             }
-            b'[' => stack.push(None),
-            b':' => {
+            b'[' => {
+                est.arrays += 1;
+                cost = cost.saturating_add(ARRAY_COST);
+                stack.push(None);
+            }
+            b':' if deep == 0 => {
                 if let Some(Some(k)) = stack.last_mut() {
                     *k += 1;
                     est.keys += 1;
                 }
             }
+            b'}' | b']' if deep > 0 => deep -= 1,
             b'}' | b']' => {
                 if let Some(Some(keys)) = stack.pop() {
                     cost = cost.saturating_add(object_cost(keys));
@@ -434,6 +451,21 @@ mod tests {
         }
         let mut exact = std::io::Cursor::new(vec![b' '; 120]);
         assert_eq!(read_capped(&mut exact, 120, "ok.json").unwrap().len(), 120);
+    }
+
+    #[test]
+    fn deep_nesting_does_not_grow_the_estimators_stack() {
+        let depth = 100_000;
+        let mut text = "[".repeat(depth).into_bytes();
+        text.extend(std::iter::repeat_n(b']', depth));
+        let e = estimate(&text);
+        assert_eq!(e.values, depth as u64);
+        assert!(e.peak_bytes >= depth as u64 * ARRAY_COST);
+        // Core refuses it with serde_json's depth limit.
+        assert!(matches!(
+            parse_bytes(text, Limits::default(), "deep.json"),
+            Err(ImportError::Scan(_))
+        ));
     }
 
     #[test]
