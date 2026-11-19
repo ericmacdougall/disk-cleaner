@@ -269,11 +269,7 @@ fn assert_held(res: &disk_cleaner_core::ScanResult, a: &Path) {
         a.display(),
         info.notes
     );
-    assert!(
-        not_removing(action_for(res, a)),
-        "{:?}",
-        action_for(res, a)
-    );
+    assert!(not_removing(action_for(res, a)), "{:?}", action_for(res, a));
 }
 
 /// git reads `a`'s newest commit through the git directory `gitdir`.
@@ -327,7 +323,10 @@ fn r16_a_bare_repository_whose_commondir_is_another_repo_holds_it() {
     let b = root.join("b.git");
     commondir_borrower(&b, "../a/.git", &a, true);
     let res = scan_with(&root, network_everywhere());
-    assert!(has_node(&res, &b), "b.git is classified as a bare repository");
+    assert!(
+        has_node(&res, &b),
+        "b.git is classified as a bare repository"
+    );
     assert_held(&res, &a);
 }
 
@@ -443,11 +442,7 @@ fn r16_a_commondir_that_cannot_be_resolved_makes_every_provider_unknown() {
             _ => write(&cd, "../no-such-repo/.git\n"),
         }
         let res = scan_with(&root, network_everywhere());
-        assert_eq!(
-            facts_of(&res, &a).no_dependents,
-            Tri::Unknown,
-            "{broken}"
-        );
+        assert_eq!(facts_of(&res, &a).no_dependents, Tri::Unknown, "{broken}");
         assert!(not_removing(action_for(&res, &a)), "{broken}");
     }
 }

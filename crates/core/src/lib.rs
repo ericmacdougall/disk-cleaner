@@ -79,15 +79,17 @@ pub fn scan_from_json(text: &str) -> Result<ScanResult> {
 /// may not carry. This format defines no verification of object data (every object-store file is
 /// to be backed up before removal), so a claim of one, from an earlier build or written by hand,
 /// is refused as an invalid scan file, never trusted and never silently dropped. Any other name
-/// containing `verif` is refused the same way. (No field of this format has such a name; maps
+/// containing `verif` is refused the same way. Names are compared ignoring case. (No field of this format has such a name; maps
 /// whose keys are data, such as paths, are not looked at.)
 const VERIFICATION_FIELDS: [&str; 4] = ["verified", "checked", "verification", "verify_objects"];
 
 fn refuse_verification_claims(value: &serde_json::Value) -> Result<()> {
     let claim = |at: String, block: Option<&serde_json::Map<String, serde_json::Value>>| {
-        let key = block?
-            .keys()
-            .find(|k| VERIFICATION_FIELDS.contains(&k.as_str()) || k.contains("verif"))?;
+        // Whatever the case: `Verified` or `VERIFY` claims the same thing.
+        let key = block?.keys().find(|k| {
+            let lower = k.to_lowercase();
+            VERIFICATION_FIELDS.contains(&lower.as_str()) || lower.contains("verif")
+        })?;
         Some(invalid(
             format!("{at}{key}"),
             "this scan format defines no verification of object data: every object-store file \
