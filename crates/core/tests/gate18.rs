@@ -343,6 +343,36 @@ fn forged_a_scan_file_that_claims_a_verification_is_refused() {
     }
 }
 
+/// The refused names are matched whatever their case, at every level the check looks at.
+#[test]
+fn forged_a_verification_claim_in_any_case_is_refused() {
+    let (_tmp, v, i) = clone_scan_json();
+    let cases: [(&str, &str); 6] = [
+        ("doc", "Verified"),
+        ("doc", "VERIFY"),
+        ("node", "Verified"),
+        ("repo", "Checked"),
+        ("object_store", "VerifiedAt"),
+        ("git_admin", "VERIFICATION"),
+    ];
+    for (level, key) in cases {
+        let mut m = v.clone();
+        let target = match level {
+            "doc" => &mut m,
+            "node" => &mut m["nodes"][i],
+            "repo" => &mut m["nodes"][i]["repo"],
+            block => &mut m["nodes"][i]["repo"][block],
+        };
+        target[key] = serde_json::json!(true);
+        match scan_from_json(&m.to_string()) {
+            Err(Error::InvalidScan { field, .. }) => {
+                assert!(field.contains(key), "{level}.{key}: {field}");
+            }
+            other => panic!("{level}.{key} accepted or wrong error: {other:?}"),
+        }
+    }
+}
+
 /// The plan JSON states no verification of object data.
 #[test]
 fn forged_the_plan_carries_no_verification_field() {

@@ -147,6 +147,9 @@ struct DirAgg {
     /// fifo, device): ambiguous evidence of a repository. Never followed.
     git_odd: bool,
     has_head: bool,
+    /// A direct entry named `HEAD` of any type but a directory: git also accepts a `HEAD` that
+    /// is a symbolic link, so this, not `has_head`, says a `commondir` here is git data.
+    head_any: bool,
     has_objects: bool,
     has_refs: bool,
     has_source: bool,
@@ -280,6 +283,20 @@ struct Refs {
     /// Every `objects/info/alternates` and `objects/info/http-alternates` entry, whatever its type.
     alternates: Vec<PathBuf>,
     alternates_overflow: bool,
+    /// Every entry named `commondir`, whatever its type and wherever it is (which git
+    /// directories it belongs to is decided after the walk).
+    commondirs: Vec<PathBuf>,
+    commondirs_overflow: bool,
+}
+
+impl Refs {
+    fn note_commondir(&mut self, path: &Path) {
+        if self.commondirs.len() < MAX_ALTERNATES {
+            self.commondirs.push(path.to_path_buf());
+        } else {
+            self.commondirs_overflow = true;
+        }
+    }
 }
 
 impl Walk {
@@ -365,6 +382,9 @@ impl Walk {
                     self.skipped_overflow = true;
                 }
             }
+            if entry.depth > 0 && name == "commondir" {
+                self.refs.note_commondir(&path);
+            }
             let agg = self.aggs.entry(path.clone()).or_default();
             agg.bytes += meta.alloc;
             if entry.depth > 0 {
@@ -406,6 +426,9 @@ impl Walk {
                 self.refs.alternates_overflow = true;
             }
         }
+        if name == "commondir" {
+            self.refs.note_commondir(&path);
+        }
         let is_file = ft.is_file();
         let is_output = is_file && rules.is_output_file(&name);
         // A small output that may lie inside an artifact, kept on its directory (bounded).
@@ -446,6 +469,9 @@ impl Walk {
         }
         if name == ".git" && !is_file {
             agg.git_odd = true;
+        }
+        if name == "HEAD" {
+            agg.head_any = true;
         }
         if ft.is_symlink() && agg.first_symlink.is_none() {
             agg.first_symlink = Some(name.clone());
@@ -761,21 +787,12 @@ fn bare_shape(agg: &DirAgg) -> bool {
     agg.has_head && agg.has_objects && agg.has_refs
 }
 
-/// A `.git` entry inside a regenerable or cache directory: never a node, but what it refers to
-/// still counts for dependencies.
-#[derive(Clone, Copy)]
-enum HiddenGit {
-    Dir,
-    File,
-}
-
 /// Assign every directory to its innermost classified ancestor, creating nodes.
 fn classify(
     dirs: &mut [(PathBuf, DirAgg)],
     rules: &RuleSet,
     roots: &HashSet<PathBuf>,
     odd_dirs: &mut Vec<PathBuf>,
-    hidden: &mut Vec<(PathBuf, HiddenGit)>,
 ) -> Vec<Build> {
     let mut builds: Vec<Build> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
@@ -810,12 +827,6 @@ fn classify(
                             && Some(builds[o].path.as_path()) == path.parent()
                     })
                     .unwrap_or(false);
-            if opaque && agg.has_git_dir {
-                hidden.push((path.clone(), HiddenGit::Dir));
-            }
-            if opaque && agg.has_git_file {
-                hidden.push((path.clone(), HiddenGit::File));
-            }
             if opaque && (agg.has_git_dir || agg.has_git_file || bare_shape(agg)) {
                 // A git repository inside a "generated" directory (a FetchContent checkout,
                 // a patched dependency): it may hold unpushed work.
@@ -1084,14 +1095,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
     let root_set: HashSet<PathBuf> = roots.iter().cloned().collect();
     let mut odd_dirs: Vec<PathBuf> = Vec::new();
-    let mut hidden: Vec<(PathBuf, HiddenGit)> = Vec::new();
-    let mut builds = classify(
-        &mut dirs,
-        &opts.rules,
-        &root_set,
-        &mut odd_dirs,
-        &mut hidden,
-    );
+    let mut builds = classify(&mut dirs, &opts.rules, &root_set, &mut odd_dirs);
     if roots.len() > 1 && !plan_r.unresolved.is_empty() {
         for (r, err) in &plan_r.unresolved {
             warnings.push(diag(&format!(
@@ -1401,7 +1405,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     link_repos(&mut builds, &roots, &mut warnings);
     link_odd_gits(&mut builds, &odd_dirs, &mut warnings);
     let ctx = InboundCtx::new(&builds, &dirs, &roots, &plan_r.canon);
-    let found = link_inbound(&ctx, &refs, &hidden);
+    let found = link_inbound(&ctx, &refs);
     apply_inbound(&mut builds, found, &mut warnings);
 
     // Scan roots inside a repository the scan does not cover: the artifacts there are checked
@@ -1995,10 +1999,15 @@ struct Inbound {
 }
 
 /// Dependencies found from the references themselves, independently of how the directories that
-/// hold them were classified (design: inbound references). Every symlink the walk met whose target
-/// lies inside a scan root, every alternates file anywhere (inside artifact directories and
-/// `.git/modules` too) and every `.git` directory or file inside an artifact directory is
-/// resolved as a path, never followed to run git or read through:
+/// hold them were classified (design: inbound references). Every recognised git directory is
+/// covered the same way, whatever it is (a repository's `.git`, a bare repository, a linked
+/// worktree's or submodule's git directory inside another one, a git directory that is no node,
+/// any of them inside an artifact or in a separately walked root), because the references are
+/// enumerated by what they are, not by what holds them: every symlink the walk met whose target
+/// lies inside a scan root, every alternates file anywhere, every `commondir` entry in a directory
+/// that holds a `HEAD` (a git directory), and every `.git` file that is not a scanned checkout
+/// (a scanned checkout's `.git` file is resolved by [`link_repos`]). Each is resolved as a path,
+/// never followed to run git or read through:
 ///
 /// - a reference whose target lies inside the git directory of a scanned repository N, made from
 ///   outside that git directory, gives N `no_dependents = no` naming who refers to it;
@@ -2007,8 +2016,13 @@ struct Inbound {
 ///   than the one that holds it: a repository there gets `no_dependents = no`, a regenerable or
 ///   cache directory there asks;
 /// - git data that cannot be read or resolved, or leads outside the scan, is unresolved.
-fn link_inbound(ctx: &InboundCtx, refs: &Refs, hidden: &[(PathBuf, HiddenGit)]) -> Inbound {
+fn link_inbound(ctx: &InboundCtx, refs: &Refs) -> Inbound {
     let mut out = Inbound::default();
+    if refs.commondirs_overflow {
+        out.unresolved.get_or_insert(format!(
+            "more than {MAX_ALTERNATES} commondir files were found, so not all were read"
+        ));
+    }
     if refs.links_overflow {
         out.unresolved.get_or_insert(format!(
             "more than {MAX_LINKS} symbolic links lead inside the scanned folders, so not all were \
@@ -2061,24 +2075,69 @@ fn link_inbound(ctx: &InboundCtx, refs: &Refs, hidden: &[(PathBuf, HiddenGit)]) 
             }
         }
     }
-    for (dir, kind) in hidden {
-        let found: std::result::Result<Vec<(PathBuf, PathBuf)>, String> = match kind {
-            HiddenGit::File => resolve_gitfile(dir).map(|(gd, store)| {
-                let at = dir.join(".git");
-                vec![(at.clone(), gd), (at, store)]
-            }),
-            HiddenGit::Dir => hidden_commondir(dir),
+    // `commondir`: the git directory that holds it takes its refs and objects from the directory
+    // it names. An entry belongs to a git directory when it lies beside a `HEAD` of any type
+    // (git accepts a symlinked one) or in a directory named `.git`.
+    for cd in &refs.commondirs {
+        let Some(gd) = cd.parent() else {
+            continue;
         };
-        match found {
-            Ok(list) => {
-                for (at, t) in list {
-                    consider(ctx, &mut out, &at, true, &t);
+        let in_git_dir = gd.file_name() == Some(OsStr::new(".git"))
+            || ctx
+                .dirs
+                .binary_search_by(|(q, _)| q.as_path().cmp(gd))
+                .is_ok_and(|k| ctx.dirs[k].1.head_any);
+        if !in_git_dir {
+            continue;
+        }
+        match resolve_commondir(gd) {
+            Ok(Some(common)) => consider(ctx, &mut out, cd, true, &common),
+            Ok(None) => {}
+            Err(why) => {
+                out.unresolved.get_or_insert(format!(
+                    "the commondir {} could not be resolved ({why})",
+                    cd.display()
+                ));
+            }
+        }
+    }
+    // `.git` files: the git directory each names, and the object store it leads to. For a
+    // scanned checkout both are checked here too (`link_repos` relates its store to a scanned
+    // repository's own `objects` and reports one outside the scan or a `.git` file it cannot
+    // resolve), so a git directory or store kept inside another repository's git directory (`git
+    // init --separate-git-dir`, or a `commondir` into it) is a reference to that repository. A
+    // checkout inside that repository's own folder (a submodule) goes with it and is not. A
+    // target outside the scan is left to `link_repos`.
+    for (dir, agg) in ctx.dirs {
+        if !agg.has_git_file {
+            continue;
+        }
+        let checkout = agg.owner.is_some_and(|o| {
+            ctx.builds[o].path == *dir && ctx.builds[o].node.class == Class::Worktree
+        });
+        if checkout {
+            if let Ok((gd, store)) = resolve_gitfile(dir) {
+                let real = canon(dir);
+                for target in [gd, store] {
+                    let inside_provider = ctx
+                        .gitdir_holding(&target)
+                        .is_some_and(|n| real.starts_with(canon(&ctx.builds[n].path)));
+                    if !inside_provider && ctx.in_scan(&target) {
+                        consider(ctx, &mut out, &dir.join(".git"), true, &target);
+                    }
                 }
+            }
+            continue;
+        }
+        match resolve_gitfile(dir) {
+            Ok((gd, store)) => {
+                let at = dir.join(".git");
+                consider(ctx, &mut out, &at, true, &gd);
+                consider(ctx, &mut out, &at, true, &store);
             }
             Err(why) => {
                 out.unresolved.get_or_insert(format!(
-                    "the git repository at {} inside a generated directory could not be \
-                     resolved ({why})",
+                    "the .git file at {} could not be resolved ({why})",
                     dir.display()
                 ));
             }
@@ -2087,23 +2146,18 @@ fn link_inbound(ctx: &InboundCtx, refs: &Refs, hidden: &[(PathBuf, HiddenGit)]) 
     out
 }
 
-/// The `commondir` of a `.git` directory found inside an artifact directory, if it has one.
-fn hidden_commondir(dir: &Path) -> std::result::Result<Vec<(PathBuf, PathBuf)>, String> {
-    let gd = dir.join(".git");
+/// The directory the `commondir` file in the git directory `gd` names, canonicalised: `None`
+/// when there is none; an error when it is not a plain file, cannot be read, or names nothing.
+fn resolve_commondir(gd: &Path) -> std::result::Result<Option<PathBuf>, String> {
     let cd = gd.join("commondir");
-    match kind_of(&cd) {
-        Ok(Kind::Missing) => Ok(Vec::new()),
-        Ok(Kind::Other) => {
-            let text = read_small_regular_file(&cd)
-                .map_err(|e| format!("the commondir was not read ({e})"))?
-                .unwrap_or_default();
-            let common = std::fs::canonicalize(gd.join(text.lines().next().unwrap_or("")))
-                .map_err(|e| format!("the commondir cannot be resolved ({e})"))?;
-            Ok(vec![(cd, common)])
-        }
-        Ok(_) => Err("the commondir is not a plain file".to_string()),
-        Err(e) => Err(format!("cannot read the commondir ({e})")),
-    }
+    let text = match read_small_regular_file(&cd) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(None),
+        Err(e) => return Err(format!("the commondir was not read ({e})")),
+    };
+    std::fs::canonicalize(gd.join(text.lines().next().unwrap_or("")))
+        .map(Some)
+        .map_err(|e| format!("the commondir cannot be resolved ({e})"))
 }
 
 /// One reference at the walked path `at` whose target is the real path `target`. `git_data` is
@@ -2560,7 +2614,8 @@ fn link_repos(builds: &mut [Build], roots: &[PathBuf], warnings: &mut Vec<String
                 b.path.join(".git").join("objects"),
                 Some(b.path.join(".git")),
             ),
-            Class::BareRepo => (b.path.join("objects"), None),
+            // A bare repository is its own git directory, and can hold a `commondir` too.
+            Class::BareRepo => (b.path.join("objects"), Some(b.path.clone())),
             _ => continue,
         };
         let mut bad: Vec<String> = Vec::new();

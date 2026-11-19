@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **14** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **15** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -218,7 +218,12 @@ specific evidence that they are installed package contents. One is listed in `ou
   package directory.
 
 So `--min-output-bytes` narrows only two cases: outputs inside an installed package's directory,
-and outputs outside every regenerable or cache directory. A 50 MiB `.venv/data/model.pt` or a
+and outputs outside every regenerable or cache directory. The size it is compared with is the
+file's size as the rest of the scan counts it: on Unix the **allocated** bytes (`st_blocks` × 512),
+so a sparse file counts only the blocks it has written and a file on a compressing file system
+(APFS, Btrfs, ZFS) counts its compressed size, and either can stay below the threshold however
+large its length; on Windows, where no allocated size is read cheaply, the **logical** length,
+so a sparse or NTFS-compressed file counts at its full length. A 50 MiB `.venv/data/model.pt` or a
 1 KiB `node_modules/.stuff/clip.mp4` is listed at the default threshold; a 1 KiB
 `node_modules/pkg/test/fixture.zip` beside `node_modules/pkg/package.json` is not, because packages
 routinely ship fixture archives, while a 200 MiB `node_modules/pkg/weights.bin` is. To bound
@@ -521,7 +526,8 @@ get `no_dependents = no`), and if it lies outside the scanned roots, or cannot b
 an unresolved borrower: every plain repo's `no_dependents = yes` becomes `unknown`.
 
 **Object sharing.** Every user of each canonical object directory is kept, so repos that share
-one (a symlinked `.git/objects`, or a `commondir` file pointing into another repo) all get
+one (a symlinked `.git/objects`, or a `commondir` file in a repository's `.git` or in a bare
+repository pointing into another repo) all get
 `no_dependents = no`, each naming the others in `dependents` and `notes`: an unpushed commit in one
 lives in the other's directory. `objects/info` and `objects/pack` must be plain directories; a
 symlink there is read as a path (never followed to run git) and is a dependency if it lands inside
@@ -555,7 +561,25 @@ directories and inside `.git` directories too) the scan records:
 - every `objects/info/alternates` and `objects/info/http-alternates` entry, wherever it is
   (inside `node_modules`, inside `.git/modules`, in a repository that is not a node); at most
   20,000;
-- every `.git` directory or `.git` file inside a regenerable or cache directory.
+- every entry named `commondir`, wherever it is; after the walk one counts when the directory
+  holding it is named `.git` or also holds an entry named `HEAD` that is not a directory (a file
+  or a symbolic link, which git also accepts), that is, when it belongs to a git directory of any
+  kind: a repository's `.git`, a bare repository, a linked worktree's or submodule's git
+  directory inside another one, a directory with only `HEAD` and `commondir` (which git accepts
+  and the scan classifies as nothing), any of them inside an artifact or in a separately walked
+  root; at most 20,000;
+- every `.git` file that is not itself a scanned checkout (inside a regenerable or cache
+  directory, inside a git directory). A scanned checkout's `.git` file is resolved with its
+  repository for the object store (see "Object sharing"), and the git directory it names and the
+  store it leads to are checked here too: either one inside another repository's git directory
+  (`git init --separate-git-dir A/.git/sub`, or a `commondir` into `A/.git/sub`) makes that
+  repository `no`, unless the checkout lies inside that repository's own folder (a submodule,
+  which goes with it).
+
+Each kind of reference above is checked for every git directory the walk recognises, whatever
+the borrower was classified as. A git directory is recognised only by the entries named above,
+and one the walk does not reach (outside every scan root, or below a directory it cannot read)
+is not found by this pass.
 
 After the walk:
 
@@ -577,9 +601,10 @@ After the walk:
   that points into a repository's working tree, or into an artifact directory (`node_modules/x ->
   ../../other-project`), is not a dependency and blocks nothing.
 - The alternates files are parsed with the syntax below; an entry that is malformed, cannot be
-  resolved or lies outside the scan, an unreadable alternates file, a hidden `.git` file or
-  `commondir` that cannot be resolved or leads outside the scan, a symlink that cannot be read, and
-  more links or alternates files than the bounds are unresolved: every git node that had
+  resolved or lies outside the scan, an unreadable alternates file, a `.git` file or `commondir`
+  that cannot be read (not a plain file, no permission) or resolved or leads outside the scan, a
+  symlink that cannot be read, and more links, alternates or `commondir` files than the bounds are
+  unresolved: every git node that had
   `no_dependents = yes` gets `unknown` and a warning says why. (`http-alternates` holds URLs, which
   never resolve to a scanned directory, so any entry there is unresolved.)
 - A regenerable or cache directory that holds such a repository still asks, as before.
@@ -596,7 +621,7 @@ After the walk:
   not enter, are not seen either. The scan records those places in `coverage`, and by default
   they make every repository ask (see "Incomplete coverage"); with `accept_incomplete_coverage`
   the plan offers them for removal after a backup anyway and discloses them on every decision they could affect.
-- More than 200,000 kept symlinks or 20,000 alternates files makes every repository's
+- More than 200,000 kept symlinks, 20,000 alternates files or 20,000 `commondir` entries makes every repository's
   `no_dependents` `unknown` (safe, but no repository is removed); a large pnpm or git-annex tree can reach
   it.
 - Resolving a symlink's target as a path touches each directory on the way (as `realpath` does), so
@@ -865,9 +890,10 @@ any check this tool runs.
 is under a backup obligation before removal: `preserve.git_admin` and `preserve.object_store`;
 both MUST be backed up. A later apply phase may define a verification against the live remote;
 this format does not, and a field that claims one is not part of it: `plan` refuses (exit 1,
-"invalid scan file") a scan file whose repository block, `repo.object_store` or `repo.git_admin`
-carries `verified`, `checked`, `verification`, `verify_objects` or any other field name containing
-`verif`, and the three blocks refuse any field this format does not define.
+"invalid scan file") a scan file whose document, any node, repository block, `repo.object_store`
+or `repo.git_admin` carries `verified`, `checked`, `verification`, `verify_objects` or any other
+field name containing `verif`, compared ignoring case (`Verified`, `VERIFY`), and the three
+repository blocks refuse any field this format does not define.
 
 **Two classes, by name alone.** Every non-directory entry of a git directory (a symlink or other
 non-directory entry included, never followed) is in exactly one of two classes, decided by its
