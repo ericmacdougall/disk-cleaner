@@ -124,6 +124,9 @@ struct DirAgg {
     markers: Vec<String>,
     has_git_dir: bool,
     has_git_file: bool,
+    /// A `.git` entry that is neither a regular directory nor a regular file (symlink, socket,
+    /// fifo, device): ambiguous evidence of a repository. Never followed.
+    git_odd: bool,
     has_head: bool,
     has_objects: bool,
     has_refs: bool,
@@ -254,6 +257,9 @@ impl Walk {
             }
         }
         let agg = parent_agg(&mut self.aggs, entry.parent_path());
+        if name == ".git" && !is_file {
+            agg.git_odd = true;
+        }
         agg.bytes += alloc;
         agg.files += 1;
         if is_output {
@@ -310,6 +316,8 @@ impl DirAgg {
 
 /// A node under construction.
 struct Build {
+    /// This repo node's `.git` is a symlink or other special entry: git is never run through it.
+    git_odd: bool,
     node: Node,
     path: PathBuf,
     scan_outputs: bool,
@@ -508,6 +516,19 @@ fn classify(
                     });
                 }
             }
+            if opaque && agg.git_odd {
+                // A `.git` that is a symlink or special file: probably a checkout whose git
+                // directory lives elsewhere. It is not followed and git is not run through it.
+                if let Some(o) = owner {
+                    let rel_path = path.to_string_lossy();
+                    builds[o].node.ask_reason.get_or_insert_with(|| {
+                        diag(&format!(
+                            "contains a .git entry that is not a plain directory or file \
+                             ({rel_path}), so it may be a checkout holding unsaved work"
+                        ))
+                    });
+                }
+            }
             if is_git_admin {
                 now_in_git = true;
             } else if !opaque {
@@ -516,6 +537,10 @@ fn classify(
                     found = Some((Class::Repo, None));
                 } else if agg.has_git_file {
                     found = Some((Class::Worktree, None));
+                } else if agg.git_odd {
+                    // Ambiguous: classified as a repo whose facts are unknown, never as loose
+                    // code that could be offered for removal with its regenerable children.
+                    found = Some((Class::Repo, None));
                 } else if bare_shape(agg) {
                     found = Some((Class::BareRepo, None));
                 } else if let Some(rule) = match_rule(dirs, i, rules) {
@@ -566,6 +591,7 @@ fn classify(
                         scan_outputs: rule.map(|r| r.scan_outputs).unwrap_or(false),
                         fixture_files: rule.map(|r| r.fixture_files.clone()).unwrap_or_default(),
                         fixture_dirs: rule.map(|r| r.fixture_dirs.clone()).unwrap_or_default(),
+                        git_odd: agg.git_odd,
                         git_bytes: 0,
                         regen_bytes: 0,
                     });
@@ -823,6 +849,31 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         })
         .collect();
     let mut unverified: Vec<(usize, PathBuf, String)> = Vec::new();
+    // A repo whose `.git` is a symlink or special file: git is not run through it, every fact is
+    // unknown and the artifacts inside ask.
+    let (odd_tasks, tasks): (Vec<_>, Vec<_>) = tasks.into_iter().partition(|t| builds[t.0].git_odd);
+    for (i, _, _, regen) in &odd_tasks {
+        infos.insert(
+            *i,
+            RepoInfo {
+                notes: vec![
+                    "the .git entry is a symlink or special file, so it was not followed and no \
+                     git command was run here"
+                        .to_string(),
+                ],
+                ..RepoInfo::default()
+            },
+        );
+        for p in regen {
+            unverified.push((
+                *i,
+                p.clone(),
+                "has a .git entry above it that is not a plain directory or file, so git was \
+                 not asked whether it is ignored"
+                    .to_string(),
+            ));
+        }
+    }
     if opts.collect_facts && !tasks.is_empty() {
         let jobs = opts.git_jobs.max(1);
         let gathered: Vec<(usize, RepoCheck)> =
@@ -870,10 +921,12 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     }
     for (i, b) in builds.iter_mut().enumerate() {
         if let Some(mut info) = infos.remove(&i) {
-            if b.node.class == Class::Repo {
+            if b.node.class == Class::Repo && !b.git_odd {
                 info.submodule_gitdirs = list_module_gitdirs(&b.path.join(".git").join("modules"));
             }
-            info.git_dir = node_git_dir(&b.path, b.node.class);
+            if !b.git_odd {
+                info.git_dir = node_git_dir(&b.path, b.node.class);
+            }
             info.sizes = RepoSizes {
                 total: b.node.bytes_total,
                 git: b.git_bytes,
@@ -884,6 +937,10 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         }
     }
     link_repos(&mut builds, &mut warnings);
+
+    // Scan roots inside a repository the scan does not cover: the artifacts there are checked
+    // against that repository's git, exactly as a full-repo scan would.
+    let enclosing_repos = check_enclosing_repos(&mut builds, &roots, opts);
 
     // Totals by class.
     for b in &builds {
@@ -917,7 +974,136 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         big_files,
         issues,
         warnings,
+        enclosing_repos,
     })
+}
+
+/// The nearest repository above `root`, looking at each ancestor's `.git` without following
+/// symlinks: `(repository directory, kind of .git entry)`. The canonical path is searched first
+/// (git works from the real directory), then the spelled one.
+fn find_enclosing_repo(root: &Path) -> Option<(PathBuf, GitEntry)> {
+    let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    for start in [real.as_path(), root] {
+        for dir in start.ancestors().skip(1) {
+            match std::fs::symlink_metadata(dir.join(".git")) {
+                Ok(m) if m.is_dir() => return Some((dir.to_path_buf(), GitEntry::Dir)),
+                Ok(m) if m.is_file() => return Some((dir.to_path_buf(), GitEntry::File)),
+                Ok(_) => return Some((dir.to_path_buf(), GitEntry::Odd)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // Cannot tell: treat as ambiguous evidence.
+                Err(_) => return Some((dir.to_path_buf(), GitEntry::Odd)),
+            }
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitEntry {
+    Dir,
+    File,
+    Odd,
+}
+
+/// For each scan root that lies inside a repository the scan does not cover, decide the
+/// artifacts below it that no scanned repo owns by asking that repository's git (config
+/// allowlist, wholly ignored and untracked), or make them ask when that cannot be established.
+/// The enclosing repository itself is never a node and never gets a plan item.
+fn check_enclosing_repos(
+    builds: &mut [Build],
+    roots: &[PathBuf],
+    opts: &ScanOptions,
+) -> Vec<EnclosingRepo> {
+    let mut out: Vec<EnclosingRepo> = Vec::new();
+    let mut seen: Vec<(PathBuf, GitEntry, Vec<PathBuf>)> = Vec::new();
+    for root in roots {
+        let (repo, kind) = match find_enclosing_repo(root) {
+            Some(x) => x,
+            None => continue,
+        };
+        // A repository inside another scan root is walked and is a node there.
+        if roots.iter().any(|r| repo.starts_with(r)) {
+            continue;
+        }
+        out.push(EnclosingRepo {
+            root: root.to_string_lossy().into_owned(),
+            repo: repo.to_string_lossy().into_owned(),
+            note: "this scan root is inside a git repository that the scan did not cover; only \
+                   the artifact directories below the root were checked against it, and the \
+                   repository itself was not assessed"
+                .to_string(),
+        });
+        // Artifacts under this root that no scanned git node encloses.
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for i in 0..builds.len() {
+            if !builds[i].node.class.is_artifact() || !builds[i].path.starts_with(root) {
+                continue;
+            }
+            let mut cur = builds[i].node.parent;
+            let mut owned = false;
+            while let Some(p) = cur {
+                if builds[p].node.class.is_git() {
+                    owned = true;
+                    break;
+                }
+                cur = builds[p].node.parent;
+            }
+            if owned {
+                continue;
+            }
+            let b = &builds[i];
+            let believed_removable = !b.node.contains_outputs
+                && b.node.ask_reason.is_none()
+                && b.node.unreadable == 0
+                && b.node.skipped_mounts == 0;
+            if believed_removable {
+                paths.push(b.path.clone());
+            }
+        }
+        if let Some(pos) = seen.iter().position(|(r, _, _)| *r == repo) {
+            seen[pos].2.extend(paths);
+        } else {
+            seen.push((repo, kind, paths));
+        }
+    }
+    for (repo, kind, paths) in seen {
+        let mut why_not: Vec<(PathBuf, String)> = Vec::new();
+        if kind == GitEntry::Odd {
+            for p in &paths {
+                why_not.push((
+                    p.clone(),
+                    "is inside a repository whose .git entry is not a plain directory or file, \
+                     so git was not asked whether it is ignored"
+                        .to_string(),
+                ));
+            }
+        } else if !opts.collect_facts {
+            for p in &paths {
+                why_not.push((
+                    p.clone(),
+                    "is inside a repository above the scan root and git facts were not \
+                     collected, so it is not verified to be ignored"
+                        .to_string(),
+                ));
+            }
+        } else if !paths.is_empty() {
+            let class = if kind == GitEntry::File {
+                Class::Worktree
+            } else {
+                Class::Repo
+            };
+            let check = collect_repo_info(&opts.facts, &repo, class, &paths);
+            why_not.extend(check.unverified_artifacts);
+        }
+        for (p, why) in why_not {
+            if let Some(b) = builds.iter_mut().find(|b| b.path == p) {
+                b.node.ask_reason.get_or_insert_with(|| {
+                    diag(&format!("{why} ({})", repo.to_string_lossy()))
+                });
+            }
+        }
+    }
+    out
 }
 
 fn canon(p: &Path) -> PathBuf {
@@ -1016,7 +1202,9 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
         match b.node.class {
             Class::Repo => {
                 by_path.insert(canon(&b.path), i);
-                by_objects.insert(canon(&b.path.join(".git").join("objects")), i);
+                if !b.git_odd {
+                    by_objects.insert(canon(&b.path.join(".git").join("objects")), i);
+                }
             }
             Class::BareRepo => {
                 by_path.insert(canon(&b.path), i);
@@ -1042,6 +1230,7 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
             }
         }
         let objects_dir = match b.node.class {
+            Class::Repo if b.git_odd => continue,
             Class::Repo => b.path.join(".git").join("objects"),
             Class::BareRepo => b.path.join("objects"),
             _ => continue,

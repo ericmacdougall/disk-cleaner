@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **2** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **3** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). All sizes are bytes. All times are unix seconds (UTC).
@@ -15,7 +15,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 2 |
+| `schema_version` | integer, currently 3 (3 added `enclosing_repos`; a version 2 scan lacks the checks that fill it, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots |
@@ -26,6 +26,13 @@ you name.
 | `big_files` | the biggest `top_files` files: `path`, `bytes`, `node` |
 | `issues` | up to 1000 unreadable entries: `path`, `message`; `totals.unreadable` has the full count |
 | `warnings` | notes about limits that applied to this run |
+| `enclosing_repos` | scan roots that lie inside a git repository the scan did not cover: `root`, `repo`, `note`. Before the walk each root is looked at upward for a `.git` directory or file in any ancestor (the real path first, then the spelled one; symlinks are not followed). That repository is not a node and never gets a plan item, but the regenerable and cache directories below the root that no scanned repo encloses are decided by its git exactly as in a full scan: the config allowlist and work-tree checks run on it, and a directory is removable only if git lists it as wholly ignored and untracked. A refused config, a git failure or timeout, `--no-git`, or an ancestor `.git` that is not a plain directory or file makes them ask. The plan header and the human outputs say the repository was not assessed |
+
+A `.git` entry that is neither a regular directory nor a regular file (a symlink, socket, fifo or
+device) is ambiguous evidence of a repository. It is never followed and git is never run through it.
+Inside a regenerable or cache directory it gives that directory an `ask_reason`; anywhere else the
+directory becomes a `repo` node whose facts are all `unknown` (note: the `.git` entry was not
+followed), so it and the artifacts under it ask and are not classified as plain loose code.
 
 ### `totals`
 

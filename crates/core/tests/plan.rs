@@ -39,6 +39,7 @@ fn synthetic(nodes: Vec<Node>) -> ScanResult {
         big_files: vec![],
         issues: vec![],
         warnings: vec![],
+        enclosing_repos: vec![],
     }
 }
 

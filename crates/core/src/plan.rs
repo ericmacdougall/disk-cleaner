@@ -161,6 +161,9 @@ pub struct Plan {
     /// be stale. Apply must re-check them with `git ls-remote` before removing anything.
     pub remote_facts_verified: bool,
     pub remote_facts_note: String,
+    /// Scan roots inside a repository the scan did not cover: that repository was not assessed.
+    #[serde(default)]
+    pub enclosing_repos: Vec<EnclosingRepo>,
     pub active: Vec<String>,
     pub totals: PlanTotals,
     pub items: Vec<PlanItem>,
@@ -526,6 +529,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             "remote facts come from local remote-tracking refs, which can be stale; \
                             they are unverified until apply re-checks them with git ls-remote"
                 .to_string(),
+        enclosing_repos: scan.enclosing_repos.clone(),
         active: opts
             .active
             .iter()

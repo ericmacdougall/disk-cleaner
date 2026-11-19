@@ -70,6 +70,15 @@ pub fn scan_summary(s: &ScanResult) -> String {
     for w in &s.warnings {
         let _ = writeln!(o, "warning: {}", esc(w));
     }
+    for e in &s.enclosing_repos {
+        let _ = writeln!(
+            o,
+            "note: {} is inside the git repository {}, which was not assessed; only the \
+             artifact directories below the root were checked against it",
+            esc(&e.root),
+            esc(&e.repo)
+        );
+    }
 
     let _ = writeln!(o, "\nSpace by class (innermost classified ancestor):");
     let mut classes: Vec<(&String, &u64)> = t.bytes_by_class.iter().collect();
@@ -165,6 +174,16 @@ pub fn plan_summary(p: &Plan) -> String {
         let _ = write!(o, " ({n})");
     }
     let _ = writeln!(o);
+    for e in &p.enclosing_repos {
+        let _ = writeln!(
+            o,
+            "Scan root {} is inside the git repository {}, which the scan did not assess: it \
+             is never offered for removal, and artifacts below the root were checked against \
+             its git only",
+            esc(&e.root),
+            esc(&e.repo)
+        );
+    }
     if p.trusted_partial_process_check {
         let _ = writeln!(
             o,

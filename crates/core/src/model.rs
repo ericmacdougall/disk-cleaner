@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -343,4 +343,16 @@ pub struct ScanResult {
     /// At most the first 1000 issues; `totals.unreadable` has the full count.
     pub issues: Vec<ScanIssue>,
     pub warnings: Vec<String>,
+    /// Scan roots that lie inside a git repository the scan did not cover.
+    #[serde(default)]
+    pub enclosing_repos: Vec<EnclosingRepo>,
+}
+
+/// A scan root inside a repository above it. The repository was not walked or assessed; only the
+/// artifact directories below the root were checked against its git.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnclosingRepo {
+    pub root: String,
+    pub repo: String,
+    pub note: String,
 }
