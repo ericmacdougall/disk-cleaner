@@ -245,12 +245,14 @@ fn f3b_submodule_with_a_stash_and_local_branch_stops_the_outer_repo_from_being_a
     let (outer, sub) = repo_with_dirty_submodule(tmp.path(), &root, &remotes);
     let res = scan_with(&root, network_everywhere());
     assert_eq!(facts_of(&res, &sub).stash_empty, Tri::No);
-    // The reviewer's case: the outer repo itself looks perfectly clean.
+    // The reviewer's case: the outer repo itself looks perfectly clean. Every fact is yes except
+    // the plain-layout rule, which now also catches it (a non-empty .git/modules).
+    let f = facts_of(&res, &outer);
     assert!(
-        facts_of(&res, &outer).all_yes(),
-        "{:?}",
-        facts_of(&res, &outer)
+        f.tree_clean == Tri::Yes && f.stash_empty == Tri::Yes && f.no_dependents == Tri::Yes,
+        "{f:?}"
     );
+    assert_eq!(f.plain_layout, Tri::No, "{f:?}");
     assert_eq!(
         action_for(&res, &outer),
         Action::Ask,
@@ -522,7 +524,7 @@ fn n2_in_place_submodule_plus_a_deinited_one_with_a_stash_asks() {
 }
 
 #[test]
-fn n2_control_two_checked_out_clean_submodules_do_not_block_the_parent() {
+fn n2_control_two_checked_out_clean_submodules_make_the_parent_ask_for_its_layout() {
     let (tmp, root, remotes) = workspace();
     let srcs = tmp.path().join("srcs");
     fs::create_dir_all(&srcs).unwrap();
@@ -546,10 +548,16 @@ fn n2_control_two_checked_out_clean_submodules_do_not_block_the_parent() {
         .filter_map(|n| n.repo.as_ref())
         .flat_map(|r| r.notes.iter())
         .collect();
+    // A repository with submodules has a non-empty .git/modules, which is not the plain layout:
+    // it asks (a deliberate limit of this phase), whatever the state of its submodules.
     assert_eq!(
         action_for(&res, &outer),
-        Action::Archive,
+        Action::Ask,
         "{why:#?}\n{notes:#?}"
+    );
+    assert!(
+        why.iter().any(|w| w.contains("unusual repository layout: modules")),
+        "{why:#?}"
     );
 }
 

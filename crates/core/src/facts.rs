@@ -219,7 +219,9 @@ fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
     ] {
         match lk(&gd.join(name)) {
             Ok(Lk::Missing) => {}
-            Ok(_) => no!("{name} exists (shared objects, a moved git directory or other local state)"),
+            Ok(_) => {
+                no!("{name} exists (shared objects, a moved git directory or other local state)")
+            }
             Err(e) => {
                 unknown.get_or_insert(format!("cannot read {name} ({e})"));
             }
@@ -256,7 +258,10 @@ fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
     }
     match git.run(
         path,
-        &["for-each-ref", "--format=%(refname) %(objecttype) %(*objecttype)"],
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objecttype) %(*objecttype)",
+        ],
     ) {
         Ok(out) => {
             for line in out.lines() {

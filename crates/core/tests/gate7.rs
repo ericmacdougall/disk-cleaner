@@ -55,7 +55,10 @@ mod unix_layouts {
         let objs = store.join("objects");
         fs::write(
             objs.join("info").join("alternates"),
-            format!("{}\n", fs::canonicalize(c.join(".git/objects")).unwrap().display()),
+            format!(
+                "{}\n",
+                fs::canonicalize(c.join(".git/objects")).unwrap().display()
+            ),
         )
         .unwrap();
         let _a = repo_linked_to(&root, "a", &objs);
@@ -164,11 +167,18 @@ fn every_shape_check_fails_on_its_own_mutation() {
     let mutations: Vec<Mutation> = vec![
         (
             "alternates file",
-            Box::new(|r: &Path| write(&r.join(".git/objects/info/alternates"), "/nowhere/objects\n")),
+            Box::new(|r: &Path| {
+                write(
+                    &r.join(".git/objects/info/alternates"),
+                    "/nowhere/objects\n",
+                )
+            }),
         ),
         (
             "http-alternates file",
-            Box::new(|r: &Path| write(&r.join(".git/objects/info/http-alternates"), "http://h/x\n")),
+            Box::new(|r: &Path| {
+                write(&r.join(".git/objects/info/http-alternates"), "http://h/x\n")
+            }),
         ),
         (
             "commondir file",
@@ -263,7 +273,11 @@ fn every_shape_check_fails_on_its_own_mutation() {
         let res = scan_with(&root, network_everywhere());
         let l = layout(&res, &repo);
         assert!(l == "no" || l == "unknown", "{what}: plain_layout {l}");
-        assert!(never_archivable(&res, &repo), "{what}: {:?}", action_for(&res, &repo));
+        assert!(
+            never_archivable(&res, &repo),
+            "{what}: {:?}",
+            action_for(&res, &repo)
+        );
         assert_eq!(action_for(&res, &repo), Action::Ask, "{what}");
     }
 }
