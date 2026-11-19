@@ -1,9 +1,27 @@
 # Apply spec: earlier reviews
 
-How revision 5 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the review of revision 4 (adversarial)
-and the review of revision 2 (acceptance), moved here from section 22 in revision 6. Criterion and
+How revisions 5 and 6 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
+from section 22 (revision 5's answers in revision 6, revision 6's in revision 7). Criterion and
 negative-case ids are those of revision 5 and later; section numbers are those of APPLY-SPEC.md.
-Revision 6 changes to the same areas are listed in APPLY-SPEC.md section 22.
+Later changes to the same areas are listed in APPLY-SPEC.md section 22.
+
+## Review of revision 5 (acceptance)
+
+| Finding | Change in revision 6 | Criteria and negative cases |
+|---|---|---|
+| N1 secrets only in the object store (stash parents, local-only and reflog-only commits) uploaded by default | History rule in 9.2 with offline commands (7.5), the index included; tracked files with uncommitted changes checked by name and content; fail closed; limit restored in 17. Revision 7 replaced the history rule (R6-1) | AC-12; NEG-32, NEG-40, NEG-41 |
+| I-1 plan text promises an apply-time remote check | C-4 lists the exact strings; run header correction until it lands | AC-37; NEG-39 |
+| I-2 reconcile deletes under `--backup-only` | Reconcile by mode; second existence check against the journal's storage (6.1, 10.1) | AC-2, AC-21; NEG-34 |
+| I-3 name rule over-keeps | Name and content rules skip committed tracked files (history rule covers them); `fixture_prone` package evidence honoured, also for content inside regenerable children; kept counts by rule (9.2) | AC-12; NEG-33, NEG-42 |
+| I-4 `include.path` with `~` | Includes read and expanded by the tool (9.2) | AC-12; NEG-33 |
+| I-5 token as URL user name | Credential definition in 9.2 | AC-12; NEG-33 |
+| I-6 more sync clients | Nextcloud, ownCloud, MEGA, Resilio, Seafile default (7.4); limit (17) | AC-7 |
+| I-7 bind-mounted file | Every entry checked for a mount (7.4) | AC-7; NEG-36 |
+| I-8 Linux xattr namespaces; file system types | Namespace rules (9.3); removal only on an allowlist of local file systems (7.4) | AC-7, AC-13; NEG-36 |
+| I-9 nested regenerable children not archived | Included: archived and removed with the git item, `removed-with` records (6.3, 9.1, D-15) | AC-29; NEG-35 |
+| I-10 restore metadata; device check in 7.2 | Restored and compared metadata listed, the rest named as not restored (13.3); 7.2 compares with the parent directory | AC-27; NEG-37 |
+| I-11 rclone temporary directory; wrappers | `--temp-dir` under the state directory; recursive wrappers, encrypted only when every path is `crypt` (9.6) | AC-24, AC-33; NEG-38 |
+| I-12 "no network" wording | No git command touches the network; rclone contacts only the user's storage and may refresh its own token (top, section 3) | AC-9 |
 
 ## Review of revision 4 (adversarial)
 
