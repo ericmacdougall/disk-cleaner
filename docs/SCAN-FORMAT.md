@@ -34,6 +34,24 @@ Inside a regenerable or cache directory it gives that directory an `ask_reason`;
 directory becomes a `repo` node whose facts are all `unknown` (note: the `.git` entry was not
 followed), so it and the artifacts under it ask and are not classified as plain loose code.
 
+A git directory that another directory reaches through a `.git` symlink has dependents: removing it
+would break that checkout's history. The link is read as a path only (`readlink`, then a
+canonicalisation of the path itself; nothing is opened and no git runs through it). When the
+target is, or lies inside, a git node of the scan, that node's `no_dependents` becomes `no` with a
+note and an entry in `dependents` naming the checkout. When a `.git` entry is not a symlink, cannot
+be resolved, or leads outside every git directory in the scan, which repository it depends on is
+unknown: every git node that had `no_dependents = yes` gets `unknown` (a known `no` stays) and a
+warning says why.
+
+**The scan document is validated on load** (`plan` reads it through `read_scan`) before anything
+plans from it: every `nodes[].parent`, `nodes[].repo.parent_node`, `big_files[].node` and
+`outputs[].node` must be in range, a node cannot be its own parent, the parent links must form no
+cycle (one iterative pass, whatever the order of `nodes`), and the sums of the byte and file counts
+must not overflow 64 bits. Negative counts are rejected by the parser. A violation is a clean error
+naming the field and index (`invalid scan file: nodes[3].parent: index 999999 is out of range`),
+exit code 1, no partial plan. The planner itself has no recursion, so a deep valid tree cannot
+overflow the stack; for a scan built by hand, bad parent links are ignored.
+
 ### `totals`
 
 `files`, `dirs`, `symlinks`, `allocated_bytes`, `logical_bytes`, `hardlink_duplicates_skipped`,

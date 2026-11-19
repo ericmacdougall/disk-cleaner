@@ -473,6 +473,7 @@ fn classify(
     dirs: &mut [(PathBuf, DirAgg)],
     rules: &RuleSet,
     roots: &HashSet<PathBuf>,
+    odd_dirs: &mut Vec<PathBuf>,
 ) -> Vec<Build> {
     let mut builds: Vec<Build> = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
@@ -493,6 +494,9 @@ fn classify(
         if !in_git {
             let path = &dirs[i].0;
             let agg = &dirs[i].1;
+            if agg.git_odd {
+                odd_dirs.push(path.clone());
+            }
             let opaque = owner
                 .map(|o| builds[o].node.class.is_artifact())
                 .unwrap_or(false);
@@ -718,7 +722,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     let mut dirs: Vec<(PathBuf, DirAgg)> = aggs.into_iter().collect();
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
     let root_set: HashSet<PathBuf> = roots.iter().cloned().collect();
-    let mut builds = classify(&mut dirs, &opts.rules, &root_set);
+    let mut odd_dirs: Vec<PathBuf> = Vec::new();
+    let mut builds = classify(&mut dirs, &opts.rules, &root_set, &mut odd_dirs);
 
     // Attribute directory aggregates to their owners.
     let mut other_bytes: u64 = 0;
@@ -937,6 +942,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         }
     }
     link_repos(&mut builds, &mut warnings);
+    link_odd_gits(&mut builds, &odd_dirs, &mut warnings);
 
     // Scan roots inside a repository the scan does not cover: the artifacts there are checked
     // against that repository's git, exactly as a full-repo scan would.
@@ -1110,6 +1116,89 @@ fn check_enclosing_repos(
         }
     }
     out
+}
+
+/// Git directories that other directories reach through a `.git` symlink have dependents:
+/// removing them would break those checkouts. The link is read as a path only (`read_link`,
+/// then a canonicalisation of the path); nothing is followed to run git or read its contents.
+///
+/// If the target is, or lies inside, a git node of the scan, that node gets `no_dependents = no`
+/// naming the dependent. If a `.git` entry is not a symlink, cannot be resolved, or leads outside
+/// every git node of the scan, which git directory it uses is unknown, so every git node that
+/// had `no_dependents = yes` gets `unknown` (a known `no` stays).
+fn link_odd_gits(builds: &mut [Build], odd_dirs: &[PathBuf], warnings: &mut Vec<String>) {
+    if odd_dirs.is_empty() {
+        return;
+    }
+    let real: Vec<Option<PathBuf>> = builds
+        .iter()
+        .map(|b| b.node.class.is_git().then(|| canon(&b.path)))
+        .collect();
+    let mut unknown_why: Option<String> = None;
+    let mut dependents: Vec<(usize, String)> = Vec::new();
+    for dir in odd_dirs {
+        let link = dir.join(".git");
+        let shown = dir.to_string_lossy().into_owned();
+        let target = match std::fs::symlink_metadata(&link) {
+            Ok(m) if m.file_type().is_symlink() => std::fs::read_link(&link).ok(),
+            _ => None,
+        };
+        let resolved = target.and_then(|t| {
+            let full = if t.is_absolute() { t } else { dir.join(t) };
+            std::fs::canonicalize(full).ok()
+        });
+        match resolved {
+            None => {
+                unknown_why.get_or_insert(format!(
+                    "the .git entry of {shown} is not a symlink that can be resolved, so which \
+                     git directory it uses is unknown"
+                ));
+            }
+            Some(r) => {
+                let hits: Vec<usize> = real
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, p)| {
+                        builds[*i].path != *dir && p.as_ref().is_some_and(|p| r.starts_with(p))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if hits.is_empty() {
+                    unknown_why.get_or_insert(format!(
+                        "the .git symlink of {shown} leads outside every git directory in the \
+                         scan, so which repository depends on it is unknown"
+                    ));
+                }
+                for i in hits {
+                    dependents.push((i, shown.clone()));
+                }
+            }
+        }
+    }
+    for (i, who) in dependents {
+        if let Some(info) = builds[i].node.repo.as_mut() {
+            info.facts.no_dependents = Tri::No;
+            if !info.dependents.contains(&who) {
+                info.notes.push(diag(&format!(
+                    "no_dependents: the checkout at {who} reaches this git directory through a \
+                     .git symlink"
+                )));
+                info.dependents.push(diag(&who));
+            }
+        }
+    }
+    if let Some(why) = unknown_why {
+        let why = diag(&why);
+        warnings.push(why.clone());
+        for b in builds.iter_mut() {
+            if let Some(info) = b.node.repo.as_mut() {
+                if info.facts.no_dependents == Tri::Yes {
+                    info.facts.no_dependents = Tri::Unknown;
+                    info.notes.push(format!("no_dependents: {why}"));
+                }
+            }
+        }
+    }
 }
 
 fn canon(p: &Path) -> PathBuf {

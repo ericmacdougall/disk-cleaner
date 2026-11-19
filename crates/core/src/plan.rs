@@ -233,23 +233,104 @@ pub fn resolve_active(
     Ok(out)
 }
 
-/// The active path that covers node `idx` or a classified directory enclosing it.
-fn active_for(scan: &ScanResult, idx: usize, active: &[PathBuf]) -> Option<String> {
-    let node = &scan.nodes[idx];
-    under_active(Path::new(&node.path), active)
-        .or_else(|| node.parent.and_then(|p| active_for(scan, p, active)))
-}
-
-/// A running process's working directory inside node `idx` or an enclosing classified directory.
-fn process_in(scan: &ScanResult, idx: usize, process: &ProcessCheck) -> Option<String> {
-    let node = &scan.nodes[idx];
+/// A running process's working directory inside this node's directory.
+fn process_hit(node: &Node, process: &ProcessCheck) -> Option<String> {
     let raw = Path::new(&node.path);
     let real = canon(raw);
     process
         .inside(raw)
         .or_else(|| process.inside(&real))
         .map(|c| format!("{} (working directory of a running process)", c.display()))
-        .or_else(|| node.parent.and_then(|p| process_in(scan, p, process)))
+}
+
+/// What the plan needs to know about every node, computed once with no recursion (a scan file can
+/// describe a tree of any depth): parents first, then per-node results inherited down the tree.
+///
+/// Parent links that are out of range or form a cycle are cut (the scan loader rejects them; this
+/// keeps `plan` total when a caller builds a scan by hand).
+struct Ctx {
+    /// Parent of each node, cycles and bad indexes removed.
+    parent: Vec<Option<usize>>,
+    /// Node indexes, every node after its parent.
+    order: Vec<usize>,
+    /// Active path covering the node or a node enclosing it.
+    active: Vec<Option<String>>,
+    /// Running process inside the node or a node enclosing it.
+    process: Vec<Option<String>>,
+    /// Newest activity evidence of the project the node belongs to.
+    activity: Vec<Option<i64>>,
+}
+
+fn build_ctx(scan: &ScanResult, opts: &PlanOptions) -> Ctx {
+    let n = scan.nodes.len();
+    let mut parent: Vec<Option<usize>> = scan
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, nd)| nd.parent.filter(|p| *p < n && *p != i))
+        .collect();
+    let mut depth = vec![usize::MAX; n];
+    let mut on_path = vec![false; n];
+    for start in 0..n {
+        if depth[start] != usize::MAX {
+            continue;
+        }
+        let mut path: Vec<usize> = Vec::new();
+        let mut cur = Some(start);
+        let mut base = 0usize;
+        while let Some(c) = cur {
+            if depth[c] != usize::MAX {
+                base = depth[c] + 1;
+                break;
+            }
+            if on_path[c] {
+                // A cycle: cut the link that closed it.
+                if let Some(&last) = path.last() {
+                    parent[last] = None;
+                }
+                base = 0;
+                break;
+            }
+            on_path[c] = true;
+            path.push(c);
+            cur = parent[c];
+        }
+        let mut d = base;
+        for &c in path.iter().rev() {
+            depth[c] = d;
+            d += 1;
+            on_path[c] = false;
+        }
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| depth[i]);
+
+    let mut active: Vec<Option<String>> = vec![None; n];
+    let mut process: Vec<Option<String>> = vec![None; n];
+    let mut activity: Vec<Option<i64>> = vec![None; n];
+    for &i in &order {
+        let node = &scan.nodes[i];
+        let par = parent[i];
+        active[i] = under_active(Path::new(&node.path), &opts.active)
+            .or_else(|| par.and_then(|p| active[p].clone()));
+        process[i] =
+            process_hit(node, &opts.process).or_else(|| par.and_then(|p| process[p].clone()));
+        // Regenerable directories use their owning project.
+        activity[i] = match par {
+            Some(p) if node.class.is_artifact() => activity[p],
+            _ => {
+                let commit = node.repo.as_ref().and_then(|r| r.last_commit_time);
+                max_opt(node.newest_mtime, commit)
+            }
+        };
+    }
+    Ctx {
+        parent,
+        order,
+        active,
+        process,
+        activity,
+    }
 }
 
 fn max_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
@@ -260,35 +341,22 @@ fn max_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
-/// Newest activity evidence of the project a node belongs to: file modification times and the
-/// newest commit. Regenerable directories use their owning project.
-fn activity(scan: &ScanResult, idx: usize) -> Option<i64> {
-    let node = &scan.nodes[idx];
-    if node.class.is_artifact() {
-        if let Some(p) = node.parent {
-            return activity(scan, p);
-        }
-    }
-    let commit = node.repo.as_ref().and_then(|r| r.last_commit_time);
-    max_opt(node.newest_mtime, commit)
-}
-
 fn join_names(names: &[&str]) -> String {
     names.join(", ")
 }
 
 /// Judge one node: active (path, process or recent activity), idle or unknown, with the reason.
-fn judge(scan: &ScanResult, idx: usize, opts: &PlanOptions) -> (ProjectState, String, Option<u64>) {
-    let last = activity(scan, idx);
+fn judge(ctx: &Ctx, idx: usize, opts: &PlanOptions) -> (ProjectState, String, Option<u64>) {
+    let last = ctx.activity[idx];
     let days = last.map(|t| (opts.now.saturating_sub(t).max(0) / 86_400) as u64);
-    if let Some(a) = active_for(scan, idx, &opts.active) {
+    if let Some(a) = ctx.active[idx].as_deref() {
         return (
             ProjectState::Active,
             format!("covered by the active path {a}"),
             days,
         );
     }
-    if let Some(p) = process_in(scan, idx, &opts.process) {
+    if let Some(p) = ctx.process[idx].as_deref() {
         return (ProjectState::Active, format!("in use: {p}"), days);
     }
     let window = opts.active_window_days;
@@ -334,12 +402,17 @@ fn orphan_submodule_gitdir(scan: &ScanResult, idx: usize) -> Option<String> {
         return None;
     }
     let inside = |j: usize| -> bool {
-        let mut cur = scan.nodes[j].parent;
+        let mut cur = scan.nodes[j].parent.filter(|p| *p < scan.nodes.len());
+        let mut steps = 0usize;
         while let Some(p) = cur {
             if p == idx {
                 return true;
             }
-            cur = scan.nodes[p].parent;
+            steps += 1;
+            if steps > scan.nodes.len() {
+                return false;
+            }
+            cur = scan.nodes[p].parent.filter(|q| *q < scan.nodes.len());
         }
         false
     };
@@ -363,12 +436,13 @@ fn orphan_submodule_gitdir(scan: &ScanResult, idx: usize) -> Option<String> {
 
 /// Build a dry-run plan from a scan.
 pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
+    let ctx = build_ctx(scan, opts);
     let mut items: Vec<PlanItem> = Vec::new();
     for (idx, node) in scan.nodes.iter().enumerate() {
         if matches!(node.class, Class::Output | Class::Other) {
             continue;
         }
-        let (state, state_reason, days) = judge(scan, idx, opts);
+        let (state, state_reason, days) = judge(&ctx, idx, opts);
         let (mut action, mut reason, mut reclaim) = decide(scan, idx, state, &state_reason);
         if action.removes() {
             if let Some(why) = node.ask_reason.as_deref() {
@@ -446,21 +520,25 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
 
     // An enclosing directory goes with everything inside it. When a nested node is kept, asked
     // about, needs recovery, or holds something that cannot be removed, the enclosing node can
-    // not be removed either: it becomes `ask`. Children come after parents, so walk backwards and
-    // let a downgraded node block its own parent in turn.
+    // not be removed either: it becomes `ask`. Deepest nodes first, so a downgraded node blocks
+    // its own parent in turn (no assumption about the order of `nodes`).
     let mut pos: Vec<Option<usize>> = vec![None; scan.nodes.len()];
     for (k, it) in items.iter().enumerate() {
         pos[it.node] = Some(k);
     }
-    for k in (0..items.len()).rev() {
-        let (node_idx, action) = (items[k].node, items[k].action);
+    for &node_idx in ctx.order.iter().rev() {
+        let k = match pos[node_idx] {
+            Some(k) => k,
+            None => continue,
+        };
+        let action = items[k].action;
         if !matches!(
             action,
             Action::Keep | Action::Ask | Action::RecoverThenArchive
         ) {
             continue;
         }
-        let parent = match scan.nodes[node_idx].parent.and_then(|p| pos[p]) {
+        let parent = match ctx.parent[node_idx].and_then(|p| pos[p]) {
             Some(pk) => pk,
             None => continue,
         };
@@ -487,6 +565,13 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             removing[it.node] = true;
         }
     }
+    // Is any enclosing node removing? Parents come first in `order`, so one pass is enough.
+    let mut nested_in_removing = vec![false; scan.nodes.len()];
+    for &i in &ctx.order {
+        nested_in_removing[i] = ctx.parent[i]
+            .map(|p| removing[p] || nested_in_removing[p])
+            .unwrap_or(false);
+    }
     let mut totals = PlanTotals::default();
     for it in &items {
         let slot = totals
@@ -494,22 +579,15 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             .entry(it.action.as_str().to_string())
             .or_default();
         slot.items += 1;
-        let mut nested = false;
-        let mut cur = scan.nodes[it.node].parent;
-        while let Some(p) = cur {
-            if removing[p] {
-                nested = true;
-                break;
-            }
-            cur = scan.nodes[p].parent;
-        }
-        if it.action.removes() && !nested {
-            slot.reclaimable_bytes += it.reclaimable_bytes;
-            totals.reclaimable_bytes += it.reclaimable_bytes;
+        if it.action.removes() && !nested_in_removing[it.node] {
+            slot.reclaimable_bytes = slot.reclaimable_bytes.saturating_add(it.reclaimable_bytes);
+            totals.reclaimable_bytes = totals
+                .reclaimable_bytes
+                .saturating_add(it.reclaimable_bytes);
             // Only regenerable directories are ready without a recovery or verification step:
             // an archive rests on remote facts that stay unverified until apply.
             if it.action == Action::RemoveRegenerable {
-                totals.ready_bytes += it.reclaimable_bytes;
+                totals.ready_bytes = totals.ready_bytes.saturating_add(it.reclaimable_bytes);
             }
         }
     }
@@ -640,12 +718,20 @@ fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Act
                 )
             }
         }
-        Class::LooseCode => (
-            Action::Ask,
-            "source outside any repo: connect an origin, back it up raw, remove it, or leave it"
-                .to_string(),
-            0,
-        ),
+        Class::LooseCode => {
+            let inside = scan
+                .enclosing_repos
+                .iter()
+                .any(|e| Path::new(&node.path).starts_with(&e.root));
+            let why = if inside {
+                "source inside a repository this scan did not cover (see the header): assess \
+                 that repository, or leave it"
+            } else {
+                "source outside any repo: connect an origin, back it up raw, remove it, or \
+                 leave it"
+            };
+            (Action::Ask, why.to_string(), 0)
+        }
         Class::Output | Class::Other => (Action::Keep, "analysis only".to_string(), 0),
     }
 }

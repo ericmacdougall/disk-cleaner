@@ -62,5 +62,104 @@ pub fn scan_from_json(text: &str) -> Result<ScanResult> {
             expected: SCHEMA_VERSION,
         });
     }
-    Ok(serde_json::from_value(value)?)
+    let scan: ScanResult = serde_json::from_value(value)?;
+    validate_scan(&scan)?;
+    Ok(scan)
+}
+
+fn invalid(field: impl Into<String>, message: impl Into<String>) -> Error {
+    Error::InvalidScan {
+        field: field.into(),
+        message: message.into(),
+    }
+}
+
+/// Check that a scan document is internally consistent before anything plans from it: every
+/// index into `nodes` is in range, the parent links form no cycle (checked iteratively, in one
+/// pass, whatever the order of `nodes`), and the byte and file counts do not overflow when summed.
+/// The first violation is returned with the field and index.
+pub fn validate_scan(scan: &ScanResult) -> Result<()> {
+    let n = scan.nodes.len();
+    for (i, node) in scan.nodes.iter().enumerate() {
+        if let Some(p) = node.parent {
+            if p >= n {
+                return Err(invalid(
+                    format!("nodes[{i}].parent"),
+                    format!("index {p} is out of range ({n} nodes)"),
+                ));
+            }
+            if p == i {
+                return Err(invalid(
+                    format!("nodes[{i}].parent"),
+                    "a node cannot be its own parent",
+                ));
+            }
+        }
+        if let Some(pn) = node.repo.as_ref().and_then(|r| r.parent_node) {
+            if pn >= n {
+                return Err(invalid(
+                    format!("nodes[{i}].repo.parent_node"),
+                    format!("index {pn} is out of range ({n} nodes)"),
+                ));
+            }
+        }
+    }
+    for (j, f) in scan.big_files.iter().enumerate() {
+        if let Some(k) = f.node.filter(|k| *k >= n) {
+            return Err(invalid(
+                format!("big_files[{j}].node"),
+                format!("index {k} is out of range ({n} nodes)"),
+            ));
+        }
+    }
+    for (j, f) in scan.outputs.iter().enumerate() {
+        if let Some(k) = f.node.filter(|k| *k >= n) {
+            return Err(invalid(
+                format!("outputs[{j}].node"),
+                format!("index {k} is out of range ({n} nodes)"),
+            ));
+        }
+    }
+    // Cycles: 0 unseen, 1 on the current walk, 2 finished.
+    let mut state = vec![0u8; n];
+    for start in 0..n {
+        if state[start] != 0 {
+            continue;
+        }
+        let mut path: Vec<usize> = Vec::new();
+        let mut cur = Some(start);
+        while let Some(c) = cur {
+            match state[c] {
+                2 => break,
+                1 => {
+                    return Err(invalid(
+                        format!("nodes[{c}].parent"),
+                        "the parent links form a cycle",
+                    ))
+                }
+                _ => {
+                    state[c] = 1;
+                    path.push(c);
+                    cur = scan.nodes[c].parent;
+                }
+            }
+        }
+        for c in path {
+            state[c] = 2;
+        }
+    }
+    // Sums: checked, so a hostile file cannot wrap a total.
+    let sum = |what: &str, values: &mut dyn Iterator<Item = u64>| -> Result<()> {
+        values
+            .try_fold(0u64, |a, v| a.checked_add(v))
+            .map(|_| ())
+            .ok_or_else(|| invalid(what, "the sum overflows 64 bits"))
+    };
+    sum("nodes[].bytes_self", &mut scan.nodes.iter().map(|x| x.bytes_self))?;
+    sum("nodes[].bytes_total", &mut scan.nodes.iter().map(|x| x.bytes_total))?;
+    sum("nodes[].files_total", &mut scan.nodes.iter().map(|x| x.files_total))?;
+    sum("nodes[].output_bytes", &mut scan.nodes.iter().map(|x| x.output_bytes))?;
+    sum("outputs[].bytes", &mut scan.outputs.iter().map(|x| x.bytes))?;
+    sum("big_files[].bytes", &mut scan.big_files.iter().map(|x| x.bytes))?;
+    Ok(())
 }

@@ -33,6 +33,10 @@ pub enum Error {
     /// An `--active` path does not exist or matches nothing that was scanned.
     #[error("--active {path}: {message}")]
     Active { path: PathBuf, message: String },
+    /// The scan file parses but is not a consistent document (an index out of range, a cycle,
+    /// counts that overflow).
+    #[error("invalid scan file: {field}: {message}")]
+    InvalidScan { field: String, message: String },
     /// The scan file was written with a schema this build does not understand.
     #[error("scan file has schema_version {found}, this build reads {expected}")]
     Schema { found: u32, expected: u32 },
