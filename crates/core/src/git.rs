@@ -260,7 +260,12 @@ mod tests {
             .collect();
         let set = |k: &str| envs.get(k).cloned().flatten();
         assert_eq!(set("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
-        for k in ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", "HOME", "XDG_CONFIG_HOME"] {
+        for k in [
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "HOME",
+            "XDG_CONFIG_HOME",
+        ] {
             assert_eq!(set(k).as_deref(), Some(NULL_DEVICE), "{k}");
         }
         assert_eq!(set("GIT_OPTIONAL_LOCKS").as_deref(), Some("0"));

@@ -420,9 +420,10 @@ fn classify(
                         if let Some(why) = r.ask.as_deref() {
                             node.ask_reason.get_or_insert_with(|| why.to_string());
                         }
-                        let unexpected = agg.markers.iter().find(|name| {
-                            r.ask_if_contains.iter().any(|m| marker_matches(m, name))
-                        });
+                        let unexpected = agg
+                            .markers
+                            .iter()
+                            .find(|name| r.ask_if_contains.iter().any(|m| marker_matches(m, name)));
                         if let Some(name) = unexpected {
                             node.ask_reason.get_or_insert_with(|| {
                                 format!(

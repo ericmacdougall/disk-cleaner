@@ -1,6 +1,6 @@
 //! Regression tests for the merge-gate review of PR #2 (findings G3 and G4; G1 is an end-to-end
 //! test in the CLI crate and G2 needs real mounts, see `mount.rs`). Each test fails on the code
-//! the review was written against unless it says it is a guard.
+//! the review was written against unless it says it is a guard or a behaviour pin.
 
 mod common;
 
@@ -8,6 +8,44 @@ use common::*;
 use disk_cleaner_core::{plan, Action, Class, PlanOptions, ScanResult, Tri};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+// ---------------------------------------------------------------- G1: a documented consequence
+
+/// Not failing-first: pins a documented consequence of the G1 fix. The scanner reads no system or
+/// global config, so `core.autocrlf=true` (Git for Windows' system default) no longer applies. A
+/// working tree written with it holds CRLF while the blobs hold LF; once a file's stat data is
+/// stale, git compares raw bytes and the tree reads as modified: never clean, never unknown.
+#[test]
+fn line_endings_converted_only_by_system_config_read_as_modified() {
+    let (_tmp, root, remotes) = workspace();
+    let repo = pushed_repo(&root, &remotes, "app");
+    commit_file(&repo, "notes.txt", "one\ntwo\n");
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let file = repo.join("notes.txt");
+    fs::remove_file(&file).unwrap();
+    git(
+        &repo,
+        &["-c", "core.autocrlf=true", "checkout", "--", "notes.txt"],
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"one\r\ntwo\r\n".to_vec());
+    let later = SystemTime::now() + Duration::from_secs(120);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+
+    let res = scan_with(&root, network_everywhere());
+    let f = facts_of(&res, &repo);
+    assert_eq!(f.tree_clean, Tri::No, "{f:?}");
+    assert_eq!(f.head_on_remote, Tri::Yes, "{f:?}");
+    assert_eq!(f.stash_empty, Tri::Yes, "{f:?}");
+    // A removing action that starts with recovery, which re-checks the facts before anything
+    // is removed; not `archive`.
+    assert_eq!(action_for(&res, &repo), Action::RecoverThenArchive);
+}
 
 // ---------------------------------------------------------------- G3: unresolved alternates
 

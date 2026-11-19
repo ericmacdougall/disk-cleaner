@@ -50,7 +50,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: git version
-        run: git --version
+        shell: bash
+        run: |
+          git --version
+          # Inherited line-ending settings the scanner no longer reads (Git for Windows sets one).
+          git config --show-origin --show-scope --get-all core.autocrlf || true
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
 

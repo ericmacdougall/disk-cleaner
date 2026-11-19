@@ -8,8 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Run git in `dir`, panic with stderr on failure, return trimmed stdout.
+///
+/// Line endings are pinned (`core.autocrlf=false`, which `args` can override): the scanner does
+/// not read system config, so a fixture checked out with a platform's default `autocrlf=true`
+/// would look modified to it (see `line_endings_converted_only_by_system_config_read_as_modified`).
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
+        .args(["-c", "core.autocrlf=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Test")

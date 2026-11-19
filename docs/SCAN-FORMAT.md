@@ -169,7 +169,10 @@ and with every `GIT_*` variable of the caller removed (`GIT_DIR`, `GIT_WORK_TREE
 - Global ignore rules (`core.excludesFile`, the default `$XDG_CONFIG_HOME/git/ignore`) and a global
   or system `core.autocrlf` no longer apply. Both can only make more files look untracked or
   modified, which moves `tree_clean` toward `no` and makes nothing newly ignored: the safe
-  direction.
+  direction. It has a cost on Windows, where Git for Windows sets `core.autocrlf=true` system-wide:
+  in a CRLF checkout, a file whose stat data is stale (touched, copied) reads as modified, so an
+  otherwise saved repo gets `recover-then-archive` (whose recovery step re-checks every fact)
+  instead of `archive`.
 - `safe.directory` is honoured only from global and system config, so a repository owned by
   another user is refused by git and every fact of it is `unknown`, never clean.
 - A global `url.<base>.insteadOf` rewrite is not applied, so a remote is classified by the URL

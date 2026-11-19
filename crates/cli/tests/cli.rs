@@ -16,8 +16,11 @@ fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
+/// Line endings are pinned: the scanner does not read system config, so a fixture checked out
+/// with a platform's default `autocrlf=true` would look modified to it.
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
+        .args(["-c", "core.autocrlf=false"])
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Test")

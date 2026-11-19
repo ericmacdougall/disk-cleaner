@@ -534,7 +534,23 @@ fn n2_control_two_checked_out_clean_submodules_do_not_block_the_parent() {
     git(&outer, &["commit", "-q", "-m", "add submodules"]);
     git(&outer, &["push", "-q", "origin", "main"]);
     let res = scan_with(&root, network_everywhere());
-    assert_eq!(action_for(&res, &outer), Action::Archive);
+    let p = plan(&res, &PlanOptions::new(7, far_future()));
+    let why: Vec<String> = p
+        .items
+        .iter()
+        .map(|i| format!("{} {:?}: {}", i.path, i.action, i.reason))
+        .collect();
+    let notes: Vec<&String> = res
+        .nodes
+        .iter()
+        .filter_map(|n| n.repo.as_ref())
+        .flat_map(|r| r.notes.iter())
+        .collect();
+    assert_eq!(
+        action_for(&res, &outer),
+        Action::Archive,
+        "{why:#?}\n{notes:#?}"
+    );
 }
 
 #[test]

@@ -373,13 +373,15 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 action = Action::Ask;
                 reclaim = 0;
             } else if node.skipped_mounts > 0 {
+                let n = node.skipped_mounts;
+                let (y, is, was) = if n == 1 {
+                    ("y", "is", "was")
+                } else {
+                    ("ies", "are", "were")
+                };
                 reason = format!(
-                    "{reason}; but {} director{} inside {} on another file system and {} not \
-                     scanned (--one-file-system), so what is there was never looked at",
-                    node.skipped_mounts,
-                    if node.skipped_mounts == 1 { "y" } else { "ies" },
-                    if node.skipped_mounts == 1 { "is" } else { "are" },
-                    if node.skipped_mounts == 1 { "was" } else { "were" },
+                    "{reason}; but {n} director{y} inside {is} on another file system and {was} \
+                     not scanned (--one-file-system), so what is there was never looked at"
                 );
                 action = Action::Ask;
                 reclaim = 0;
