@@ -311,6 +311,29 @@ fn t2_incomplete_coverage_makes_a_saved_repository_ask_by_default() {
 }
 
 #[test]
+fn t2_a_repository_that_asks_for_another_reason_also_names_what_was_not_read() {
+    // Its facts show `no_dependents` as unknown, so its reason must say why in words too.
+    let mut n = saved_repo("/w/a");
+    n.repo.as_mut().unwrap().facts.stash_empty = Tri::Unknown;
+    let res = synthetic(vec![n], one_unreadable_folder());
+    let p = plan(&res, &year_later());
+    let it = &p.items[0];
+    assert_eq!(it.action, Action::Ask, "{}", it.reason);
+    assert_eq!(it.facts.unwrap().no_dependents, Tri::Unknown);
+    assert!(it.reason.contains("[stash_empty]"), "{}", it.reason);
+    assert!(
+        it.reason.contains("1 folder could not be read"),
+        "{}",
+        it.reason
+    );
+    assert!(
+        it.reason.contains("--accept-incomplete-coverage"),
+        "{}",
+        it.reason
+    );
+}
+
+#[test]
 fn t2_a_skipped_mount_point_makes_a_saved_repository_ask_by_default() {
     let coverage = Coverage {
         complete: false,
