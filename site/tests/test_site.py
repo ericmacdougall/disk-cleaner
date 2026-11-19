@@ -611,6 +611,7 @@ class TestContent(unittest.TestCase):
         # CI keeps unsigned binaries as workflow artifacts, so "no download" is not quite true; there is
         # no release and no download page.
         self.assertNotIn("no release or download yet", flat)
+        self.assertNotIn("Nothing to download yet", flat)
         self.assertIn("no release or download page", flat)
         days = re.search(r"retention-days:\s*(\d+)", read(CI_YML)).group(1)
         readme = re.sub(r"\s+", " ", read(ROOT_README))
