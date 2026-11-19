@@ -270,3 +270,38 @@ fn j4_partial_process_check_asks_and_leaves_no_ready_bytes() {
     assert_eq!(p.totals.ready_bytes, 0);
     assert_eq!(p.totals.reclaimable_bytes, 0);
 }
+
+#[test]
+fn j4_with_the_opt_in_a_partial_check_still_allows_removal_and_the_plan_says_so() {
+    let (_t, root, proj) = proj_with("package.json");
+    let nm = proj.join("node_modules");
+    write(&nm.join("dep").join("package.json"), "{}");
+    let res = scan_plain(&root);
+    let mut o = PlanOptions::new(7, far_future());
+    o.process = ProcessCheck::Partial {
+        cwds: vec![PathBuf::from("/somewhere/unrelated")],
+        unreadable: 1,
+    };
+    o.trust_partial_process_check = true;
+    let p = plan(&res, &o);
+    let item = p
+        .items
+        .iter()
+        .find(|i| i.path == nm.to_string_lossy())
+        .unwrap();
+    assert_eq!(item.action, Action::RemoveRegenerable, "{}", item.reason);
+    assert!(p.trusted_partial_process_check);
+    assert!(p.totals.ready_bytes > 0);
+    // A partial check that does find a process inside still keeps it.
+    o.process = ProcessCheck::Partial {
+        cwds: vec![nm.join("dep")],
+        unreadable: 1,
+    };
+    let p = plan(&res, &o);
+    let item = p
+        .items
+        .iter()
+        .find(|i| i.path == nm.to_string_lossy())
+        .unwrap();
+    assert_eq!(item.action, Action::Keep);
+}

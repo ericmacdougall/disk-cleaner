@@ -77,6 +77,10 @@ pub struct PlanOptions {
     pub now: i64,
     /// Working directories of running processes.
     pub process: ProcessCheck,
+    /// The user accepts a partial process check (some processes could not be inspected) as
+    /// enough to remove things. Off by default: an unreadable process may be working inside the
+    /// candidate.
+    pub trust_partial_process_check: bool,
 }
 
 impl PlanOptions {
@@ -88,6 +92,7 @@ impl PlanOptions {
             window_source: "input".to_string(),
             now,
             process: ProcessCheck::none_running(),
+            trust_partial_process_check: false,
         }
     }
 }
@@ -148,6 +153,10 @@ pub struct Plan {
     pub process_check: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_check_note: Option<String>,
+    /// The user chose to treat a partial process check as sufficient
+    /// (`trust_partial_process_check` / `--trust-partial-process-check`).
+    #[serde(default)]
+    pub trusted_partial_process_check: bool,
     /// Always false in this phase: remote facts come from local remote-tracking refs, which can
     /// be stale. Apply must re-check them with `git ls-remote` before removing anything.
     pub remote_facts_verified: bool,
@@ -396,11 +405,25 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             }
         }
         if action.removes() {
-            if let ProcessCheck::Unknown { reason: why } = &opts.process {
-                // Cannot prove nothing is using it: a person decides.
-                reason = format!("{reason}; but running processes could not be inspected ({why})");
-                action = Action::Ask;
-                reclaim = 0;
+            match &opts.process {
+                ProcessCheck::Unknown { reason: why } => {
+                    // Cannot prove nothing is using it: a person decides.
+                    reason =
+                        format!("{reason}; but running processes could not be inspected ({why})");
+                    action = Action::Ask;
+                    reclaim = 0;
+                }
+                ProcessCheck::Partial { unreadable, .. } if !opts.trust_partial_process_check => {
+                    // One of the processes nobody could look at may be working inside it.
+                    reason = format!(
+                        "{reason}; but {unreadable} running process(es) could not be inspected, \
+                         so one of them may be using it (--trust-partial-process-check accepts \
+                         that risk)"
+                    );
+                    action = Action::Ask;
+                    reclaim = 0;
+                }
+                _ => {}
             }
         }
         items.push(PlanItem {
@@ -497,6 +520,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         window_source: opts.window_source.clone(),
         process_check: opts.process.status().to_string(),
         process_check_note: opts.process.note(),
+        trusted_partial_process_check: opts.trust_partial_process_check,
         remote_facts_verified: false,
         remote_facts_note:
             "remote facts come from local remote-tracking refs, which can be stale; \

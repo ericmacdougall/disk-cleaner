@@ -25,12 +25,16 @@ pub enum ConfigSource {
 pub struct Config {
     /// A project is active when it was touched within this many days.
     pub active_window_days: u64,
+    /// Treat a partial process check (some processes unreadable) as sufficient to remove things.
+    /// Off unless the user turns it on.
+    pub trust_partial_process_check: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             active_window_days: DEFAULT_ACTIVE_WINDOW_DAYS,
+            trust_partial_process_check: false,
         }
     }
 }
@@ -39,6 +43,7 @@ impl Default for Config {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     active_window_days: Option<u64>,
+    trust_partial_process_check: Option<bool>,
 }
 
 /// `<platform config dir>/disk-cleaner/config.toml`, if the platform config dir can be found.
@@ -65,6 +70,7 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
     })?;
     Ok(Config {
         active_window_days: raw.active_window_days.unwrap_or(DEFAULT_ACTIVE_WINDOW_DAYS),
+        trust_partial_process_check: raw.trust_partial_process_check.unwrap_or(false),
     })
 }
 

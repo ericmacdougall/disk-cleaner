@@ -313,8 +313,9 @@ struct Build {
     node: Node,
     path: PathBuf,
     scan_outputs: bool,
-    /// The rule says this directory holds third-party package contents.
-    dependency_store: bool,
+    /// The rule's package evidence (`fixture_files`, `fixture_dirs`); empty means none.
+    fixture_files: Vec<String>,
+    fixture_dirs: Vec<String>,
     git_bytes: u64,
     regen_bytes: u64,
 }
@@ -329,6 +330,42 @@ fn rel_slash(path: &Path, base: &Path) -> String {
                 .join("/")
         })
         .unwrap_or_default()
+}
+
+/// Is the directory `dirs[i]` part of an installed package of the artifact `build`? Some directory
+/// from it up to (not including) the artifact root must hold one of the rule's `fixture_files`
+/// (a `package.json`), or sit directly below a directory named in `fixture_dirs`
+/// (`site-packages`). A file straight in the artifact root has no evidence.
+fn has_package_evidence(build: &Build, dirs: &[(PathBuf, DirAgg)], i: usize) -> bool {
+    if build.fixture_files.is_empty() && build.fixture_dirs.is_empty() {
+        return false;
+    }
+    let mut p = dirs[i].0.as_path();
+    while p != build.path && p.starts_with(&build.path) {
+        let below_named = p
+            .parent()
+            .and_then(|par| par.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| build.fixture_dirs.iter().any(|d| d == n));
+        if below_named {
+            return true;
+        }
+        if let Ok(k) = dirs.binary_search_by(|(q, _)| q.as_path().cmp(p)) {
+            let has = dirs[k]
+                .1
+                .markers
+                .iter()
+                .any(|m| build.fixture_files.iter().any(|f| marker_matches(f, m)));
+            if has {
+                return true;
+            }
+        }
+        match p.parent() {
+            Some(par) => p = par,
+            None => break,
+        }
+    }
+    false
 }
 
 /// A directory inside (or being) a regenerable or cache directory is looked at for things that
@@ -366,7 +403,9 @@ fn note_nested_state(build: &mut Build, dirs: &[(PathBuf, DirAgg)], i: usize, ru
     }
     let hits = [
         agg.state_hard.as_ref(),
-        agg.state_soft.as_ref().filter(|_| !build.dependency_store),
+        agg.state_soft
+            .as_ref()
+            .filter(|_| !has_package_evidence(build, dirs, i)),
     ];
     for (name, k) in hits.into_iter().flatten() {
         let kind = &rules.state_files()[*k].kind;
@@ -525,7 +564,8 @@ fn classify(
                         node,
                         path: path.clone(),
                         scan_outputs: rule.map(|r| r.scan_outputs).unwrap_or(false),
-                        dependency_store: rule.map(|r| r.dependency_store).unwrap_or(false),
+                        fixture_files: rule.map(|r| r.fixture_files.clone()).unwrap_or_default(),
+                        fixture_dirs: rule.map(|r| r.fixture_dirs.clone()).unwrap_or_default(),
                         git_bytes: 0,
                         regen_bytes: 0,
                     });

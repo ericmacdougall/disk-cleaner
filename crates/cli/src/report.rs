@@ -165,6 +165,13 @@ pub fn plan_summary(p: &Plan) -> String {
         let _ = write!(o, " ({n})");
     }
     let _ = writeln!(o);
+    if p.trusted_partial_process_check {
+        let _ = writeln!(
+            o,
+            "Partial process check accepted by the user: if some processes could not be \
+             inspected, removable items may still be in use by them"
+        );
+    }
     if !p.active.is_empty() {
         let _ = writeln!(o, "Active paths: {}", esc(&p.active.join(", ")));
     }

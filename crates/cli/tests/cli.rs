@@ -251,6 +251,7 @@ fn active_flag_keeps_everything_under_it() {
             "--active-window-days",
             "1",
             "--json",
+            "--trust-partial-process-check",
         ])
         .args(["--now", &far_future()]);
         if let Some(a) = active {
@@ -323,7 +324,15 @@ fn scan_with_project_touched(tmp: &Path, days: u64) -> (PathBuf, String) {
     )
 }
 
+/// `plan --json` as the end-to-end tests want it: a runner may not be able to read every
+/// process, and a partial process check otherwise turns every removal into `ask`.
 fn plan_json(scan_file: &Path, home: &Path, extra: &[&str]) -> Output {
+    let mut args = vec!["--trust-partial-process-check"];
+    args.extend_from_slice(extra);
+    plan_json_raw(scan_file, home, &args)
+}
+
+fn plan_json_raw(scan_file: &Path, home: &Path, extra: &[&str]) -> Output {
     let mut c = bin();
     c.args(["plan", "--scan", scan_file.to_str().unwrap(), "--json"])
         .args(extra);
@@ -1026,18 +1035,18 @@ fn j4_trust_partial_process_check_flag_and_config_are_accepted_and_recorded() {
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
 
-    let o = plan_json(&scan_file, &home, &["--trust-partial-process-check"]);
+    let o = plan_json_raw(&scan_file, &home, &["--trust-partial-process-check"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["trusted_partial_process_check"], true);
 
-    let o = plan_json(&scan_file, &home, &[]);
+    let o = plan_json_raw(&scan_file, &home, &[]);
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["trusted_partial_process_check"], false);
 
     let cfg = tmp.path().join("trust.toml");
     fs::write(&cfg, "trust_partial_process_check = true\n").unwrap();
-    let o = plan_json(&scan_file, &home, &["--config", cfg.to_str().unwrap()]);
+    let o = plan_json_raw(&scan_file, &home, &["--config", cfg.to_str().unwrap()]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
     assert_eq!(v["trusted_partial_process_check"], true);

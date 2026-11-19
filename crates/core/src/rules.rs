@@ -34,11 +34,16 @@ pub struct Rule {
     /// directory is then never offered for removal.
     #[serde(default)]
     pub ask_if_contains: Vec<String>,
-    /// The directory holds third-party package contents (dependencies, registries), which
-    /// routinely include key, certificate and database files as test fixtures. File names that
-    /// are `fixture_prone` in `[[state_file]]` do not make such a directory ask.
+    /// Evidence that a file belongs to an installed package, for directories of third-party
+    /// package contents. Package fixtures routinely use key, certificate and database names; a
+    /// `fixture_prone` file name in `[[state_file]]` is exempt only when some directory between
+    /// the file and this directory (exclusive) holds one of these entries (`name` or `*.suffix`).
     #[serde(default)]
-    pub dependency_store: bool,
+    pub fixture_files: Vec<String>,
+    /// Like `fixture_files`, by directory name: the file sits in a package directory directly
+    /// below a directory with one of these names (`site-packages`).
+    #[serde(default)]
+    pub fixture_dirs: Vec<String>,
 }
 
 /// A file-name pattern for unique state: a file that, found anywhere under a regenerable or
@@ -53,7 +58,7 @@ pub struct StateFile {
     /// Names that match `pattern` but are not state (`.env.example`).
     #[serde(default)]
     pub except: Vec<String>,
-    /// Package fixtures routinely use this name: it does not count under a `dependency_store`.
+    /// Package fixtures routinely use this name: it does not count when the file has package evidence (see `Rule::fixture_files`).
     #[serde(default)]
     pub fixture_prone: bool,
 }
@@ -193,7 +198,12 @@ impl RuleSet {
             by_last.entry(last).or_default().push(i);
             // Entries named by `ask_if_contains` are recorded like markers, so the scanner sees
             // them among the matched directory's own entries.
-            for m in r.markers.iter().chain(&r.ask_if_contains) {
+            for m in r
+                .markers
+                .iter()
+                .chain(&r.ask_if_contains)
+                .chain(&r.fixture_files)
+            {
                 if !marker_specs.contains(m) {
                     marker_specs.push(m.clone());
                 }
@@ -391,18 +401,27 @@ mod tests {
     }
 
     #[test]
-    fn dependency_stores_are_flagged_and_build_directories_are_not() {
+    fn fixture_evidence_is_defined_for_package_directories_only() {
         let rs = RuleSet::builtin();
-        for name in ["node_modules", ".venv", "venv", "Pods", ".cargo/registry"] {
-            let r = rs.rules().iter().find(|r| r.name == name).unwrap();
-            assert!(r.dependency_store, "{name}");
-        }
-        for name in ["build", "target", "dist", "obj"] {
+        let rule = |n: &str| rs.rules().iter().find(|r| r.name == n).unwrap();
+        assert!(rule("node_modules")
+            .fixture_files
+            .iter()
+            .any(|f| f == "package.json"));
+        assert!(rule(".venv")
+            .fixture_dirs
+            .iter()
+            .any(|d| d == "site-packages"));
+        assert!(rule("venv")
+            .fixture_dirs
+            .iter()
+            .any(|d| d == "site-packages"));
+        for name in ["build", "target", "dist", "obj", "Pods", ".npm"] {
             assert!(rs
                 .rules()
                 .iter()
                 .filter(|r| r.name == name)
-                .all(|r| !r.dependency_store));
+                .all(|r| r.fixture_files.is_empty() && r.fixture_dirs.is_empty()));
         }
     }
 

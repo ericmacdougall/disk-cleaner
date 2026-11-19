@@ -375,12 +375,15 @@ fn check_module_configs(git: &crate::git::Git, cwd: &Path, modules: &Path) -> Re
 
 /// Refuse to run git in a repo whose config, or whose submodules' configs, could execute
 /// programs, or whose `core.worktree` points at some other directory.
-fn check_repo_config(git: &crate::git::Git, path: &Path) -> Result<(), String> {
+fn check_repo_config(git: &crate::git::Git, path: &Path, class: Class) -> Result<(), String> {
     let keys = local_config_keys(git, path)?;
     unsafe_key(&keys, "repo config")?;
     if keys.iter().any(|k| k.eq_ignore_ascii_case("core.worktree")) {
+        // The effective value: with `extensions.worktreeConfig` a value in `config.worktree`
+        // overrides the shared one, and `--local` would not see it. System and global config
+        // are switched off, so the only scopes left are the two the allowlist already read.
         let value = git
-            .run(path, &["config", "--local", "--get", "core.worktree"])
+            .run(path, &["config", "--get", "core.worktree"])
             .map_err(|e| note("config", &e))?;
         let gitdir = git
             .run(path, &["rev-parse", "--absolute-git-dir"])
@@ -399,6 +402,18 @@ fn check_repo_config(git: &crate::git::Git, path: &Path) -> Result<(), String> {
             );
         }
     }
+    if class != Class::BareRepo {
+        // Whatever the config says, the tree git inspects must be the scanned directory.
+        let top = git
+            .run(path, &["rev-parse", "--show-toplevel"])
+            .map_err(|e| note("work tree", &e))?;
+        if canon(Path::new(top.trim())) != canon(path) {
+            return Err(
+                "git's work tree is not the scanned directory; facts would describe another tree"
+                    .into(),
+            );
+        }
+    }
     let common = git
         .run(path, &["rev-parse", "--git-common-dir"])
         .map_err(|e| note("git dir", &e))?;
@@ -409,6 +424,114 @@ fn check_repo_config(git: &crate::git::Git, path: &Path) -> Result<(), String> {
         path.join(common)
     };
     check_module_configs(git, path, &common.join("modules"))
+}
+
+/// Gitlinks (submodule entries, mode 160000) recorded in an `ls-files -s -z` listing:
+/// `(commit, stage, path)`.
+fn index_gitlinks(out: &str) -> Vec<(String, String, String)> {
+    out.split('\0')
+        .filter_map(|e| {
+            let (meta, p) = e.split_once('\t')?;
+            let mut it = meta.split(' ');
+            if it.next()? != "160000" {
+                return None;
+            }
+            let sha = it.next()?.to_string();
+            let stage = it.next()?.to_string();
+            Some((sha, stage, p.to_string()))
+        })
+        .collect()
+}
+
+/// Gitlinks in an `ls-tree -r -z` listing: path to commit.
+fn tree_gitlinks(out: &str) -> std::collections::BTreeMap<String, String> {
+    out.split('\0')
+        .filter_map(|e| {
+            let (meta, p) = e.split_once('\t')?;
+            let mut it = meta.split(' ');
+            if it.next()? != "160000" {
+                return None;
+            }
+            let _kind = it.next()?;
+            Some((p.to_string(), it.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// Does each checked-out submodule sit at the commit the parent's index records, and does the
+/// index agree with HEAD about every gitlink? `status --ignore-submodules=all` hides both.
+///
+/// `Ok(None)` is clean, `Ok(Some(why))` is a difference, `Err` means it could not be decided.
+/// A recorded submodule with no checkout (missing or empty directory) is fine; a directory with
+/// files but no `.git` is not. The submodule's HEAD is read with the hardened runner after its own
+/// config passed the same allowlist as any repo; no status is run inside it.
+fn gitlink_state(git: &Git, path: &Path, has_head: bool) -> Result<Option<String>, String> {
+    let listing = git
+        .run(path, &["ls-files", "-s", "-z"])
+        .map_err(|e| note("gitlinks", &e))?;
+    let index = index_gitlinks(&listing);
+    let head = if has_head {
+        let tree = git
+            .run(path, &["ls-tree", "-r", "-z", "HEAD"])
+            .map_err(|e| note("gitlinks", &e))?;
+        tree_gitlinks(&tree)
+    } else {
+        Default::default()
+    };
+    if index.len() > 200 {
+        return Err("more than 200 submodules; their commits were not compared".into());
+    }
+    for (sha, stage, sub) in &index {
+        if stage != "0" {
+            return Ok(Some(format!("submodule {sub} has an unmerged index entry")));
+        }
+        if head.get(sub) != Some(sha) {
+            return Ok(Some(format!(
+                "the index records submodule {sub} differently from HEAD (a staged change)"
+            )));
+        }
+        let dir = path.join(sub);
+        match std::fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot read submodule {sub}: {e}")),
+            Ok(m) if !m.is_dir() => {
+                return Ok(Some(format!("submodule {sub} is not a directory")));
+            }
+            Ok(_) => {}
+        }
+        let empty = std::fs::read_dir(&dir)
+            .map_err(|e| format!("cannot read submodule {sub}: {e}"))?
+            .next()
+            .is_none();
+        if empty {
+            continue; // recorded, not checked out
+        }
+        match std::fs::symlink_metadata(dir.join(".git")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Some(format!(
+                    "the path of submodule {sub} is a plain directory with files, not a checkout"
+                )));
+            }
+            Err(e) => return Err(format!("cannot read submodule {sub}: {e}")),
+            Ok(_) => {}
+        }
+        check_repo_config(git, &dir, Class::Worktree)
+            .map_err(|why| format!("submodule {sub}: {why}"))?;
+        let at = git
+            .run(&dir, &["rev-parse", "--verify", "HEAD"])
+            .map_err(|e| note("submodule HEAD", &e))?;
+        if at.trim() != sha {
+            return Ok(Some(format!(
+                "submodule {sub} is checked out at another commit than the index records"
+            )));
+        }
+    }
+    if let Some(gone) = head.keys().find(|p| !index.iter().any(|(_, _, q)| q == *p)) {
+        return Ok(Some(format!(
+            "the index no longer records submodule {gone} (a staged removal)"
+        )));
+    }
+    Ok(None)
 }
 
 /// Result of inspecting one repo.
@@ -448,7 +571,7 @@ pub fn collect_repo_info(
     let git = &cfg.git;
     // The repo's own config is untrusted. Refuse to run anything else if it could make git
     // execute a program (filter drivers, gpg.program, ...).
-    if let Err(why) = check_repo_config(git, path) {
+    if let Err(why) = check_repo_config(git, path, class) {
         return all_unknown(why, regen_paths);
     }
     let mut unverified: Vec<(PathBuf, String)> = Vec::new();
@@ -646,7 +769,19 @@ pub fn collect_repo_info(
                             })
                             .count();
                         if hidden == 0 {
-                            Tri::Yes
+                            // `status` runs with --ignore-submodules=all, which also hides a
+                            // submodule checked out at another commit than the index records.
+                            match gitlink_state(git, path, info.head_commit.is_some()) {
+                                Ok(None) => Tri::Yes,
+                                Ok(Some(why)) => {
+                                    notes.push(format!("tree_clean: {why}"));
+                                    Tri::No
+                                }
+                                Err(why) => {
+                                    notes.push(format!("tree_clean: {why}"));
+                                    Tri::Unknown
+                                }
+                            }
                         } else {
                             notes.push(format!(
                                 "tree_clean: {hidden} file(s) are marked skip-worktree or \

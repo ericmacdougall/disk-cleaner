@@ -7,7 +7,7 @@ have read a repo as saved without them, so it is refused: scan again). All sizes
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 
 Produce a scan with `disk-cleaner scan <path>... --out scan.json` (or `--json` for stdout) and a
-plan with `disk-cleaner plan --scan scan.json [--active-window-days N] [--config FILE] [--active PATH]... [--json]`. Both are
+plan with `disk-cleaner plan --scan scan.json [--active-window-days N] [--config FILE] [--active PATH]... [--trust-partial-process-check] [--json]`. Both are
 read-only. Nothing in this phase deletes, moves or modifies anything; `--out` writes only the file
 you name.
 
@@ -109,13 +109,27 @@ make it ask, whatever the rule: Terraform state (`*.tfstate`, `terraform.tfstate
 values (`*.tfvars`), `.env` and `.env.*` (not `.env.example`, `.sample`, `.template`, `.dist`),
 `id_rsa`, `id_ed25519`, local databases (`*.sqlite`, `*.sqlite3`, `*.db`) and key material
 (`*.pem`, `*.key`, `*.keystore`, `*.jks`, `*.p12`). The reason names the kind and the path inside
-the directory, never contents. Trade-off: the databases and key material are `fixture_prone`, and
-directories of third-party packages (`dependency_store = true`: `node_modules`, virtual
-environments, `Pods`, `deps`, `.tox`, package registries and caches) skip those names, because
-packages ship them as test fixtures (a `test/fixtures/cert.pem`) and every JavaScript project would
-otherwise ask. The cost is that a real key placed inside `node_modules` is not noticed by name;
-Terraform state, `.env` and the SSH key names are not skipped even there. Build output
-directories, `target` and the like always treat all the names as state.
+the directory, never contents. Trade-off: the databases and key material are `fixture_prone`:
+installed packages ship them as test fixtures (a `test/fixtures/cert.pem`), and every JavaScript
+project would otherwise ask. They are exempt only for a file that shows **evidence of belonging to
+an installed package**, defined per rule in the rules file:
+
+- `node_modules` (`fixture_files = ["package.json"]`): some directory between the file and the
+  `node_modules` root, root excluded, holds a `package.json`. Scoped packages
+  (`node_modules/@scope/pkg/package.json`) and nested `node_modules` qualify; a file in
+  `node_modules/local/` with no `package.json` above it, or straight in the root, does not.
+- Python environments (`.venv`, `venv`, `.tox`, `.cache/pre-commit`:
+  `fixture_dirs = ["site-packages", "dist-packages"]`): the file sits in a package directory
+  directly below a `site-packages` or `dist-packages` directory. A file in the environment root, or
+  straight in `site-packages`, does not qualify.
+- Cargo registry and git checkouts (a `Cargo.toml`), NuGet packages (a `*.nuspec`): same idea.
+- Every other rule (`Pods`, `deps`, `.npm`, `.pnpm-store`, `.cache/pip`, `.cache/uv`,
+  `.gradle/caches`, all build output directories) defines no evidence, so those names always ask.
+
+What the evidence rule still cannot prove: a user file dropped inside an installed package's own
+directory (`node_modules/pkg/notes.db`, `site-packages/pkg/local.key`) looks exactly like a
+fixture and is not noticed by name. Terraform state, `.env` and the SSH key names ask everywhere,
+with or without evidence.
 
 ### `repo`
 
@@ -139,7 +153,7 @@ Facts (the safe value is always `yes`):
 | `head_on_remote` | the worktree's own HEAD, including a detached HEAD, is contained in a remote-tracking ref of a network remote |
 | `all_branches_on_remote` | every local ref (branches, notes, replace refs...; not the stash or HEAD) is contained in a network remote ref, and there are no local tags: tag names are not visible in tracking refs, so a repo with tags is `unknown` until apply runs `git ls-remote` |
 | `stash_empty` | the stash is empty |
-| `tree_clean` | no tracked changes and no untracked files in this repo's own tree (submodules are their own nodes), and no file marked skip-worktree or assume-unchanged (those hide local edits) |
+| `tree_clean` | no tracked changes and no untracked files in this repo's own tree (submodules are their own nodes), no file marked skip-worktree or assume-unchanged (those hide local edits), and every submodule gitlink agrees: the index matches HEAD, and each checked-out submodule's HEAD equals the commit the index records (`status --ignore-submodules=all` hides both). A recorded submodule with a missing or empty directory is fine; a directory with files and no `.git` at a gitlink path, an unmerged gitlink or a differing commit is `no`; a submodule whose config fails the allowlist, whose HEAD cannot be read, or more than 200 submodules is `unknown`. The commits are compared with `ls-files -s`, `ls-tree -r HEAD` and `rev-parse --verify HEAD` run in the submodule through the hardened runner; no status runs inside it |
 | `no_unique_ignored` | no ignored files outside regenerable and cache directories (`.env`, local databases...) |
 | `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone depends on this object store |
 | `reflog_saved` | every commit reachable from any reflog entry (HEAD of this worktree and every ref's reflog) is contained in a network remote's tracking refs. An unpushed commit after `git reset --hard`, an amended or rebased-away commit and a stash's commits are `no`. No network remote is `no`; an unborn HEAD, any git failure or a timeout is `unknown` |
@@ -190,7 +204,10 @@ section and variable of the key (not its subsection), and no further git command
 `<gitdir>/modules/**/config` (bounded walk; a symlink, unreadable file or too many entries also
 counts as unsafe), because git runs a child status inside submodules using their own config; the
 outer status uses `--ignore-submodules=all` since each checked-out submodule is its own node. A
-`core.worktree` that does not resolve to the node's own directory is refused. Repos using Git LFS
+`core.worktree` whose effective value (the shared config, then `config.worktree` when
+`extensions.worktreeConfig` is set, the later winning) does not resolve to the node's own directory
+is refused, and independently `git rev-parse --show-toplevel` must equal the node's real path
+(bare repos excepted); any mismatch or failure makes every fact `unknown`. Repos using Git LFS
 (`filter.lfs.*`, `lfs.*`) or custom merge or diff drivers are therefore reported `unknown`: no `lfs`
 key is allowed. Git runs with `core.fsmonitor=false`,
 `log.showSignature=false`, `core.ignoreStat=false`, `core.hooksPath` set to the null device,
@@ -242,7 +259,7 @@ node inside the repo (matched by identity, not by count); the reason names the o
 
 `schema_version`, `dry_run` (always `true`), `generated_at`, `scan_generated_at`,
 `active_window_days`, `window_source`, `process_check` (`ok`, `partial` or `unknown`),
-`process_check_note`, `remote_facts_verified` (always `false` in this phase) and
+`process_check_note`, `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
 `remote_facts_note`, `active`, `totals` and `items`.
 
 Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `state` (`active`,
@@ -258,6 +275,7 @@ One setting decides activity: `active_window_days`, default **7**. It is read fr
 
 ```toml
 active_window_days = 7
+# trust_partial_process_check = true   # optional, see below; default false
 ```
 
 A missing default file means the default. A file that exists but is malformed, has an unknown key
@@ -276,7 +294,13 @@ A project is **active** when any of these holds:
 Process information comes from `sysinfo`. `process_check` is `ok` when every process's working
 directory was readable, `partial` when some (usually other users') were not, and `unknown` when none
 could be read. When `unknown`, a removing action is never proposed: it becomes `ask` and says so.
-With no evidence at all the state is `unknown`.
+When `partial`, the same holds: an unreadable process may be working inside the candidate, so every
+removing action becomes `ask` (reason: some running processes could not be inspected) and
+`totals.ready_bytes` is 0. The user can accept the risk with the setting
+`trust_partial_process_check = true` in the config file or `plan --trust-partial-process-check`;
+the plan then records `trusted_partial_process_check: true` and the human header says the user
+accepted it. A readable process inside a candidate still keeps it. With no evidence at all the
+state is `unknown`.
 
 `action` is one of `keep`, `remove-regenerable`, `recover-then-archive`, `archive`,
 `backup-then-remove` and `ask`. The plan has no age of its own beyond the window and the

@@ -80,6 +80,11 @@ struct PlanArgs {
     /// Print the plan as JSON.
     #[arg(long)]
     json: bool,
+    /// Accept a partial process check: when some running processes cannot be inspected, still
+    /// offer removal based on the ones that could. Without this (or the config setting
+    /// `trust_partial_process_check = true`) every removing action becomes `ask` then.
+    #[arg(long)]
+    trust_partial_process_check: bool,
     /// Override the current time (unix seconds); for reproducible plans and tests.
     #[arg(long, hide = true)]
     now: Option<i64>,
@@ -144,6 +149,8 @@ fn run_plan(a: PlanArgs) -> Result<()> {
         window_source,
         now,
         process: running_cwds(),
+        trust_partial_process_check: a.trust_partial_process_check
+            || cfg.trust_partial_process_check,
     };
     let p = plan(&scan_result, &opts);
     if a.json {
