@@ -43,7 +43,11 @@ fn m1_two_repos_sharing_one_object_directory_depend_on_each_other() {
     let res = scan_with(&root, network_everywhere());
     assert_eq!(facts_of(&res, &a).no_dependents, Tri::No);
     assert_eq!(facts_of(&res, &b).no_dependents, Tri::No);
-    assert!(not_removing(action_for(&res, &a)), "{:?}", action_for(&res, &a));
+    assert!(
+        not_removing(action_for(&res, &a)),
+        "{:?}",
+        action_for(&res, &a)
+    );
     assert!(dependents(&res, &a).iter().any(|d| d.ends_with("/b")));
     assert!(dependents(&res, &b).iter().any(|d| d.ends_with("/a")));
 }
@@ -85,7 +89,11 @@ fn m1_a_symlinked_objects_info_directory_into_another_repo_is_a_dependency() {
     fs::remove_dir_all(&info).unwrap();
     symlink(a.join(".git").join("objects").join("info"), &info).unwrap();
     let res = scan_with(&root, network_everywhere());
-    assert!(not_removing(action_for(&res, &a)), "{:?}", action_for(&res, &a));
+    assert!(
+        not_removing(action_for(&res, &a)),
+        "{:?}",
+        action_for(&res, &a)
+    );
 }
 
 #[test]
@@ -97,7 +105,11 @@ fn m1_a_commondir_file_pointing_at_another_repo_is_a_dependency() {
     git(&b, &["init", "-q", "-b", "main"]);
     write(&b.join(".git").join("commondir"), "../../a/.git\n");
     let res = scan_with(&root, network_everywhere());
-    assert!(not_removing(action_for(&res, &a)), "{:?}", action_for(&res, &a));
+    assert!(
+        not_removing(action_for(&res, &a)),
+        "{:?}",
+        action_for(&res, &a)
+    );
 }
 
 #[test]
@@ -126,7 +138,11 @@ fn shared_clone(root: &Path, provider: &Path, name: &str) -> (PathBuf, PathBuf) 
             b.to_str().unwrap(),
         ],
     );
-    let alt = b.join(".git").join("objects").join("info").join("alternates");
+    let alt = b
+        .join(".git")
+        .join("objects")
+        .join("info")
+        .join("alternates");
     assert!(alt.exists(), "the clone must have an alternates file");
     (b, alt)
 }
@@ -198,7 +214,12 @@ fn m2_a_malformed_quoted_entry_makes_every_repo_unknown() {
     fs::write(&alt, "\"/unterminated\\q\n").unwrap();
     let res = scan_with(&root, network_everywhere());
     for r in [&prov, &other] {
-        assert_eq!(facts_of(&res, r).no_dependents, Tri::Unknown, "{}", r.display());
+        assert_eq!(
+            facts_of(&res, r).no_dependents,
+            Tri::Unknown,
+            "{}",
+            r.display()
+        );
         assert_eq!(action_for(&res, r), Action::Ask);
     }
 }

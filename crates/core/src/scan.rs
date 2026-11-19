@@ -1514,10 +1514,9 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => bad.push(format!(
-                        "the commondir {} was not read ({e})",
-                        cd.display()
-                    )),
+                    Err(e) => {
+                        bad.push(format!("the commondir {} was not read ({e})", cd.display()))
+                    }
                 },
                 Ok(_) | Err(_) => bad.push(format!("{} is not a plain file", cd.display())),
             }
@@ -1557,7 +1556,10 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
                         alt_entries.push((i, c, alt_path.display().to_string()));
                         None
                     }
-                    Err(e) => Some(format!("the entry {} cannot be resolved ({e})", p.display())),
+                    Err(e) => Some(format!(
+                        "the entry {} cannot be resolved ({e})",
+                        p.display()
+                    )),
                 },
             };
             if let Some(why) = problem {
@@ -1673,7 +1675,8 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
         if let Some(info) = builds[owner].node.repo.as_mut() {
             if !info.dependents.iter().any(|d| d == who) {
                 info.dependents.push(who.to_string());
-                info.notes.push(diag(&format!("no_dependents: {who} {why}")));
+                info.notes
+                    .push(diag(&format!("no_dependents: {who} {why}")));
             }
             info.facts.no_dependents = Tri::No;
         }
