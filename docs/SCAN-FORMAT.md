@@ -166,20 +166,24 @@ and with every `GIT_*` variable of the caller removed (`GIT_DIR`, `GIT_WORK_TREE
 - A `.gitattributes` `filter`, `diff` or `merge` attribute whose driver is defined only
   globally has no driver, so git compares the raw content. An LFS-tracked file that was touched
   therefore shows as modified rather than clean (`tree_clean = no`, not `unknown`).
-- Global ignore rules (`core.excludesFile`, the default `$XDG_CONFIG_HOME/git/ignore`) and a global
-  or system `core.autocrlf` no longer apply. Both can only make more files look untracked or
-  modified, which moves `tree_clean` toward `no` and makes nothing newly ignored: the safe
-  direction. It has a cost on Windows, where Git for Windows sets `core.autocrlf=true` system-wide:
+- Global ignore rules (`core.excludesFile`, the default `$XDG_CONFIG_HOME/git/ignore`) no longer
+  apply. A file only they ignored is now untracked instead of ignored: `tree_clean` becomes `no`
+  while `no_unique_ignored` may become `yes`, so the repo still fails a fact and gets
+  `recover-then-archive`, never `archive`. Recovery (a later phase) must treat such a file as
+  possibly secret: it was ignored on this machine even though the repo does not ignore it.
+- A global or system `core.autocrlf` no longer applies, which can only make files look modified
+  (`tree_clean` toward `no`). It has a cost on Windows, where Git for Windows sets
+  `core.autocrlf=true` system-wide:
   in a CRLF checkout, a file whose stat data is stale (touched, copied) reads as modified, so an
   otherwise saved repo gets `recover-then-archive` (whose recovery step re-checks every fact)
   instead of `archive`.
 - `safe.directory` is honoured only from global and system config, so a repository owned by
   another user is refused by git and every fact of it is `unknown`, never clean.
 - A global `url.<base>.insteadOf` rewrite is not applied, so a remote is classified by the URL
-  written in the repo's own config. This is the one change that can move a fact toward `yes`: a
-  remote whose written URL is a network address but which a global rewrite sends to a local mirror
-  now counts as a network remote. Remote facts are labelled unverified until apply re-checks them
-  against the live remote, which must resolve the effective URL.
+  written in the repo's own config. This can move remote facts toward `yes` with nothing else
+  failing: a remote whose written URL is a network address but which a global rewrite sends to a
+  local mirror now counts as a network remote. Remote facts are labelled unverified until apply
+  re-checks them against the live remote, which must resolve the effective URL.
 
 Remote facts come from local remote-tracking refs, which can be stale (a remote changed with
 `set-url` keeps its old refs). The plan therefore labels them unverified; apply (a later phase) must

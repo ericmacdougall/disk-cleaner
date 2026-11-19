@@ -914,11 +914,19 @@ fn g1_inherited_git_config_never_runs_a_filter_and_is_not_applied() {
                 "{tag}: filtered repo tree_clean = {clean}, want no"
             ));
         }
-        // An inherited ignore rule must not hide the untracked file.
+        // An inherited ignore rule must not hide the untracked file. Not applying it moves the
+        // file from "ignored" to "untracked": `tree_clean` becomes `no` and `no_unique_ignored`
+        // becomes `yes` (documented; the repo still needs recovery, never a plain archive).
         let clean = repo_fact(&v, &hidden, "tree_clean");
         if clean != "no" {
             failures.push(format!(
                 "{tag}: globally ignored untracked file was hidden (tree_clean = {clean})"
+            ));
+        }
+        let ignored = repo_fact(&v, &hidden, "no_unique_ignored");
+        if ignored != "yes" {
+            failures.push(format!(
+                "{tag}: no_unique_ignored = {ignored}, want yes (the file is untracked now)"
             ));
         }
     }
