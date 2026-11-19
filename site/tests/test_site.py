@@ -140,6 +140,50 @@ def action_refs(yml):
     return re.findall(r"^\s*-?\s*uses:\s*(\S+)", yml, re.M)
 
 
+NUMBER_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+                "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+                "eighteen", "nineteen", "twenty"]
+CORE_MODEL = ROOT / "crates" / "core" / "src" / "model.rs"
+CORE_PLAN = ROOT / "crates" / "core" / "src" / "plan.rs"
+
+
+def core_fact_names(src=None):
+    """Fact names in the order `RepoFacts::entries()` in the core crate returns them."""
+    src = read(CORE_MODEL) if src is None else src
+    body = re.search(r"fn entries\(&self\)[^{]*\{(.*?)\n    \}", src, re.S).group(1)
+    return re.findall(r'\("([a-z_]+)",\s*self\.', body)
+
+
+def core_action_names(src=None):
+    """Plan action names from `Action::as_str` in the core crate."""
+    src = read(CORE_PLAN) if src is None else src
+    return re.findall(r'Action::\w+ => "([a-z-]+)"', src)
+
+
+def example_text(html):
+    return re.search(r'aria-label="Example scanner output"><code>(.*?)</code></pre>', html, re.S).group(1)
+
+
+def example_fact_groups(text):
+    """For each repo, worktree or bare repo in the example scan summary, its fact names in order."""
+    groups, cur = [], None
+    for line in text.splitlines():
+        if re.match(r"^\s+\[(repo|worktree|bare-repo)\] ", line) and "=" not in line:
+            cur = []
+            groups.append(cur)
+        elif cur is not None:
+            cur.extend(re.findall(r"\b([a-z_]+)=(?:yes|NO|UNKNOWN)\b", line))
+    return [g for g in groups if g]
+
+
+def example_actions(text):
+    """The action word of each item line after "Items:" in the example plan."""
+    after = text.split("\nItems:\n", 1)
+    if len(after) < 2:
+        return []
+    return re.findall(r"^  ([a-z][a-z-]+) +\S+ \S+ +\[", after[1], re.M)
+
+
 def css_tokens(html):
     """(light, dark) dicts of custom properties from the inline stylesheet."""
     style = re.search(r"<style>(.*?)</style>", html, re.S).group(1)
@@ -175,6 +219,20 @@ class TestDetectorsAreNotVacuous(unittest.TestCase):
         c.feed('<div id="a"><p id="a"></div>')
         self.assertTrue(c.errors or c.stack)
         self.assertEqual(c.ids, ["a", "a"])
+
+    def test_core_and_example_parsers_fire(self):
+        model = ('    pub fn entries(&self) -> [(&\'static str, Tri); 2] {\n        [\n'
+                 '            ("has_network_remote", self.has_network_remote),\n'
+                 '            ("stash_empty", self.stash_empty),\n        ]\n    }\n')
+        self.assertEqual(core_fact_names(model), ["has_network_remote", "stash_empty"])
+        self.assertEqual(core_action_names('Action::Keep => "keep",\n Action::Ask => "ask",'), ["keep", "ask"])
+        self.assertGreaterEqual(len(core_fact_names()), 7, "real model.rs parsed to too few facts")
+        self.assertIn("keep", core_action_names(), "real plan.rs parsed to no actions")
+        old = ("Repos and worktrees (2):\n  [repo] ~/a  1.0 GiB\n      has_network_remote=yes stash_empty=NO\n"
+               "      .git 1 B, regenerable 0 B, outputs 0 B\n  [worktree] ~/b  1 B\n      ...\n"
+               "Items:\n  recover-then-archive    0 B     [repo] ~/a\n")
+        self.assertEqual(example_fact_groups(old), [["has_network_remote", "stash_empty"]])
+        self.assertEqual(example_actions(old), ["recover-then-archive"])
 
     def test_permissions_and_pin_parsers_fire(self):
         yml = "permissions:\n  contents: read\n  issues: write\njobs:\n  a:\n    steps:\n      - uses: actions/x@v4\n"
@@ -294,10 +352,30 @@ class TestContent(unittest.TestCase):
             self.assertEqual(forbidden_hits(read(f), bad), [], f.name)
 
     def test_status_wording_present(self):
-        self.assertIn("Early.", self.text)
-        self.assertIn("It deletes nothing", self.text)
-        self.assertRegex(self.text, r"read-only")
-        self.assertIn("in review", self.text.lower())
+        flat = re.sub(r"\s+", " ", self.text)
+        self.assertIn("Early.", flat)
+        self.assertIn("It deletes nothing", flat)
+        self.assertRegex(flat, r"read-only")
+        self.assertIn("merged into the main branch", flat)
+        self.assertIn("not released", flat)
+
+    def test_no_stale_review_claims(self):
+        # The scanner and planner were merged into main; copy written while they were on a draft pull
+        # request must not come back.
+        flat = re.sub(r"\s+", " ", self.text).lower()
+        stale = ["in review", "review branch", "open draft pull request, not merged",
+                 "open pull request for the scanner", "still in review"]
+        self.assertEqual([s for s in stale if s in flat], [])
+
+    def test_unshipped_parts_are_planned(self):
+        rows = {}
+        for m in re.finditer(r'<th scope="row"[^>]*>([^<]+)</th><td[^>]*data-label="Status"[^>]*>'
+                             r'<span class="badge">([^<]+)</span>', self.html):
+            rows[m.group(1).strip()] = m.group(2).strip()
+        for part in ("Recovery, backup, apply, restore", "Desktop app", "App stores and installers"):
+            self.assertEqual(rows.get(part), "Planned", part)
+        self.assertNotEqual(rows.get("CLI: scan and plan"), "Planned")
+        self.assertNotIn("Released", rows.values(), "nothing is released yet")
 
     def test_no_download_button_or_install_claim(self):
         self.assertNotRegex(self.html, r'(?i)<a[^>]*class="btn[^"]*"[^>]*>[^<]*download')
@@ -314,6 +392,26 @@ class TestContent(unittest.TestCase):
         flat = re.sub(r"\s+", " ", self.text)
         self.assertIn("target platforms", flat)
         self.assertIn("only macOS has been tested by hand", flat)
+
+    def test_fact_count_matches_core(self):
+        n = len(core_fact_names())
+        flat = re.sub(r"\s+", " ", self.text)
+        said = re.findall(r"records (\w+) facts", flat) + re.findall(r"all (\w+) are yes", flat)
+        self.assertEqual(len(said), 2, said)
+        for word in said:
+            self.assertEqual(NUMBER_WORDS.index(word), n, f"page says {word}, core has {n} facts")
+
+    def test_example_lists_the_core_facts(self):
+        groups = example_fact_groups(example_text(self.html))
+        self.assertTrue(groups, "no repo with facts in the example")
+        for g in groups:
+            self.assertEqual(g, core_fact_names())
+
+    def test_example_uses_current_action_names(self):
+        actions = core_action_names()
+        used = example_actions(example_text(self.html))
+        self.assertTrue(used, "no plan items in the example")
+        self.assertEqual([a for a in used if a not in actions], [])
 
     def test_page_weight_under_300_kb(self):
         total = INDEX.stat().st_size + sum(f.stat().st_size for f in (SITE / "brand").glob("*.svg"))
