@@ -1,7 +1,12 @@
 // Spec AC-7: text and control colours meet WCAG 2.2 AA in light and dark, from the tokens in
 // styles.css (contrast ratio formula of WCAG 2.2).
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import css from "./styles.css?raw";
+
+// Read the file itself: vitest sends CSS imports (`?raw` included) through its CSS pipeline,
+// which yields an empty string while CSS processing is off (every token was undefined in
+// CI run 44636050907).
+const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
 
 function tokens(block: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -62,6 +67,11 @@ describe("colour contrast (WCAG 2.2 AA)", () => {
       });
     }
   }
+
+  it("reads the tokens from styles.css (not vacuous)", () => {
+    expect(Object.keys(light).length).toBeGreaterThanOrEqual(8);
+    expect(dark.bg).not.toBe(light.bg);
+  });
 
   it("the formula matches known values", () => {
     expect(contrast("#000000", "#ffffff")).toBeCloseTo(21, 5);
