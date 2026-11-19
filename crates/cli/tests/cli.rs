@@ -1062,3 +1062,70 @@ fn j4_trust_partial_process_check_flag_and_config_are_accepted_and_recorded() {
     let text = stdout(&run(&mut c));
     assert!(text.contains("accepted"), "the header must say so: {text}");
 }
+
+// ---------------------------------------------------------------- L1 (click-test)
+
+fn plan_exit(scan_json: &serde_json::Value, dir: &Path, name: &str) -> (Option<i32>, String) {
+    let f = dir.join(name);
+    fs::write(&f, scan_json.to_string()).unwrap();
+    let o = run(bin().args(["plan", "--scan", f.to_str().unwrap(), "--json"]));
+    (
+        o.status.code(),
+        String::from_utf8_lossy(&o.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn l1_hostile_scan_files_are_a_clean_error_with_exit_code_1() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (scan_file, _nm) = scan_with_project_touched(tmp.path(), 30);
+    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
+    let child = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|n| n.get("parent").is_some())
+        .unwrap();
+
+    let mut a = v.clone();
+    a["nodes"][child]["parent"] = serde_json::json!(999_999);
+    let (code, err) = plan_exit(&a, tmp.path(), "a.json");
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("nodes["), "{err}");
+
+    let mut b = v.clone();
+    b["nodes"][child]["parent"] = serde_json::json!(child);
+    let (code, err) = plan_exit(&b, tmp.path(), "b.json");
+    assert_eq!(code, Some(1), "{err}");
+}
+
+#[test]
+fn l1_changing_one_index_at_a_time_gives_an_error_or_a_plan_never_a_crash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (scan_file, _nm) = scan_with_project_touched(tmp.path(), 30);
+    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
+    let n = v["nodes"].as_array().unwrap().len();
+    let mut cases = 0;
+    for i in 0..n {
+        for val in [0usize, i, n, n + 7, usize::MAX >> 12] {
+            let mut m = v.clone();
+            m["nodes"][i]["parent"] = serde_json::json!(val);
+            let (code, err) = plan_exit(&m, tmp.path(), "m.json");
+            assert!(matches!(code, Some(0) | Some(1)), "parent {i}={val}: {code:?} {err}");
+            cases += 1;
+        }
+    }
+    for key in ["big_files", "outputs"] {
+        let len = v[key].as_array().map(|a| a.len()).unwrap_or(0);
+        for i in 0..len.min(5) {
+            for val in [0usize, n, n + 7] {
+                let mut m = v.clone();
+                m[key][i]["node"] = serde_json::json!(val);
+                let (code, err) = plan_exit(&m, tmp.path(), "m.json");
+                assert!(matches!(code, Some(0) | Some(1)), "{key}[{i}]={val}: {code:?} {err}");
+                cases += 1;
+            }
+        }
+    }
+    assert!(cases > 5);
+}
