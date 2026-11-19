@@ -176,24 +176,35 @@ fn q1_control_two_unrelated_clean_clones_stay_archivable() {
 // ---------------------------------------------------------------- Q3
 
 /// The facts of a scan that must not depend on how the roots overlap.
-fn summary(res: &ScanResult) -> (u64, u64, u64, u64, usize, Vec<(String, u64)>, Vec<String>) {
+#[derive(Debug, PartialEq)]
+struct Summary {
+    files: u64,
+    dirs: u64,
+    allocated: u64,
+    logical: u64,
+    node_count: usize,
+    nodes: Vec<(String, u64)>,
+    big_files: Vec<String>,
+}
+
+fn summary(res: &ScanResult) -> Summary {
     let mut nodes: Vec<(String, u64)> = res
         .nodes
         .iter()
         .map(|n| (n.path.clone(), n.bytes_total))
         .collect();
     nodes.sort();
-    let mut big: Vec<String> = res.big_files.iter().map(|b| b.path.clone()).collect();
-    big.sort();
-    (
-        res.totals.files,
-        res.totals.dirs,
-        res.totals.allocated_bytes,
-        res.totals.logical_bytes,
-        res.nodes.len(),
+    let mut big_files: Vec<String> = res.big_files.iter().map(|b| b.path.clone()).collect();
+    big_files.sort();
+    Summary {
+        files: res.totals.files,
+        dirs: res.totals.dirs,
+        allocated: res.totals.allocated_bytes,
+        logical: res.totals.logical_bytes,
+        node_count: res.nodes.len(),
         nodes,
-        big,
-    )
+        big_files,
+    }
 }
 
 fn plan_bytes(res: &ScanResult) -> (u64, Vec<(String, u64)>) {

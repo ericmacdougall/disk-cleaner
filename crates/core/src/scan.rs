@@ -899,7 +899,13 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     let root_set: HashSet<PathBuf> = roots.iter().cloned().collect();
     let mut odd_dirs: Vec<PathBuf> = Vec::new();
     let mut hidden: Vec<(PathBuf, HiddenGit)> = Vec::new();
-    let mut builds = classify(&mut dirs, &opts.rules, &root_set, &mut odd_dirs, &mut hidden);
+    let mut builds = classify(
+        &mut dirs,
+        &opts.rules,
+        &root_set,
+        &mut odd_dirs,
+        &mut hidden,
+    );
 
     // Attribute directory aggregates to their owners.
     let mut other_bytes: u64 = 0;
@@ -1487,7 +1493,11 @@ fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -
                     .collect::<HashMap<PathBuf, usize>>()
             })
             .collect(),
-        walk_order: order.iter().filter(|&&i| kept[i]).map(|&i| pos(i)).collect(),
+        walk_order: order
+            .iter()
+            .filter(|&&i| kept[i])
+            .map(|&i| pos(i))
+            .collect(),
     }
 }
 
@@ -1731,10 +1741,8 @@ fn link_inbound(ctx: &InboundCtx, refs: &Refs, hidden: &[(PathBuf, HiddenGit)]) 
             match target {
                 Ok(t) => consider(ctx, &mut out, file, true, &t),
                 Err(why) => {
-                    out.unresolved.get_or_insert(format!(
-                        "alternates file {}: {why}",
-                        file.display()
-                    ));
+                    out.unresolved
+                        .get_or_insert(format!("alternates file {}: {why}", file.display()));
                 }
             }
         }
