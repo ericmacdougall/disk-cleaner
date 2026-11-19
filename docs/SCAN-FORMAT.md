@@ -227,8 +227,16 @@ is followed):
 7. Every ref is `refs/stash` or under `refs/heads/`, `refs/tags/` or `refs/remotes/` (so
    `refs/backup/*`, `refs/replace/*`, `refs/notes/*`, `refs/original/*`, `refs/bisect/*` or a
    fetched `refs/pull/*` make it not plain), and its target is a commit or an annotated tag whose
-   target is a commit (`for-each-ref --format='%(refname) %(objecttype) %(*objecttype)'`; a blob, a
-   tree, or a tag of a tag is not plain).
+   target is a commit (`for-each-ref --format='%(refname) %(objecttype) %(type) %(*objecttype)'`:
+   `%(type)` is a tag object's direct target type, so a tag whose target is another tag is not plain
+   even though `%(*objecttype)` peels it all the way to a commit; a blob or a tree is not plain).
+
+The structural checks (1 to 4) run first, by `lstat` alone. If an entry git itself reads (`HEAD`,
+`config`, `refs`, `objects`, `objects/info`, `objects/pack`) is missing, a symlink or the wrong kind, or a
+`commondir` exists, no git command is run at all in that repo: its facts are `unknown`,
+`plain_layout` is `no` and the reason names the entry (`HEAD is a symlink`). A repo that is merely
+unusual but healthy (a `.git` file, alternates, worktrees, modules) is still read with the hardened,
+read-only commands and asks for its layout.
 
 A `shallow` file does not make a repository unplain (a shallow clone is complete for what it
 holds); the shape check ignores it. A failure is `no`; a check that cannot be made is `unknown`;
@@ -393,7 +401,7 @@ state is `unknown`.
 1. Active: `keep`.
 2. Regenerable and cache: contains output files, has an `ask_reason`, is incomplete (`unreadable`
    or `skipped_mounts`), or state unknown: `ask`; otherwise `remove-regenerable`.
-3. Repo and worktree: state unknown: `ask`; `plain_layout` not `yes`: `ask` (unusual repository layout); any fact `unknown`: `ask`; any fact `no`:
+3. Repo and worktree: state unknown: `ask`; `plain_layout` not `yes`: `ask` (unusual repository layout); `no_dependents` `no`: `ask`, never a removing action, naming up to three dependents and the count of the rest (recovery saves this repo's own refs and cannot make the repos that use its objects safe); any fact `unknown`: `ask`, with each unknown fact explained in words (what could not be checked and what would settle it; for local tags, that tag names cannot be checked against the remote without contacting it and will be verified when a removal is applied); any other fact `no`:
    `recover-then-archive`; every fact `yes`: `archive` (labelled unverified, see
    `remote_facts_verified`). A repo whose `.git/modules` hold a submodule git directory that no scanned
    git node inside it uses, or that is incomplete (`unreadable` or `skipped_mounts`), asks.

@@ -622,6 +622,93 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     }
 }
 
+/// Why a repository that others depend on asks: up to three of them are named.
+fn dependents_reason(node: &Node) -> String {
+    let mut who: Vec<String> = Vec::new();
+    if let Some(r) = node.repo.as_ref() {
+        who.extend(r.dependents.iter().cloned());
+        for w in &r.worktrees {
+            if !who.contains(w) {
+                who.push(w.clone());
+            }
+        }
+    }
+    if who.is_empty() {
+        return "other checkouts or clones use this repository's objects or refs; deal with those \
+                first"
+            .to_string();
+    }
+    let shown = who.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    let rest = who.len().saturating_sub(3);
+    let more = if rest > 0 {
+        format!(" and {rest} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "{} other checkouts use this repository's objects or refs: {shown}{more}; deal with those \
+         first",
+        who.len()
+    )
+}
+
+/// For each unknown fact: what could not be checked and what would settle it.
+fn explain_unknown(node: &Node, facts: &Facts) -> String {
+    let notes = node
+        .repo
+        .as_ref()
+        .map(|r| r.notes.join(" "))
+        .unwrap_or_default();
+    let parts: Vec<String> = facts
+        .unknown()
+        .into_iter()
+        .map(|name| {
+            let text: &str = match name {
+                "has_network_remote" => {
+                    "the remotes could not be read (git failed); run the scan again with git working"
+                }
+                "head_on_remote" => {
+                    "HEAD could not be compared with the remote-tracking refs (git failed, or there \
+                     is no commit yet); run the scan again"
+                }
+                "all_branches_on_remote" if notes.contains("has tags") => {
+                    "this repository has local tags and tag names cannot be checked against the \
+                     remote without contacting it; they will be verified when a removal is applied"
+                }
+                "all_branches_on_remote" => {
+                    "the local branches could not be compared with the remote-tracking refs (git \
+                     failed); run the scan again"
+                }
+                "stash_empty" => "the stash could not be read (git failed); run the scan again",
+                "tree_clean" => {
+                    "whether the working tree is clean could not be established (git failed, or a \
+                     submodule could not be read); run the scan again"
+                }
+                "no_unique_ignored" => {
+                    "the ignored files could not be listed (git failed); run the scan again"
+                }
+                "no_dependents" => {
+                    "whether other repositories use this one's objects could not be established (an \
+                     alternates file, symlink or git directory could not be resolved or lies \
+                     outside the scanned folders); scan the folders that hold those repositories \
+                     too"
+                }
+                "reflog_saved" => {
+                    "commits kept only by the reflog could not be compared with the remote (git \
+                     failed or timed out, or there is no commit yet); run the scan again"
+                }
+                "no_pending_state" => {
+                    "an unfinished rebase, merge, cherry-pick, revert or bisect, or local LFS or \
+                     annex content, is present or could not be checked; finish or abandon it"
+                }
+                _ => "a safety check could not be made; run the scan again",
+            };
+            text.to_string()
+        })
+        .collect();
+    parts.join("; ")
+}
+
 /// Disclosure for a scan that covered only folders, not whole volumes.
 fn scope_note(scan: &ScanResult) -> &'static str {
     if scan.scope == "volume" {
@@ -694,12 +781,17 @@ fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Act
                     0,
                 );
             }
+            if facts.no_dependents == Tri::No {
+                // Recovery saves this repository's own refs; it cannot make the repositories
+                // that use its objects or refs safe, so it must not be removed first.
+                return (Action::Ask, dependents_reason(node), 0);
+            }
             if facts.any_unknown() {
                 (
                     Action::Ask,
                     format!(
-                        "idle ({why}) but cannot prove it is safe: unknown {}",
-                        join_names(&facts.unknown())
+                        "idle ({why}) but cannot prove it is safe: {}",
+                        explain_unknown(node, &facts)
                     ),
                     0,
                 )

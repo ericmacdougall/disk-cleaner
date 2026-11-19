@@ -170,10 +170,35 @@ fn plain_ref_name(name: &str) -> bool {
 /// local-only LFS or annex content ([`pending_state`]); every ref lies under `refs/heads/`,
 /// `refs/tags/`, `refs/remotes/` or is `refs/stash`, and points at a commit or at an annotated tag
 /// whose target is a commit. (The config allowlist runs before any of this.)
-fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
+/// Outcome of the structural part of the layout check.
+enum Shape {
+    Fine,
+    /// A check failed. `skip_git` is true when git must not be run in this repo at all: an
+    /// entry git itself reads (`HEAD`, `config`, `refs`, `objects`) is missing, a symlink or the
+    /// wrong kind, or a `commondir` would send git to another repository. It is false for a
+    /// layout that is merely unusual but healthy (a `.git` file, alternates, worktrees, modules).
+    No { issue: String, skip_git: bool },
+    Unknown(String),
+}
+
+/// The structural checks of [`layout_check`] (the real `.git` directory, the expected entries, the
+/// forbidden entries, empty `worktrees` and `modules`). They are `lstat` and directory listings
+/// only, so they run before any git command and decide whether git may be run at all.
+fn shape(path: &Path, class: Class) -> Shape {
     macro_rules! no {
         ($($a:tt)*) => {
-            return (Tri::No, Some(format!($($a)*)))
+            return Shape::No {
+                issue: format!($($a)*),
+                skip_git: true,
+            }
+        };
+    }
+    macro_rules! no_soft {
+        ($($a:tt)*) => {
+            return Shape::No {
+                issue: format!($($a)*),
+                skip_git: false,
+            }
         };
     }
     let gd = if class == Class::BareRepo {
@@ -183,11 +208,19 @@ fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
         match lk(&g) {
             Ok(Lk::Dir) => g,
             Ok(Lk::Missing) => no!(".git is missing"),
+            Ok(Lk::File) => {
+                return Shape::No {
+                    issue: ".git is a file, not a real directory (a linked worktree, submodule \
+                            checkout or --separate-git-dir repository: not handled in this phase)"
+                        .to_string(),
+                    skip_git: false,
+                }
+            }
             Ok(_) => no!(
                 ".git is not a real directory (a linked worktree, submodule checkout, \
                  --separate-git-dir repository or a symlink: not handled in this phase)"
             ),
-            Err(e) => return (Tri::Unknown, Some(format!("cannot read .git ({e})"))),
+            Err(e) => return Shape::Unknown(format!("cannot read .git ({e})")),
         }
     };
     let mut unknown: Option<String> = None;
@@ -210,17 +243,23 @@ fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
             }
         }
     }
-    for name in [
-        "objects/info/alternates",
-        "objects/info/http-alternates",
-        "commondir",
-        "info/grafts",
-        "annex",
+    for (name, skip_git) in [
+        ("objects/info/alternates", false),
+        ("objects/info/http-alternates", false),
+        ("commondir", true),
+        ("info/grafts", false),
+        ("annex", false),
     ] {
         match lk(&gd.join(name)) {
             Ok(Lk::Missing) => {}
             Ok(_) => {
-                no!("{name} exists (shared objects, a moved git directory or other local state)")
+                return Shape::No {
+                    issue: format!(
+                        "{name} exists (shared objects, a moved git directory or other local \
+                         state)"
+                    ),
+                    skip_git,
+                }
             }
             Err(e) => {
                 unknown.get_or_insert(format!("cannot read {name} ({e})"));
@@ -233,18 +272,36 @@ fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
             Ok(Lk::Dir) => match std::fs::read_dir(gd.join(name)) {
                 Ok(mut rd) => {
                     if rd.next().is_some() {
-                        no!("{name} is not empty");
+                        no_soft!("{name} is not empty");
                     }
                 }
                 Err(e) => {
                     unknown.get_or_insert(format!("cannot read {name} ({e})"));
                 }
             },
-            Ok(_) => no!("{name} is not a plain directory"),
+            Ok(_) => no_soft!("{name} is not a plain directory"),
             Err(e) => {
                 unknown.get_or_insert(format!("cannot read {name} ({e})"));
             }
         }
+    }
+    match unknown {
+        Some(why) => Shape::Unknown(why),
+        None => Shape::Fine,
+    }
+}
+
+fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
+    macro_rules! no {
+        ($($a:tt)*) => {
+            return (Tri::No, Some(format!($($a)*)))
+        };
+    }
+    let mut unknown: Option<String> = None;
+    match shape(path, class) {
+        Shape::Fine => {}
+        Shape::No { issue, .. } => return (Tri::No, Some(issue)),
+        Shape::Unknown(why) => unknown = Some(why),
     }
     match pending_state(git, path) {
         Ok(found) if found.is_empty() => {}
@@ -260,7 +317,9 @@ fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
         path,
         &[
             "for-each-ref",
-            "--format=%(refname) %(objecttype) %(*objecttype)",
+            // `%(type)` is a tag object's direct target type; `%(*objecttype)` would peel a
+            // tag of a tag all the way to the commit and hide it.
+            "--format=%(refname) %(objecttype) %(type) %(*objecttype)",
         ],
     ) {
         Ok(out) => {
@@ -268,13 +327,17 @@ fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
                 let mut it = line.split(' ');
                 let name = it.next().unwrap_or("");
                 let ty = it.next().unwrap_or("");
+                let direct = it.next().unwrap_or("");
                 let peeled = it.next().unwrap_or("");
                 if !plain_ref_name(name) {
                     no!("the ref {name} is outside refs/heads, refs/tags, refs/remotes and refs/stash");
                 }
-                match (ty, peeled) {
+                match (ty, direct) {
                     ("commit", _) | ("tag", "commit") => {}
-                    _ => no!("the ref {name} does not point at a commit (it is a {ty} {peeled})"),
+                    _ => no!(
+                        "the ref {name} does not point at a commit (it is a {ty} whose target is \
+                         a {direct}, peeling to a {peeled})"
+                    ),
                 }
             }
         }
@@ -728,6 +791,22 @@ pub fn collect_repo_info(
     regen_paths: &[PathBuf],
 ) -> RepoCheck {
     let git = &cfg.git;
+    // A damaged or unusual structure is found by `lstat` alone and git is not run in it at all
+    // (a repo that is only unusual, such as a `.git` file or shared objects, is still read and
+    // asks for its layout).
+    if let Shape::No {
+        issue,
+        skip_git: true,
+    } = shape(path, class)
+    {
+        let mut rc = all_unknown(
+            format!("layout: {issue}; no git command was run in this repo"),
+            regen_paths,
+        );
+        rc.info.facts.plain_layout = Tri::No;
+        rc.info.layout_issue = Some(diag(&issue));
+        return rc;
+    }
     // The repo's own config is untrusted. Refuse to run anything else if it could make git
     // execute a program (filter drivers, gpg.program, ...).
     if let Err(why) = check_repo_config(git, path, class) {
