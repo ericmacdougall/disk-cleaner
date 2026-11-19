@@ -19,7 +19,8 @@ use disk_cleaner_core::{Class, ScanResult, Tri};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The refusal of a `config.worktree` that is a symlink, a directory or another kind of entry.
+/// The refusal of a `config.worktree` that is a symlink or another kind of entry git's own start
+/// does not already reject (a directory it does: see [`LISTING_FAILED`]).
 const NOT_REGULAR: &str = "config.worktree is not a regular file";
 
 /// The refusal when this git directory has no `config.worktree` and git still lists keys of the
@@ -40,7 +41,12 @@ fn unsafe_key(label: &str) -> String {
 }
 
 fn notes(res: &ScanResult, repo: &Path) -> Vec<String> {
-    node(res, repo).repo.as_ref().expect("repo info").notes.clone()
+    node(res, repo)
+        .repo
+        .as_ref()
+        .expect("repo info")
+        .notes
+        .clone()
 }
 
 /// The config allowlist let git run: no note is a config refusal or a failed config read.
@@ -58,7 +64,12 @@ fn assert_not_refused(res: &ScanResult, repo: &Path) {
         );
     }
     let f = facts_of(res, repo);
-    assert_eq!(f.has_network_remote, Tri::Yes, "{}: {notes:?}", repo.display());
+    assert_eq!(
+        f.has_network_remote,
+        Tri::Yes,
+        "{}: {notes:?}",
+        repo.display()
+    );
 }
 
 /// As [`assert_not_refused`], and the facts that need a work tree and git are known.
@@ -83,7 +94,13 @@ fn refused(res: &ScanResult, repo: &Path, want: &str, exact: bool, layout_no: bo
         "{}: every fact must be unknown: {f:?} ({notes:?})",
         repo.display()
     );
-    let hit = |n: &String| if exact { n == want } else { n.starts_with(want) };
+    let hit = |n: &String| {
+        if exact {
+            n == want
+        } else {
+            n.starts_with(want)
+        }
+    };
     assert!(
         notes.iter().any(hit),
         "{}: no note {} {want:?}: {notes:?}",
@@ -247,7 +264,12 @@ fn a_submodule_checkout_with_a_relative_git_file_and_no_config_worktree_is_inspe
     let modgd = outer.join(".git").join("modules").join("sub");
     assert!(!modgd.join("config.worktree").exists());
     let res = scan_with(&root, network_everywhere());
-    assert_eq!(facts_of(&res, &outer).tree_clean, Tri::Yes, "{:?}", notes(&res, &outer));
+    assert_eq!(
+        facts_of(&res, &outer).tree_clean,
+        Tri::Yes,
+        "{:?}",
+        notes(&res, &outer)
+    );
     assert_not_refused(&res, &sub);
 }
 
@@ -329,12 +351,18 @@ fn control_a_safe_key_in_the_main_worktrees_config_worktree_is_read() {
 
 // ---------------------------------------------------------------- not a regular file
 
+/// With the extension on, git reads `config.worktree` when it starts, so a directory there makes
+/// the first command, the `--local` listing, fail ("Is a directory", or "Permission denied" on
+/// Windows): the repo is refused by that listing, before any other git command and before the
+/// `lstat` of the file is reached.
+const LISTING_FAILED: &str = "config: git exited";
+
 #[test]
 fn a_config_worktree_that_is_a_directory_is_refused() {
     let (_tmp, root, repo) = extension_repo();
     fs::create_dir(repo.join(".git").join("config.worktree")).unwrap();
     let res = scan_with(&root, network_everywhere());
-    assert_refused(&res, &repo, NOT_REGULAR);
+    refused(&res, &repo, LISTING_FAILED, false, false);
 }
 
 #[test]
@@ -343,7 +371,7 @@ fn a_linked_worktrees_config_worktree_that_is_a_directory_is_refused() {
     let (wt, gd) = linked(&root, &repo);
     fs::create_dir(gd.join("config.worktree")).unwrap();
     let res = scan_with(&root, network_everywhere());
-    assert_refused(&res, &wt, NOT_REGULAR);
+    refused(&res, &wt, LISTING_FAILED, false, false);
 }
 
 #[cfg(unix)]
