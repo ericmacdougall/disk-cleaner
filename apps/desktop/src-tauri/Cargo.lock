@@ -705,6 +705,7 @@ version = "0.1.0"
 dependencies = [
  "disk-cleaner-core",
  "jwalk",
+ "libc",
  "serde",
  "serde_json",
  "toml_edit 0.22.27",
