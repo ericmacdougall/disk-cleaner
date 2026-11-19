@@ -217,8 +217,11 @@ crates/
   core/      scan, classify, facts, plan, manifest (no UI, no network)
   git/       repo facts and recovery, wrapping the git CLI
   storage/   rclone rc client, verification
-  cli/       disk-cleaner binary
-app/         Tauri shell and web UI
+  cli/       disk-cleaner binary (also `disk-cleaner tui`)
+  view/      read-only size walk, tree index, paging, settings persistence for the UIs
+  tui/       terminal view (ratatui)
+apps/
+  desktop/   Tauri shell and web UI (its own Cargo workspace and lockfile)
 rules/       artifact and cache rules (data)
 ```
 
