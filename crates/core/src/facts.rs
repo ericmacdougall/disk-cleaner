@@ -184,6 +184,10 @@ enum Shape {
     Unknown(String),
 }
 
+/// The layout issue of a repository with linked worktrees; [`collect_repo_info`] adds the paths
+/// git reports.
+const WORKTREES_NOT_EMPTY: &str = "worktrees is not empty";
+
 /// The structural checks of [`layout_check`] (the real `.git` directory, the expected entries, the
 /// forbidden entries, empty `worktrees` and `modules`). They are `lstat` and directory listings
 /// only, so they run before any git command and decide whether git may be run at all.
@@ -275,6 +279,9 @@ fn shape(path: &Path, class: Class) -> Shape {
             Ok(Lk::Dir) => match std::fs::read_dir(gd.join(name)) {
                 Ok(mut rd) => {
                     if rd.next().is_some() {
+                        if name == "worktrees" {
+                            no_soft!("{WORKTREES_NOT_EMPTY}");
+                        }
                         no_soft!("{name} is not empty");
                     }
                 }
@@ -338,8 +345,8 @@ fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
                 match (ty, direct) {
                     ("commit", _) | ("tag", "commit") => {}
                     _ => no!(
-                        "the ref {name} does not point at a commit (it is a {ty} whose target is \
-                         a {direct}, peeling to a {peeled})"
+                        "the ref {name} does not point at a commit ({})",
+                        ref_kind(ty, direct, peeled)
                     ),
                 }
             }
@@ -352,6 +359,25 @@ fn layout_check(git: &Git, path: &Path, class: Class) -> (Tri, Option<String>) {
         Some(why) => (Tri::Unknown, Some(why)),
         None => (Tri::Yes, None),
     }
+}
+
+/// What a ref that is not a commit points at, naming only the parts `for-each-ref` printed:
+/// `it is a blob`, `it is a tag whose target is a tree`, `... peeling to a blob`.
+fn ref_kind(ty: &str, direct: &str, peeled: &str) -> String {
+    if ty.is_empty() {
+        return "its object type could not be read".to_string();
+    }
+    let target = if direct.is_empty() {
+        String::new()
+    } else {
+        format!(" whose target is a {direct}")
+    };
+    let peel = if peeled.is_empty() || peeled == direct {
+        String::new()
+    } else {
+        format!(", peeling to a {peeled}")
+    };
+    format!("it is a {ty}{target}{peel}")
 }
 
 /// Names that, present in a worktree's own git directory, show an operation that is not finished.
@@ -372,6 +398,29 @@ const IN_PROGRESS: [&str; 9] = [
 /// Directories of the shared git directory that hold content not recorded in any ref: Git LFS
 /// objects and git-annex content that may never have been uploaded.
 const LOCAL_CONTENT: [&str; 2] = ["lfs/objects", "annex/objects"];
+
+/// Count the index entries whose edits git hides: those marked assume-unchanged (a lowercase tag
+/// in `git ls-files -v`) or skip-worktree (`S`), whose file is present in the working tree.
+///
+/// A sparse checkout marks every file outside its cone skip-worktree and leaves it out of the
+/// working tree; such an absent file holds no edit (its content is in the index), so it is not
+/// counted. A present file is counted without reading it: comparing its bytes with the index
+/// blob would need git's clean filters and line-ending rules, which this crate never runs, so a
+/// raw hash would give false alarms and a filtered one would run repository-chosen programs. A
+/// file that cannot be `lstat`ed is counted too. `listing` is the `-z` output.
+fn hidden_index_entries(root: &Path, listing: &str) -> u64 {
+    listing
+        .split('\0')
+        .filter_map(|e| {
+            let mut chars = e.chars();
+            let tag = chars.next()?;
+            let rel = chars.as_str().strip_prefix(' ')?;
+            let hidden_tag = tag == 'S' || tag.is_ascii_lowercase();
+            (hidden_tag && !rel.is_empty()).then_some(rel)
+        })
+        .filter(|rel| !matches!(lk(&root.join(rel)), Ok(Lk::Missing)))
+        .count() as u64
+}
 
 /// Does `dir` exist and hold at least one entry? `Err` for anything but a plain directory or a
 /// missing one: a symlink or an unreadable path is not looked through.
@@ -783,7 +832,7 @@ fn all_unknown(reason: String, unverified: &[PathBuf]) -> RepoCheck {
         },
         unverified_artifacts: unverified
             .iter()
-            .map(|p| (p.clone(), format!("cannot verify against git: {why}")))
+            .map(|p| (p.clone(), format!("was not checked against git: {why}")))
             .collect(),
     }
 }
@@ -1003,50 +1052,49 @@ pub fn collect_repo_info(
             // status would run inside it using its config.
             "--ignore-submodules=all",
         ];
-        facts.tree_clean = match git.run(path, &status_args) {
-            Ok(out) if !out.trim().is_empty() => Tri::No,
-            Ok(_) => {
-                // `status` hides edits to files marked skip-worktree or assume-unchanged.
-                match git.run(path, &["ls-files", "-v", "-z"]) {
-                    Ok(listing) => {
-                        let hidden = listing
-                            .split('\0')
-                            .filter(|e| {
-                                matches!(e.chars().next(),
-                                    Some(c) if c.is_ascii_lowercase() || c == 'S')
-                            })
-                            .count();
-                        if hidden == 0 {
-                            // `status` runs with --ignore-submodules=all, which also hides a
-                            // submodule checked out at another commit than the index records.
-                            match gitlink_state(git, path, info.head_commit.is_some()) {
-                                Ok(None) => Tri::Yes,
-                                Ok(Some(why)) => {
-                                    notes.push(format!("tree_clean: {why}"));
-                                    Tri::No
-                                }
-                                Err(why) => {
-                                    notes.push(format!("tree_clean: {why}"));
-                                    Tri::Unknown
-                                }
-                            }
-                        } else {
-                            notes.push(format!(
-                                "tree_clean: {hidden} file(s) are marked skip-worktree or \
-                                 assume-unchanged, so local edits would be invisible"
-                            ));
-                            Tri::No
-                        }
-                    }
-                    Err(e) => {
-                        notes.push(note("tree_clean", &e));
-                        Tri::Unknown
-                    }
-                }
-            }
-            Err(e) => {
+        // `status` hides edits to files marked skip-worktree or assume-unchanged, and so do
+        // `diff`, `add -A` and `stash`: those entries are counted on their own, whatever
+        // `status` says, because recovery cannot capture them.
+        let hidden = match git.run(path, &["ls-files", "-v", "-z"]) {
+            Ok(listing) => Ok(hidden_index_entries(path, &listing)),
+            Err(e) => Err(note("tree_clean", &e)),
+        };
+        facts.tree_clean = match (git.run(path, &status_args), hidden) {
+            (Err(e), _) => {
                 notes.push(note("tree_clean", &e));
                 Tri::Unknown
+            }
+            (Ok(_), Err(why)) => {
+                notes.push(why);
+                Tri::Unknown
+            }
+            (Ok(out), Ok(hidden)) => {
+                if hidden > 0 {
+                    info.hidden_index_entries = hidden;
+                    notes.push(format!(
+                        "tree_clean: {} marked skip-worktree or assume-unchanged and present in \
+                         the working tree, so git hides any edits to {}",
+                        crate::words::count(hidden, "file is", "files are"),
+                        crate::words::agree(hidden, "it", "them")
+                    ));
+                }
+                if !out.trim().is_empty() || hidden > 0 {
+                    Tri::No
+                } else {
+                    // `status` runs with --ignore-submodules=all, which also hides a submodule
+                    // checked out at another commit than the index records.
+                    match gitlink_state(git, path, info.head_commit.is_some()) {
+                        Ok(None) => Tri::Yes,
+                        Ok(Some(why)) => {
+                            notes.push(format!("tree_clean: {why}"));
+                            Tri::No
+                        }
+                        Err(why) => {
+                            notes.push(format!("tree_clean: {why}"));
+                            Tri::Unknown
+                        }
+                    }
+                }
             }
         };
         let ignored_args = [
@@ -1072,8 +1120,8 @@ pub fn collect_repo_info(
                             // Not below the repo as spelled: git cannot be asked about it.
                             unverified.push((
                                 p.clone(),
-                                "cannot relate this directory to the repository path, so it is \
-                                 not verified to be ignored"
+                                "could not be related to the repository path, so it is not \
+                                 verified to be ignored"
                                     .to_string(),
                             ));
                             continue;
@@ -1089,8 +1137,8 @@ pub fn collect_repo_info(
                     } else {
                         unverified.push((
                             p.clone(),
-                            "git does not show this directory as wholly ignored: it is tracked, \
-                             partly tracked or not ignored, so it may hold source"
+                            "is not shown by git as wholly ignored: it is tracked, partly \
+                             tracked or not ignored, so it may hold source"
                                 .to_string(),
                         ));
                     }
@@ -1109,8 +1157,8 @@ pub fn collect_repo_info(
                 } else {
                     let shown: Vec<&str> = unique.iter().take(5).copied().collect();
                     notes.push(format!(
-                        "{} ignored path(s) outside regenerable directories, e.g. {}",
-                        unique.len(),
+                        "no_unique_ignored: {} outside regenerable directories, e.g. {}",
+                        crate::words::count(unique.len() as u64, "ignored path", "ignored paths"),
                         shown.join(", ")
                     ));
                     Tri::No
@@ -1121,7 +1169,7 @@ pub fn collect_repo_info(
                 for p in regen_paths {
                     unverified.push((
                         p.clone(),
-                        "cannot verify against git that this directory is ignored".to_string(),
+                        "could not be checked against git to be ignored".to_string(),
                     ));
                 }
                 Tri::Unknown
@@ -1206,7 +1254,15 @@ pub fn collect_repo_info(
 
     let (plain, issue) = layout_check(git, path, class);
     facts.plain_layout = plain;
-    info.layout_issue = issue.map(|i| diag(&i));
+    info.layout_issue = issue.map(|i| {
+        let i = diag(&i);
+        // Name the linked worktrees git reports, so a person can find them.
+        if i == WORKTREES_NOT_EMPTY && !info.worktrees.is_empty() {
+            format!("{i}: {}", crate::words::some_of(&info.worktrees, 3))
+        } else {
+            i
+        }
+    });
     info.facts = facts;
     info.notes = notes.0;
     info.remotes = remotes.unwrap_or_default();

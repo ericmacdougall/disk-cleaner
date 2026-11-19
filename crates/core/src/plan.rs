@@ -8,6 +8,7 @@
 
 use crate::model::*;
 use crate::procs::ProcessCheck;
+use crate::words::{agree, count, some_of};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -359,10 +360,6 @@ fn max_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
-fn join_names(names: &[&str]) -> String {
-    names.join(", ")
-}
-
 /// Judge one node: active (path, process or recent activity), idle or unknown, with the reason.
 fn judge(ctx: &Ctx, idx: usize, opts: &PlanOptions) -> (ProjectState, String, Option<u64>) {
     let last = ctx.activity[idx];
@@ -389,7 +386,8 @@ fn judge(ctx: &Ctx, idx: usize, opts: &PlanOptions) -> (ProjectState, String, Op
                 (
                     ProjectState::Active,
                     format!(
-                        "newest activity {d} day(s) ago, within the {window}-day active window"
+                        "newest activity {} ago, within the {window}-day active window",
+                        count(d, "day", "days")
                     ),
                     days,
                 )
@@ -397,7 +395,8 @@ fn judge(ctx: &Ctx, idx: usize, opts: &PlanOptions) -> (ProjectState, String, Op
                 (
                     ProjectState::Idle,
                     format!(
-                        "newest activity {d} day(s) ago, outside the {window}-day active window"
+                        "newest activity {} ago, outside the {window}-day active window",
+                        count(d, "day", "days")
                     ),
                     days,
                 )
@@ -463,6 +462,9 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         None
     };
     let mut items: Vec<PlanItem> = Vec::new();
+    // Per item: its action from its own facts and contents, before the process check (which
+    // downgrades every removing item alike, so it is no reason for one item to veto another).
+    let mut own_action: Vec<Action> = Vec::new();
     for (idx, node) in scan.nodes.iter().enumerate() {
         if matches!(node.class, Class::Output | Class::Other) {
             continue;
@@ -477,23 +479,19 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 reclaim = 0;
             } else if node.unreadable > 0 {
                 reason = format!(
-                    "{reason}; but {} entr{} inside could not be read, so the scan of it is \
-                     incomplete",
-                    node.unreadable,
-                    if node.unreadable == 1 { "y" } else { "ies" }
+                    "{reason}; but {} inside could not be read, so the scan of it is incomplete",
+                    count(node.unreadable, "entry", "entries")
                 );
                 action = Action::Ask;
                 reclaim = 0;
             } else if node.skipped_mounts > 0 {
                 let n = node.skipped_mounts;
-                let (y, is, was) = if n == 1 {
-                    ("y", "is", "was")
-                } else {
-                    ("ies", "are", "were")
-                };
                 reason = format!(
-                    "{reason}; but {n} director{y} inside {is} on another file system and {was} \
-                     not scanned (--one-file-system), so what is there was never looked at"
+                    "{reason}; but {} inside {} on another file system and {} not scanned \
+                     (--one-file-system), so what is there was never looked at",
+                    count(n, "directory", "directories"),
+                    agree(n, "is", "are"),
+                    agree(n, "was", "were")
                 );
                 action = Action::Ask;
                 reclaim = 0;
@@ -507,6 +505,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 reclaim = 0;
             }
         }
+        own_action.push(action);
         if action.removes() {
             match &opts.process {
                 ProcessCheck::Unknown { reason: why } => {
@@ -518,10 +517,12 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 }
                 ProcessCheck::Partial { unreadable, .. } if !opts.trust_partial_process_check => {
                     // One of the processes nobody could look at may be working inside it.
+                    let n = *unreadable as u64;
                     reason = format!(
-                        "{reason}; but {unreadable} running process(es) could not be inspected, \
-                         so one of them may be using it (--trust-partial-process-check accepts \
-                         that risk)"
+                        "{reason}; but {} could not be inspected, so {} may be using it \
+                         (--trust-partial-process-check accepts that risk)",
+                        count(n, "running process", "running processes"),
+                        agree(n, "it", "one of them")
                     );
                     action = Action::Ask;
                     reclaim = 0;
@@ -549,8 +550,10 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
 
     // An enclosing directory goes with everything inside it. When a nested node is kept, asked
     // about, needs recovery, or holds something that cannot be removed, the enclosing node can
-    // not be removed either: it becomes `ask`. Deepest nodes first, so a downgraded node blocks
-    // its own parent in turn (no assumption about the order of `nodes`).
+    // not be removed either: it becomes `ask`, and its reason leads with that veto (whatever else
+    // also downgraded it). Deepest nodes first, so a downgraded node blocks its own parent in
+    // turn (no assumption about the order of `nodes`).
+    let mut vetoes: Vec<Vec<String>> = vec![Vec::new(); items.len()];
     let mut pos: Vec<Option<usize>> = vec![None; scan.nodes.len()];
     for (k, it) in items.iter().enumerate() {
         pos[it.node] = Some(k);
@@ -560,7 +563,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             Some(k) => k,
             None => continue,
         };
-        let action = items[k].action;
+        let action = own_action[k];
         if !matches!(
             action,
             Action::Keep | Action::Ask | Action::RecoverThenArchive
@@ -571,19 +574,26 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             Some(pk) => pk,
             None => continue,
         };
-        if items[parent].action.removes() {
-            let child = items[k].path.clone();
+        if own_action[parent].removes() {
             let why = match action {
                 Action::Keep => "is kept",
                 Action::Ask => "needs a person's decision",
                 _ => "has unsaved work to recover first",
             };
-            items[parent].reason = format!(
-                "{}; but the nested {child} {why}, and everything inside goes with this one",
-                items[parent].reason
-            );
+            let veto = format!("the nested {} {why}", items[k].path);
+            vetoes[parent].push(veto);
+            own_action[parent] = Action::Ask;
             items[parent].action = Action::Ask;
             items[parent].reclaimable_bytes = 0;
+        }
+    }
+    for (it, v) in items.iter_mut().zip(vetoes) {
+        if !v.is_empty() {
+            it.reason = format!(
+                "{}, and everything inside goes with this one; on its own: {}",
+                v.join("; "),
+                it.reason
+            );
         }
     }
 
@@ -661,8 +671,8 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     }
 }
 
-/// The places the scan could not look, each as (`"<n> folder(s)"`, verb phrase), and how many
-/// there are in all.
+/// The places the scan could not look, each as (`"1 folder"` or `"2 folders"`, verb phrase), and
+/// how many there are in all.
 fn gaps(c: &Coverage) -> (Vec<(String, &'static str)>, u64) {
     let kinds = [
         (
@@ -692,22 +702,10 @@ fn gaps(c: &Coverage) -> (Vec<(String, &'static str)>, u64) {
     for (n, one, many, verb_one, verb_many) in kinds {
         if n > 0 {
             total = total.saturating_add(n);
-            if n == 1 {
-                out.push((format!("1 {one}"), verb_one));
-            } else {
-                out.push((format!("{n} {many}"), verb_many));
-            }
+            out.push((count(n, one, many), agree(n, verb_one, verb_many)));
         }
     }
     (out, total)
-}
-
-fn it_or_them(total: u64) -> &'static str {
-    if total == 1 {
-        "it"
-    } else {
-        "them"
-    }
 }
 
 /// `1 folder could not be read and 2 mount points were not entered (--one-file-system)`.
@@ -723,8 +721,8 @@ fn coverage_gaps(c: &Coverage) -> String {
         .join(" and ")
 }
 
-/// The plan header's sentence for an incomplete scan.
-fn coverage_note(c: &Coverage, complete: bool) -> Option<String> {
+/// The plan header's sentence for an incomplete scan (also printed by the scan report).
+pub fn coverage_note(c: &Coverage, complete: bool) -> Option<String> {
     if complete {
         return None;
     }
@@ -732,7 +730,7 @@ fn coverage_note(c: &Coverage, complete: bool) -> Option<String> {
     Some(format!(
         "Coverage is incomplete: {}, so links or clones inside {} were not checked.",
         coverage_gaps(c),
-        it_or_them(total)
+        agree(total, "it", "them")
     ))
 }
 
@@ -764,7 +762,7 @@ fn coverage_reason(c: &Coverage, complete: bool) -> Option<String> {
         .join(" and ");
     Some(format!(
         "; {text}; dependents inside {} were not checked",
-        it_or_them(total)
+        agree(total, "it", "them")
     ))
 }
 
@@ -777,9 +775,92 @@ fn effective_facts(mut facts: Facts, strict: bool) -> Facts {
     facts
 }
 
+/// Each fact said in words: what `no` means (a noun phrase: what is not saved elsewhere) and what
+/// `unknown` means (what could not be checked and what would settle it). Every reason that
+/// rests on a fact says it in these words and then names the fact as a trailing tag,
+/// `[tree_clean]`, so the words never depend on knowing the field names.
+static FACT_WORDS: [(&str, &str, &str); 10] = [
+    (
+        "has_network_remote",
+        "no remote that points to another machine",
+        "the remotes could not be read (git failed); run the scan again with git working",
+    ),
+    (
+        "head_on_remote",
+        "a checked-out commit that no network remote has",
+        "HEAD could not be compared with the remote-tracking refs (git failed, or there is no \
+         commit yet); run the scan again",
+    ),
+    (
+        "all_branches_on_remote",
+        "local branches, tags or other refs that no network remote has",
+        "the local branches could not be compared with the remote-tracking refs (git failed); \
+         run the scan again",
+    ),
+    (
+        "stash_empty",
+        "stashed changes",
+        "the stash could not be read (git failed); run the scan again",
+    ),
+    (
+        "tree_clean",
+        "uncommitted changes or untracked files",
+        "whether the working tree is clean could not be established (git failed, or a submodule \
+         could not be read); run the scan again",
+    ),
+    (
+        "no_unique_ignored",
+        "ignored files outside regenerable directories (such as .env files or local databases)",
+        "the ignored files could not be listed (git failed); run the scan again",
+    ),
+    (
+        "no_dependents",
+        "other checkouts, clones or links that use this repository's objects or refs",
+        "whether other repositories use this one's objects could not be established (an \
+         alternates file, symlink or git directory could not be resolved or lies outside the \
+         scanned folders); scan the folders that hold those repositories too",
+    ),
+    (
+        "reflog_saved",
+        "commits that only the reflog still reaches",
+        "commits kept only by the reflog could not be compared with the remote (git failed or \
+         timed out, or there is no commit yet); run the scan again",
+    ),
+    (
+        "no_pending_state",
+        "an unfinished operation or local-only LFS or annex content",
+        "an unfinished rebase, merge, cherry-pick, revert or bisect, or local LFS or annex \
+         content, is present or could not be checked; finish or abandon it",
+    ),
+    (
+        "plain_layout",
+        "a layout check failed",
+        "the layout could not be checked",
+    ),
+];
+
+/// The words for fact `name` in state `t` (`No` or `Unknown`), without the tag.
+pub fn fact_sentence(name: &str, t: Tri) -> &'static str {
+    let found = FACT_WORDS.iter().find(|(n, _, _)| *n == name);
+    match (found, t) {
+        (Some(&(_, no, _)), Tri::No) => no,
+        (Some(&(_, _, unknown)), Tri::Unknown) => unknown,
+        (None, Tri::No) => "a safety check failed",
+        (None, Tri::Unknown) => "a safety check could not be made; run the scan again",
+        (_, Tri::Yes) => "the check passed",
+    }
+}
+
+/// [`fact_sentence`] followed by the fact's name as a tag: `stashed changes [stash_empty]`.
+pub fn fact_words(name: &str, t: Tri) -> String {
+    format!("{} [{name}]", fact_sentence(name, t))
+}
+
 /// Why a repository that others depend on asks: up to three of them are named.
 fn dependents_reason(node: &Node) -> String {
+    const TAG: &str = " [no_dependents]";
     let mut who: Vec<String> = Vec::new();
+    let mut links: Vec<String> = Vec::new();
     let mut precious = false;
     if let Some(r) = node.repo.as_ref() {
         who.extend(r.dependents.iter().cloned());
@@ -788,36 +869,52 @@ fn dependents_reason(node: &Node) -> String {
                 who.push(w.clone());
             }
         }
+        links.extend(r.links_into_git_dir.iter().cloned());
         precious = r.precious_objects;
     }
     if precious {
-        let named = if who.is_empty() {
+        let known: Vec<String> = who.iter().chain(links.iter()).cloned().collect();
+        let named = if known.is_empty() {
             String::new()
         } else {
-            let shown = who.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-            format!(" (known: {shown})")
+            format!(" (known: {})", some_of(&known, 3))
         };
         return format!(
             "this repository sets extensions.preciousObjects, which declares that other \
-             repositories borrow its objects{named}; deal with those first"
+             repositories borrow its objects{named}; deal with those first{TAG}"
         );
     }
-    if who.is_empty() {
-        return "other checkouts or clones use this repository's objects or refs; deal with those \
-                first"
-            .to_string();
+    let mut parts: Vec<String> = Vec::new();
+    if !who.is_empty() {
+        let n = who.len() as u64;
+        let one = "other checkout or clone uses";
+        let many = "other checkouts or clones use";
+        parts.push(format!(
+            "{} this repository's objects or refs: {}",
+            count(n, one, many),
+            some_of(&who, 3)
+        ));
     }
-    let shown = who.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-    let rest = who.len().saturating_sub(3);
-    let more = if rest > 0 {
-        format!(" and {rest} more")
-    } else {
-        String::new()
-    };
+    match links.len() {
+        0 => {}
+        1 => parts.push(format!(
+            "a link at {} points into this repository's git directory",
+            links[0]
+        )),
+        n => parts.push(format!(
+            "{n} links point into this repository's git directory: {}",
+            some_of(&links, 3)
+        )),
+    }
+    let n = (who.len() + links.len()) as u64;
+    if parts.is_empty() {
+        let what = fact_sentence("no_dependents", Tri::No);
+        parts.push(format!("{what} were found"));
+    }
     format!(
-        "{} other checkouts or links use this repository's objects or refs: {shown}{more}; deal \
-         with those first",
-        who.len()
+        "{}; deal with {} first{TAG}",
+        parts.join("; "),
+        agree(n, "it", "those")
     )
 }
 
@@ -838,56 +935,18 @@ fn explain_unknown(node: &Node, facts: &Facts, strict: Option<&str>) -> String {
     let parts: Vec<String> = facts
         .unknown()
         .into_iter()
-        .map(|name| {
-            if let (Some(gap), "no_dependents", false) = (strict, name, scanned_unknown) {
-                return format!(
-                    "full coverage was required (require_full_coverage or \
-                     --require-full-coverage) and {gap}, so links or clones there may depend \
-                     on this repository; make them readable and scan again, or plan without \
-                     that setting"
-                );
-            }
-            let text: &str = match name {
-                "has_network_remote" => {
-                    "the remotes could not be read (git failed); run the scan again with git working"
-                }
-                "head_on_remote" => {
-                    "HEAD could not be compared with the remote-tracking refs (git failed, or there \
-                     is no commit yet); run the scan again"
-                }
-                "all_branches_on_remote" if notes.contains("has tags") => {
-                    "this repository has local tags and tag names cannot be checked against the \
-                     remote without contacting it; they will be verified when a removal is applied"
-                }
-                "all_branches_on_remote" => {
-                    "the local branches could not be compared with the remote-tracking refs (git \
-                     failed); run the scan again"
-                }
-                "stash_empty" => "the stash could not be read (git failed); run the scan again",
-                "tree_clean" => {
-                    "whether the working tree is clean could not be established (git failed, or a \
-                     submodule could not be read); run the scan again"
-                }
-                "no_unique_ignored" => {
-                    "the ignored files could not be listed (git failed); run the scan again"
-                }
-                "no_dependents" => {
-                    "whether other repositories use this one's objects could not be established (an \
-                     alternates file, symlink or git directory could not be resolved or lies \
-                     outside the scanned folders); scan the folders that hold those repositories \
-                     too"
-                }
-                "reflog_saved" => {
-                    "commits kept only by the reflog could not be compared with the remote (git \
-                     failed or timed out, or there is no commit yet); run the scan again"
-                }
-                "no_pending_state" => {
-                    "an unfinished rebase, merge, cherry-pick, revert or bisect, or local LFS or \
-                     annex content, is present or could not be checked; finish or abandon it"
-                }
-                _ => "a safety check could not be made; run the scan again",
-            };
-            text.to_string()
+        .map(|name| match (strict, name) {
+            (Some(gap), "no_dependents") if !scanned_unknown => format!(
+                "full coverage was required (require_full_coverage or --require-full-coverage) \
+                 and {gap}, so links or clones there may depend on this repository; make them \
+                 readable and scan again, or plan without that setting [{name}]"
+            ),
+            (_, "all_branches_on_remote") if notes.contains("has tags") => format!(
+                "this repository has local tags and tag names cannot be checked against the \
+                 remote without contacting it; they will be verified when a removal is applied \
+                 [{name}]"
+            ),
+            _ => fact_words(name, Tri::Unknown),
         })
         .collect();
     parts.join("; ")
@@ -920,12 +979,15 @@ fn decide(
             let what = node.rule.as_deref().unwrap_or("artifact");
             if node.contains_outputs {
                 let n = scan.outputs.iter().filter(|o| o.node == Some(idx)).count();
+                let n = n as u64;
                 return (
                     Action::Ask,
                     format!(
-                        "{what} directory holds {n} output file(s) (video, archive, model...) \
-                         that are not regenerable; not offered for removal until they are \
-                         backed up or moved"
+                        "{what} directory holds {} (video, archive, model...) that {} not \
+                         regenerable; not offered for removal until {} backed up or moved",
+                        count(n, "output file", "output files"),
+                        agree(n, "is", "are"),
+                        agree(n, "it is", "they are")
                     ),
                     0,
                 );
@@ -966,10 +1028,10 @@ fn decide(
                     .repo
                     .as_ref()
                     .and_then(|r| r.layout_issue.clone())
-                    .unwrap_or_else(|| "the layout could not be checked".to_string());
+                    .unwrap_or_else(|| fact_sentence("plain_layout", facts.plain_layout).into());
                 return (
                     Action::Ask,
-                    format!("unusual repository layout: {issue}"),
+                    format!("unusual repository layout: {issue} [plain_layout]"),
                     0,
                 );
             }
@@ -978,7 +1040,33 @@ fn decide(
                 // that use its objects or refs safe, so it must not be removed first.
                 return (Action::Ask, dependents_reason(node), 0);
             }
-            if facts.any_unknown() {
+            let hidden = node
+                .repo
+                .as_ref()
+                .map(|r| r.hidden_index_entries)
+                .unwrap_or(0);
+            if hidden > 0 {
+                // Recovery captures changes with git's own commands, which do not see edits to
+                // these files: only a person can save them.
+                let also = if facts.any_unknown() {
+                    format!("; also, {}", explain_unknown(node, &facts, strict))
+                } else {
+                    String::new()
+                };
+                (
+                    Action::Ask,
+                    format!(
+                        "idle ({why}), but {} marked skip-worktree or assume-unchanged, so git \
+                         hides edits to {} and {} be saved automatically; review {} first \
+                         [tree_clean]{also}",
+                        count(hidden, "file is", "files are"),
+                        agree(hidden, "it", "them"),
+                        agree(hidden, "it cannot", "they cannot"),
+                        agree(hidden, "it", "them")
+                    ),
+                    0,
+                )
+            } else if facts.any_unknown() {
                 (
                     Action::Ask,
                     format!(
@@ -988,12 +1076,17 @@ fn decide(
                     0,
                 )
             } else if !facts.all_yes() {
+                let unsaved = facts
+                    .failing()
+                    .into_iter()
+                    .map(|name| fact_words(name, Tri::No))
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 (
                     Action::RecoverThenArchive,
                     format!(
-                        "idle ({why}), but not fully saved elsewhere ({}); recover first, then \
-                         archive{}",
-                        join_names(&facts.failing()),
+                        "idle ({why}), but not fully saved elsewhere: {unsaved}; recover first, \
+                         then archive{}",
                         scope_note(scan)
                     ),
                     node.bytes_total,
@@ -1004,7 +1097,7 @@ fn decide(
                     format!(
                         "idle ({why}); local remote-tracking refs say every commit (reflog \
                          entries included) is on a network remote, nothing is unsaved, no \
-                         operation is half done and nothing depends on it{} \
+                         operation is half done and no dependents were found{} \
                          (unverified until apply re-checks the remote with git ls-remote)",
                         scope_note(scan)
                     ),
@@ -1047,5 +1140,33 @@ fn decide(
             (Action::Ask, why.to_string(), 0)
         }
         Class::Output | Class::Other => (Action::Keep, "analysis only".to_string(), 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_fact_has_words_for_no_and_for_unknown() {
+        let facts = Facts::default();
+        let names: Vec<&str> = facts.entries().iter().map(|(n, _)| *n).collect();
+        assert_eq!(FACT_WORDS.len(), names.len());
+        for name in names {
+            assert!(
+                FACT_WORDS.iter().any(|(n, _, _)| *n == name),
+                "{name} has no row in FACT_WORDS"
+            );
+            for t in [Tri::No, Tri::Unknown] {
+                let words = fact_sentence(name, t);
+                assert!(
+                    !words.is_empty() && !words.starts_with("a safety check"),
+                    "{name} as {} has no sentence of its own",
+                    t.as_str()
+                );
+                assert!(!words.contains(name), "{name}: {words}");
+                assert_eq!(fact_words(name, t), format!("{words} [{name}]"));
+            }
+        }
     }
 }

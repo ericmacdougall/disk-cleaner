@@ -1,0 +1,58 @@
+//! Plain-language helpers shared by plan reasons, scan notes and report headers, so every count
+//! is said the same way ("1 file is", "2 files are").
+
+/// `n` with the noun that agrees with it: `count(1, "file", "files")` is `1 file`.
+pub fn count(n: u64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// The word that agrees with `n`: `agree(1, "is", "are")` is `is`.
+pub fn agree<'a>(n: u64, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 {
+        one
+    } else {
+        many
+    }
+}
+
+/// Up to `max` of `items`, comma separated, then `and N more` for the rest.
+pub fn some_of(items: &[String], max: usize) -> String {
+    let shown = items
+        .iter()
+        .take(max)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = items.len().saturating_sub(max);
+    if rest > 0 {
+        format!("{shown} and {rest} more")
+    } else {
+        shown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_agree_with_their_number() {
+        assert_eq!(count(0, "file", "files"), "0 files");
+        assert_eq!(count(1, "file", "files"), "1 file");
+        assert_eq!(count(2, "entry", "entries"), "2 entries");
+        assert_eq!(agree(1, "is", "are"), "is");
+        assert_eq!(agree(3, "is", "are"), "are");
+    }
+
+    #[test]
+    fn some_of_names_up_to_max_and_counts_the_rest() {
+        let v: Vec<String> = "abcd".chars().map(String::from).collect();
+        assert_eq!(some_of(&v[..1], 3), "a");
+        assert_eq!(some_of(&v[..3], 3), "a, b, c");
+        assert_eq!(some_of(&v, 3), "a, b, c and 1 more");
+    }
+}

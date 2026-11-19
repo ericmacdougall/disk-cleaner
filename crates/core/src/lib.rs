@@ -16,6 +16,7 @@ pub mod procs;
 pub mod redact;
 pub mod rules;
 pub mod scan;
+pub mod words;
 
 pub use config::{Config, ConfigSource, DEFAULT_ACTIVE_WINDOW_DAYS};
 pub use error::{Error, Result};
@@ -88,12 +89,13 @@ fn invalid(field: impl Into<String>, message: impl Into<String>) -> Error {
 /// The first violation is returned with the field and index.
 pub fn validate_scan(scan: &ScanResult) -> Result<()> {
     let n = scan.nodes.len();
+    let nodes = words::count(n as u64, "node", "nodes");
     for (i, node) in scan.nodes.iter().enumerate() {
         if let Some(p) = node.parent {
             if p >= n {
                 return Err(invalid(
                     format!("nodes[{i}].parent"),
-                    format!("index {p} is out of range ({n} nodes)"),
+                    format!("index {p} is out of range ({nodes})"),
                 ));
             }
             if p == i {
@@ -107,7 +109,7 @@ pub fn validate_scan(scan: &ScanResult) -> Result<()> {
             if pn >= n {
                 return Err(invalid(
                     format!("nodes[{i}].repo.parent_node"),
-                    format!("index {pn} is out of range ({n} nodes)"),
+                    format!("index {pn} is out of range ({nodes})"),
                 ));
             }
         }
@@ -116,7 +118,7 @@ pub fn validate_scan(scan: &ScanResult) -> Result<()> {
         if let Some(k) = f.node.filter(|k| *k >= n) {
             return Err(invalid(
                 format!("big_files[{j}].node"),
-                format!("index {k} is out of range ({n} nodes)"),
+                format!("index {k} is out of range ({nodes})"),
             ));
         }
     }
@@ -124,7 +126,7 @@ pub fn validate_scan(scan: &ScanResult) -> Result<()> {
         if let Some(k) = f.node.filter(|k| *k >= n) {
             return Err(invalid(
                 format!("outputs[{j}].node"),
-                format!("index {k} is out of range ({n} nodes)"),
+                format!("index {k} is out of range ({nodes})"),
             ));
         }
     }

@@ -745,7 +745,7 @@ fn classify(
                     };
                     if rule.map(|r| r.scan_outputs).unwrap_or(false) && parent_is_loose {
                         node.ask_reason = Some(
-                            "no git history proves this build-named directory holds only \
+                            "is a build-named directory that no git history shows to hold only \
                              generated files and not hand-written source"
                                 .to_string(),
                         );
@@ -1153,7 +1153,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 unverified.push((
                     *i,
                     p.clone(),
-                    "git facts were not collected, so it is not verified to be ignored".to_string(),
+                    "is not verified to be ignored, because git facts were not collected"
+                        .to_string(),
                 ));
             }
         }
@@ -1720,8 +1721,9 @@ impl<'a> InboundCtx<'a> {
 /// What the inbound-reference pass found.
 #[derive(Default)]
 struct Inbound {
-    /// (repository, the dependent to name, the path that refers into it)
-    deps: Vec<(usize, String, String)>,
+    /// (repository, the dependent to name, the path that refers into it, whether that path is a
+    /// plain link rather than a checkout or clone)
+    deps: Vec<(usize, String, String, bool)>,
     /// (regenerable or cache node, why it must ask)
     asks: Vec<(usize, String)>,
     /// Why some reference could not be placed: every repository's `no_dependents = yes` becomes
@@ -1853,7 +1855,10 @@ fn consider(ctx: &InboundCtx, out: &mut Inbound, at: &Path, git_data: bool, targ
             .as_ref()
             .is_some_and(|gd| here.real.starts_with(gd));
         if !inside_own {
-            out.deps.push((n, here.who, shown));
+            // A symlink outside every git directory and checkout names only itself: it is a
+            // convenience link, not a checkout or clone.
+            let link = !git_data && here.who == shown;
+            out.deps.push((n, here.who, shown, link));
         }
         return;
     }
@@ -1865,13 +1870,13 @@ fn consider(ctx: &InboundCtx, out: &mut Inbound, at: &Path, git_data: bool, targ
         Some(x) => {
             let class = ctx.builds[x].node.class;
             if class.is_git() {
-                out.deps.push((x, here.who, shown));
+                out.deps.push((x, here.who, shown, false));
             } else if class.is_artifact() {
                 out.asks.push((
                     x,
                     diag(&format!(
-                        "git data at {} ({shown}) refers into this directory, so it may hold \
-                         objects or files that exist nowhere else",
+                        "is referred to by git data at {} ({shown}), so it may hold objects or \
+                         files that exist nowhere else",
                         here.who
                     )),
                 ));
@@ -1892,23 +1897,30 @@ fn consider(ctx: &InboundCtx, out: &mut Inbound, at: &Path, git_data: bool, targ
 fn apply_inbound(builds: &mut [Build], found: Inbound, warnings: &mut Vec<String>) {
     let mut named: HashMap<usize, usize> = HashMap::new();
     let mut more: HashMap<usize, usize> = HashMap::new();
-    for (n, who, via) in found.deps {
+    for (n, who, via, link) in found.deps {
         let Some(info) = builds[n].node.repo.as_mut() else {
             continue;
         };
         info.facts.no_dependents = Tri::No;
         let who = diag(&who);
-        if info.dependents.contains(&who) {
+        if info.dependents.contains(&who) || info.links_into_git_dir.contains(&who) {
             continue;
         }
         let count = named.entry(n).or_insert(0);
         if *count < MAX_NAMED_INBOUND {
             *count += 1;
-            info.notes.push(diag(&format!(
-                "no_dependents: {via} refers into this repository's git directory, so {who} \
-                 depends on it"
-            )));
-            info.dependents.push(who);
+            if link {
+                info.notes.push(format!(
+                    "no_dependents: a link at {who} points into this repository's git directory"
+                ));
+                info.links_into_git_dir.push(who);
+            } else {
+                info.notes.push(diag(&format!(
+                    "no_dependents: {via} refers into this repository's git directory, so {who} \
+                     depends on it"
+                )));
+                info.dependents.push(who);
+            }
         } else {
             *more.entry(n).or_insert(0) += 1;
         }
@@ -1916,8 +1928,9 @@ fn apply_inbound(builds: &mut [Build], found: Inbound, warnings: &mut Vec<String
     for (n, k) in more {
         if let Some(info) = builds[n].node.repo.as_mut() {
             info.notes.push(format!(
-                "no_dependents: {k} more references into this repository's git directory were \
-                 found"
+                "no_dependents: {} into this repository's git directory {} found",
+                crate::words::count(k as u64, "more reference", "more references"),
+                crate::words::agree(k as u64, "was", "were")
             ));
         }
     }

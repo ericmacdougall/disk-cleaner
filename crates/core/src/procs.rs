@@ -37,7 +37,9 @@ impl ProcessCheck {
         match self {
             ProcessCheck::Ok { .. } => None,
             ProcessCheck::Partial { unreadable, .. } => Some(format!(
-                "{unreadable} process(es) could not be inspected; a project they use may look idle"
+                "{} not be inspected; a project {} may look idle",
+                crate::words::count(*unreadable as u64, "process could", "processes could"),
+                crate::words::agree(*unreadable as u64, "it uses", "they use")
             )),
             ProcessCheck::Unknown { reason } => Some(reason.clone()),
         }

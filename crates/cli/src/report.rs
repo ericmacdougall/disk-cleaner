@@ -1,5 +1,7 @@
 //! Human-readable summaries of scans and plans.
 
+use disk_cleaner_core::plan::coverage_note;
+use disk_cleaner_core::words::count;
 use disk_cleaner_core::{Class, Plan, ScanResult, Tri};
 use std::fmt::Write;
 
@@ -48,33 +50,39 @@ pub fn scan_summary(s: &ScanResult) -> String {
     let _ = writeln!(o, "Scanned {}", esc(&s.roots.join(", ")));
     let _ = writeln!(
         o,
-        "{} files, {} directories, {} allocated ({} logical)",
-        t.files,
-        t.dirs,
+        "{}, {}, {} allocated ({} logical)",
+        count(t.files, "file", "files"),
+        count(t.dirs, "directory", "directories"),
         human_bytes(t.allocated_bytes),
         human_bytes(t.logical_bytes)
     );
     if t.hardlink_duplicates_skipped > 0 {
+        let n = t.hardlink_duplicates_skipped;
         let _ = writeln!(
             o,
-            "{} hard-linked duplicate(s) counted once",
-            t.hardlink_duplicates_skipped
+            "{} counted once",
+            count(n, "hard-linked duplicate", "hard-linked duplicates")
         );
     }
     if t.unreadable > 0 {
-        let _ = writeln!(o, "{} entries could not be read (not fatal)", t.unreadable);
-    }
-    if t.mount_points_skipped > 0 {
-        let _ = writeln!(o, "{} mount point(s) not crossed", t.mount_points_skipped);
-    }
-    let c = &s.coverage;
-    if !c.complete {
+        let n = t.unreadable;
         let _ = writeln!(
             o,
-            "Coverage incomplete: {} folder(s) could not be read and {} mount point(s) were not \
-             entered; links or clones inside them were not checked",
-            c.unreadable_dirs, c.mount_points_skipped
+            "{} not be read (not fatal)",
+            count(n, "entry could", "entries could")
         );
+    }
+    if t.mount_points_skipped > 0 {
+        let n = t.mount_points_skipped;
+        let _ = writeln!(
+            o,
+            "{} not crossed",
+            count(n, "mount point was", "mount points were")
+        );
+    }
+    let c = &s.coverage;
+    if let Some(note) = coverage_note(c, c.complete) {
+        let _ = writeln!(o, "{note}");
         for e in c
             .unreadable_dir_examples
             .iter()
@@ -183,8 +191,9 @@ pub fn plan_summary(p: &Plan) -> String {
     let mut o = String::new();
     let _ = writeln!(
         o,
-        "Dry-run plan (nothing is changed). Active window: {} days (from {}).",
-        p.active_window_days, p.window_source
+        "Dry-run plan (nothing is changed). Active window: {} (from {}).",
+        count(p.active_window_days, "day", "days"),
+        p.window_source
     );
     let _ = write!(o, "Running-process check: {}", p.process_check);
     if let Some(n) = &p.process_check_note {
@@ -253,9 +262,9 @@ pub fn plan_summary(p: &Plan) -> String {
     for (a, t) in &p.totals.by_action {
         let _ = writeln!(
             o,
-            "  {:<22} {:>4} item(s)  {:>10}",
+            "  {:<22} {:>10}  {:>10}",
             a,
-            t.items,
+            count(t.items, "item", "items"),
             human_bytes(t.reclaimable_bytes)
         );
     }

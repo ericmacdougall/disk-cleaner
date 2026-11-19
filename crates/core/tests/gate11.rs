@@ -127,7 +127,8 @@ fn s1_an_ordinary_untracked_file_is_still_recover_then_archive_in_words() {
     let it = item(&p, &a);
     assert_eq!(it.action, Action::RecoverThenArchive, "{}", it.reason);
     assert!(
-        it.reason.contains("uncommitted changes or untracked files [tree_clean]"),
+        it.reason
+            .contains("uncommitted changes or untracked files [tree_clean]"),
         "{}",
         it.reason
     );
@@ -321,8 +322,16 @@ fn s2d_an_archive_reason_says_no_dependents_were_found() {
         );
         let it = &p.items[0];
         assert_eq!(it.action, Action::Archive, "{}", it.reason);
-        assert!(it.reason.contains("no dependents were found"), "{}", it.reason);
-        assert!(!it.reason.contains("nothing depends on it"), "{}", it.reason);
+        assert!(
+            it.reason.contains("no dependents were found"),
+            "{}",
+            it.reason
+        );
+        assert!(
+            !it.reason.contains("nothing depends on it"),
+            "{}",
+            it.reason
+        );
     }
 }
 

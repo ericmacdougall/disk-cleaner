@@ -47,7 +47,7 @@ fn p1_a_repository_other_clones_borrow_from_asks_and_names_them() {
     let it = item(&p, &prov);
     assert_eq!(it.action, Action::Ask, "{}", it.reason);
     assert_eq!(it.reclaimable_bytes, 0);
-    assert!(it.reason.contains("deal with those first"), "{}", it.reason);
+    assert!(it.reason.contains("deal with it first"), "{}", it.reason);
     assert!(
         it.reason.contains(&b1.to_string_lossy().into_owned()),
         "{}",

@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **6** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **7** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -9,7 +9,9 @@ made `no_dependents` and `plain_layout` stricter (inbound references, symlinks a
 directory, see below): a version 4 scan can say `yes` where version 5 says `no`, so it is refused.
 Version 6 added the required scan field `coverage`, `repo.precious_objects` and the plan fields
 `coverage_complete`, `coverage_note` and `required_full_coverage`; a version 5 scan does not say
-where it could not look, so it is refused.
+where it could not look, so it is refused. Version 7 added `repo.hidden_index_entries` and
+`repo.links_into_git_dir`; a version 6 scan cannot tell an edit git hides from an ordinary
+untracked file, so it is refused.
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 
@@ -22,7 +24,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 6 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 7 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots that were walked, as spelled; overlapping roots are normalised first (see "Overlapping scan roots") |
@@ -201,6 +203,8 @@ with or without evidence.
 | `parent_repo`, `parent_node` | for a linked worktree: its repo as git reports it, and its index in `nodes` if scanned |
 | `precious_objects` | present and `true` when the repository sets `extensions.preciousObjects = true` (see "Declared dependents") |
 | `dependents` | clones in the scan that borrow objects from this repo (alternates; the file is read only if it is a regular file under 64 KiB, otherwise a warning is recorded and `no_dependents` of the other git nodes becomes `unknown`, see below) |
+| `links_into_git_dir` | symlinks in the scan, outside every git directory and checkout, that point into this repository's git directory (a convenience link such as `hooks -> A/.git/hooks`); they make `no_dependents` `no` and the plan names each as "a link at <path>", not as a checkout |
+| `hidden_index_entries` | present when not 0: index entries marked skip-worktree or assume-unchanged whose file is present in the working tree. Git hides edits to them from `status`, `diff`, `add` and `stash`, so recovery cannot save them; `tree_clean` is `no` and the plan asks (see "Hidden index entries") |
 | `submodule_gitdirs`, `git_dir` | submodule git directories under `.git/modules`; this node's own git directory |
 | `sizes` | `total`, `git` (the `.git` directory), `regenerable`, `output` |
 
@@ -212,7 +216,7 @@ Facts (the safe value is always `yes`):
 | `head_on_remote` | the worktree's own HEAD, including a detached HEAD, is contained in a remote-tracking ref of a network remote |
 | `all_branches_on_remote` | every local ref (branches, notes, replace refs...; not the stash or HEAD) is contained in a network remote ref, and there are no local tags: tag names are not visible in tracking refs, so a repo with tags is `unknown` until apply runs `git ls-remote` |
 | `stash_empty` | the stash is empty |
-| `tree_clean` | no tracked changes and no untracked files in this repo's own tree (submodules are their own nodes), no file marked skip-worktree or assume-unchanged (those hide local edits), and every submodule gitlink agrees: the index matches HEAD, and each checked-out submodule's HEAD equals the commit the index records (`status --ignore-submodules=all` hides both). A recorded submodule with a missing or empty directory is fine; a directory with files and no `.git` at a gitlink path, an unmerged gitlink or a differing commit is `no`; a submodule whose config fails the allowlist, whose HEAD cannot be read, or more than 200 submodules is `unknown`. The commits are compared with `ls-files -s`, `ls-tree -r HEAD` and `rev-parse --verify HEAD` run in the submodule through the hardened runner; no status runs inside it |
+| `tree_clean` | no tracked changes and no untracked files in this repo's own tree (submodules are their own nodes), no present file marked skip-worktree or assume-unchanged (those hide local edits; counted in `hidden_index_entries`, and a sparse checkout's absent files are not counted), and every submodule gitlink agrees: the index matches HEAD, and each checked-out submodule's HEAD equals the commit the index records (`status --ignore-submodules=all` hides both). A recorded submodule with a missing or empty directory is fine; a directory with files and no `.git` at a gitlink path, an unmerged gitlink or a differing commit is `no`; a submodule whose config fails the allowlist, whose HEAD cannot be read, or more than 200 submodules is `unknown`. The commits are compared with `ls-files -s`, `ls-tree -r HEAD` and `rev-parse --verify HEAD` run in the submodule through the hardened runner; no status runs inside it |
 | `no_unique_ignored` | no ignored files outside regenerable and cache directories (`.env`, local databases...) |
 | `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone, shared object directory or other reference into this repository's git directory was found (see "Inbound references"), and the repository does not declare `extensions.preciousObjects = true` (see "Declared dependents"). Places the scan could not read are not covered: see "Incomplete coverage" |
 | `reflog_saved` | every commit reachable from any reflog entry (HEAD of this worktree and every ref's reflog) is contained in a network remote's tracking refs. An unpushed commit after `git reset --hard`, an amended or rebased-away commit and a stash's commits are `no`. No network remote is `no`; an unborn HEAD, any git failure or a timeout is `unknown` |
@@ -258,7 +262,8 @@ is followed):
 3. None of `objects/info/alternates`, `objects/info/http-alternates`, `commondir`, `info/grafts`
    or `annex` exists.
 4. `worktrees/` and `modules/` are absent or empty (so a repository with submodules, checked out
-   or not, always asks).
+   or not, always asks). For a non-empty `worktrees/`, `layout_issue` adds up to three of the
+   linked worktree paths git reports (`worktrees is not empty: /w/a-feature, ...`).
 5. No unfinished rebase, merge, cherry-pick, revert or bisect and no local-only LFS or annex
    content (`no_pending_state`).
 6. The config passed the allowlist (a refused config makes every fact `unknown` before this).
@@ -333,7 +338,10 @@ After the walk:
   else the link itself. This covers a symlinked `objects`, a symlinked fanout directory or pack file,
   a hidden checkout's `.git` symlink, and a convenience link such as `hooks -> A/.git/hooks`. The
   last is deliberately conservative: a link into a git directory may be how another checkout
-  reaches its objects, and the scan cannot tell the difference, so the repository asks.
+  reaches its objects, and the scan cannot tell the difference, so the repository asks. A link
+  that names only itself (outside every git directory and checkout) is recorded in
+  `links_into_git_dir` instead of `dependents`, and the reason says "a link at <path> points into
+  this repository's git directory".
 - A reference that is git data (an alternates entry, a `.git` file's `gitdir:`, the `commondir` and
   object store it leads to, or a symlink inside a git directory or object store) whose target lies
   in another node is a dependency on that node: a repository there gets `no_dependents = no`, a
@@ -535,15 +543,33 @@ state is `unknown`.
 1. Active: `keep`.
 2. Regenerable and cache: contains output files, has an `ask_reason`, is incomplete (`unreadable`
    or `skipped_mounts`), or state unknown: `ask`; otherwise `remove-regenerable`.
-3. Repo and worktree: state unknown: `ask`; `plain_layout` not `yes`: `ask` (unusual repository layout); `no_dependents` `no`: `ask`, never a removing action, naming up to three dependents and the count of the rest (recovery saves this repo's own refs and cannot make the repos that use its objects safe); any fact `unknown`: `ask`, with each unknown fact explained in words (what could not be checked and what would settle it; for local tags, that tag names cannot be checked against the remote without contacting it and will be verified when a removal is applied); any other fact `no`:
-   `recover-then-archive`; every fact `yes`: `archive` (labelled unverified, see
-   `remote_facts_verified`). A repo whose `.git/modules` hold a submodule git directory that no scanned
+3. Repo and worktree: state unknown: `ask`; `plain_layout` not `yes`: `ask` (unusual repository layout); `no_dependents` `no`: `ask`, never a removing action, naming up to three dependents and links and the count of the rest (recovery saves this repo's own refs and cannot make the repos that use its objects safe); `hidden_index_entries` above 0: `ask` ("N files are marked skip-worktree or assume-unchanged, so git hides edits to them and they cannot be saved automatically; review them first"); any fact `unknown`: `ask`, with each unknown fact explained in words (what could not be checked and what would settle it; for local tags, that tag names cannot be checked against the remote without contacting it and will be verified when a removal is applied); any other fact `no`:
+   `recover-then-archive`, naming in words what is not saved elsewhere; every fact `yes`: `archive` (labelled unverified, see
+   `remote_facts_verified`; its reason says "no dependents were found", never that nothing depends on it). A repo whose `.git/modules` hold a submodule git directory that no scanned
    git node inside it uses, or that is incomplete (`unreadable` or `skipped_mounts`), asks.
 4. Bare repo: `keep` when something depends on it, otherwise `ask`.
 5. Loose code: `ask`.
 6. Enclosing: a node that would be removed becomes `ask` when any node inside it is `keep`, `ask` or
    `recover-then-archive` (a nested video, a submodule with a stash, a recently active nested
    project), because everything inside goes with it. A removable regenerable child does not block.
+   The reason leads with that veto (`the nested <path> needs a person's decision, and everything
+   inside goes with this one; on its own: ...`), even when another check also made it ask.
+
+**Reasons in words.** Every reason that rests on a fact says what the fact means in words and then
+names the fact as a trailing tag, for example `stashed changes [stash_empty]` or `the stash could
+not be read (git failed); run the scan again [stash_empty]`. One table in `plan.rs` holds the words
+for every fact as `no` and as `unknown`. Counts agree with their number (`1 file is`, `2 files
+are`) in reasons, notes and report headers.
+
+**Hidden index entries.** `git update-index --skip-worktree` and `--assume-unchanged` tell git to
+stop looking at a file, so an edit to it is invisible to `status`, `diff`, `add -A` and `stash`,
+the commands recovery would use. The scan runs `git ls-files -v -z` and counts the entries tagged
+`S` (skip-worktree) or with a lowercase tag (assume-unchanged) whose file is present (`lstat`; a
+file that cannot be checked counts). A sparse checkout marks every file outside its cone
+skip-worktree and removes it from the working tree; an absent file holds no edit, so a sparse
+checkout with everything pushed is still archivable. A present file is not hashed: comparing its
+bytes with the index blob would need the repository's clean filters and line-ending rules, which
+this tool never runs, so any present entry asks.
 
 Activity evidence is the newest of `newest_mtime` and `last_commit_time`; a regenerable directory
 uses its owning project. `totals.reclaimable_bytes` does not count an item nested inside another

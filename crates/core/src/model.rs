@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -209,6 +209,16 @@ pub struct RepoInfo {
     /// repositories borrow its objects (`no_dependents` is then `no`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub precious_objects: bool,
+    /// Symlinks inside the scan that point into this repository's git directory and are not
+    /// checkouts (a convenience link to `.git/hooks`, say): removing the repository breaks them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links_into_git_dir: Vec<String>,
+    /// Index entries marked skip-worktree or assume-unchanged whose file is present in the
+    /// working tree. Git hides edits to them from `status`, `diff`, `add` and `stash`, so they
+    /// cannot be saved automatically; the plan asks. (Sparse-checkout entries whose file is
+    /// absent are not counted.)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub hidden_index_entries: u64,
     /// Git directories of submodules stored under `.git/modules` (their stash and local
     /// branches are deleted with this repo), as real paths.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
