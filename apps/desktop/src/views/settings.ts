@@ -73,6 +73,8 @@ export class SettingsForm {
   private inputs: Record<keyof Draft, HTMLInputElement>;
   private current: SettingsPayload | null = null;
   pending = false;
+  /** The shorten question is open; the form stays locked until it is answered. */
+  private confirming = false;
 
   constructor(
     private backend: Backend,
@@ -151,14 +153,20 @@ export class SettingsForm {
     this.form.setAttribute("aria-busy", String(p));
   }
 
-  /** Save. Ignored while a save is pending. */
+  /** Save. Ignored while a save is pending or the shorten question is open. */
   async save(confirmShorten: boolean): Promise<void> {
-    if (this.pending || !this.current) return;
+    if (this.pending || this.confirming || !this.current) return;
     const c = changesFrom(this.draft(), this.current);
     if ("error" in c) {
       this.message.textContent = c.error;
       return;
     }
+    await this.submit(c, confirmShorten);
+  }
+
+  /** Send these exact changes. The form stays locked from here until the save ends or the
+   * shorten question is answered, so a confirmation always applies to the change it showed. */
+  private async submit(c: { core: CoreChanges; app: AppSettings }, confirmShorten: boolean): Promise<void> {
     this.setPending(true);
     this.message.textContent = "Saving...";
     try {
@@ -168,26 +176,33 @@ export class SettingsForm {
       this.message.textContent = `${what}${r.report.note ? ` ${r.report.note}` : ""}${r.report.replanned ? " The plan was recomputed." : ""}`;
       this.onSaved(r.report.replanned);
     } catch (e) {
-      if (errorKind(e) === "needs_confirmation") {
-        this.setPending(false);
-        this.confirm(e as { old?: number; new?: number; message: string });
+      if (errorKind(e) === "needs_confirmation" && !confirmShorten) {
+        this.confirm(e as { old?: number; new?: number; message: string }, c);
         return;
       }
       this.message.textContent = `Not saved: ${errorMessage(e)}`;
     } finally {
-      if (this.pending) this.setPending(false);
+      if (!this.confirming) this.setPending(false);
     }
   }
 
-  private confirm(e: { old?: number; new?: number; message: string }): void {
+  private confirm(e: { old?: number; new?: number; message: string }, c: { core: CoreChanges; app: AppSettings }): void {
+    this.confirming = true;
+    this.message.textContent = "";
     const keep = h("button", { type: "button", onclick: () => close(false) }, `Keep ${e.old ?? ""} days`);
     const shorten = h("button", { type: "button", class: "primary", onclick: () => close(true) }, `Shorten to ${e.new ?? ""} days`);
     const close = (go: boolean) => {
+      if (!this.confirming) return;
+      this.confirming = false;
       this.dialog.hidden = true;
       replace(this.dialog);
-      this.inputs.activeWindowDays.focus();
-      if (go) void this.save(true);
-      else this.message.textContent = "Not saved: the active window was kept.";
+      if (go) {
+        void this.submit(c, true).then(() => this.inputs.activeWindowDays.focus());
+      } else {
+        this.setPending(false);
+        this.inputs.activeWindowDays.focus();
+        this.message.textContent = "Not saved: the active window was kept.";
+      }
     };
     replace(
       this.dialog,

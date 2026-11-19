@@ -37,6 +37,9 @@ export class DevView {
   private cls: string | null = null;
   private offset = 0;
   private data: DevSummary | null = null;
+  /** Each item request gets a number; only the latest one is shown. */
+  private itemsGen = 0;
+  private pagePending = false;
 
   constructor(
     private backend: Backend,
@@ -105,18 +108,33 @@ export class DevView {
     );
   }
 
+  /** Load the current class and offset. Only the latest request is shown (a late reply of
+   * an older one is dropped), and the range is the one that request asked for. */
   private async loadItems(): Promise<void> {
     const cls = this.cls;
+    const offset = this.offset;
     const g = this.data?.groups.find((x) => x.class === cls);
     if (!cls || !g) return;
-    const list = await this.backend.devPage(this.view, cls, this.offset, DEV_PAGE);
-    if (cls !== this.cls) return;
+    const gen = ++this.itemsGen;
+    this.pagePending = true;
+    let list: DevItem[];
+    try {
+      list = await this.backend.devPage(this.view, cls, offset, DEV_PAGE);
+    } catch (e) {
+      if (gen === this.itemsGen) {
+        this.pagePending = false;
+        this.status(errorMessage(e));
+      }
+      return;
+    }
+    if (gen !== this.itemsGen) return;
+    this.pagePending = false;
     const pager = h(
       "div",
       { class: "pager" },
-      h("button", { type: "button", disabled: this.offset === 0, onclick: () => void this.pageBy(-DEV_PAGE) }, "Previous"),
-      ` ${g.count === 0 ? 0 : this.offset + 1} to ${Math.min(g.count, this.offset + DEV_PAGE)} of ${formatCount(g.count)} `,
-      h("button", { type: "button", disabled: this.offset + DEV_PAGE >= g.count, onclick: () => void this.pageBy(DEV_PAGE) }, "Next"),
+      h("button", { type: "button", disabled: offset === 0, onclick: () => void this.pageBy(-DEV_PAGE) }, "Previous"),
+      ` ${g.count === 0 ? 0 : offset + 1} to ${Math.min(g.count, offset + DEV_PAGE)} of ${formatCount(g.count)} `,
+      h("button", { type: "button", disabled: offset + DEV_PAGE >= g.count, onclick: () => void this.pageBy(DEV_PAGE) }, "Next"),
     );
     replace(
       this.items,
@@ -160,8 +178,14 @@ export class DevView {
     );
   }
 
+  /** Previous or Next: ignored while a page is loading; never past the first or last page. */
   private async pageBy(delta: number): Promise<void> {
-    this.offset = Math.max(0, this.offset + delta);
+    if (this.pagePending) return;
+    const count = this.data?.groups.find((x) => x.class === this.cls)?.count ?? 0;
+    const last = count > 0 ? Math.floor((count - 1) / DEV_PAGE) * DEV_PAGE : 0;
+    const next = Math.min(last, Math.max(0, this.offset + delta));
+    if (next === this.offset) return;
+    this.offset = next;
     await this.loadItems();
   }
 
