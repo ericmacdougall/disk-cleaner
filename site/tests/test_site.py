@@ -760,5 +760,146 @@ class TestWorkflows(unittest.TestCase):
         self.assertIn("branches: [main]", y)
 
 
+GATE_CMD = "python3 -I site/tools/pages_gate.py"
+
+
+def job_block(yml, name):
+    """Text of one job under `jobs:` (two-space indent), up to the next job."""
+    m = re.search(rf"^  {re.escape(name)}:\s*\n(.*?)(?=^  \S|^\S|\Z)", yml, re.M | re.S)
+    return m.group(1) if m else ""
+
+
+def job_permissions(block):
+    perms, inside = {}, False
+    for line in block.splitlines():
+        if re.match(r"^    permissions:\s*$", line):
+            inside = True
+            continue
+        if inside:
+            m = re.match(r"^      ([a-z-]+):\s*(\S+)\s*$", line)
+            if m:
+                perms[m.group(1)] = m.group(2)
+            else:
+                break
+    return perms
+
+
+def load_gate():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("pages_gate", SITE / "tools" / "pages_gate.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestPagesGate(unittest.TestCase):
+    """The deploy job runs only when Pages is enabled with GitHub Actions as its source. Pages being off
+    skips the deploy and the run stays green; any other answer from the API fails, so a broken token or
+    an outage is never mistaken for "Pages is off"."""
+
+    def test_job_parsers_fire(self):
+        yml = ("jobs:\n  a:\n    permissions:\n      pages: read\n    steps: []\n"
+               "  b:\n    needs: a\n    if: x\n")
+        self.assertEqual(job_permissions(job_block(yml, "a")), {"pages": "read"})
+        self.assertIn("needs: a", job_block(yml, "b"))
+        self.assertEqual(job_block(yml, "c"), "")
+
+    def test_decision_for_each_answer(self):
+        gate = load_gate()
+        on = gate.decide(200, b'{"build_type": "workflow", "html_url": "https://x.example/p/"}')
+        self.assertTrue(on.enabled)
+        off = gate.decide(404, b'{"message": "Not Found"}')
+        self.assertFalse(off.enabled)
+        self.assertEqual(off.level, "notice")
+        legacy = gate.decide(200, b'{"build_type": "legacy"}')
+        self.assertFalse(legacy.enabled)
+        self.assertEqual(legacy.level, "warning")
+        for status, body in ((401, b"{}"), (403, b'{"message": "Resource not accessible"}'),
+                             (500, b""), (200, b"not json"), (200, b"[]"), (302, b"")):
+            with self.assertRaises(gate.GateError, msg=f"{status} {body!r}"):
+                gate.decide(status, body)
+
+    def run_main(self, fetch, env):
+        import contextlib
+        import io
+        import os
+        import tempfile
+        gate = load_gate()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "output"
+            out.write_text("", encoding="utf-8")
+            full = {"GITHUB_REPOSITORY": "o/r", "GITHUB_TOKEN": "tok-DO-NOT-PRINT", "GITHUB_OUTPUT": str(out)}
+            full.update(env)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                code = gate.main(env={k: v for k, v in full.items() if v is not None}, fetch=fetch)
+            return code, out.read_text(encoding="utf-8"), buf.getvalue()
+
+    def test_main_writes_the_output_and_exit_code(self):
+        import urllib.error
+        code, out, log = self.run_main(lambda url, token: (404, b'{"message": "Not Found"}'), {})
+        self.assertEqual((code, out.strip()), (0, "enabled=false"))
+        self.assertIn("::notice", log)
+        code, out, log = self.run_main(lambda url, token: (200, b'{"build_type": "workflow"}'), {})
+        self.assertEqual((code, out.strip()), (0, "enabled=true"))
+        code, out, log = self.run_main(lambda url, token: (403, b"{}"), {})
+        self.assertEqual((code, out.strip()), (1, ""))
+        self.assertIn("::error", log)
+
+        def down(url, token):
+            raise urllib.error.URLError("no route")
+        code, out, log = self.run_main(down, {})
+        self.assertEqual((code, out.strip()), (1, ""))
+        code, out, log = self.run_main(lambda url, token: (404, b""), {"GITHUB_TOKEN": None})
+        self.assertEqual(code, 1, "no token must fail, not skip")
+        code, out, log = self.run_main(lambda url, token: (404, b""), {"GITHUB_REPOSITORY": "../x"})
+        self.assertEqual(code, 1, "a malformed repository name must fail")
+        code, out, log = self.run_main(lambda url, token: (404, b""), {"GITHUB_API_URL": "http://api.example.test"})
+        self.assertEqual(code, 1, "the token is only sent over https")
+
+    def test_main_asks_the_right_url_and_never_prints_the_token(self):
+        seen = []
+
+        def fetch(url, token):
+            seen.append((url, token))
+            return 403, b'{"message": "Bad credentials"}'
+        code, out, log = self.run_main(fetch, {"GITHUB_API_URL": "https://api.example.test"})
+        self.assertEqual(seen, [("https://api.example.test/repos/o/r/pages", "tok-DO-NOT-PRINT")])
+        self.assertNotIn("tok-DO-NOT-PRINT", log + out)
+
+    def test_pages_deploy_is_gated_at_job_level(self):
+        y = read(PAGES_YML)
+        gate, deploy = job_block(y, "gate"), job_block(y, "deploy")
+        self.assertIn(GATE_CMD, gate)
+        self.assertEqual(job_permissions(gate), {"contents": "read", "pages": "read"})
+        self.assertRegex(gate, r"outputs:\s*\n\s*enabled: \$\{\{ steps\.gate\.outputs\.enabled \}\}")
+        self.assertRegex(gate, r"id: gate")
+        self.assertRegex(deploy, re.compile(r"^    needs: gate\s*$", re.M))
+        self.assertRegex(deploy, re.compile(r"^    if: needs\.gate\.outputs\.enabled == 'true'\s*$", re.M))
+        self.assertIn("deploy-pages", deploy)
+        self.assertNotIn("deploy-pages", gate)
+        self.assertNotIn("environment", gate, "the gate must not touch the github-pages environment")
+        self.assertLess(y.index("  gate:"), y.index("  deploy:"))
+
+    def test_pull_requests_run_the_same_gate_read_only(self):
+        y = read(SITE_YML)
+        job = job_block(y, "pages-gate")
+        self.assertIn(GATE_CMD, job)
+        self.assertEqual(job_permissions(job), {"contents": "read", "pages": "read"})
+        self.assertNotIn("environment", job)
+
+    def test_gate_script_is_not_published(self):
+        import tempfile
+        spec_mod = load_gate()
+        self.assertTrue(callable(spec_mod.decide))
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("prepare", SITE / "tools" / "prepare.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = mod.prepare(Path(tmp) / "out")
+            self.assertFalse((out / "tools" / "pages_gate.py").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
