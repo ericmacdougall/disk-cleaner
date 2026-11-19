@@ -203,6 +203,27 @@ time. `no_dependents` cannot see clones outside the scanned roots. An alternates
 read (a symlink, larger than 64 KiB, unreadable) leaves its provider unidentified, so every other
 git node in the scan that had `no_dependents = yes` gets `unknown` instead (a known `no` stays).
 
+**Object sharing.** Every user of each canonical object directory is kept, so repos that share
+one (a symlinked `.git/objects`, or a `commondir` file pointing into another repo) all get
+`no_dependents = no`, each naming the others in `dependents` and `notes`: an unpushed commit in one
+lives in the other's directory. `objects/info` and `objects/pack` must be plain directories; a
+symlink there is read as a path (never followed to run git) and is a dependency if it lands inside
+a scanned repo's object directory. A symlinked `objects`, `objects/info` or `objects/pack` or a
+`commondir` that leaves the scan, or a non-plain entry, is unresolved like an unread alternates
+file (every other git node's `yes` becomes `unknown`). A linked worktree makes the repo git
+reports as its parent a dependency (`no`), so a forged `commondir` cannot hide it. No allowlisted
+config key can relocate objects: only `objects/info/alternates`, a symlink, or `commondir` can, and
+the environment variables that could are cleared.
+
+**Alternates syntax.** The file is parsed as git does: blank lines and lines starting with `#` are
+skipped; an entry starting with `"` is C-style quoted (`\\`, `\"`, `\a \b \f \n \r \t \v`, `\ooo`
+octal with a first digit of 0 to 3; anything else, a missing closing quote or text after it is
+malformed); other entries are paths as written; a relative entry is resolved against the borrower's
+`objects` directory. Each entry is canonicalised and must equal the object directory of a scanned
+git node; an entry that is malformed, cannot be canonicalised, or names a place outside the scan
+is never dropped: it is unresolved (see above) and a warning says why. Chains are followed
+through scanned repos only: if A borrows from B and B from C, C lists both A and B as dependents.
+
 Remote URLs have embedded credentials removed (`https://user:token@host/x` is stored as
 `https://host/x`; everything up to the last `@` counts as userinfo, and query strings and fragments are
 dropped) before they are stored, and all git error text is redacted the same way.

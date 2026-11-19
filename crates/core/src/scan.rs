@@ -1288,34 +1288,150 @@ fn list_module_gitdirs(modules: &Path) -> Vec<String> {
     found
 }
 
-/// Tie linked worktrees to their parent repo and mark repos that other clones in the scan
-/// borrow objects from (alternates).
+/// One entry of an alternates file after parsing git's syntax.
+#[derive(Debug, PartialEq, Eq)]
+enum Alt {
+    /// An object directory, absolute or relative to the borrower's `objects` directory.
+    Path(PathBuf),
+    /// An entry that could not be interpreted (malformed quoting, not valid as a path).
+    Bad(String),
+}
+
+/// Turn raw bytes of a path into a `PathBuf`, or `None` if the platform cannot represent them.
+fn path_from_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes).ok().map(PathBuf::from)
+    }
+}
+
+/// Undo git's C-style quoting of one entry that starts with a double quote: `\\`, `\"`, `\a`,
+/// `\b`, `\f`, `\n`, `\r`, `\t`, `\v` and three-digit octal `\ooo` (first digit 0 to 3). Returns the
+/// bytes and the text after the closing quote, or `None` when the quoting is malformed.
+fn unquote_c_style(s: &str) -> Option<(Vec<u8>, &str)> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'"') {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'"' => return Some((out, &s[i + 1..])),
+            b'\\' => {
+                i += 1;
+                let c = *b.get(i)?;
+                match c {
+                    b'\\' | b'"' => out.push(c),
+                    b'a' => out.push(7),
+                    b'b' => out.push(8),
+                    b'f' => out.push(12),
+                    b'n' => out.push(10),
+                    b'r' => out.push(13),
+                    b't' => out.push(9),
+                    b'v' => out.push(11),
+                    b'0'..=b'3' => {
+                        let d1 = *b.get(i + 1)?;
+                        let d2 = *b.get(i + 2)?;
+                        if !(b'0'..=b'7').contains(&d1) || !(b'0'..=b'7').contains(&d2) {
+                            return None;
+                        }
+                        out.push((c - b'0') * 64 + (d1 - b'0') * 8 + (d2 - b'0'));
+                        i += 2;
+                    }
+                    _ => return None,
+                }
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    None // no closing quote
+}
+
+/// Parse an alternates file: one entry per line; blank lines and lines starting with `#` are
+/// skipped; an entry starting with `"` is C-style quoted; anything else is a path taken as written.
+/// Nothing is dropped: an entry that cannot be interpreted is returned as `Alt::Bad`.
+fn parse_alternates(text: &str) -> Vec<Alt> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('"') {
+            match unquote_c_style(line) {
+                Some((bytes, rest)) if rest.trim().is_empty() => match path_from_bytes(bytes) {
+                    Some(p) if !p.as_os_str().is_empty() => out.push(Alt::Path(p)),
+                    _ => out.push(Alt::Bad("a quoted entry is not a usable path".to_string())),
+                },
+                _ => out.push(Alt::Bad("a quoted entry is malformed".to_string())),
+            }
+        } else {
+            out.push(Alt::Path(PathBuf::from(line)));
+        }
+    }
+    out
+}
+
+/// What kind of thing a path is, without following a final symlink.
+enum Kind {
+    Missing,
+    Dir,
+    Symlink,
+    Other,
+}
+
+fn kind_of(p: &Path) -> std::result::Result<Kind, String> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.file_type().is_symlink() => Ok(Kind::Symlink),
+        Ok(m) if m.is_dir() => Ok(Kind::Dir),
+        Ok(_) => Ok(Kind::Other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Kind::Missing),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn add_member(members: &mut HashMap<PathBuf, Vec<usize>>, key: PathBuf, i: usize) {
+    let list = members.entry(key).or_default();
+    if !list.contains(&i) {
+        list.push(i);
+    }
+}
+
+/// Tie linked worktrees to their parent repo and find which repos use the same objects.
+///
+/// Every user of each canonical object directory is kept (a multimap), so two repos that share a
+/// directory (a symlinked `objects`, or a `commondir` into another repo) are dependents of each
+/// other. Alternates entries are parsed in git's own syntax and resolved against the borrower's
+/// object directory; chains are followed through scanned repos only. Whatever cannot be placed on
+/// a scanned repo (an entry that is malformed, cannot be resolved, or leads outside the scan; a
+/// symlinked `objects`, `objects/info` or `objects/pack` that leaves the scan) makes the repo
+/// that holds it an "unresolved borrower": every other git node loses a `yes` it can no longer
+/// prove. Symlinks are read as paths; nothing is followed to run git.
 fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
     let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
-    let mut by_objects: HashMap<PathBuf, usize> = HashMap::new();
     for (i, b) in builds.iter().enumerate() {
-        match b.node.class {
-            Class::Repo => {
-                by_path.insert(canon(&b.path), i);
-                if !b.git_odd {
-                    by_objects.insert(canon(&b.path.join(".git").join("objects")), i);
-                }
-            }
-            Class::BareRepo => {
-                by_path.insert(canon(&b.path), i);
-                by_objects.insert(canon(&b.path.join("objects")), i);
-            }
-            Class::Worktree => {
-                by_path.insert(canon(&b.path), i);
-            }
-            _ => {}
+        if b.node.class.is_git() {
+            by_path.insert(canon(&b.path), i);
         }
     }
 
-    let mut parent_links: Vec<(usize, usize)> = Vec::new();
-    let mut dependents: Vec<(usize, String)> = Vec::new();
-    // Borrowers whose alternates file was not read: which repo they borrow from is unknown.
+    // Phase 1: the object directory of every repo and what it declares.
+    let mut members: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    let mut symlinked: Vec<(usize, PathBuf)> = Vec::new();
+    let mut via_commondir: Vec<(usize, PathBuf)> = Vec::new();
+    let mut part_links: Vec<(usize, PathBuf)> = Vec::new();
+    let mut alt_entries: Vec<(usize, PathBuf, String)> = Vec::new();
     let mut unresolved: Vec<(usize, String)> = Vec::new();
+    let mut parent_links: Vec<(usize, usize)> = Vec::new();
     for (i, b) in builds.iter().enumerate() {
         if let Some(parent) = b.node.repo.as_ref().and_then(|r| r.parent_repo.as_ref()) {
             if let Some(&p) = by_path.get(&canon(Path::new(parent))) {
@@ -1324,12 +1440,100 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
                 }
             }
         }
-        let objects_dir = match b.node.class {
+        let (objects_dir, git_dir) = match b.node.class {
             Class::Repo if b.git_odd => continue,
-            Class::Repo => b.path.join(".git").join("objects"),
-            Class::BareRepo => b.path.join("objects"),
+            Class::Repo => (
+                b.path.join(".git").join("objects"),
+                Some(b.path.join(".git")),
+            ),
+            Class::BareRepo => (b.path.join("objects"), None),
             _ => continue,
         };
+        let mut bad: Vec<String> = Vec::new();
+        let mut objects_is_link = false;
+        // The objects directory itself.
+        match kind_of(&objects_dir) {
+            Ok(Kind::Dir) => match std::fs::canonicalize(&objects_dir) {
+                Ok(k) => add_member(&mut members, k, i),
+                Err(e) => bad.push(format!(
+                    "{} cannot be resolved ({e})",
+                    objects_dir.display()
+                )),
+            },
+            Ok(Kind::Symlink) => match std::fs::canonicalize(&objects_dir) {
+                Ok(k) => {
+                    objects_is_link = true;
+                    add_member(&mut members, k.clone(), i);
+                    symlinked.push((i, k));
+                }
+                Err(e) => bad.push(format!(
+                    "{} is a symlink that cannot be resolved ({e})",
+                    objects_dir.display()
+                )),
+            },
+            Ok(Kind::Missing) => {}
+            Ok(Kind::Other) => bad.push(format!(
+                "{} is not a plain directory",
+                objects_dir.display()
+            )),
+            Err(e) => bad.push(format!("cannot read {} ({e})", objects_dir.display())),
+        }
+        // objects/info and objects/pack: plain directories, or a symlink read as a path.
+        for sub in ["info", "pack"] {
+            let p = objects_dir.join(sub);
+            match kind_of(&p) {
+                Ok(Kind::Dir) | Ok(Kind::Missing) => {}
+                Ok(Kind::Symlink) => match std::fs::canonicalize(&p) {
+                    Ok(t) => part_links.push((i, t)),
+                    Err(e) => bad.push(format!(
+                        "{} is a symlink that cannot be resolved ({e})",
+                        p.display()
+                    )),
+                },
+                Ok(Kind::Other) => bad.push(format!("{} is not a plain directory", p.display())),
+                Err(e) => bad.push(format!("cannot read {} ({e})", p.display())),
+            }
+        }
+        // A `commondir` file in a repo's git directory moves its refs and objects elsewhere.
+        if let Some(gd) = &git_dir {
+            let cd = gd.join("commondir");
+            match kind_of(&cd) {
+                Ok(Kind::Missing) => {}
+                Ok(Kind::Other) => match read_small_regular_file(&cd) {
+                    Ok(Some(text)) => {
+                        let line = text.lines().next().unwrap_or("");
+                        match std::fs::canonicalize(gd.join(line).join("objects")) {
+                            Ok(k) => {
+                                add_member(&mut members, k.clone(), i);
+                                via_commondir.push((i, k));
+                            }
+                            Err(e) => bad.push(format!(
+                                "the commondir {} cannot be resolved ({e})",
+                                cd.display()
+                            )),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => bad.push(format!(
+                        "the commondir {} was not read ({e})",
+                        cd.display()
+                    )),
+                },
+                Ok(_) | Err(_) => bad.push(format!("{} is not a plain file", cd.display())),
+            }
+        }
+        for why in bad {
+            warnings.push(diag(&format!(
+                "{why}; which repo it shares objects with cannot be identified, so no other repo \
+                 in the scan is treated as free of dependents"
+            )));
+            unresolved.push((i, why));
+        }
+        // Alternates. When `objects` is a symlink the file belongs to the directory's owner, who
+        // is read as its own repo (or is outside the scan and already unresolved).
+        if objects_is_link {
+            continue;
+        }
         let alt_path = objects_dir.join("info").join("alternates");
         let text = match read_small_regular_file(&alt_path) {
             Ok(Some(t)) => t,
@@ -1345,34 +1549,155 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
                 continue;
             }
         };
-        for line in text.lines().map(str::trim) {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+        for entry in parse_alternates(&text) {
+            let problem = match entry {
+                Alt::Bad(why) => Some(why),
+                Alt::Path(p) => match std::fs::canonicalize(objects_dir.join(&p)) {
+                    Ok(c) => {
+                        alt_entries.push((i, c, alt_path.display().to_string()));
+                        None
+                    }
+                    Err(e) => Some(format!("the entry {} cannot be resolved ({e})", p.display())),
+                },
+            };
+            if let Some(why) = problem {
+                warnings.push(diag(&format!(
+                    "alternates file {}: {why}; the repo it borrows objects from cannot be \
+                     identified, so no other repo in the scan is treated as free of dependents",
+                    alt_path.display()
+                )));
+                unresolved.push((i, alt_path.display().to_string()));
             }
-            let target = canon(&objects_dir.join(line));
-            if let Some(&owner) = by_objects.get(&target) {
-                if owner != i {
-                    dependents.push((owner, b.node.path.clone()));
+        }
+    }
+
+    // Phase 2: relate everything to scanned repos.
+    for (i, k) in symlinked.iter().chain(via_commondir.iter()) {
+        if members.get(k).map(|l| l.len()).unwrap_or(0) < 2 {
+            let why = format!(
+                "the object directory of {} is reached through a symlink or commondir that \
+                 leads outside the scan",
+                builds[*i].path.display()
+            );
+            warnings.push(diag(&why));
+            unresolved.push((*i, why));
+        }
+    }
+    let mut shared: Vec<(usize, usize)> = Vec::new();
+    for list in members.values() {
+        for &a in list {
+            for &b in list {
+                if a != b {
+                    shared.push((a, b));
                 }
             }
         }
     }
+    for (i, t) in &part_links {
+        let owners: Vec<usize> = members
+            .iter()
+            .filter(|(k, _)| t.starts_with(k.as_path()))
+            .flat_map(|(_, l)| l.iter().copied())
+            .filter(|j| j != i)
+            .collect();
+        if owners.is_empty() {
+            let why = format!(
+                "an objects subdirectory of {} is a symlink that leads outside the scan",
+                builds[*i].path.display()
+            );
+            warnings.push(diag(&why));
+            unresolved.push((*i, why));
+        }
+        for j in owners {
+            shared.push((*i, j));
+            shared.push((j, *i));
+        }
+    }
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for (i, c, file) in &alt_entries {
+        match members.get(c) {
+            Some(list) => {
+                for &p in list.iter().filter(|p| **p != *i) {
+                    edges.push((*i, p));
+                }
+            }
+            None => {
+                warnings.push(diag(&format!(
+                    "an entry of the alternates file {file} is not the object directory of any \
+                     repo in the scan ({}); the repo it borrows objects from cannot be identified",
+                    c.display()
+                )));
+                unresolved.push((*i, file.clone()));
+            }
+        }
+    }
+    // A linked worktree keeps its refs in, and borrows objects from, the repo git says it
+    // belongs to.
+    for &(child, parent) in &parent_links {
+        if builds[child].node.class == Class::Worktree {
+            edges.push((child, parent));
+        }
+    }
+    // Chains: a repo also depends on whatever its providers borrow from.
+    let n = builds.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(b, p) in &edges {
+        if !adj[b].contains(&p) {
+            adj[b].push(p);
+        }
+    }
+    let mut chained: Vec<(usize, usize, bool)> = Vec::new(); // (provider, user, direct)
+    for start in 0..n {
+        if adj[start].is_empty() {
+            continue;
+        }
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = adj[start].clone();
+        while let Some(p) = stack.pop() {
+            if seen[p] || p == start {
+                continue;
+            }
+            seen[p] = true;
+            chained.push((p, start, adj[start].contains(&p)));
+            stack.extend(adj[p].iter().copied());
+        }
+    }
+
     for (child, parent) in parent_links {
         if let Some(info) = builds[child].node.repo.as_mut() {
             info.parent_node = Some(parent);
         }
     }
-    for (owner, who) in dependents {
+    let paths: Vec<String> = builds.iter().map(|b| b.node.path.clone()).collect();
+    let mark = |builds: &mut [Build], owner: usize, who: &str, why: &str| {
         if let Some(info) = builds[owner].node.repo.as_mut() {
-            if !info.dependents.contains(&who) {
-                info.dependents.push(who);
+            if !info.dependents.iter().any(|d| d == who) {
+                info.dependents.push(who.to_string());
+                info.notes.push(diag(&format!("no_dependents: {who} {why}")));
             }
             info.facts.no_dependents = Tri::No;
         }
+    };
+    for (a, b) in shared {
+        mark(
+            builds,
+            a,
+            &paths[b],
+            "shares an object directory with this repo, so its commits may live here",
+        );
     }
-    // An unread alternates file may point at any repo in the scan. Every git node other than the
-    // borrower itself loses a `yes` it can no longer prove (a known `no` stays `no`), so none of
-    // them is offered for removal.
+    for (p, user, direct) in chained {
+        let why = if direct {
+            "borrows objects from this repo"
+        } else {
+            "borrows objects from this repo through a chain of alternates"
+        };
+        mark(builds, p, &paths[user], why);
+    }
+
+    // An entry that could not be placed may point at any repo in the scan. Every git node other
+    // than the borrower itself loses a `yes` it can no longer prove (a known `no` stays `no`), so
+    // none of them is offered for removal.
     for (j, b) in builds.iter_mut().enumerate() {
         if !b.node.class.is_git() {
             continue;
@@ -1384,10 +1709,50 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
             if info.facts.no_dependents == Tri::Yes {
                 info.facts.no_dependents = Tri::Unknown;
                 info.notes.push(diag(&format!(
-                    "no_dependents: the alternates file {file} was not read, so a clone in the \
-                     scan may borrow objects from this repo"
+                    "no_dependents: {file} could not be placed on a repo in the scan, so a clone \
+                     in the scan may borrow objects from this repo"
                 )));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod alternates_tests {
+    use super::*;
+
+    #[test]
+    fn plain_quoted_relative_comment_and_blank_entries() {
+        let text = "# c\n\n/abs/path\n../rel\n\"/with space/\\303\\251\"\n";
+        let got = parse_alternates(text);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], Alt::Path(PathBuf::from("/abs/path")));
+        assert_eq!(got[1], Alt::Path(PathBuf::from("../rel")));
+        assert_eq!(got[2], Alt::Path(PathBuf::from("/with space/\u{e9}")));
+    }
+
+    #[test]
+    fn escapes_and_malformed_quoting() {
+        let (b, rest) = unquote_c_style("\"a\\\\b\\\"c\\n\\t\\a\\b\\f\\r\\v\" tail").unwrap();
+        assert_eq!(b, b"a\\b\"c\n\t\x07\x08\x0c\r\x0b".to_vec());
+        assert_eq!(rest, " tail");
+        for bad in [
+            "\"abc",
+            "\"a\\q\"",
+            "\"a\\4\"",
+            "\"a\\30\"",
+            "\"a\\389\"",
+            "\"a\\",
+        ] {
+            assert!(unquote_c_style(bad).is_none(), "{bad}");
+        }
+        assert!(matches!(
+            parse_alternates("\"/x\" trailing\n").as_slice(),
+            [Alt::Bad(_)]
+        ));
+        assert!(matches!(
+            parse_alternates("\"\"\n").as_slice(),
+            [Alt::Bad(_)]
+        ));
     }
 }
