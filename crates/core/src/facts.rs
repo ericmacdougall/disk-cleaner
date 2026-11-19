@@ -820,7 +820,16 @@ pub fn collect_repo_info(
                 for p in regen_paths {
                     let rel = match rel_slash(p, path) {
                         Some(r) => r,
-                        None => continue,
+                        None => {
+                            // Not below the repo as spelled: git cannot be asked about it.
+                            unverified.push((
+                                p.clone(),
+                                "cannot relate this directory to the repository path, so it is \
+                                 not verified to be ignored"
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
                     };
                     // A generated directory is wholly ignored and untracked, so git lists it
                     // as one ignored entry (or inside one). Anything else may hold source.

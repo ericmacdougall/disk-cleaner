@@ -1092,14 +1092,18 @@ fn check_enclosing_repos(
             } else {
                 Class::Repo
             };
-            let check = collect_repo_info(&opts.facts, &repo, class, &paths);
+            // Real paths on both sides, so the artifacts can be related to the repository
+            // however the root was spelled (a symlinked temp or home directory).
+            let real: Vec<PathBuf> = paths.iter().map(|p| canon(p)).collect();
+            let check = collect_repo_info(&opts.facts, &canon(&repo), class, &real);
             why_not.extend(check.unverified_artifacts);
         }
         for (p, why) in why_not {
-            if let Some(b) = builds.iter_mut().find(|b| b.path == p) {
-                b.node.ask_reason.get_or_insert_with(|| {
-                    diag(&format!("{why} ({})", repo.to_string_lossy()))
-                });
+            let hit = builds.iter_mut().find(|b| b.path == p || canon(&b.path) == p);
+            if let Some(b) = hit {
+                b.node
+                    .ask_reason
+                    .get_or_insert_with(|| diag(&format!("{why} ({})", repo.to_string_lossy())));
             }
         }
     }

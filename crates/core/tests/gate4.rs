@@ -11,9 +11,7 @@ use std::path::PathBuf;
 
 /// A repo whose `packages/app` holds a project and a `node_modules` with a dependency file.
 /// Returns (tmp, directory holding the repo, the repo, the app).
-fn enclosing_repo_fixture(
-    track_deps: bool,
-) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+fn enclosing_repo_fixture(track_deps: bool) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let (tmp, root, _remotes) = workspace();
     let repo = root.join("repo");
     init_repo(&repo);
@@ -73,10 +71,7 @@ fn k1_the_scan_records_that_the_root_is_inside_a_repo_it_did_not_cover() {
     let text = list[0].to_string();
     assert!(text.contains(&repo.file_name().unwrap().to_string_lossy().into_owned()));
     // The enclosing repo itself never gets a plan item.
-    let p = disk_cleaner_core::plan(
-        &sub,
-        &disk_cleaner_core::PlanOptions::new(7, far_future()),
-    );
+    let p = disk_cleaner_core::plan(&sub, &disk_cleaner_core::PlanOptions::new(7, far_future()));
     assert!(p.items.iter().all(|i| !i.class.is_git()));
 }
 
@@ -136,7 +131,11 @@ fn k2_a_project_whose_dot_git_is_a_symlink_is_not_plain_loose_code() {
     assert!(!action_for(&res, &proj).removes());
     // No git was run through the symlink: its facts are unknown, with a note.
     let n = node(&res, &proj);
-    let notes = n.repo.as_ref().map(|r| r.notes.join(" ")).unwrap_or_default();
+    let notes = n
+        .repo
+        .as_ref()
+        .map(|r| r.notes.join(" "))
+        .unwrap_or_default();
     assert!(notes.contains(".git"), "{notes}");
 }
 
