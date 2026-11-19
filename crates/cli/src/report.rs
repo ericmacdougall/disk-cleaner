@@ -262,7 +262,7 @@ pub fn plan_summary(p: &Plan) -> String {
             o,
             "Before a repository is removed, its own git files are saved with the manifest (the \
              manifest is the restore record a later apply step writes), and its object store is \
-             verified against the remote or saved too."
+             backed up too."
         );
     }
     let _ = writeln!(
@@ -315,14 +315,9 @@ pub fn plan_summary(p: &Plan) -> String {
             let s = &pre.object_store;
             let _ = writeln!(
                 o,
-                "      object store: {} ({}), {}",
+                "      object store: {} ({}) of object data, to be backed up before removal",
                 count(s.files, "file", "files"),
-                human_bytes(s.bytes),
-                if s.verified {
-                    "verified by this scan; apply re-checks it against the remote"
-                } else {
-                    "not yet verified: verify against the remote or save before removing"
-                }
+                human_bytes(s.bytes)
             );
         }
     }

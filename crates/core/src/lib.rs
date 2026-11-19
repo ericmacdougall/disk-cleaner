@@ -69,9 +69,51 @@ pub fn scan_from_json(text: &str) -> Result<ScanResult> {
             expected: SCHEMA_VERSION,
         });
     }
+    refuse_verification_claims(&value)?;
     let scan: ScanResult = serde_json::from_value(value)?;
     validate_scan(&scan)?;
     Ok(scan)
+}
+
+/// Field names a repository block, its `object_store` or its `git_admin` may not carry. This
+/// format defines no verification of object data (every object-store file is to be backed up
+/// before removal), so a claim of one, from an earlier build or written by hand, is refused as
+/// an invalid scan file, never trusted and never silently dropped. Any other name containing
+/// `verif` is refused the same way.
+const VERIFICATION_FIELDS: [&str; 4] = ["verified", "checked", "verification", "verify_objects"];
+
+fn refuse_verification_claims(value: &serde_json::Value) -> Result<()> {
+    let Some(nodes) = value.get("nodes").and_then(|n| n.as_array()) else {
+        return Ok(());
+    };
+    for (i, node) in nodes.iter().enumerate() {
+        let Some(repo) = node.get("repo").and_then(|r| r.as_object()) else {
+            continue;
+        };
+        let inner = |name: &str| repo.get(name).and_then(|b| b.as_object());
+        let blocks = [
+            ("", Some(repo)),
+            ("object_store.", inner("object_store")),
+            ("git_admin.", inner("git_admin")),
+        ];
+        for (prefix, block) in blocks {
+            let Some(block) = block else {
+                continue;
+            };
+            let claim = block
+                .keys()
+                .find(|k| VERIFICATION_FIELDS.contains(&k.as_str()) || k.contains("verif"));
+            if let Some(key) = claim {
+                return Err(invalid(
+                    format!("nodes[{i}].repo.{prefix}{key}"),
+                    "this scan format defines no verification of object data: every \
+                     object-store file is to be backed up before removal, so a scan file that \
+                     claims a verification is not accepted",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Sum `values` with checked arithmetic.

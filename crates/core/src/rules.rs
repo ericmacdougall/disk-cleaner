@@ -19,7 +19,10 @@ pub struct Rule {
     pub markers: Vec<String>,
     /// `regenerable` or `cache`.
     pub class: Class,
-    /// Search this directory for output files before offering it for removal.
+    /// A build-output directory: output files of any size anywhere in it are listed (and make
+    /// it ask). Every artifact asks for a listed output whatever this says; without it, an output
+    /// is listed when it is at least the scan's output threshold or directly in the directory.
+    /// It also makes the directory ask when it sits in loose code with no git history.
     #[serde(default)]
     pub scan_outputs: bool,
     /// One line description.
@@ -297,6 +300,14 @@ impl RuleSet {
                 .unwrap_or(false),
             _ => false,
         })
+    }
+
+    /// Is `dir`'s own name the last component of some artifact rule's name? A cheap superset
+    /// test for "directly in an artifact's top directory", used before the owner is known.
+    pub fn is_artifact_dir_name(&self, dir: &Path) -> bool {
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| self.by_last.contains_key(n))
     }
 }
 

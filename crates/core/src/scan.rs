@@ -401,8 +401,12 @@ impl Walk {
         if is_output {
             self.totals.output_bytes += alloc;
             // Listing candidates: big ones anywhere, any size inside a build-directory
-            // candidate. The owner is only known after classification, which filters again.
-            if alloc >= opts.min_output_bytes || rules.in_output_scan_candidate(entry.parent_path())
+            // candidate or directly in a directory named like an artifact. The owner is only
+            // known after classification, which filters again.
+            let parent = entry.parent_path();
+            if alloc >= opts.min_output_bytes
+                || rules.in_output_scan_candidate(parent)
+                || rules.is_artifact_dir_name(parent)
             {
                 self.outputs_raw.push((path.clone(), alloc));
             }
@@ -1172,13 +1176,20 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     let mut outputs: Vec<OutputFile> = Vec::new();
     for (path, bytes) in outputs_raw {
         let owner = path.parent().and_then(&owner_of);
-        let in_build_dir = owner.map(|o| builds[o].scan_outputs).unwrap_or(false);
-        if in_build_dir {
-            if let Some(o) = owner {
+        // Nothing inside an artifact becomes a node, so its owner is the artifact itself.
+        let artifact = owner.filter(|&o| builds[o].node.class.is_artifact());
+        // Listed: any size inside a build-output directory (`scan_outputs`) or directly in any
+        // artifact's top directory (package managers put no such file there), and anywhere at
+        // least the output threshold.
+        let in_build_dir = artifact.is_some_and(|o| builds[o].scan_outputs);
+        let at_top = artifact.is_some_and(|o| path.parent() == Some(builds[o].path.as_path()));
+        if in_build_dir || at_top || bytes >= opts.min_output_bytes {
+            // Every listed output makes the artifact holding it ask, whatever its rule: a rule
+            // says what is regenerable, never that an output file is. No installed-package
+            // exemption is made here.
+            if let Some(o) = artifact {
                 builds[o].node.contains_outputs = true;
             }
-        }
-        if in_build_dir || bytes >= opts.min_output_bytes {
             outputs.push(OutputFile {
                 path: path.to_string_lossy().into_owned(),
                 bytes,

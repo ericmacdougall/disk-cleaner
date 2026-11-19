@@ -41,8 +41,6 @@ pub struct Config {
     /// Most allocated bytes of its own files (everything but object files) one git directory may
     /// hold and still be removed after a backup; more asks.
     pub max_git_admin_bytes: u64,
-    /// Have `scan` verify each repository's object store with git (as `--verify-objects`).
-    pub verify_objects: bool,
 }
 
 impl Default for Config {
@@ -52,13 +50,15 @@ impl Default for Config {
             trust_partial_process_check: false,
             accept_incomplete_coverage: false,
             max_git_admin_bytes: DEFAULT_MAX_GIT_ADMIN_BYTES,
-            verify_objects: false,
         }
     }
 }
 
 /// The key an earlier version used for the opposite opt-in (strict coverage, now the default).
 const RETIRED_COVERAGE_KEY: &str = "require_full_coverage";
+/// The key an earlier build used to have `scan` verify object stores with git. There is no
+/// verification of object data any more: every object-store file is to be backed up.
+const RETIRED_VERIFY_KEY: &str = "verify_objects";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,9 +67,10 @@ struct RawConfig {
     trust_partial_process_check: Option<bool>,
     accept_incomplete_coverage: Option<bool>,
     max_git_admin_bytes: Option<u64>,
-    verify_objects: Option<bool>,
     /// Read only to refuse it with a message naming its replacement, whatever its value.
     require_full_coverage: Option<toml::Value>,
+    /// Read only to refuse it with a message saying why, whatever its value.
+    verify_objects: Option<toml::Value>,
 }
 
 /// `<platform config dir>/disk-cleaner/config.toml`, if the platform config dir can be found.
@@ -105,6 +106,16 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
             ),
         });
     }
+    if raw.verify_objects.is_some() {
+        return Err(Error::Config {
+            path: origin.to_path_buf(),
+            message: format!(
+                "{RETIRED_VERIFY_KEY} is no longer a setting: this tool defines no verification \
+                 of object data, and every object-store file is to be backed up before a \
+                 repository is removed; remove the key"
+            ),
+        });
+    }
     Ok(Config {
         active_window_days: raw.active_window_days.unwrap_or(DEFAULT_ACTIVE_WINDOW_DAYS),
         trust_partial_process_check: raw.trust_partial_process_check.unwrap_or(false),
@@ -112,7 +123,6 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
         max_git_admin_bytes: raw
             .max_git_admin_bytes
             .unwrap_or(DEFAULT_MAX_GIT_ADMIN_BYTES),
-        verify_objects: raw.verify_objects.unwrap_or(false),
     })
 }
 

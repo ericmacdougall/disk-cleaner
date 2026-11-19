@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -185,8 +185,10 @@ pub struct RepoSizes {
     pub output: u64,
 }
 
-/// Git-derived information about a repo, worktree or bare repo.
+/// Git-derived information about a repo, worktree or bare repo. A field this build does not
+/// know is refused when a scan file is read (see [`crate::scan_from_json`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoInfo {
     pub facts: Facts,
     /// The first layout check that failed or could not be made, when `plain_layout` is not
@@ -260,9 +262,9 @@ pub struct RepoInfo {
     /// node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_admin: Option<GitAdminSurvey>,
-    /// The object store's files, which a removal must verify against the remote or back up
-    /// first (see [`crate::preserve`]). `None` when they were not counted: the plan then never
-    /// removes the node.
+    /// The object store's files, which a removal must back up first too (see
+    /// [`crate::preserve`]; this format defines no verification of object data). `None` when
+    /// they were not counted: the plan then never removes the node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_store: Option<ObjectStoreSurvey>,
     pub sizes: RepoSizes,
@@ -270,26 +272,22 @@ pub struct RepoInfo {
 
 /// What [`crate::preserve::survey`] counted of one git directory's object store: the files in
 /// `objects/` whose names are those of object-store files (loose objects, packs and their
-/// indexes and sidecars, multi-pack-indexes, commit-graphs).
+/// indexes and sidecars, multi-pack-indexes, commit-graphs). All of them are to be backed up
+/// before a removal: there is no verification field, and a scan file that carries one is
+/// refused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectStoreSurvey {
     /// How many files.
     pub files: u64,
     /// Their allocated bytes.
     pub bytes: u64,
-    /// True only when the scan ran git's own verification of the whole store
-    /// (`scan --verify-objects`) and it accounted for every one of these files.
-    pub verified: bool,
-    /// The scan ran git's verification (`scan --verify-objects`), whatever it found. The kinds
-    /// git never reads (`crate::preserve::unread_by_git`) are then counted with the git
-    /// directory's own files, and `git_admin_files` lists them there.
-    #[serde(default)]
-    pub checked: bool,
 }
 
 /// What [`crate::preserve::survey`] counted of one git directory's own files: everything in it
 /// that is not an object file of its object store.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitAdminSurvey {
     /// How many files (regular files, symlinks and other non-directory entries).
     pub files: u64,

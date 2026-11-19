@@ -1428,7 +1428,10 @@ fn r15_object_data_is_backed_up_and_no_verification_is_accepted() {
         &home,
         &["--now", &now, "--config", cfg.to_str().unwrap()],
     );
-    assert!(!o.status.success(), "a config with verify_objects was accepted");
+    assert!(
+        !o.status.success(),
+        "a config with verify_objects was accepted"
+    );
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("verify_objects"), "{err}");
 

@@ -286,7 +286,6 @@ fn saved_repo(path: &str) -> disk_cleaner_core::Node {
         object_store: Some(disk_cleaner_core::ObjectStoreSurvey {
             files: 3,
             bytes: 12_288,
-            ..Default::default()
         }),
         ..RepoInfo::default()
     });

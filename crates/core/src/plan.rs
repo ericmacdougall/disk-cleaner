@@ -22,10 +22,11 @@ pub enum Action {
     /// Delete a regenerable or cache directory.
     RemoveRegenerable,
     /// A git node with unsaved work: save it to recovery refs or a bundle, re-check, back up
-    /// the git directory's own files ([`PlanItem::preserve`]), verify that backup, then remove.
+    /// the git directory's own files and its object store ([`PlanItem::preserve`]), verify that
+    /// backup, then remove.
     RecoverBackupThenRemove,
     /// A git node whose commits are all on a network remote: back up the git directory's own
-    /// files ([`PlanItem::preserve`]), verify that backup, then remove.
+    /// files and its object store ([`PlanItem::preserve`]), verify that backup, then remove.
     BackupThenRemove,
     /// A person decides.
     Ask,
@@ -115,19 +116,18 @@ pub struct Preserve {
     pub object_store: PreserveObjectStore,
 }
 
-/// The git directories' object-store files (see [`crate::preserve`]). They are not copied by
-/// default, as they can be very large; a consumer that applies a plan must refuse to remove the
-/// item unless each of them is either verified as git data whose objects are all on the
-/// re-verified remote, or backed up like [`PreserveGitAdmin`].
+/// The git directories' object-store files: the object data (see [`crate::preserve`]). They are
+/// counted apart from [`PreserveGitAdmin`] because they can be very large, but the obligation is
+/// the same: a consumer that applies a plan must refuse to remove the item unless a verified
+/// backup of all of them exists. This format defines no verification of object data that could
+/// stand in for that backup.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreserveObjectStore {
     /// How many files, summed over the item's git directories.
     pub files: u64,
     /// Their allocated bytes.
     pub bytes: u64,
-    /// True only when the scan verified every one of these stores with git
-    /// (`scan --verify-objects`) and the item's facts say every ref is on a network remote.
-    pub verified: bool,
 }
 
 /// The git directories' own files: everything in each git directory that is not an object file
@@ -684,10 +684,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         }
         let why = match preserve_for(scan, &children, it.node) {
             Ok(None) => continue,
-            Ok(Some(mut pre)) if it.class.is_git() => {
-                // Verified only when the scan verified the stores and every fact is yes: a
-                // recovery changes the refs first, so its store is checked after it.
-                pre.object_store.verified &= it.action == Action::BackupThenRemove;
+            Ok(Some(pre)) if it.class.is_git() => {
                 let g = &pre.git_admin;
                 let s = &pre.object_store;
                 let inside = g.git_dirs.len().saturating_sub(1) as u64;
@@ -699,15 +696,10 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 } else {
                     String::new()
                 };
-                let state = if s.verified {
-                    "verified by this scan"
-                } else {
-                    "not yet verified"
-                };
                 it.reason = format!(
                     "{}; its {} ({}{also}: settings, hooks, logs and the like) {} saved with the \
-                     manifest first; its object store ({}, {}) must be verified against the \
-                     remote or saved too ({state}), then it is removed",
+                     manifest first; its object store ({}, {}) holds object data that must be \
+                     backed up too before removal, then it is removed",
                     it.reason,
                     count(g.files, "local git file", "local git files"),
                     kib(g.bytes),
@@ -1084,7 +1076,7 @@ fn preserve_veto(node: &Node, max: u64) -> Option<String> {
     {
         return Some(
             "its object store's files were not counted (see the notes), so they could not be \
-             verified or backed up first"
+             backed up first"
                 .to_string(),
         );
     }
@@ -1110,10 +1102,9 @@ fn preserve_veto(node: &Node, max: u64) -> Option<String> {
 /// large file kept inside `.git` (possible when `max_git_admin_bytes` is raised) is visible.
 const LARGE_PRESERVED: u64 = 1024 * 1024;
 
-/// What removing `idx` must back up, or verify, first: the own files and the object store of
-/// every git directory it removes (its own and those of git nodes inside it). The object store
-/// counts as verified only when the scan verified every one of them; the caller also requires
-/// the item's facts. `Err` names a git node inside it whose files were not counted.
+/// What removing `idx` must back up first: the own files and the object store of every git
+/// directory it removes (its own and those of git nodes inside it). `Err` names a git node inside
+/// it whose files were not counted.
 fn preserve_for(
     scan: &ScanResult,
     children: &[Vec<usize>],
@@ -1133,10 +1124,7 @@ fn preserve_for(
     }
     found.sort_unstable();
     let mut out = PreserveGitAdmin::default();
-    let mut store = PreserveObjectStore {
-        verified: true,
-        ..PreserveObjectStore::default()
-    };
+    let mut store = PreserveObjectStore::default();
     let mut examples: Vec<String> = Vec::new();
     let mut large: Vec<(u64, String)> = Vec::new();
     for i in found {
@@ -1148,7 +1136,6 @@ fn preserve_for(
             .ok_or_else(|| n.path.clone())?;
         store.files = store.files.saturating_add(s.files);
         store.bytes = store.bytes.saturating_add(s.bytes);
-        store.verified &= s.verified;
         let gd = if n.class == Class::BareRepo {
             PathBuf::from(&n.path)
         } else {
@@ -1289,13 +1276,30 @@ fn decide(
         Class::Regenerable | Class::Cache => {
             let what = node.rule.as_deref().unwrap_or("artifact");
             if node.contains_outputs {
-                let n = scan.outputs.iter().filter(|o| o.node == Some(idx)).count();
-                let n = n as u64;
+                // Named relative to the directory, so a person can find them.
+                let files: Vec<String> = scan
+                    .outputs
+                    .iter()
+                    .filter(|o| o.node == Some(idx))
+                    .map(|o| {
+                        Path::new(&o.path)
+                            .strip_prefix(&node.path)
+                            .map(|r| r.to_string_lossy().replace('\\', "/"))
+                            .unwrap_or_else(|_| o.path.clone())
+                    })
+                    .collect();
+                let n = files.len() as u64;
+                let named = if files.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", some_of(&files, 3))
+                };
                 return (
                     Action::Ask,
                     format!(
-                        "{what} directory holds {} (video, archive, model...) that {} not \
-                         regenerable; not offered for removal until {} backed up or moved",
+                        "{what} directory holds {} (video, archive, model, dataset...) that {} \
+                         not regenerable{named}; not offered for removal until {} backed up or \
+                         moved",
                         count(n, "output file", "output files"),
                         agree(n, "is", "are"),
                         agree(n, "it is", "they are")

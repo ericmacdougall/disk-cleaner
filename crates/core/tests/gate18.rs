@@ -143,7 +143,10 @@ fn f2_an_output_above_the_threshold_makes_any_artifact_ask_and_names_it() {
 
     let rs = project(&root, "rs", "Cargo.toml");
     let target = rs.join("target");
-    write(&target.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172789f06886806bc55\n");
+    write(
+        &target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    );
     let target_out = target.join("release").join("model.onnx");
     write_bytes(&target_out, BIG);
 
@@ -317,7 +320,10 @@ fn forged_a_scan_file_that_claims_a_verification_is_refused() {
         target[key] = val.clone();
         match scan_from_json(&m.to_string()) {
             Err(Error::InvalidScan { field, message }) => {
-                assert!(field.contains(key), "{block}.{key}={val}: {field}: {message}");
+                assert!(
+                    field.contains(key),
+                    "{block}.{key}={val}: {field}: {message}"
+                );
             }
             other => panic!("{block}.{key}={val} accepted or wrong error: {other:?}"),
         }
@@ -334,7 +340,10 @@ fn forged_the_plan_carries_no_verification_field() {
     let it = item(&p, &repo);
     assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
     let pre = serde_json::to_value(it.preserve.as_ref().unwrap()).unwrap();
-    assert!(pre["object_store"]["files"].as_u64().unwrap_or(0) > 0, "{pre}");
+    assert!(
+        pre["object_store"]["files"].as_u64().unwrap_or(0) > 0,
+        "{pre}"
+    );
     assert!(pre["object_store"].get("verified").is_none(), "{pre}");
     assert!(
         it.reason
@@ -342,7 +351,11 @@ fn forged_the_plan_carries_no_verification_field() {
         "{}",
         it.reason
     );
-    for gone in ["verified by this scan", "not yet verified", "verified against the remote"] {
+    for gone in [
+        "verified by this scan",
+        "not yet verified",
+        "verified against the remote",
+    ] {
         assert!(!it.reason.contains(gone), "{gone:?} in {}", it.reason);
     }
 }

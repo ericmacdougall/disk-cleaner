@@ -19,9 +19,6 @@ pub type NetworkPredicate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct FactsConfig {
     pub git: Git,
     pub is_network: NetworkPredicate,
-    /// Verify each repository's object store with git (`scan --verify-objects`): slow, and off
-    /// by default; without it every object store is recorded as not verified.
-    pub verify_objects: bool,
 }
 
 impl Default for FactsConfig {
@@ -29,7 +26,6 @@ impl Default for FactsConfig {
         FactsConfig {
             git: Git::default(),
             is_network: Arc::new(is_network_url),
-            verify_objects: false,
         }
     }
 }
@@ -38,12 +34,6 @@ impl FactsConfig {
     /// Use a different git binary or timeout.
     pub fn with_git(mut self, git: Git) -> Self {
         self.git = git;
-        self
-    }
-
-    /// Verify object stores with git (see [`FactsConfig::verify_objects`]).
-    pub fn with_verify_objects(mut self, on: bool) -> Self {
-        self.verify_objects = on;
         self
     }
 
@@ -1993,13 +1983,10 @@ pub fn collect_repo_info(
         }
     };
 
-    // The two obligations of a removal (`crate::preserve`): the git directory's own files, always
-    // backed up, and the object store's files, verified against the remote or backed up. The
-    // classes go by name; with `verify_objects` git checks the store, and a file git does not
-    // account for is the repository's own content, named like the others above.
+    // The two backup obligations of a removal (`crate::preserve`): the git directory's own files
+    // and the object store's files. The classes go by name; nothing is verified.
     if let Some(gd) = own_git_dir.as_deref() {
-        let verify_with = cfg.verify_objects.then_some((git, path));
-        match crate::preserve::survey(gd, verify_with) {
+        match crate::preserve::survey(gd) {
             Ok(found) => {
                 let mut own_content: Vec<String> = Vec::new();
                 if !found.not_objects.is_empty() {
@@ -2010,28 +1997,6 @@ pub fn collect_repo_info(
                         crate::words::some_of(&shown, 5)
                     ));
                     own_content.extend(shown);
-                }
-                if let Some(v) = &found.verification {
-                    if !v.unaccounted.is_empty() {
-                        let shown: Vec<String> = v.unaccounted.iter().map(|n| diag(n)).collect();
-                        notes.push(format!(
-                            "no_local_admin_content: git does not account for these files of \
-                             the object store, so they are the repository's own: {}",
-                            crate::words::some_of(&shown, 5)
-                        ));
-                        own_content.extend(shown);
-                    }
-                    if let Some(d) = &v.damaged {
-                        let d = diag(d);
-                        notes.push(format!(
-                            "no_local_admin_content: git found a problem in the object store: \
-                             {d}"
-                        ));
-                        own_content.push(format!("objects (git found a problem: {d})"));
-                    }
-                    for why in &v.unverified {
-                        notes.push(format!("object store not verified: {}", diag(why)));
-                    }
                 }
                 if !own_content.is_empty() {
                     let mut all = info.local_admin_content.clone();

@@ -49,6 +49,8 @@ Rules that follow from the principles:
 
 - A build directory (`dist`, `build`, `out`, `target`) is regenerable only inside a project, and is
   scanned for `output` files first. A rendered video inside `out/` is an output, not an artifact.
+  The same holds for every artifact: a model above the output threshold in `.venv` or
+  `node_modules` makes it ask, naming the file.
 - Artifact rules are data (a rules file), not code, so the community can extend them. Each rule
   names the marker that proves the project type (for example `Cargo.toml` next to `target`).
 
@@ -95,19 +97,14 @@ splits every file of the git directory, by name alone, into exactly one of two o
   (saved with the manifest, the restore record an apply step writes, and read back) before
   anything is removed;
 - `preserve.object_store`, files under `objects/` named like loose objects, packs and their
-  indexes and sidecars, multi-pack-indexes and commit-graphs: each must be either fully verified
-  as git data whose objects are all on the re-verified remote, or backed up like the first class.
+  indexes and sidecars, multi-pack-indexes and commit-graphs: the object data, backed up too
+  before anything is removed. It is counted apart only because it can be large.
 
-No file is exempt because its first bytes look right: earlier versions tried that and a file with a
-valid header and someone's notes after it slipped through. The plan records
-`preserve.object_store.verified`, which is `true` only when `scan --verify-objects` had git itself
-(`verify-pack`, `multi-pack-index verify`, `commit-graph verify`, `fsck --full --strict`) verify the
-whole store and account for every file of the class; a file git does not account for moves to the
-first class and the repository asks. Only a file whose whole content a git command validated
-(checksum or complete parse) can count as verified, so the derived files no git command reads (a
-cruft pack's `.mtimes`, a multi-pack-index's `.rev`, incremental multi-pack-index layers) are
-backed up with the first class whenever the scan verified the store. Even then the apply step re-verifies against the remote. A git
-directory whose own files exceed `max_git_admin_bytes` (64 MiB by default) asks instead, because that
+No file is exempt because of its name, its first bytes or any check this tool runs: earlier
+versions tried content checks, then an opt-in git verification of the object store, and review
+showed each could pass a file holding someone's notes. This phase defines no verification of
+object data; a later apply phase may define one against the live remote, and `plan` refuses a scan
+file that claims one. A git directory whose own files exceed `max_git_admin_bytes` (64 MiB by default) asks instead, because that
 much is the user's data, not git's settings. No apply phase exists yet; the rule is part of the plan format
 (docs/SCAN-FORMAT.md, "The preserve obligation"), which also lists the existing asks the backup
 makes redundant and keeps them for now.
