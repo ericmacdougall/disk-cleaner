@@ -968,6 +968,16 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         &mut odd_dirs,
         &mut hidden,
     );
+    if roots.len() > 1 && !plan_r.unresolved.is_empty() {
+        for (r, err) in &plan_r.unresolved {
+            warnings.push(diag(&format!(
+                "scan root {} could not be resolved to its real path ({err}); every artifact \
+                 and repository asks, because the scan cannot tell which of them contain it",
+                r.display()
+            )));
+        }
+        ask_for_unresolved_roots(&mut builds, &plan_r.unresolved);
+    }
 
     // Attribute directory aggregates to their owners.
     let mut other_bytes: u64 = 0;
@@ -1221,7 +1231,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
 
     // Scan roots inside a repository the scan does not cover: the artifacts there are checked
     // against that repository's git, exactly as a full-repo scan would.
-    let enclosing_repos = check_enclosing_repos(&mut builds, &roots, opts);
+    let enclosing_repos = check_enclosing_repos(&mut builds, &roots, &plan_r.canon, opts);
 
     // Totals by class.
     for b in &builds {
@@ -1295,6 +1305,7 @@ enum GitEntry {
 fn check_enclosing_repos(
     builds: &mut [Build],
     roots: &[PathBuf],
+    canon_roots: &[PathBuf],
     opts: &ScanOptions,
 ) -> Vec<EnclosingRepo> {
     let mut out: Vec<EnclosingRepo> = Vec::new();
@@ -1304,8 +1315,9 @@ fn check_enclosing_repos(
             Some(x) => x,
             None => continue,
         };
-        // A repository inside another scan root is walked and is a node there.
-        if roots.iter().any(|r| repo.starts_with(r)) {
+        // A repository inside another scan root is walked and is a node there. `repo` is usually
+        // a real path, so the roots are compared by their real paths too.
+        if roots.iter().chain(canon_roots).any(|r| repo.starts_with(r)) {
             continue;
         }
         out.push(EnclosingRepo {
@@ -1489,6 +1501,9 @@ struct RootPlan {
     prune: Vec<HashMap<PathBuf, usize>>,
     /// Indexes into `roots`, enclosing roots first.
     walk_order: Vec<usize>,
+    /// Walked roots whose real path could not be established, with the error: which directories
+    /// of the other walks enclose them is unknown.
+    unresolved: Vec<(PathBuf, String)>,
 }
 
 /// Normalise the scan roots. Each is compared by its real path: a root that is the same directory
@@ -1497,12 +1512,26 @@ struct RootPlan {
 /// `--one-file-system`, is on that root's device), with a warning either way. A nested root the
 /// enclosing walk would not reach (another file system, an unlistable directory on the way) is
 /// kept and walked on its own, and the enclosing walk stops at it, so nothing is counted twice and
-/// it is not reported as a skipped mount point. The walk keeps the spelling the user gave, so
-/// reported paths do not change.
+/// it is not reported as a skipped mount point.
+///
+/// Ownership follows real paths, but classification follows the walked paths, so a kept nested
+/// root is walked under the spelling of the closest root that encloses it (that root's spelling
+/// plus the real path below it), with a warning when this differs from what the user gave: a
+/// repository on a mount under `node_modules` then belongs to that `node_modules` however the
+/// mount was spelled. Every other root keeps the spelling the user gave.
 fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -> RootPlan {
     let mut uniq: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut unresolved: Vec<(PathBuf, String)> = Vec::new();
     for s in spelled {
-        let c = canon(&s);
+        let c = match std::fs::canonicalize(&s) {
+            Ok(c) => c,
+            Err(e) => {
+                if !unresolved.iter().any(|(u, _)| *u == s) {
+                    unresolved.push((s.clone(), e.to_string()));
+                }
+                s.clone()
+            }
+        };
         if let Some((first, _)) = uniq.iter().find(|(_, k)| *k == c) {
             if *first != s {
                 warnings.push(diag(&format!(
@@ -1537,6 +1566,26 @@ fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -
             continue;
         }
         kept[i] = true;
+        // Enclosing roots were decided first (shallower), so their spellings are final.
+        let closest = enclosing
+            .iter()
+            .copied()
+            .max_by_key(|&k| uniq[k].1.components().count());
+        if let Some(k) = closest {
+            if let Ok(rel) = c.strip_prefix(&uniq[k].1) {
+                let at = uniq[k].0.join(rel);
+                if at != uniq[i].0 {
+                    warnings.push(diag(&format!(
+                        "scan root {} is the directory {} inside scan root {}, and is reported \
+                         under that path",
+                        uniq[i].0.display(),
+                        at.display(),
+                        uniq[k].0.display()
+                    )));
+                    uniq[i].0 = at;
+                }
+            }
+        }
         for k in enclosing {
             if let Ok(rel) = c.strip_prefix(&uniq[k].1) {
                 let at = uniq[k].0.join(rel);
@@ -1563,6 +1612,30 @@ fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -
             .filter(|&&i| kept[i])
             .map(|&i| pos(i))
             .collect(),
+        unresolved,
+    }
+}
+
+/// When a scan root's real path could not be established and other roots were walked too, any
+/// directory of the scan may physically enclose it (through a symlink in its spelling), so every
+/// artifact and repository asks: removing one could remove what that root holds.
+fn ask_for_unresolved_roots(builds: &mut [Build], unresolved: &[(PathBuf, String)]) {
+    let Some((root, err)) = unresolved.first() else {
+        return;
+    };
+    let more = match unresolved.len() {
+        1 => String::new(),
+        n => format!(" (and {} more)", n - 1),
+    };
+    let why = diag(&format!(
+        "scan root {}{more} could not be resolved to its real path ({err}), so whether it lies \
+         inside this directory is unknown; scan it on its own",
+        root.display()
+    ));
+    for b in builds.iter_mut() {
+        if b.node.class.is_artifact() || b.node.class.is_git() {
+            b.node.ask_reason.get_or_insert_with(|| why.clone());
+        }
     }
 }
 

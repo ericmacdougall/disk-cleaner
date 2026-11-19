@@ -199,6 +199,7 @@ fn printed_path(git: &Git, path: &Path, args: &[&str], what: &str) -> Result<Pat
 }
 
 /// What an entry is, by `lstat`: never followed.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Lk {
     Missing,
     Dir,
@@ -363,6 +364,29 @@ fn shape(path: &Path, class: Class) -> Shape {
             }
         }
     }
+    // A positive model of the top level: every entry is known, or a pseudoref whose commit is
+    // checked later. Anything else may keep data where this tool does not look.
+    match top_level(&gd) {
+        Ok(top) if !top.unknown.is_empty() => {
+            let n = top.unknown.len();
+            let shown_names: Vec<&str> = top.unknown.iter().take(5).map(|s| s.as_str()).collect();
+            let more = if n > 5 {
+                format!(" and {} more", n - 5)
+            } else {
+                String::new()
+            };
+            no_soft!(
+                "the git directory holds {} this tool does not know ({}{more}), which may keep \
+                 data where it does not look",
+                if n == 1 { "an entry" } else { "entries" },
+                shown_names.join(", ")
+            );
+        }
+        Ok(_) => {}
+        Err(why) => {
+            unknown.get_or_insert(why);
+        }
+    }
     match unknown {
         Some(why) => Shape::Unknown(why),
         None => Shape::Fine,
@@ -466,6 +490,264 @@ const IN_PROGRESS: [&str; 9] = [
 /// Directories of the shared git directory that hold content not recorded in any ref: Git LFS
 /// objects and git-annex content that may never have been uploaded.
 const LOCAL_CONTENT: [&str; 2] = ["lfs/objects", "annex/objects"];
+
+/// Entries at the top of a git directory that are known not to hold history of their own, with
+/// the kind each must be (`None`: any kind). Everything else there is either a pseudoref, whose
+/// commit is checked ([`pseudoref_check`]), or unknown, which makes the layout not plain.
+///
+/// - `HEAD`, `config`, `refs`, `objects`, `worktrees`, `modules`: checked by [`shape`] and the
+///   ref and object checks. `packed-refs` holds refs, which `for-each-ref` and `rev-list` read;
+///   `logs` holds the reflogs, which `reflog_saved` reads; `index` holds staged content, which
+///   `status` (`tree_clean`) reports.
+/// - `config.worktree`, `description`, `hooks`, `info`, `branches`, `remotes`: settings, scripts
+///   and exclude patterns, no objects (`info/grafts` and `info/alternates` are refused by
+///   [`shape`]).
+/// - `shallow`: the ids of the commits where a shallow clone's history was cut, which came from
+///   the remote.
+/// - `COMMIT_EDITMSG`, `TAG_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG`, `MERGE_MODE`, `MERGE_RR`: message
+///   and merge-mode text; a squash merge's changes are in the index and working tree, which
+///   `tree_clean` covers. `rr-cache`: recorded conflict resolutions, which can be derived again.
+/// - `gitk.cache`, `gc.log`, `gc.pid`, `fsmonitor--daemon`, `fsmonitor--daemon.ipc`, and the
+///   split index's `sharedindex.*` files: caches, logs, a lock-holder's pid, the file-system
+///   monitor's socket and cookies, and part of the index. None keeps an object alive.
+/// - `lfs`: its `objects` are checked by [`pending_state`]; the rest is a download cache.
+/// - The names of [`IN_PROGRESS`]: an unfinished operation, which [`pending_state`] reports.
+///
+/// `FETCH_HEAD` is not here: the commits it names were fetched, but from a remote this tool may
+/// not count as saved (a local path), so they are checked like any pseudoref.
+const TOP_LEVEL_KNOWN: [(&str, Option<Lk>); 29] = [
+    ("HEAD", Some(Lk::File)),
+    ("config", Some(Lk::File)),
+    ("config.worktree", Some(Lk::File)),
+    ("description", Some(Lk::File)),
+    ("index", Some(Lk::File)),
+    ("packed-refs", Some(Lk::File)),
+    ("shallow", Some(Lk::File)),
+    ("COMMIT_EDITMSG", Some(Lk::File)),
+    ("TAG_EDITMSG", Some(Lk::File)),
+    ("MERGE_MSG", Some(Lk::File)),
+    ("SQUASH_MSG", Some(Lk::File)),
+    ("MERGE_MODE", Some(Lk::File)),
+    ("MERGE_RR", Some(Lk::File)),
+    ("gitk.cache", Some(Lk::File)),
+    ("gc.log", Some(Lk::File)),
+    ("gc.pid", Some(Lk::File)),
+    ("fsmonitor--daemon.ipc", None),
+    ("fsmonitor--daemon", Some(Lk::Dir)),
+    ("hooks", Some(Lk::Dir)),
+    ("info", Some(Lk::Dir)),
+    ("logs", Some(Lk::Dir)),
+    ("objects", Some(Lk::Dir)),
+    ("refs", Some(Lk::Dir)),
+    ("branches", Some(Lk::Dir)),
+    ("remotes", Some(Lk::Dir)),
+    ("rr-cache", Some(Lk::Dir)),
+    ("lfs", Some(Lk::Dir)),
+    ("worktrees", Some(Lk::Dir)),
+    ("modules", Some(Lk::Dir)),
+];
+
+/// Most bytes read from one pseudoref: git writes one line (or, for `FETCH_HEAD`, one line per
+/// fetched ref), so anything longer is not a pseudoref this tool understands.
+const MAX_PSEUDOREF_BYTES: u64 = 64 * 1024;
+
+/// What a pseudoref file holds.
+#[derive(Debug, PartialEq, Eq)]
+enum Pseudo {
+    /// Object ids (one, or one per line of `FETCH_HEAD`).
+    Ids(Vec<String>),
+    /// `ref: refs/...`: it names a ref, which the ref checks cover.
+    Symbolic,
+    /// It could not be read or parsed (the reason).
+    Unreadable(String),
+}
+
+/// The entries at the top of a git directory that matter here.
+#[derive(Default)]
+struct TopLevel {
+    /// Entries that are neither known nor a pseudoref (names, lossily).
+    unknown: Vec<String>,
+    /// Pseudorefs, by name.
+    pseudorefs: Vec<(String, Pseudo)>,
+}
+
+/// A full object id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
+fn is_object_id(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A name git gives a pseudoref: one ending in `_HEAD`, or one in capitals (`ORIG_HEAD`,
+/// `AUTO_MERGE`, `MERGE_AUTOSTASH`, `BISECT_EXPECTED_REV`, and any git adds later).
+fn pseudoref_name(name: &str) -> bool {
+    name.ends_with("_HEAD")
+        || (name.bytes().any(|b| b.is_ascii_uppercase())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'))
+}
+
+/// Parse a pseudoref's bytes. `FETCH_HEAD` has one line per fetched ref, each starting with an
+/// object id and a tab; every other pseudoref is one line: an object id or `ref: refs/...`.
+fn parse_pseudoref(name: &str, bytes: &[u8]) -> Pseudo {
+    let bad = || Pseudo::Unreadable("it is not an object id or a ref: line".to_string());
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => return bad(),
+    };
+    if name == "FETCH_HEAD" {
+        let mut ids = Vec::new();
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            match line.split_once('\t') {
+                Some((id, _)) if is_object_id(id) => ids.push(id.to_string()),
+                _ => return bad(),
+            }
+        }
+        return Pseudo::Ids(ids);
+    }
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    if line.contains('\n') {
+        return bad();
+    }
+    if is_object_id(line) {
+        return Pseudo::Ids(vec![line.to_string()]);
+    }
+    let target = line.strip_prefix("ref: ").unwrap_or("");
+    if target.starts_with("refs/") && !target.bytes().any(|b| b.is_ascii_whitespace()) {
+        Pseudo::Symbolic
+    } else {
+        bad()
+    }
+}
+
+/// Read at most [`MAX_PSEUDOREF_BYTES`] of a regular file.
+fn read_bounded(p: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    f.take(MAX_PSEUDOREF_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    if buf.len() as u64 > MAX_PSEUDOREF_BYTES {
+        return Err(format!("it is longer than {MAX_PSEUDOREF_BYTES} bytes"));
+    }
+    Ok(buf)
+}
+
+/// Sort every entry directly inside the git directory `gd`: known ([`TOP_LEVEL_KNOWN`]), a
+/// pseudoref (a regular file whose name looks like one or whose content parses as one), or
+/// unknown. Only regular files are opened; a directory, symlink or special file that is not
+/// known is unknown. Nothing below the top level is read.
+fn top_level(gd: &Path) -> Result<TopLevel, String> {
+    let list_err = |e: std::io::Error| format!("cannot list the git directory ({e})");
+    let mut out = TopLevel::default();
+    for entry in std::fs::read_dir(gd).map_err(list_err)? {
+        let entry = entry.map_err(list_err)?;
+        let os_name = entry.file_name();
+        let name = match os_name.to_str() {
+            Some(n) => n.to_string(),
+            None => {
+                out.unknown.push(os_name.to_string_lossy().into_owned());
+                continue;
+            }
+        };
+        let kind = lk(&entry.path()).map_err(|e| format!("cannot read {name} ({e})"))?;
+        if let Some((_, want)) = TOP_LEVEL_KNOWN.iter().find(|(n, _)| *n == name) {
+            if want.is_none() || *want == Some(kind) {
+                continue;
+            }
+            out.unknown.push(name);
+            continue;
+        }
+        if IN_PROGRESS.contains(&name.as_str())
+            || (name.starts_with("sharedindex.") && kind == Lk::File)
+        {
+            continue;
+        }
+        if kind != Lk::File {
+            out.unknown.push(name);
+            continue;
+        }
+        match read_bounded(&entry.path()) {
+            Ok(bytes) => {
+                let parsed = parse_pseudoref(&name, &bytes);
+                if pseudoref_name(&name) || !matches!(parsed, Pseudo::Unreadable(_)) {
+                    out.pseudorefs.push((name, parsed));
+                } else {
+                    out.unknown.push(name);
+                }
+            }
+            Err(e) if pseudoref_name(&name) => out.pseudorefs.push((name, Pseudo::Unreadable(e))),
+            Err(_) => out.unknown.push(name),
+        }
+    }
+    out.unknown.sort();
+    out.pseudorefs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Pseudorefs of one git directory compared with the network remotes.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PseudorefCheck {
+    /// Names whose commit no network remote's tracking refs contain.
+    unsaved: Vec<String>,
+    /// Names that could not be read, parsed or compared, each with the reason.
+    unchecked: Vec<(String, String)>,
+}
+
+impl PseudorefCheck {
+    fn tri(&self) -> Tri {
+        if !self.unchecked.is_empty() {
+            Tri::Unknown
+        } else if !self.unsaved.is_empty() {
+            Tri::No
+        } else {
+            Tri::Yes
+        }
+    }
+}
+
+/// Check every pseudoref at the top of `gitdir` (this worktree's own git directory): the commit
+/// each names must be contained in a network remote's tracking refs (`names`, not empty), as for
+/// the reflogs. `<id>^{commit}` makes an id that is not a commit (a tree, as `AUTO_MERGE` holds,
+/// or a missing object) an error, so it is unchecked instead of passing an empty walk.
+fn pseudoref_check(git: &Git, path: &Path, gitdir: &Path, names: &[String]) -> PseudorefCheck {
+    let mut out = PseudorefCheck::default();
+    let top = match top_level(gitdir) {
+        Ok(t) => t,
+        Err(why) => {
+            out.unchecked.push(("the list of pseudorefs".to_string(), why));
+            return out;
+        }
+    };
+    let pats: Vec<String> = names.iter().map(|n| format!("--remotes={n}")).collect();
+    for (name, content) in top.pseudorefs {
+        let ids = match content {
+            Pseudo::Ids(ids) => ids,
+            Pseudo::Symbolic => continue,
+            Pseudo::Unreadable(why) => {
+                out.unchecked.push((name, why));
+                continue;
+            }
+        };
+        for id in ids {
+            let rev = format!("{id}^{{commit}}");
+            let mut args: Vec<&str> = vec!["rev-list", "-n", "1", rev.as_str(), "--not"];
+            args.extend(pats.iter().map(|s| s.as_str()));
+            match git.run(path, &args) {
+                Ok(o) if o.trim().is_empty() => {}
+                Ok(_) => {
+                    out.unsaved.push(name.clone());
+                    break;
+                }
+                Err(e) => {
+                    out.unchecked.push((name.clone(), e.to_string()));
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Count the index entries whose edits git hides: those marked assume-unchanged (a lowercase tag
 /// in `git ls-files -v`) or skip-worktree (`S`), whose file is present in the working tree.
@@ -1085,12 +1367,42 @@ pub fn collect_repo_info(
             let pats: Vec<String> = names.iter().map(|n| format!("--remotes={n}")).collect();
             let mut args: Vec<&str> = vec!["rev-list", "-n", "1", "--reflog", "--not"];
             args.extend(pats.iter().map(|s| s.as_str()));
-            match git.run(path, &args) {
+            let reflogs = match git.run(path, &args) {
                 Ok(out) => Tri::from_bool(out.trim().is_empty()),
                 Err(e) => {
                     notes.push(note("reflog_saved", &e));
                     Tri::Unknown
                 }
+            };
+            // Pseudorefs (`ORIG_HEAD` after a reset, `MERGE_AUTOSTASH`, any other file at the
+            // top of the git directory that names a commit) keep a commit alive after every ref
+            // and reflog has let go of it.
+            let gitdir_args = ["rev-parse", "--absolute-git-dir"];
+            let pseudo = match printed_path(git, path, &gitdir_args, "git dir") {
+                Ok(gitdir) => pseudoref_check(git, path, &gitdir, names),
+                Err(why) => PseudorefCheck {
+                    unchecked: vec![("the list of pseudorefs".to_string(), why)],
+                    ..PseudorefCheck::default()
+                },
+            };
+            for name in &pseudo.unsaved {
+                notes.push(format!(
+                    "reflog_saved: {name} names a commit that no network remote has"
+                ));
+            }
+            for (name, why) in &pseudo.unchecked {
+                notes.push(format!(
+                    "reflog_saved: {name} could not be read or compared with the remote ({why})"
+                ));
+            }
+            let tri = pseudo.tri();
+            info.unsaved_pseudorefs = pseudo.unsaved.iter().map(|n| diag(n)).collect();
+            info.unchecked_pseudorefs = pseudo.unchecked.iter().map(|(n, _)| diag(n)).collect();
+            // Unknown wins: something that could not be checked is never recovered on trust.
+            match (reflogs, tri) {
+                (Tri::Unknown, _) | (_, Tri::Unknown) => Tri::Unknown,
+                (Tri::No, _) | (_, Tri::No) => Tri::No,
+                _ => Tri::Yes,
             }
         }
         _ => Tri::Unknown,
@@ -1354,6 +1666,58 @@ pub fn collect_repo_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pseudoref_names_and_contents_are_recognised() {
+        for n in ["ORIG_HEAD", "AUTO_MERGE", "FOO_HEAD", "BISECT_EXPECTED_REV", "X1"] {
+            assert!(pseudoref_name(n), "{n}");
+        }
+        for n in ["notes.txt", "gitk.cache", "Orig_head", "_", "123"] {
+            assert!(!pseudoref_name(n), "{n}");
+        }
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let ids = |v: &[&str]| Pseudo::Ids(v.iter().map(|s| s.to_string()).collect());
+        assert_eq!(
+            parse_pseudoref("ORIG_HEAD", format!("{id}\n").as_bytes()),
+            ids(&[id])
+        );
+        assert_eq!(parse_pseudoref("ORIG_HEAD", id.as_bytes()), ids(&[id]));
+        let long = "ab".repeat(32);
+        assert_eq!(parse_pseudoref("X", long.as_bytes()), ids(&[long.as_str()]));
+        assert_eq!(
+            parse_pseudoref("ORIG_HEAD", b"ref: refs/heads/main\n"),
+            Pseudo::Symbolic
+        );
+        let fetch = format!("{id}\t\tbranch 'main' of x\n{id}\tnot-for-merge\tbranch 'b' of x\n");
+        assert_eq!(
+            parse_pseudoref("FETCH_HEAD", fetch.as_bytes()),
+            ids(&[id, id])
+        );
+        assert_eq!(parse_pseudoref("FETCH_HEAD", b""), ids(&[]));
+        for bad in [
+            &b"not a commit id\n"[..],
+            b"",
+            b"0123\n",
+            b"ref: HEAD\n",
+            b"ref: refs/heads/a b\n",
+            b"\xff\n",
+        ] {
+            assert!(
+                matches!(parse_pseudoref("ORIG_HEAD", bad), Pseudo::Unreadable(_)),
+                "{bad:?}"
+            );
+        }
+        let upper = id.to_ascii_uppercase();
+        assert!(matches!(
+            parse_pseudoref("ORIG_HEAD", upper.as_bytes()),
+            Pseudo::Unreadable(_)
+        ));
+        let two = format!("{id}\n{id}\n");
+        assert!(matches!(
+            parse_pseudoref("ORIG_HEAD", two.as_bytes()),
+            Pseudo::Unreadable(_)
+        ));
+    }
 
     #[test]
     fn lfs_keys_are_not_allowed() {

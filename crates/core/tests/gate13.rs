@@ -227,7 +227,10 @@ fn u1_a_garbage_orig_head_asks() {
 fn u1_an_unknown_directory_or_file_at_the_top_of_the_git_directory_makes_the_layout_not_plain() {
     let (_tmp, root, remotes) = workspace();
     let with_dir = pushed_repo(&root, &remotes, "with-dir");
-    write(&with_dir.join(".git").join("stuff").join("kept.txt"), "data\n");
+    write(
+        &with_dir.join(".git").join("stuff").join("kept.txt"),
+        "data\n",
+    );
     let with_file = pushed_repo(&root, &remotes, "with-file");
     write(&with_file.join(".git").join("notes.txt"), "data\n");
     let control = pushed_repo(&root, &remotes, "control");

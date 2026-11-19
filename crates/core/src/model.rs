@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -94,7 +94,8 @@ pub struct Facts {
     /// No linked worktree or alternates clone depends on this object store.
     pub no_dependents: Tri,
     /// Every commit reachable from any reflog entry (an unpushed commit after `reset --hard`, an
-    /// amended or rebased-away commit) is contained in a network remote's tracking refs.
+    /// amended or rebased-away commit) or named by a pseudoref at the top of the git directory
+    /// (`ORIG_HEAD` and the like) is contained in a network remote's tracking refs.
     pub reflog_saved: Tri,
     /// No unfinished rebase, merge, cherry-pick, revert or bisect, and no local-only Git LFS or
     /// git-annex content: state that no ref records. Never `No`: when something is found the
@@ -226,6 +227,16 @@ pub struct RepoInfo {
     /// This node's own git directory (a real path): `<dir>/.git`, or what its `.git` file names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_dir: Option<String>,
+    /// Pseudorefs at the top of this worktree's git directory (`ORIG_HEAD`, `MERGE_AUTOSTASH`,
+    /// any file there that names a commit) whose commit no network remote's tracking refs
+    /// contain: `reflog_saved` is then `no`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsaved_pseudorefs: Vec<String>,
+    /// Pseudorefs that could not be read, parsed or compared with the remote (one naming a tree
+    /// or a missing object, or holding text that is not an object id): `reflog_saved` is then
+    /// `unknown`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unchecked_pseudorefs: Vec<String>,
     pub sizes: RepoSizes,
 }
 

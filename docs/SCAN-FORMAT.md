@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **7** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **9** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -14,7 +14,11 @@ where it could not look, so it is refused. Version 7 added `repo.hidden_index_en
 untracked file, so it is refused. Version 8 reads the file names git prints byte for byte (a
 version 7 scan could miss a hidden edit to a file whose name is not valid UTF-8, so it is
 refused) and replaced the plan field `required_full_coverage` with `accepted_incomplete_coverage`
-(incomplete coverage now makes repositories ask unless the user accepts it).
+(incomplete coverage now makes repositories ask unless the user accepts it). Version 9 added
+`repo.unsaved_pseudorefs` and `repo.unchecked_pseudorefs`: `reflog_saved` now also covers
+pseudorefs such as `ORIG_HEAD`, and an unknown entry at the top of the git directory makes
+`plain_layout` `no`; a version 8 scan could read a repository as saved while `ORIG_HEAD` alone kept
+an unpushed commit, so it is refused.
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 Such a node therefore gets an `ask_reason` and is never offered for removal (see "File names git
@@ -29,10 +33,10 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 8 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 9 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
-| `roots` | absolute scan roots that were walked, as spelled; overlapping roots are normalised first (see "Overlapping scan roots") |
+| `roots` | absolute scan roots that were walked, as spelled (a kept inner root under the spelling of the root that encloses it); overlapping roots are normalised first (see "Overlapping scan roots") |
 | `options` | `one_file_system`, `top_files`, `min_output_bytes`, `git_facts` |
 | `totals` | see below |
 | `nodes` | classified directories (below) |
@@ -93,7 +97,7 @@ the directory that holds them); `output_bytes` counts them separately.
 
 Every directory is walked once, however the roots overlap. Before the walk each root is made
 absolute and compared with the others by its real path (`canonicalize`); the walk itself and every
-reported path keep the spelling the user gave.
+reported path keep the spelling the user gave, except for a kept inner root (below).
 
 - A root that is the same directory as an earlier root (`/projects` and `/projects/app/..`, or a
   symlinked spelling of it) is dropped, with a warning.
@@ -106,7 +110,17 @@ reported path keep the spelling the user gave.
   counts that directory's own entry once and does not enter it). This is the `--one-file-system`
   case: a child root on another device than its ancestor is not covered by the ancestor's walk, so
   it is still walked, it is counted once, and it is not reported as a skipped mount point. It also
-  covers a directory on the way that cannot be listed.
+  covers a directory on the way that cannot be listed. A kept inner root belongs to the directories
+  that physically enclose it, so it is walked and reported under the spelling of the closest root
+  that encloses it plus its real path below that root, with a warning when this differs from what
+  the user typed (`/scan` and `/alias/proj/node_modules/mnt`, where `/alias` links to `/scan`, walk
+  `/scan/proj/node_modules/mnt`). A repository found there is then inside that `node_modules` for
+  every rule: the artifact asks, a veto propagates to enclosing nodes, and dependency discovery
+  sees it.
+- A root whose real path cannot be established (`canonicalize` fails, for example a symlink whose
+  target is missing) cannot be placed: when more than one root is walked, every artifact and
+  repository in the scan gets an `ask_reason` saying so, since any of them might enclose it, and a
+  warning names the root.
 
 Dropping a covered inner root, rather than refusing the combination, was chosen because the
 user's intent is unambiguous (the inner root is already part of the scan) and the warning says what
@@ -211,6 +225,7 @@ with or without evidence.
 | `links_into_git_dir` | symlinks in the scan, outside every git directory and checkout, that point into this repository's git directory (a convenience link such as `hooks -> A/.git/hooks`); they make `no_dependents` `no` and the plan names each as "a link at <path>", not as a checkout |
 | `hidden_index_entries` | present when not 0: index entries marked skip-worktree or assume-unchanged whose file is present in the working tree. Git hides edits to them from `status`, `diff`, `add` and `stash`, so recovery cannot save them; `tree_clean` is `no` and the plan asks (see "Hidden index entries") |
 | `submodule_gitdirs`, `git_dir` | submodule git directories under `.git/modules`; this node's own git directory |
+| `unsaved_pseudorefs`, `unchecked_pseudorefs` | present when not empty: pseudorefs at the top of this worktree's git directory (`ORIG_HEAD` and the like) whose commit no network remote's tracking refs contain (`reflog_saved` is `no`), and those that could not be read, parsed or compared (`reflog_saved` is `unknown`) |
 | `sizes` | `total`, `git` (the `.git` directory), `regenerable`, `output` |
 
 Facts (the safe value is always `yes`):
@@ -224,7 +239,7 @@ Facts (the safe value is always `yes`):
 | `tree_clean` | no tracked changes and no untracked files in this repo's own tree (submodules are their own nodes), no present file marked skip-worktree or assume-unchanged (those hide local edits; counted in `hidden_index_entries`, and a sparse checkout's absent files are not counted), and every submodule gitlink agrees: the index matches HEAD, and each checked-out submodule's HEAD equals the commit the index records (`status --ignore-submodules=all` hides both). A recorded submodule with a missing or empty directory is fine; a directory with files and no `.git` at a gitlink path, an unmerged gitlink or a differing commit is `no`; a submodule whose config fails the allowlist, whose HEAD cannot be read, or more than 200 submodules is `unknown`. The commits are compared with `ls-files -s`, `ls-tree -r HEAD` and `rev-parse --verify HEAD` run in the submodule through the hardened runner; no status runs inside it |
 | `no_unique_ignored` | no ignored files outside regenerable and cache directories (`.env`, local databases...) |
 | `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone, shared object directory or other reference into this repository's git directory was found (see "Inbound references"), and the repository does not declare `extensions.preciousObjects = true` (see "Declared dependents"). Places the scan could not read are not covered: see "Incomplete coverage" |
-| `reflog_saved` | every commit reachable from any reflog entry (HEAD of this worktree and every ref's reflog) is contained in a network remote's tracking refs. An unpushed commit after `git reset --hard`, an amended or rebased-away commit and a stash's commits are `no`. No network remote is `no`; an unborn HEAD, any git failure or a timeout is `unknown` |
+| `reflog_saved` | every commit reachable from any reflog entry (HEAD of this worktree and every ref's reflog), and every commit a pseudoref at the top of this worktree's git directory names (`ORIG_HEAD`, `MERGE_AUTOSTASH`, `FETCH_HEAD`, `AUTO_MERGE`, any file there that names a commit: see "Plain layout", check 4a), is contained in a network remote's tracking refs. An unpushed commit after `git reset --hard`, an amended or rebased-away commit and a stash's commits are `no`, also when reflogs are disabled or expired and only `ORIG_HEAD` still names the commit (`repo.unsaved_pseudorefs` lists such pseudorefs and the plan reason names them). No network remote is `no`; an unborn HEAD, any git failure or a timeout is `unknown`, and so is a pseudoref that cannot be read, does not parse, or names something that is not a commit (a tree, as `AUTO_MERGE` does, or an object the repository does not have): `repo.unchecked_pseudorefs` lists them and the plan reason names them. `unknown` wins over `no` |
 | `plain_layout` | the repository has the plain layout described under "Plain layout" below. `no` or `unknown` makes the plan `ask` with the reason `unusual repository layout: <first failing check>` (kept in `repo.layout_issue`); it is never `recover-then-archive` or `archive` |
 | `no_pending_state` | no unfinished rebase, merge, cherry-pick, revert or bisect in this worktree's git directory (`rebase-merge`, `rebase-apply`, `sequencer`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_*`) and no local-only content under `.git/lfs/objects` or `.git/annex/objects`. Found by name only. Never `no`: a finding is `unknown` (state that no ref records cannot be recovered into a ref, so a person decides) |
 
@@ -239,6 +254,18 @@ repo is never `yes`. Reflogs expire (90 days, 30 for unreachable entries), so th
 reads `no` until they expire. Other state git keeps outside refs: `refs/original` and
 `refs/rewritten` are refs and are covered by `all_branches_on_remote`; a non-empty `.git/rr-cache`
 only records conflict resolutions that can be derived again and is not work.
+
+Each pseudoref's object id is read from the file itself (bounded, no git command) and checked with
+`git rev-list -n 1 <id>^{commit} --not --remotes=<network remote>...`: `^{commit}` makes an id
+that is not a commit an error (`unknown`) instead of an empty walk. A `git pull` or a reset to a
+pushed commit leaves `ORIG_HEAD` and `FETCH_HEAD` at commits a tracking ref contains, so they do not
+change the fact. `ORIG_HEAD` is not cleaned up by `git gc`: when it names a commit that was later
+pruned, the repository asks (`unknown`) until `ORIG_HEAD` is removed or moved.
+
+**Known limit: unreferenced objects.** Objects that no ref, reflog or pseudoref points at
+(dangling commits awaiting garbage collection, including those `git fsck --lost-found` would list)
+are not examined, because git itself treats them as discardable. A `lost-found` directory in the
+git directory makes the layout not plain (check 4a).
 
 Any git failure, timeout or missing binary makes the affected fact `unknown`, never `yes`. A bare
 repo has no working tree, so its `tree_clean` and `no_unique_ignored` are `unknown`. Remote-tracking
@@ -269,6 +296,24 @@ is followed):
 4. `worktrees/` and `modules/` are absent or empty (so a repository with submodules, checked out
    or not, always asks). For a non-empty `worktrees/`, `layout_issue` adds up to three of the
    linked worktree paths git reports (`worktrees is not empty: /w/a-feature, ...`).
+4a. Every entry directly inside the git directory is known or is a pseudoref (a positive model of
+   the top level; nothing below it is read here). Known, with the kind each must be: the files
+   `HEAD`, `config`, `config.worktree`, `description`, `index`, `packed-refs`, `shallow`,
+   `COMMIT_EDITMSG`, `TAG_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG`, `MERGE_MODE`, `MERGE_RR`,
+   `gitk.cache`, `gc.log`, `gc.pid` and the split index's `sharedindex.*`; the directories `hooks`,
+   `info`, `logs`, `objects`, `refs`, `branches`, `remotes`, `rr-cache`, `lfs`, `fsmonitor--daemon`;
+   `fsmonitor--daemon.ipc` (a socket); the names checked elsewhere (`worktrees`, `modules`, and the
+   unfinished-operation names of `no_pending_state`). Each holds settings, text, caches, refs or
+   reflogs that other checks read, or the index, whose staged content `tree_clean` sees; none keeps
+   a commit that no other check looks at. A pseudoref is a regular file whose name ends in `_HEAD`
+   or is all capitals, or whose content (at most 64 KiB, opened only after `lstat` shows a regular
+   file) parses as one: one line holding an object id or `ref: refs/...`, or for `FETCH_HEAD` one
+   line per fetched ref starting with an object id and a tab. Pseudorefs are checked by
+   `reflog_saved`. Any other entry (a file that is not a pseudoref, a directory such as `lost-found`
+   or `reftable`, a lock file, a symlink, a special file) makes `plain_layout` `no`, naming up to
+   five such entries (`the git directory holds an entry this tool does not know (stuff), ...`).
+   `FETCH_HEAD` is checked, not trusted: the commits it names were fetched, but possibly from a
+   remote this tool does not count as saved (a local path).
 5. No unfinished rebase, merge, cherry-pick, revert or bisect and no local-only LFS or annex
    content (`no_pending_state`).
 6. The config passed the allowlist (a refused config makes every fact `unknown` before this).

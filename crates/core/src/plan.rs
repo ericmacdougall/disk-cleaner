@@ -838,9 +838,9 @@ static FACT_WORDS: [(&str, &str, &str); 10] = [
     ),
     (
         "reflog_saved",
-        "commits that only the reflog still reaches",
-        "commits kept only by the reflog could not be compared with the remote (git failed or \
-         timed out, or there is no commit yet); run the scan again",
+        "commits that only the reflog or a pseudoref such as ORIG_HEAD still reaches",
+        "commits kept only by the reflog or a pseudoref such as ORIG_HEAD could not be compared \
+         with the remote (git failed or timed out, or there is no commit yet); run the scan again",
     ),
     (
         "no_pending_state",
@@ -948,6 +948,11 @@ fn explain_unknown(node: &Node, facts: &Facts, strict: Option<&str>) -> String {
         .as_ref()
         .map(|r| r.facts.no_dependents == Tri::Unknown)
         .unwrap_or(true);
+    let unchecked = node
+        .repo
+        .as_ref()
+        .map(|r| r.unchecked_pseudorefs.clone())
+        .unwrap_or_default();
     let parts: Vec<String> = facts
         .unknown()
         .into_iter()
@@ -956,6 +961,13 @@ fn explain_unknown(node: &Node, facts: &Facts, strict: Option<&str>) -> String {
                 "the scan was incomplete ({gap}), so links or clones there may depend on this \
                  repository; make them readable and scan again, or accept incomplete coverage \
                  with --accept-incomplete-coverage [{name}]"
+            ),
+            (_, "reflog_saved") if !unchecked.is_empty() => format!(
+                "{} at the top of the git directory could not be read or compared with the \
+                 remote (it does not name a commit, or git failed); look at {} and run the scan \
+                 again [{name}]",
+                some_of(&unchecked, 3),
+                agree(unchecked.len() as u64, "it", "them")
             ),
             (_, "all_branches_on_remote") if notes.contains("has tags") => format!(
                 "this repository has local tags and tag names cannot be checked against the \
@@ -1092,10 +1104,21 @@ fn decide(
                     0,
                 )
             } else if !facts.all_yes() {
+                let pseudorefs = node
+                    .repo
+                    .as_ref()
+                    .map(|r| r.unsaved_pseudorefs.clone())
+                    .unwrap_or_default();
                 let unsaved = facts
                     .failing()
                     .into_iter()
-                    .map(|name| fact_words(name, Tri::No))
+                    .map(|name| match name {
+                        "reflog_saved" if !pseudorefs.is_empty() => format!(
+                            "commits kept only by {} or the reflog [{name}]",
+                            some_of(&pseudorefs, 3)
+                        ),
+                        _ => fact_words(name, Tri::No),
+                    })
                     .collect::<Vec<_>>()
                     .join("; ");
                 (
@@ -1112,7 +1135,8 @@ fn decide(
                     Action::Archive,
                     format!(
                         "idle ({why}); local remote-tracking refs say every commit (reflog \
-                         entries included) is on a network remote, nothing is unsaved, no \
+                         entries and pseudorefs such as ORIG_HEAD included) is on a network \
+                         remote, nothing is unsaved, no \
                          operation is half done and no dependents were found{} \
                          (unverified until apply re-checks the remote with git ls-remote)",
                         scope_note(scan)
