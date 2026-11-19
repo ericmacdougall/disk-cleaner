@@ -927,6 +927,55 @@ class TestPagesGate(unittest.TestCase):
         self.assertEqual(seen, [("https://api.example.test/repos/o/r/pages", "tok-DO-NOT-PRINT")])
         self.assertNotIn("tok-DO-NOT-PRINT", log + out)
 
+    def test_real_fetch_does_not_follow_redirects_or_leak_the_token(self):
+        # The real fetch() against a throwaway server on 127.0.0.1: a redirect comes back as its own
+        # status (so decide() fails) and the redirect target never sees the request or the token.
+        import http.server
+        import threading
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, self.headers.get("Authorization")))
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/target")
+                    self.end_headers()
+                elif self.path == "/denied":
+                    body = b'{"message": "Resource not accessible"}'
+                    self.send_response(403)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    body = b'{"build_type": "workflow"}'
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            gate = load_gate()
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            status, _ = gate.fetch(base + "/redirect", "tok-x")
+            self.assertEqual(status, 302)
+            self.assertEqual([p for p, _ in seen], ["/redirect"], "the redirect must not be followed")
+            with self.assertRaises(gate.GateError):
+                gate.decide(status, b"")
+            self.assertEqual(gate.fetch(base + "/denied", "tok-x"), (403, b'{"message": "Resource not accessible"}'))
+            self.assertEqual(gate.fetch(base + "/ok", "tok-x"), (200, b'{"build_type": "workflow"}'))
+            self.assertTrue(all(auth == "Bearer tok-x" for _, auth in seen), seen)
+            self.assertGreater(gate.TIMEOUT, 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_pages_deploy_is_gated_at_job_level(self):
         y = read(PAGES_YML)
         gate, deploy = job_block(y, "gate"), job_block(y, "deploy")
