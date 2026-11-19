@@ -157,6 +157,12 @@ struct DirAgg {
     /// state files), split by whether package fixtures routinely use the name. Names only.
     state_hard: Option<(String, usize)>,
     state_soft: Option<(String, usize)>,
+    /// Direct output files below the output threshold that the walk did not list on its own
+    /// (names and sizes, the first [`SMALL_OUTPUTS_PER_DIR`]) and how many more there were.
+    /// Kept only for directories that may be inside an artifact; whether they are listed
+    /// depends on the owner and its package evidence, known after classification.
+    small_outputs: Vec<(String, u64)>,
+    small_outputs_more: u64,
     /// Name of the first direct entry that is a symlink.
     first_symlink: Option<String>,
     /// Direct entries below a `.git` directory that are not what git writes there
@@ -254,6 +260,10 @@ struct Walk {
 }
 
 const MAX_ISSUE_PATHS: usize = 100_000;
+
+/// Most small output files listed one by one per directory (see `DirAgg::small_outputs`); the
+/// rest are counted in the owner's `outputs_unlisted`.
+const SMALL_OUTPUTS_PER_DIR: usize = 16;
 
 /// Most symlinks recorded for the inbound-reference pass; more makes every repo's dependents
 /// unknown.
@@ -398,6 +408,8 @@ impl Walk {
         }
         let is_file = ft.is_file();
         let is_output = is_file && rules.is_output_file(&name);
+        // A small output that may lie inside an artifact, kept on its directory (bounded).
+        let mut small_output = false;
         if is_output {
             self.totals.output_bytes += alloc;
             // Listing candidates: big ones anywhere, any size inside a build-directory
@@ -409,6 +421,8 @@ impl Walk {
                 || rules.is_artifact_dir_name(parent)
             {
                 self.outputs_raw.push((path.clone(), alloc));
+            } else {
+                small_output = rules.in_artifact_candidate(parent);
             }
         }
         if is_file && opts.top_files > 0 {
@@ -440,6 +454,13 @@ impl Walk {
         agg.files += 1;
         if is_output {
             agg.output_bytes += alloc;
+        }
+        if small_output {
+            if agg.small_outputs.len() < SMALL_OUTPUTS_PER_DIR {
+                agg.small_outputs.push((name.clone(), alloc));
+            } else {
+                agg.small_outputs_more += 1;
+            }
         }
         if is_file {
             agg.newest = Some(agg.newest.map_or(meta.mtime, |n| n.max(meta.mtime)));
@@ -1195,6 +1216,30 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 path: path.to_string_lossy().into_owned(),
                 bytes,
                 node: owner,
+            });
+        }
+    }
+    // Small outputs nested inside an artifact: listed at any size, and the artifact asks,
+    // unless the directory is part of an installed package (the same evidence the
+    // `fixture_prone` exemption uses: a `package.json` above it in `node_modules`, a package
+    // directory below `site-packages`). Inside a package the threshold above still applies.
+    for (i, (dir, agg)) in dirs.iter().enumerate() {
+        if agg.small_outputs.is_empty() {
+            continue;
+        }
+        let Some(o) = agg.owner.filter(|&o| builds[o].node.class.is_artifact()) else {
+            continue;
+        };
+        if has_package_evidence(&builds[o], &dirs, i) {
+            continue;
+        }
+        builds[o].node.contains_outputs = true;
+        builds[o].node.outputs_unlisted += agg.small_outputs_more;
+        for (name, bytes) in &agg.small_outputs {
+            outputs.push(OutputFile {
+                path: dir.join(name).to_string_lossy().into_owned(),
+                bytes: *bytes,
+                node: Some(o),
             });
         }
     }

@@ -40,8 +40,9 @@ such files were in it, so it is refused. Version 14 removed object verification:
 `repo.object_store.checked` and `preserve.object_store.verified`. This format defines no
 verification of object data, both classes of a git directory are backed up, and a scan file that
 claims a verification is refused as invalid. Version 14 also made every listed output file make
-the artifact holding it ask, whatever the artifact's rule, and lists an output of any size directly
-in an artifact's top directory (see "Outputs"). A version 13 scan could mark a store verified, or
+the artifact holding it ask, whatever the artifact's rule, and lists an output of any size inside
+an artifact unless it sits in an installed package's directory (see "Outputs"), with the node
+field `outputs_unlisted`. A version 13 scan could mark a store verified, or
 leave an output in a dependency directory such as `.venv` unflagged, so it is refused.
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
@@ -165,6 +166,7 @@ One entry per classified directory. A directory belongs to its innermost classif
 | `files_total` | files in the subtree |
 | `output_bytes` | allocated bytes of output-extension files in the subtree |
 | `contains_outputs` | regenerable or cache directory that holds a listed output file (see "Outputs"); never offered for removal |
+| `outputs_unlisted` | output files that make this directory ask but are not in `outputs` one by one: small ones beyond the first 16 of one directory (omitted when 0) |
 | `newest_mtime` | newest modification time of files attributed to this node, excluding `.git` and nested nodes |
 | `unreadable` | entries inside this node that could not be read (omitted when 0) |
 | `skipped_mounts` | directories inside this node on another file system that `--one-file-system` did not enter (omitted when 0) |
@@ -201,22 +203,46 @@ incomplete and is never offered for removal.
 
 **Outputs.** Output files are recognised by extension (video, audio, images, documents,
 archives, datasets, model weights, VM disks, database files and dumps; the list is in
-`rules/artifacts.toml`). One is listed in `outputs` when it is at least `min_output_bytes` (scan
-option `--min-output-bytes`, default 100 MiB) anywhere; when it is inside a build directory (rule
-`scan_outputs = true`) whatever its size; or when it sits directly in the top directory of any
-regenerable or cache directory whatever its size. Every
-listed output inside a regenerable or cache directory flags that directory `contains_outputs`,
-whatever its rule, so it asks and its reason names up to three of the files; the rule says what is
-regenerable, never that an output file is. (A tool that keeps such a file at the top of its own
-directory, as coverage does with the images in `htmlcov/` and some caches do with `*.db` or
-`*.mdb` files, makes that directory ask: the safe side, at the cost of reclaiming less.) That covers
-dependency directories too: a
-`.venv/trained.safetensors` or a `node_modules/pkg/weights.bin` above the threshold makes the
-directory ask, even inside an installed package (no installed-package exemption is made). Below the
-threshold, an output nested inside a dependency directory (a 1 KiB `node_modules/pkg/test/fixture.zip`)
-is not listed, because packages routinely ship fixture archives. A flagged directory is also left
-out of its repository's regenerable set, so its ignored files count as unique (`no_unique_ignored`
-`no`) and the plan's enclosing rule keeps the repository from being removed with it.
+`rules/artifacts.toml`). Recognised outputs are protected in every artifact class unless there is
+specific evidence that they are installed package contents. One is listed in `outputs` when:
+
+- it is at least `min_output_bytes` (scan option `--min-output-bytes`, default 100 MiB), anywhere;
+- it is inside a regenerable or cache directory, whatever its size, unless it sits in an installed
+  package's directory: the same **evidence of belonging to an installed package** that the
+  `fixture_prone` exemption uses (below: a `package.json` above it inside `node_modules`, a package
+  directory directly below `site-packages`, a `Cargo.toml` or `*.nuspec` above it in those
+  caches). A file directly in the artifact's top directory never has that evidence;
+- it is inside a build directory (rule `scan_outputs = true`), whatever its size, even inside a
+  package directory.
+
+So `--min-output-bytes` narrows only two cases: outputs inside an installed package's directory,
+and outputs outside every regenerable or cache directory. A 50 MiB `.venv/data/model.pt` or a
+1 KiB `node_modules/.stuff/clip.mp4` is listed at the default threshold; a 1 KiB
+`node_modules/pkg/test/fixture.zip` beside `node_modules/pkg/package.json` is not, because packages
+routinely ship fixture archives, while a 200 MiB `node_modules/pkg/weights.bin` is. At most 16
+small outputs of one directory are listed one by one; the rest are counted in the node's
+`outputs_unlisted`. Every listed output inside a regenerable or cache directory flags that
+directory `contains_outputs`, whatever its rule, so it asks and its reason counts the files and
+names up to three; the rule says what is regenerable, never that an output file is. A flagged
+directory is also left out of its repository's regenerable set, so its ignored files count as
+unique (`no_unique_ignored` `no`) and the plan's enclosing rule keeps the repository from being
+removed with it.
+
+**Known over-asking.** Output extensions are names, not proof, and some tools keep files with
+those names in their own generated directories. Such a directory asks every time: the safe side,
+at the cost of reclaiming less. Expected cases, from how these tools lay out their files (not
+measured on every tool):
+
+- Python environments with a `.pth` file straight in `site-packages` (`.pth` is also a model
+  weight extension): `distutils-precedence.pth` from the setuptools that older `venv` versions
+  install, `_virtualenv.pth` from `virtualenv` (and so `tox`, Poetry and Hatch environments) and
+  `uv venv`, and the `.pth` file of an editable install (`pip install -e`). A plain `venv` from a
+  Python that installs only pip has none and stays regenerable.
+- Coverage's `htmlcov/` (`*.png`), `.parcel-cache` (`*.mdb`), `.cache/pre-commit` (`db.db`),
+  Unity's `Library`, `.gradle` and `.gradle/caches` (`*.bin`), `.turbo` (cached `*.tar.zst`),
+  `Library/Caches/Homebrew` (downloaded `*.tar.gz`), `.cache/uv` and `.tox` (`*.tar.gz`),
+  browser caches such as `.cache/ms-playwright` and `.cache/puppeteer`, `Pods` (images in pod
+  resources), and caches kept inside `node_modules` outside any package (`node_modules/.cache`).
 
 **Unique-state file names** (`[[state_file]]` in `rules/artifacts.toml`, matched on the file name
 only, ignoring case; no file is opened). Found anywhere under a regenerable or cache directory they
@@ -241,10 +267,16 @@ an installed package**, defined per rule in the rules file:
 - Every other rule (`Pods`, `deps`, `.npm`, `.pnpm-store`, `.cache/pip`, `.cache/uv`,
   `.gradle/caches`, all build output directories) defines no evidence, so those names always ask.
 
-What the evidence rule still cannot prove: a user file dropped inside an installed package's own
-directory (`node_modules/pkg/notes.db`, `site-packages/pkg/local.key`) looks exactly like a
-fixture and is not noticed by name. Terraform state, `.env` and the SSH key names ask everywhere,
-with or without evidence.
+**Known limit: files placed by hand inside an installed package.** A state-like file (a database,
+key or certificate name marked `fixture_prone`) inside a directory that carries package evidence
+is assumed to be package content. So is an output file below the output threshold there. A file
+a person placed there by hand (`node_modules/pkg/prod.key`, `site-packages/pkg/local.db`, a
+50 MiB `node_modules/pkg/model.pt` at the default threshold) looks exactly like a file the
+package shipped and is not detected; the directory is offered for removal as if it were not there.
+This scan reads names only and keeps no record of what each package installed; a later phase can
+compare the files against the package records (`package-lock.json` integrity, a wheel's
+`RECORD`) to tell them apart. Terraform state, `.env` and the SSH key names ask everywhere, with
+or without evidence, and so does an output at or above the threshold.
 
 ### `repo`
 

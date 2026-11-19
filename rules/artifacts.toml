@@ -8,11 +8,12 @@
 #                 anything else).
 #   class         "regenerable" (rebuilt by the project's tooling) or "cache" (re-downloaded)
 #   scan_outputs  true for build output directories: output files (video, archives, model
-#                 weights...) of any size anywhere in them are listed. Every artifact, whatever
-#                 this says, asks when it holds a listed output (one of at least the scan's
-#                 output threshold anywhere, or of any size directly in its top directory).
+#                 weights...) of any size anywhere in them are listed, even inside a package
+#                 directory. Every artifact, whatever this says, asks when it holds a listed
+#                 output: one of any size that is not in an installed package's directory (see
+#                 fixture_files, fixture_dirs), or one of at least the scan's output threshold.
 #                 Dependency directories (node_modules, venv) leave this false, so the small
-#                 fixtures packages ship deep inside them are not listed.
+#                 fixtures packages ship inside their own package directories are not listed.
 #   note          one line shown to the user
 #   ask           a reason (read after "it", e.g. "can hold ..."): the directory can hold content
 #                 that exists nowhere else, so it is shown but never offered for removal
@@ -28,6 +29,8 @@
 #                 file sits in a package directory directly below a `fixture_dirs` name
 #                 (virtual environments: site-packages). Without such evidence, and in every
 #                 rule that defines none, those names are unique state and the directory asks.
+#                 The same evidence decides outputs: an output file below the scan's output
+#                 threshold is listed (and the directory asks) unless it has that evidence.
 #
 # [[state_file]] (end of file): file names that mean "this is not only generated files". They
 # are looked for anywhere under a regenerable or cache directory, and the same rules that carry
@@ -473,8 +476,9 @@ kind = "a certificate bundle with its private key"
 fixture_prone = true
 
 # ---- Output files ------------------------------------------------------------------------
-# Files with these extensions are produced work, not artifacts. Found inside a build output
-# directory they are listed individually and the directory is not offered for removal.
+# Files with these extensions are produced work, not artifacts. Found inside any regenerable or
+# cache directory they are listed individually and the directory is not offered for removal,
+# unless the file sits in an installed package's directory and is below the output threshold.
 [outputs]
 extensions = [
     # video

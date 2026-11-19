@@ -1288,11 +1288,20 @@ fn decide(
                             .unwrap_or_else(|_| o.path.clone())
                     })
                     .collect();
-                let n = files.len() as u64;
+                // Small ones beyond the first few per directory are counted, not listed.
+                let unlisted = node.outputs_unlisted;
+                let n = files.len() as u64 + unlisted;
                 let named = if files.is_empty() {
                     String::new()
-                } else {
+                } else if unlisted == 0 {
                     format!(": {}", some_of(&files, 3))
+                } else {
+                    let shown = files.len().min(3);
+                    format!(
+                        ": {} and {} more",
+                        files[..shown].join(", "),
+                        n - shown as u64
+                    )
                 };
                 return (
                     Action::Ask,

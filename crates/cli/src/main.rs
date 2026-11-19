@@ -49,6 +49,8 @@ struct ScanArgs {
     #[arg(long, default_value_t = 50)]
     top_files: usize,
     /// List output files (video, archives, models...) of at least this many bytes anywhere.
+    /// Inside an artifact an output is listed whatever its size, except in an installed
+    /// package's directory, where this threshold applies.
     #[arg(long, default_value_t = 100 * 1024 * 1024)]
     min_output_bytes: u64,
     /// Skip git; every repo fact is then unknown.

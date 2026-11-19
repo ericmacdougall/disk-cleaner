@@ -329,6 +329,10 @@ pub struct Node {
     pub output_bytes: u64,
     /// A build directory that holds output files: never offered for removal.
     pub contains_outputs: bool,
+    /// Output files in this directory that are not listed in `outputs` one by one (small ones
+    /// beyond the first few per directory), counted toward its ask (omitted when 0).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub outputs_unlisted: u64,
     /// Newest modification time (unix seconds) of files attributed to this node, excluding
     /// `.git` and nested classified directories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -366,6 +370,7 @@ impl Node {
             files_total: 0,
             output_bytes: 0,
             contains_outputs: false,
+            outputs_unlisted: 0,
             newest_mtime: None,
             unreadable: 0,
             skipped_mounts: 0,

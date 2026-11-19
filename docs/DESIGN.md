@@ -49,8 +49,9 @@ Rules that follow from the principles:
 
 - A build directory (`dist`, `build`, `out`, `target`) is regenerable only inside a project, and is
   scanned for `output` files first. A rendered video inside `out/` is an output, not an artifact.
-  The same holds for every artifact: a model above the output threshold in `.venv` or
-  `node_modules` makes it ask, naming the file.
+  The same holds for every artifact: a model of any size in `.venv` or `node_modules` outside an
+  installed package's own directory, or above the output threshold anywhere in `.venv` or
+  `node_modules`, makes it ask, naming the file.
 - Artifact rules are data (a rules file), not code, so the community can extend them. Each rule
   names the marker that proves the project type (for example `Cargo.toml` next to `target`).
 

@@ -20,9 +20,11 @@ pub struct Rule {
     /// `regenerable` or `cache`.
     pub class: Class,
     /// A build-output directory: output files of any size anywhere in it are listed (and make
-    /// it ask). Every artifact asks for a listed output whatever this says; without it, an output
-    /// is listed when it is at least the scan's output threshold or directly in the directory.
-    /// It also makes the directory ask when it sits in loose code with no git history.
+    /// it ask), even inside a package directory. Every artifact asks for a listed output
+    /// whatever this says; without it, an output is listed at any size unless it sits in an
+    /// installed package's directory (`fixture_files`, `fixture_dirs`), where it is listed when
+    /// it is at least the scan's output threshold. It also makes the directory ask when it sits
+    /// in loose code with no git history.
     #[serde(default)]
     pub scan_outputs: bool,
     /// One line description.
@@ -41,6 +43,7 @@ pub struct Rule {
     /// package contents. Package fixtures routinely use key, certificate and database names; a
     /// `fixture_prone` file name in `[[state_file]]` is exempt only when some directory between
     /// the file and this directory (exclusive) holds one of these entries (`name` or `*.suffix`).
+    /// The same evidence lets an output file below the scan's output threshold go unlisted.
     #[serde(default)]
     pub fixture_files: Vec<String>,
     /// Like `fixture_files`, by directory name: the file sits in a package directory directly
@@ -308,6 +311,15 @@ impl RuleSet {
         dir.file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| self.by_last.contains_key(n))
+    }
+
+    /// Does any component of `dir` carry the last name component of some artifact rule? A cheap
+    /// superset test for "somewhere inside an artifact", used before the owner is known.
+    pub fn in_artifact_candidate(&self, dir: &Path) -> bool {
+        dir.components().any(|c| match c {
+            Component::Normal(n) => n.to_str().is_some_and(|s| self.by_last.contains_key(s)),
+            _ => false,
+        })
     }
 }
 

@@ -18,6 +18,7 @@ use common::*;
 use disk_cleaner_core::{
     plan, scan, Action, FactsConfig, Plan, PlanItem, PlanOptions, ScanOptions, ScanResult,
 };
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -288,8 +289,18 @@ fn r15b_control_a_real_venv_stays_regenerable() {
             .output()
             .is_ok_and(|o| o.status.success())
     });
+    // Written straight to stderr, which the test harness does not capture, so the CI log shows
+    // which branch ran on each system.
+    let say = |line: String| {
+        let _ = writeln!(std::io::stderr(), "{line}");
+    };
     let Some(exe) = made else {
-        eprintln!("SKIPPED r15b_control_a_real_venv_stays_regenerable: no python3 or python");
+        // Every CI runner has Python: a skip there would read as a pass.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "no python3 or python could make a venv on CI"
+        );
+        say("SKIPPED r15b_control_a_real_venv_stays_regenerable: no python3 or python".into());
         return;
     };
     let version = Command::new(exe)
@@ -312,14 +323,22 @@ fn r15b_control_a_real_venv_stays_regenerable() {
         && mine.iter().all(|o| {
             let f = Path::new(o);
             f.extension().is_some_and(|e| e == "pth")
-                && f.parent().and_then(Path::file_name).is_some_and(|n| n == "site-packages")
+                && f.parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|n| n == "site-packages")
         });
     if over_ask {
-        eprintln!("KNOWN OVER-ASK with {exe} ({version}): {mine:?}");
+        say(format!(
+            "KNOWN OVER-ASK r15b_control_a_real_venv_stays_regenerable with {exe} ({version}): \
+             {mine:?}"
+        ));
         assert_eq!(it.action, Action::Ask, "{}", it.reason);
         return;
     }
-    eprintln!("RAN r15b_control_a_real_venv_stays_regenerable with {exe} ({version})");
+    say(format!(
+        "RAN r15b_control_a_real_venv_stays_regenerable with {exe} ({version}): {:?}",
+        it.action
+    ));
     assert_eq!(
         it.action,
         Action::RemoveRegenerable,
