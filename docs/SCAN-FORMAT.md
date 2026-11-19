@@ -577,6 +577,11 @@ state is `unknown`.
    `recover-then-archive`, naming in words what is not saved elsewhere; every fact `yes`: `archive` (labelled unverified, see
    `remote_facts_verified`; its reason says "no dependents were found", never that nothing depends on it). A repo whose `.git/modules` hold a submodule git directory that no scanned
    git node inside it uses, or that is incomplete (`unreadable` or `skipped_mounts`), asks.
+   When the scan's coverage is incomplete and the user did not accept that, `no_dependents`
+   `yes` is read as `unknown` (see "Incomplete coverage"), so no repo is archived or recovered;
+   its reason names what was not read unless the node's own incompleteness above is the reason.
+   Any node, of any class, with an `ask_reason` (such as a path that is not valid UTF-8) is never
+   given a removing action.
 4. Bare repo: `keep` when something depends on it, otherwise `ask`.
 5. Loose code: `ask`.
 6. Enclosing: a node that would be removed becomes `ask` when any node inside it is `keep`, `ask` or

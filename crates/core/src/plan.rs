@@ -475,10 +475,12 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         }
         let (state, state_reason, days) = judge(&ctx, idx, opts);
         // Decided first on the scan's own facts, so a reason about this node itself (an
-        // unreadable entry or a skipped mount inside it) is the one given; strict coverage then
-        // turns whatever would still be archived into a question.
+        // unreadable entry or a skipped mount inside it) is the one given; otherwise, under
+        // strict coverage, it is decided again with the unproven `no_dependents` as unknown, so
+        // the reason says what was not read whenever the facts show it.
         let (mut action, mut reason, mut reclaim) = decide(scan, idx, state, &state_reason, None);
-        if action.removes() {
+        let removing = action.removes();
+        if removing {
             if let Some(why) = node.ask_reason.as_deref() {
                 reason = format!("{reason}; but it {why}");
                 action = Action::Ask;
@@ -511,10 +513,11 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 reclaim = 0;
             }
         }
+        let vetoed = removing && action == Action::Ask;
         if let Some(gap) = strict.as_deref() {
-            if matches!(action, Action::Archive | Action::RecoverThenArchive) {
-                // Only a repository is archived; with its unproven `no_dependents` as unknown it
-                // asks, and the reason names what was not read and the opt-in.
+            if !vetoed {
+                // A repository that would be archived now asks; one that asks for another reason
+                // also names what was not read and the opt-in. Other nodes are unaffected.
                 (action, reason, reclaim) = decide(scan, idx, state, &state_reason, Some(gap));
             }
         }

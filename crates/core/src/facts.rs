@@ -898,12 +898,16 @@ pub struct RepoCheck {
     /// Regenerable directories inside the repo that git does not prove are ignored, untracked
     /// build output: `(path, reason)`.
     pub unverified_artifacts: Vec<(PathBuf, String)>,
+    /// For a linked worktree: the main worktree git names, as an exact path. (`info.parent_repo`
+    /// is its redacted spelling for the scan file and is never looked up.)
+    pub parent_path: Option<PathBuf>,
 }
 
 fn all_unknown(reason: String, unverified: &[PathBuf]) -> RepoCheck {
     let reason = diag(&reason);
     let why = reason.clone();
     RepoCheck {
+        parent_path: None,
         info: RepoInfo {
             layout_issue: Some(reason.clone()),
             notes: vec![reason],
@@ -1261,6 +1265,7 @@ pub fn collect_repo_info(
     }
 
     // Dependents: linked worktrees. (Alternates clones are linked by the scanner.)
+    let mut parent_path: Option<PathBuf> = None;
     facts.no_dependents = match worktree_paths(git, path) {
         Ok(entries) => {
             let me = canon(path);
@@ -1271,6 +1276,7 @@ pub fn collect_repo_info(
                 // A linked worktree: it belongs to the first listed worktree, and nothing
                 // can depend on it.
                 info.parent_repo = entries.first().map(|e| path_label(e));
+                parent_path = entries.first().cloned();
                 Tri::Yes
             } else {
                 let has_none = others.is_empty();
@@ -1341,6 +1347,7 @@ pub fn collect_repo_info(
     RepoCheck {
         info,
         unverified_artifacts: unverified,
+        parent_path,
     }
 }
 

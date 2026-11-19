@@ -491,6 +491,8 @@ struct Build {
     regen_bytes: u64,
     /// The first symlink found inside this node's own git directory, relative to it.
     gitdir_symlink: Option<String>,
+    /// For a linked worktree: its main worktree as git printed it, exact (see `RepoCheck`).
+    parent_path: Option<PathBuf>,
 }
 
 /// The `ask_reason` of a node whose path is not valid UTF-8 (the plan prefixes "it").
@@ -790,6 +792,7 @@ fn classify(
                         git_bytes: 0,
                         regen_bytes: 0,
                         gitdir_symlink: None,
+                        parent_path: None,
                     });
                     new_owner = Some(idx);
                     if class == Class::BareRepo {
@@ -1151,6 +1154,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 unverified.push((i, p, why));
             }
             infos.insert(i, check.info);
+            builds[i].parent_path = check.parent_path;
         }
     } else {
         for (i, _, _, regen) in &tasks {
@@ -2280,8 +2284,9 @@ fn link_repos(builds: &mut [Build], roots: &[PathBuf], warnings: &mut Vec<String
     let mut unresolved: Vec<(usize, String)> = Vec::new();
     let mut parent_links: Vec<(usize, usize)> = Vec::new();
     for (i, b) in builds.iter().enumerate() {
-        if let Some(parent) = b.node.repo.as_ref().and_then(|r| r.parent_repo.as_ref()) {
-            if let Some(&p) = by_path.get(&canon(Path::new(parent))) {
+        // The exact path git printed, never the redacted `parent_repo` text.
+        if let Some(parent) = &b.parent_path {
+            if let Some(&p) = by_path.get(&canon(parent)) {
                 if p != i {
                     parent_links.push((i, p));
                 }
