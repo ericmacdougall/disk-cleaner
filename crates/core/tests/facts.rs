@@ -238,7 +238,10 @@ fn neg9_a_stash_alone_blocks_removal() {
     assert_eq!(f.has_network_remote, Tri::Yes);
     let a = action_for(&res, &repo);
     assert_eq!(a, Action::RecoverBackupThenRemove);
-    assert!(!matches!(a, Action::BackupThenRemove | Action::RemoveRegenerable));
+    assert!(!matches!(
+        a,
+        Action::BackupThenRemove | Action::RemoveRegenerable
+    ));
 }
 
 #[test]
