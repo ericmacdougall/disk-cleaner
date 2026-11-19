@@ -148,7 +148,10 @@ fn midx_layer(f: &str) -> bool {
 
 fn info_entry(f: &str, kind: Kind) -> bool {
     match kind {
-        Kind::File => matches!(f, "packs" | "commit-graph" | "alternates" | "http-alternates"),
+        Kind::File => matches!(
+            f,
+            "packs" | "commit-graph" | "alternates" | "http-alternates"
+        ),
         Kind::Dir => f == "commit-graphs",
         Kind::Other => false,
     }
@@ -338,7 +341,11 @@ mod tests {
             below_git_dir(&p),
             Some(vec!["objects".to_string(), "ab".to_string()])
         );
-        let nested = Path::new("w").join(".git").join("x").join(".git").join("refs");
+        let nested = Path::new("w")
+            .join(".git")
+            .join("x")
+            .join(".git")
+            .join("refs");
         assert_eq!(below_git_dir(&nested), Some(vec!["refs".to_string()]));
         assert_eq!(below_git_dir(&Path::new("w").join(".git")), None);
         assert_eq!(below_git_dir(Path::new("w/src")), None);

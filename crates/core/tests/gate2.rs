@@ -453,12 +453,14 @@ fn sibling_a_local_lfs_objects_and_annex_content_are_not_removable() {
 #[test]
 fn sibling_a_control_rr_cache_and_a_quiet_repo_keep_the_fact_yes() {
     // rr-cache only records conflict resolutions that can be re-derived: not unique work.
+    // git names each entry by the conflict's full hash, so the fixture uses a 40-hex id.
+    let id = "0123456789abcdef0123456789abcdef01234567";
     let (state, act) = pending_case(|repo| {
         write(
             &repo
                 .join(".git")
                 .join("rr-cache")
-                .join("abc")
+                .join(id)
                 .join("preimage"),
             "x",
         );
