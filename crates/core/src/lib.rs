@@ -67,6 +67,14 @@ pub fn scan_from_json(text: &str) -> Result<ScanResult> {
     Ok(scan)
 }
 
+/// Sum `values` with checked arithmetic.
+fn checked_total(what: &str, mut values: impl Iterator<Item = u64>) -> Result<()> {
+    values
+        .try_fold(0u64, |a, v| a.checked_add(v))
+        .map(|_| ())
+        .ok_or_else(|| invalid(what, "the sum overflows 64 bits"))
+}
+
 fn invalid(field: impl Into<String>, message: impl Into<String>) -> Error {
     Error::InvalidScan {
         field: field.into(),
@@ -149,17 +157,11 @@ pub fn validate_scan(scan: &ScanResult) -> Result<()> {
         }
     }
     // Sums: checked, so a hostile file cannot wrap a total.
-    let sum = |what: &str, values: &mut dyn Iterator<Item = u64>| -> Result<()> {
-        values
-            .try_fold(0u64, |a, v| a.checked_add(v))
-            .map(|_| ())
-            .ok_or_else(|| invalid(what, "the sum overflows 64 bits"))
-    };
-    sum("nodes[].bytes_self", &mut scan.nodes.iter().map(|x| x.bytes_self))?;
-    sum("nodes[].bytes_total", &mut scan.nodes.iter().map(|x| x.bytes_total))?;
-    sum("nodes[].files_total", &mut scan.nodes.iter().map(|x| x.files_total))?;
-    sum("nodes[].output_bytes", &mut scan.nodes.iter().map(|x| x.output_bytes))?;
-    sum("outputs[].bytes", &mut scan.outputs.iter().map(|x| x.bytes))?;
-    sum("big_files[].bytes", &mut scan.big_files.iter().map(|x| x.bytes))?;
+    checked_total("nodes[].bytes_self", scan.nodes.iter().map(|x| x.bytes_self))?;
+    checked_total("nodes[].bytes_total", scan.nodes.iter().map(|x| x.bytes_total))?;
+    checked_total("nodes[].files_total", scan.nodes.iter().map(|x| x.files_total))?;
+    checked_total("nodes[].output_bytes", scan.nodes.iter().map(|x| x.output_bytes))?;
+    checked_total("outputs[].bytes", scan.outputs.iter().map(|x| x.bytes))?;
+    checked_total("big_files[].bytes", scan.big_files.iter().map(|x| x.bytes))?;
     Ok(())
 }

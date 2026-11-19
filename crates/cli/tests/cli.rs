@@ -1079,7 +1079,8 @@ fn plan_exit(scan_json: &serde_json::Value, dir: &Path, name: &str) -> (Option<i
 fn l1_hostile_scan_files_are_a_clean_error_with_exit_code_1() {
     let tmp = tempfile::tempdir().unwrap();
     let (scan_file, _nm) = scan_with_project_touched(tmp.path(), 30);
-    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
     let child = v["nodes"]
         .as_array()
         .unwrap()
@@ -1103,7 +1104,8 @@ fn l1_hostile_scan_files_are_a_clean_error_with_exit_code_1() {
 fn l1_changing_one_index_at_a_time_gives_an_error_or_a_plan_never_a_crash() {
     let tmp = tempfile::tempdir().unwrap();
     let (scan_file, _nm) = scan_with_project_touched(tmp.path(), 30);
-    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
     let n = v["nodes"].as_array().unwrap().len();
     let mut cases = 0;
     for i in 0..n {
@@ -1111,7 +1113,10 @@ fn l1_changing_one_index_at_a_time_gives_an_error_or_a_plan_never_a_crash() {
             let mut m = v.clone();
             m["nodes"][i]["parent"] = serde_json::json!(val);
             let (code, err) = plan_exit(&m, tmp.path(), "m.json");
-            assert!(matches!(code, Some(0) | Some(1)), "parent {i}={val}: {code:?} {err}");
+            assert!(
+                matches!(code, Some(0) | Some(1)),
+                "parent {i}={val}: {code:?} {err}"
+            );
             cases += 1;
         }
     }
@@ -1122,7 +1127,10 @@ fn l1_changing_one_index_at_a_time_gives_an_error_or_a_plan_never_a_crash() {
                 let mut m = v.clone();
                 m[key][i]["node"] = serde_json::json!(val);
                 let (code, err) = plan_exit(&m, tmp.path(), "m.json");
-                assert!(matches!(code, Some(0) | Some(1)), "{key}[{i}]={val}: {code:?} {err}");
+                assert!(
+                    matches!(code, Some(0) | Some(1)),
+                    "{key}[{i}]={val}: {code:?} {err}"
+                );
                 cases += 1;
             }
         }
