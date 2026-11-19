@@ -105,11 +105,7 @@ pub fn git_dir_of(node: &Node) -> io::Result<PathBuf> {
 /// then.
 pub fn git_admin_files(node: &Node) -> io::Result<Vec<String>> {
     let gd = git_dir_of(node)?;
-    Ok(sort(&gd)?
-        .own
-        .into_iter()
-        .map(|(p, _)| p)
-        .collect())
+    Ok(sort(&gd)?.own.into_iter().map(|(p, _)| p).collect())
 }
 
 /// Every file in `node`'s git directory whose name is that of an object-store file, the same
@@ -118,11 +114,7 @@ pub fn git_admin_files(node: &Node) -> io::Result<Vec<String>> {
 /// every non-directory entry of the git directory exactly once.
 pub fn object_store_files(node: &Node) -> io::Result<Vec<String>> {
     let gd = git_dir_of(node)?;
-    Ok(sort(&gd)?
-        .store
-        .into_iter()
-        .map(|(p, _)| p)
-        .collect())
+    Ok(sort(&gd)?.store.into_iter().map(|(p, _)| p).collect())
 }
 
 /// Count `git_dir`'s two classes for the plan (see [`sort`]).

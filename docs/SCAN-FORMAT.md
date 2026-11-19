@@ -204,10 +204,13 @@ archives, datasets, model weights, VM disks, database files and dumps; the list 
 `rules/artifacts.toml`). One is listed in `outputs` when it is at least `min_output_bytes` (scan
 option `--min-output-bytes`, default 100 MiB) anywhere; when it is inside a build directory (rule
 `scan_outputs = true`) whatever its size; or when it sits directly in the top directory of any
-regenerable or cache directory whatever its size (package managers put no such file there). Every
+regenerable or cache directory whatever its size. Every
 listed output inside a regenerable or cache directory flags that directory `contains_outputs`,
 whatever its rule, so it asks and its reason names up to three of the files; the rule says what is
-regenerable, never that an output file is. That covers dependency directories too: a
+regenerable, never that an output file is. (A tool that keeps such a file at the top of its own
+directory, as coverage does with the images in `htmlcov/` and some caches do with `*.db` or
+`*.mdb` files, makes that directory ask: the safe side, at the cost of reclaiming less.) That covers
+dependency directories too: a
 `.venv/trained.safetensors` or a `node_modules/pkg/weights.bin` above the threshold makes the
 directory ask, even inside an installed package (no installed-package exemption is made). Below the
 threshold, an output nested inside a dependency directory (a 1 KiB `node_modules/pkg/test/fixture.zip`)
@@ -818,7 +821,8 @@ exempted object files whose first bytes looked right. Every round of review foun
 a file whose prefix passed and whose rest was someone's notes. Schemas 12 and 13 then let an
 opt-in `scan --verify-objects` mark an object store verified by git's own checks, and review found
 that a check of a file's checksum does not show its content is git's (a bitmap with an arbitrary
-payload and a recomputed checksum passed) and that the checks git runs differ between versions.
+payload and a recomputed checksum would pass) and that the checks git runs differ between
+versions.
 Schema 14 removes that verification: no file is exempt because of its name, its first bytes or
 any check this tool runs.
 

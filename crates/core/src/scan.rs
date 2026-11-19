@@ -1179,8 +1179,9 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         // Nothing inside an artifact becomes a node, so its owner is the artifact itself.
         let artifact = owner.filter(|&o| builds[o].node.class.is_artifact());
         // Listed: any size inside a build-output directory (`scan_outputs`) or directly in any
-        // artifact's top directory (package managers put no such file there), and anywhere at
-        // least the output threshold.
+        // artifact's top directory, and anywhere at least the output threshold. A tool that keeps
+        // such a file at the top of its own directory (coverage's `htmlcov/*.png`, a cache's
+        // `*.db`) makes that directory ask: the safe side.
         let in_build_dir = artifact.is_some_and(|o| builds[o].scan_outputs);
         let at_top = artifact.is_some_and(|o| path.parent() == Some(builds[o].path.as_path()));
         if in_build_dir || at_top || bytes >= opts.min_output_bytes {

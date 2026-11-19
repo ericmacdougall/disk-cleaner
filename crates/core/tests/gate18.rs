@@ -5,8 +5,7 @@
 //! `.venv/trained.safetensors` above the output threshold was listed as an output while the
 //! whole `.venv` was offered `remove-regenerable`. Now any listed output makes the artifact that
 //! holds it ask and name it, whatever the rule, and the enclosing repository is not removed
-//! either. An output file of any size directly in an artifact's top directory is listed too:
-//! package managers put none there.
+//! either. An output file of any size directly in an artifact's top directory is listed too.
 //!
 //! F1, F3: `scan --verify-objects` is removed. This format defines no verification of object
 //! data, so a scan file that claims one (`verified`, `checked`) is refused as invalid.
@@ -326,6 +325,20 @@ fn forged_a_scan_file_that_claims_a_verification_is_refused() {
                 );
             }
             other => panic!("{block}.{key}={val} accepted or wrong error: {other:?}"),
+        }
+    }
+
+    // The same claim on the node or on the document itself.
+    let mut on_node = v.clone();
+    on_node["nodes"][i]["verified"] = serde_json::json!(true);
+    let mut on_doc = v.clone();
+    on_doc["object_store_verified"] = serde_json::json!(true);
+    for m in [on_node, on_doc] {
+        match scan_from_json(&m.to_string()) {
+            Err(Error::InvalidScan { field, .. }) => {
+                assert!(field.contains("verified"), "{field}");
+            }
+            other => panic!("accepted or wrong error: {other:?}"),
         }
     }
 }

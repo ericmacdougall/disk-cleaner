@@ -75,18 +75,36 @@ pub fn scan_from_json(text: &str) -> Result<ScanResult> {
     Ok(scan)
 }
 
-/// Field names a repository block, its `object_store` or its `git_admin` may not carry. This
-/// format defines no verification of object data (every object-store file is to be backed up
-/// before removal), so a claim of one, from an earlier build or written by hand, is refused as
-/// an invalid scan file, never trusted and never silently dropped. Any other name containing
-/// `verif` is refused the same way.
+/// Field names the scan document, a node, its repository block, `object_store` or `git_admin`
+/// may not carry. This format defines no verification of object data (every object-store file is
+/// to be backed up before removal), so a claim of one, from an earlier build or written by hand,
+/// is refused as an invalid scan file, never trusted and never silently dropped. Any other name
+/// containing `verif` is refused the same way. (No field of this format has such a name; maps
+/// whose keys are data, such as paths, are not looked at.)
 const VERIFICATION_FIELDS: [&str; 4] = ["verified", "checked", "verification", "verify_objects"];
 
 fn refuse_verification_claims(value: &serde_json::Value) -> Result<()> {
+    let claim = |at: String, block: Option<&serde_json::Map<String, serde_json::Value>>| {
+        let key = block?
+            .keys()
+            .find(|k| VERIFICATION_FIELDS.contains(&k.as_str()) || k.contains("verif"))?;
+        Some(invalid(
+            format!("{at}{key}"),
+            "this scan format defines no verification of object data: every object-store file \
+             is to be backed up before removal, so a scan file that claims a verification is not \
+             accepted",
+        ))
+    };
+    if let Some(e) = claim(String::new(), value.as_object()) {
+        return Err(e);
+    }
     let Some(nodes) = value.get("nodes").and_then(|n| n.as_array()) else {
         return Ok(());
     };
     for (i, node) in nodes.iter().enumerate() {
+        if let Some(e) = claim(format!("nodes[{i}]."), node.as_object()) {
+            return Err(e);
+        }
         let Some(repo) = node.get("repo").and_then(|r| r.as_object()) else {
             continue;
         };
@@ -97,19 +115,8 @@ fn refuse_verification_claims(value: &serde_json::Value) -> Result<()> {
             ("git_admin.", inner("git_admin")),
         ];
         for (prefix, block) in blocks {
-            let Some(block) = block else {
-                continue;
-            };
-            let claim = block
-                .keys()
-                .find(|k| VERIFICATION_FIELDS.contains(&k.as_str()) || k.contains("verif"));
-            if let Some(key) = claim {
-                return Err(invalid(
-                    format!("nodes[{i}].repo.{prefix}{key}"),
-                    "this scan format defines no verification of object data: every \
-                     object-store file is to be backed up before removal, so a scan file that \
-                     claims a verification is not accepted",
-                ));
+            if let Some(e) = claim(format!("nodes[{i}].repo.{prefix}"), block) {
+                return Err(e);
             }
         }
     }
