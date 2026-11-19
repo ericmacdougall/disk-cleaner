@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **11** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **12** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -26,13 +26,17 @@ added `repo.git_admin` (the survey of the git directory's own files), the plan i
 `preserve` and the config key `max_git_admin_bytes`, renamed the plan actions `archive` to
 `backup-then-remove` and `recover-then-archive` to `recover-backup-then-remove`, and made the
 preserve obligation a rule of the plan format (see "The preserve obligation"); a version 10 scan
-has no survey to back up from, so it is refused.
+has no survey to back up from, so it is refused. Version 12 split every git directory into two
+classes by name, added `repo.object_store`, the plan field `preserve.object_store`, the scan option
+`--verify-objects` and the config key `verify_objects`, and dropped the content checks that
+exempted files whose first bytes looked like object files (see "The preserve obligation"); a
+version 11 scan left such files out of every obligation, so it is refused.
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 Such a node therefore gets an `ask_reason` and is never offered for removal (see "File names git
 prints").
 
-Produce a scan with `disk-cleaner scan <path>... --out scan.json` (or `--json` for stdout) and a
+Produce a scan with `disk-cleaner scan <path>... [--verify-objects] [--config FILE] --out scan.json` (or `--json` for stdout) and a
 plan with `disk-cleaner plan --scan scan.json [--active-window-days N] [--config FILE] [--active PATH]... [--trust-partial-process-check] [--accept-incomplete-coverage] [--json]`. Both are
 read-only. Nothing in this phase deletes, moves or modifies anything; `--out` writes only the file
 you name.
@@ -41,7 +45,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 11 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 12 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots that were walked, as spelled (a kept inner root under the spelling of the root that encloses it); overlapping roots are normalised first (see "Overlapping scan roots") |
@@ -236,7 +240,8 @@ with or without evidence.
 | `unsaved_pseudorefs` | present when not empty: the exact names of the pseudorefs at the top of this worktree's git directory (`ORIG_HEAD` and the like) whose commit no network remote's tracking refs contain (`reflog_saved` is `no`). A name that would not be shown exactly (a control character, text the redaction rewrites) is never listed here: such a pseudoref is unchecked instead, so recovery is never told a name that is not the file's |
 | `unchecked_pseudorefs` | present when not empty: one sentence per pseudoref that could not be read, parsed or compared, naming it and what is wrong (`ORIG_HEAD at the top of the git directory names a tag object, not a commit`); `reflog_saved` is `unknown` |
 | `local_admin_content`, `local_admin_content_count` | present when not empty: up to five examples, sorted, of what the git directory holds of its own (`hooks/pre-commit`, `info/notes.txt`, `description`, `config: user.email`), and how many were found in all; `no_local_admin_content` is `no` (see "Local content in the git directory") |
-| `git_admin` | present when the node's own git directory could be enumerated: `files` and `bytes` (allocated) of every file in it that is not an object file (see "The preserve obligation"), `examples` (up to five, sorted, of those whose names are not ones every clone has) and `largest` (the three largest, `path` and `bytes`). Absent when there is no own git directory (a linked worktree) or the walk failed (a note says why); the plan then asks |
+| `git_admin` | present when the node's own git directory could be enumerated: `files` and `bytes` (allocated) of every file in it that is not of the object-store class (see "The preserve obligation"), `examples` (up to five, sorted, of those whose names are not ones every clone has) and `largest` (the three largest, `path` and `bytes`). Absent when there is no own git directory (a linked worktree) or the walk failed (a note says why); the plan then asks |
+| `object_store` | present with `git_admin`: `files` and `bytes` (allocated) of the git directory's object-store class, and `verified`, `true` only when `--verify-objects` had git verify the whole store and account for each of those files (see "The preserve obligation") |
 | `sizes` | `total`, `git` (the `.git` directory), `regenerable`, `output` |
 
 Facts (the safe value is always `yes`):
@@ -398,7 +403,7 @@ Anything found makes `no_local_admin_content` `no`, and the plan asks ("this rep
 of its own in its git directory that exist nowhere else: hooks/pre-commit, info/notes.txt; copy
 them out or decide they can go") with nothing reclaimable. This ask predates the preserve
 obligation (see "The preserve obligation"), which now backs up every one of these files before any
-removal; it is kept unchanged in schema 11 so that no repository moves toward removal in the
+removal; it is kept unchanged since schema 11 so that no repository moves toward removal in the
 change that introduced the backup. The stock templates were checked on git 2.56 on Linux, macOS and Windows: all
 three install the same fourteen `*.sample` hooks, the same comment-only `info/exclude` and the same
 `description`.
@@ -442,9 +447,9 @@ The shapes were checked on git 2.56 on Linux, macOS and Windows against a fresh 
 `git repack -a -d --write-bitmap-index`, `git commit-graph write --reachable` (single and
 `--split`), `git multi-pack-index write` (plain and `--bitmap`), a recorded rerere resolution and
 `git pack-refs --all`: each stays `backup-then-remove`. Whatever the shape check finds, every file in
-the git directory is also in `preserve.git_admin` unless it is an object file that passes the
-content check in "The preserve obligation", so a file the shape rules miss is still backed up
-before any removal.
+the git directory is also under one of the two obligations in "The preserve obligation" (backed up,
+or for an object-store name verified against the remote or backed up), so a file the shape rules
+miss is never removed unsaved.
 
 A `shallow` file does not make a repository unplain (a shallow clone is complete for what it
 holds); the shape check ignores it. A failure is `no`; a check that cannot be made is `unknown`;
@@ -702,6 +707,7 @@ active_window_days = 7
 # trust_partial_process_check = true   # optional, see below; default false
 # accept_incomplete_coverage = true    # optional, see "Accepting incomplete coverage"; default false
 # max_git_admin_bytes = 67108864       # optional, see "The preserve obligation"; default 64 MiB
+# verify_objects = true                # optional, read by scan (as --verify-objects); default false
 ```
 
 A missing default file means the default. A file that exists but is malformed, has an unknown key
@@ -740,8 +746,9 @@ its git directory's own files (see "The preserve obligation"). The plan has no a
 3. Repo and worktree: state unknown: `ask`; `plain_layout` not `yes`: `ask` (unusual repository layout); `no_dependents` `no`: `ask`, never a removing action, naming up to three dependents and links and the count of the rest (recovery saves this repo's own refs and cannot make the repos that use its objects safe); `no_local_admin_content` `no`: `ask` with nothing reclaimable, naming up to five of the git directory's own files and the count of the rest (recovery does not save them); `hidden_index_entries` above 0: `ask` ("N files are marked skip-worktree or assume-unchanged, so git hides edits to them and they cannot be saved automatically; review them first"); any fact `unknown`: `ask`, with each unknown fact explained in words (what could not be checked and what would settle it; for local tags, that tag names cannot be checked against the remote without contacting it and will be verified when a removal is applied); any other fact `no`:
    `recover-backup-then-remove`, naming in words what is not saved elsewhere; every fact `yes`: `backup-then-remove` (labelled unverified, see
    `remote_facts_verified`; its reason says "no dependents were found", never that nothing depends on it). Both then carry
-   `preserve` and say what is backed up ("its git settings, hooks, logs and other local git files (N files, X KiB) are saved
-   with the manifest first, then it is removed"); a git node whose own files were not counted, or hold more than
+   `preserve` and say what is backed up and what must be verified ("its N local git files (X KiB: settings, hooks, logs and
+   the like) are saved with the manifest first; its object store (M files, Y GiB) must be verified against the remote or saved
+   too (not yet verified), then it is removed"); a git node whose files were not counted, or whose own files hold more than
    `max_git_admin_bytes`, asks instead. A repo whose `.git/modules` hold a submodule git directory that no scanned
    git node inside it uses, or that is incomplete (`unreadable` or `skipped_mounts`), asks.
    When the scan's coverage is incomplete and the user did not accept that, `no_dependents`
@@ -780,77 +787,141 @@ removing item twice; `totals.ready_bytes` is only `remove-regenerable` bytes: a
 backup that has not been made, so it is never "ready". An absurdly large
 `--active-window-days` saturates (everything with evidence is active) instead of wrapping.
 
+
 ### The preserve obligation
 
 Earlier schemas tried to prove that a git directory held nothing unique by judging its files one
-kind at a time (hooks, `info/`, message files, `rr-cache/`, `logs/`, ...). Every round of review
-found another kind, so schema 11 makes a backup the mechanism instead.
+kind at a time (hooks, `info/`, message files, `rr-cache/`, `logs/`, ...), and schema 11 then
+exempted object files whose first bytes looked right. Every round of review found another kind, or
+a file whose prefix passed and whose rest was someone's notes. Schema 12 makes a backup or git's
+own full verification the only way past the obligation, and no file is exempt because of what its
+first bytes say.
+
+**Two classes, by name alone.** Every non-directory entry of a git directory (a symlink or other
+non-directory entry included, never followed) is in exactly one of two classes, decided by its
+path below the git directory. No content is read to decide.
+
+| Class | Plan field | Which files | Obligation |
+|---|---|---|---|
+| (b) the object store | `preserve.object_store` | in `objects/`, a name of an object-store file: `<xx>/<38 or 62 hex>` (loose object); `pack/pack-<id>.{pack,idx,rev,bitmap,mtimes}`; `pack/multi-pack-index`, `pack/multi-pack-index-<id>.{bitmap,rev}`, `pack/multi-pack-index.d/multi-pack-index-<id>.{midx,bitmap,rev}`; `info/commit-graph`, `info/commit-graphs/graph-<id>.graph` | verified against the remote, or backed up |
+| (a) the git directory's own files | `preserve.git_admin` | every other entry, of any name or kind | always backed up |
+
+Class (a) therefore includes `config`, `HEAD`, `index`, `packed-refs`, every file under `refs/` and
+`logs/` (`logs/refs/.notes` included), every hook whatever its name or suffix (an edited
+`pre-commit.sample`, a `custom.sample`), `info/*`, `description`, `COMMIT_EDITMSG` and the other
+message files, `rr-cache/` (recorded resolutions, including one recorded before a merge was
+aborted), `.keep` and `.promisor` markers, `objects/info/packs`, `objects/info/alternates`, the
+chain files `multi-pack-index-chain` and `commit-graph-chain`, `lfs/`, `modules/`, `worktrees/`,
+and any stray file anywhere, including one inside `objects/` whose name is not an object-store
+name. An entry with an object-store name that is not a regular file (a symlink) is class (a) too,
+and makes `no_local_admin_content` `no`, so the repository asks. `disk_cleaner_core::git_admin_files`
+and `disk_cleaner_core::object_store_files` list the two classes; together they list every file
+exactly once.
 
 **The rule.** Every plan item whose action removes a git node (repository, worktree or bare
-repository) carries `preserve.git_admin`, covering its own git directory and those of the git
-nodes inside it. A removing item that is not a git node but holds one (the scan already makes such
-a directory ask) asks rather than remove a git directory without the obligation. A consumer that
-applies a plan MUST NOT remove such a node unless a backup of every file `preserve.git_admin`
-covers has been made and verified (each file read back and compared) first; if the backup cannot
-be made or verified, it MUST NOT remove anything. The file list is enumerated again at apply time
-with `disk_cleaner_core::git_admin_files` (the same classifier the scan used) rather than trusted
-from the plan, and an enumeration error means nothing is removed. **No apply phase exists in this
-version**: `scan` and `plan` are read-only, and this rule binds whatever applies a plan later.
+repository) carries `preserve`, covering its own git directory and those of the git nodes inside
+it. A removing item that is not a git node but holds one (the scan already makes such a directory
+ask) asks rather than remove a git directory without the obligation. A consumer that applies a
+plan MUST NOT remove such a node unless, first:
 
-**What `preserve.git_admin` covers.** Every file in the git directory, of any kind (a symlink
-or other non-directory entry included, never followed), except the object files of its object
-store. An object file is one of these, and only when its content is what its name says:
+1. every file of class (a) has been backed up and the backup verified (each file read back and
+   compared); and
+2. every file of class (b) has EITHER been fully verified as git data whose objects are all present
+   on the remote, as re-verified by the consumer (a loose object: inflated completely, its hash
+   equal to the id its path names, no bytes after the zlib stream; a pack: the trailer checksum over
+   the whole file matches, every object in it is reachable from the re-verified remote refs, and its
+   `.idx` checksum and pack-checksum fields match; a reverse index, bitmap, cruft mtimes,
+   multi-pack-index or commit-graph: regenerable from verified packs, so it may be dropped only
+   when its packs verified, and is otherwise unverified) OR been backed up like class (a).
 
-| Object file | Name | Content check |
-|---|---|---|
-| loose object | `objects/<xx>/<38 or 62 hex>` | the start of the file is a valid zlib stream whose inflated start is `<blob\|tree\|commit\|tag> <1-20 digits>\0` (at most 2 KiB read, at most 64 bytes inflated, at most 50,000 loose objects checked per git directory) |
-| pack | `objects/pack/pack-<id>.pack` | begins with `PACK` and version 2 or 3, and `pack-<id>.idx` beside it passes its own check |
-| pack index | `objects/pack/pack-<id>.idx` | version 2 (`\377tOc`, version 2 or 3) or the version 1 layout (256 non-decreasing counts and a length that matches them), and `pack-<id>.pack` beside it passes its check |
-| reverse index, bitmap, cruft mtimes | `objects/pack/pack-<id>.{rev,bitmap,mtimes}` | magic `RIDX`, `BITM`, `MTME`, and its pack and index pass |
-| multi-pack-index | `objects/pack/multi-pack-index`, `objects/pack/multi-pack-index-<id>.{bitmap,rev}`, `objects/pack/multi-pack-index.d/multi-pack-index-<id>.{midx,bitmap,rev}` | magic `MIDX`, `BITM`, `RIDX` |
-| commit-graph | `objects/info/commit-graph`, `objects/info/commit-graphs/graph-<id>.graph` | magic `CGPH` |
+If the backup cannot be made or verified, or a file cannot be verified, it MUST NOT remove
+anything. Both lists are enumerated again at apply time with the two functions above (the same
+classifier the scan used) rather than trusted from the plan, and an enumeration error means nothing
+is removed. **No apply phase exists in this version**: `scan` and `plan` are read-only, and this
+rule binds whatever applies a plan later.
 
-Everything else is covered, for example: `config`, `HEAD`, `index`, `packed-refs`, every file
-under `refs/` and `logs/` (`logs/refs/.notes` included), every hook whatever its name or suffix
-(an edited `pre-commit.sample`, a `custom.sample`), `info/*`, `description`, `COMMIT_EDITMSG` and
-the other message files, `rr-cache/` (recorded resolutions, including one recorded before a merge
-was aborted), `.keep` and `.promisor` markers, `objects/info/packs`, `objects/info/alternates`,
-the chain files `multi-pack-index-chain` and `commit-graph-chain`, and any stray file anywhere,
-including one inside `objects/`.
+**`verified` and `scan --verify-objects`.** `preserve.object_store.verified` is `false` unless the
+scan itself verified the store. That happens only with `scan --verify-objects` (or
+`verify_objects = true` in the config file), which runs these read-only git commands through the
+same hardened runner as the facts (no system or global config, no hooks, no transport, the
+per-command timeout), in the repository:
 
-**A file named like an object that is not one** (a text file in a fanout directory, a `.pack`
-holding text, an index without its pack, a pack without its index, a `.rev` whose pack fails) is
-covered like any other file, and it also makes `no_local_admin_content` `no` with the file named,
-so the repository asks: it is not a git object.
+| Command | What it checks |
+|---|---|
+| `git rev-parse --show-object-format` | the hash length; a loose-object name of another length is a file git never reads |
+| `git verify-pack <pack>.idx`, for each pack whose `.pack` and `.idx` are both present | runs `index-pack --verify`: reads the whole pack, checks its trailer checksum and every object, and compares the index it computes with the `.idx` on disk; it writes nothing in this mode |
+| `git -c core.multiPackIndex=true multi-pack-index verify`, when a multi-pack-index exists | the multi-pack-index against its checksum and its packs |
+| `git -c core.commitGraph=true commit-graph verify`, when a commit-graph exists | the commit-graph (single or split) against its checksum and the objects |
+| `git fsck --full --strict --no-dangling --unreachable --no-progress` | every object; each loose object is inflated completely and its hash compared with its name, and bytes after the zlib stream are an error; `unreachable` lines name objects that no ref, reflog or the index reaches |
 
-**The cap.** `preserve.git_admin` is meant for small files. When one git directory's covered files
-take more than `max_git_admin_bytes` (allocated, default 64 MiB, config key
-`max_git_admin_bytes`), the node asks, naming the largest of them: a large file put inside `.git`
-is the user's data, not git's settings, and a person decides where it goes.
+Each file of class (b) must then be accounted for by what git verified: a loose object of the
+repository's hash length (fsck reads every one); a `.pack` and `.idx` pair that `verify-pack`
+accepted; a pack's `.rev`, `.bitmap` and `.mtimes` when that pack verified; a multi-pack-index that
+verified, and its `.bitmap` and `.rev` only when named by its checksum (the file's last 20 or 32
+bytes); a multi-pack-index layer or split commit-graph file only when its chain file lists it.
 
-**The plan fields.** `preserve.git_admin` holds `git_dirs` (the git directories covered: `<path>/.git`
-for a repository or worktree, the path itself for a bare repository, and those of git nodes nested
-inside a removed directory), `files` and `bytes` (allocated, summed over `git_dirs`) and, when any
-covered file has a name that not every clone has, `examples` (up to five paths relative to the
-item's directory, such as `.git/COMMIT_EDITMSG` or `.git/hooks/pre-commit`). A git node whose
-files the scan could not count (`repo.git_admin` absent) asks ("its git directory's own files were
-not counted ..., so they could not be backed up first"). The human plan prints a `back up first:`
-line under each such item.
+- `verified` is `true` only when every command ran and passed, every class-(b) file was accounted
+  for, no object is unreachable, and (in the plan) the item's action is `backup-then-remove`, so the
+  facts say every ref's commits are on a network remote. A `recover-backup-then-remove` item is
+  never verified: recovery changes the refs first.
+- A command that times out or cannot start, unreachable objects (they may exist nowhere else), an
+  unknown object format, or incremental multi-pack-index layers (which this version does not verify)
+  leave `verified` `false` with a note; the obligation still covers every file.
+- A class-(b) file git does not account for (an index without its pack, a pack without its index, a
+  sidecar of no verified pack or not named by the multi-pack-index's checksum, a layer or graph file
+  no chain lists, a loose object of the wrong length) is moved to class (a), counted there, named in
+  `repo.local_admin_content`, and makes `no_local_admin_content` `no`, so the repository asks.
+- A command that ran and failed (git found the store damaged, or could not read it) makes
+  `no_local_admin_content` `no` with the entry `objects (git found a problem: ...)`, so the
+  repository asks: a damaged store is for a person to look at.
+
+The scan records the result in `repo.object_store` (`files`, `bytes`, `verified`). The commands
+were confirmed against git's documentation and source (git-scm.com docs for `fsck`, `verify-pack`
+and `index-pack`, and `builtin/verify-pack.c`, `builtin/index-pack.c` and `object-file.c` on
+2026-11-19): `read_loose_object` checks the hash and reports "garbage at end of loose object", and
+`index-pack --verify` checks the trailer and compares against the existing index without writing
+it. The tests in `crates/core/tests/gate17.rs` check each case end to end on Linux, macOS and
+Windows.
+
+**The cap.** Class (a) is meant for small files. When one git directory's class-(a) files take
+more than `max_git_admin_bytes` (allocated, default 64 MiB, config key `max_git_admin_bytes`), the
+node asks, naming the largest of them: a large file put inside `.git` is the user's data, not git's
+settings, and a person decides where it goes. Class (b) has no cap: it is not copied unless it
+cannot be verified.
+
+**The plan fields.** `preserve.git_admin` holds `git_dirs` (the git directories covered:
+`<path>/.git` for a repository or worktree, the path itself for a bare repository, and those of git
+nodes nested inside a removed directory), `files` and `bytes` (allocated, summed over `git_dirs`)
+and `examples` (up to five paths relative to the item's directory: first the three largest covered
+files of at least 1 MiB, so a large file kept after raising `max_git_admin_bytes` is named, then
+files whose names not every clone has, such as `.git/COMMIT_EDITMSG` or `.git/hooks/pre-commit`).
+`preserve.object_store` holds `files`, `bytes` and `verified`, summed over the same git
+directories (verified only when all are). The reason says both: "its N local git files (X KiB:
+settings, hooks, logs and the like) are saved with the manifest first; its object store (M files,
+Y GiB) must be verified against the remote or saved too (verified by this scan | not yet
+verified), then it is removed". A git node whose files the scan could not count (`repo.git_admin`
+or `repo.object_store` absent) asks. The human plan defines the manifest once in its header ("the
+manifest is the restore record a later apply step writes") and prints a `back up first:` line and an
+`object store:` line under each such item.
 
 **Asks the backup makes redundant.** With the obligation in place, some existing asks guard content
-that the backup now saves. They are kept unchanged in schema 11, so that no repository moves toward
-removal in the change that introduced the backup; relaxing them is a separate decision:
+that the backup now saves. They are kept unchanged, so that no repository moves toward removal in
+the change that introduced the backup; relaxing them is a separate decision:
 
 - `no_local_admin_content` `no` from a custom hook, a non-stock `info/` file, an edited
   `description`, a pending `TAG_EDITMSG`, `MERGE_MSG` or `SQUASH_MSG`, legacy `branches/` or
   `remotes/` files, or a config key of a local family (`user.*`, `url.*`, `branch.<b>.description`,
   unknown families): all of these files are in `preserve.git_admin`;
 - `no_local_admin_content` `no` from a stray file found by the shape check under `refs/`, `logs/`,
-  `rr-cache/`, `objects/` (other than a file named like an object that fails its content check, which
-  stays an ask for its own reason), `lfs/` or `fsmonitor--daemon/`;
+  `rr-cache/`, `objects/`, `lfs/` or `fsmonitor--daemon/`;
 - the part of `plain_layout` that refuses an unknown top-level file (not directory) in the git
   directory: such a file is backed up too, although `plain_layout` also guards how git reads the
   repository, so only that part would be redundant.
+
+One ask of schema 11 is gone, by design: a file with an object-store name whose first bytes did not
+look like an object file made the repository ask. Schema 12 reads no content to classify, so a
+default scan puts such a file under the object-store obligation (unverified) instead, and
+`--verify-objects` makes the repository ask when git does not account for it or finds it damaged.
 
 Not redundant, and not touched by the backup: dependents, hidden index entries, pseudorefs (they
 are about commits, which the remote check covers), coverage, the process check, alternates, linked

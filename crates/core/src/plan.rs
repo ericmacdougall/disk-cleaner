@@ -8,7 +8,7 @@
 
 use crate::model::*;
 use crate::procs::ProcessCheck;
-use crate::words::{agree, count, kib, some_of};
+use crate::words::{agree, count, kib, size, some_of};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -684,8 +684,12 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         }
         let why = match preserve_for(scan, &children, it.node) {
             Ok(None) => continue,
-            Ok(Some(pre)) if it.class.is_git() => {
+            Ok(Some(mut pre)) if it.class.is_git() => {
+                // Verified only when the scan verified the stores and every fact is yes: a
+                // recovery changes the refs first, so its store is checked after it.
+                pre.object_store.verified &= it.action == Action::BackupThenRemove;
                 let g = &pre.git_admin;
+                let s = &pre.object_store;
                 let inside = g.git_dirs.len().saturating_sub(1) as u64;
                 let also = if inside > 0 {
                     format!(
@@ -695,12 +699,21 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 } else {
                     String::new()
                 };
+                let state = if s.verified {
+                    "verified by this scan"
+                } else {
+                    "not yet verified"
+                };
                 it.reason = format!(
-                    "{}; its git settings, hooks, logs and other local git files ({}, {}{also}) \
-                     are saved with the manifest first, then it is removed",
+                    "{}; its {} ({}{also}: settings, hooks, logs and the like) {} saved with the \
+                     manifest first; its object store ({}, {}) must be verified against the \
+                     remote or saved too ({state}), then it is removed",
                     it.reason,
-                    count(g.files, "file", "files"),
-                    kib(g.bytes)
+                    count(g.files, "local git file", "local git files"),
+                    kib(g.bytes),
+                    agree(g.files, "is", "are"),
+                    count(s.files, "file", "files"),
+                    size(s.bytes)
                 );
                 it.preserve = Some(pre);
                 continue;
@@ -1063,6 +1076,13 @@ fn preserve_veto(node: &Node, max: u64) -> Option<String> {
                 .to_string(),
         );
     };
+    if node.repo.as_ref().and_then(|r| r.object_store.as_ref()).is_none() {
+        return Some(
+            "its object store's files were not counted (see the notes), so they could not be \
+             verified or backed up first"
+                .to_string(),
+        );
+    }
     if g.bytes <= max {
         return None;
     }
@@ -1081,9 +1101,14 @@ fn preserve_veto(node: &Node, max: u64) -> Option<String> {
     ))
 }
 
-/// What removing `idx` must back up first: the own files of every git directory it removes (its
-/// own and those of git nodes inside it). `Err` names a git node inside it whose files were not
-/// counted.
+/// A preserved file at least this large is named first among the examples (up to three), so a
+/// large file kept inside `.git` (possible when `max_git_admin_bytes` is raised) is visible.
+const LARGE_PRESERVED: u64 = 1024 * 1024;
+
+/// What removing `idx` must back up, or verify, first: the own files and the object store of
+/// every git directory it removes (its own and those of git nodes inside it). The object store
+/// counts as verified only when the scan verified every one of them; the caller also requires
+/// the item's facts. `Err` names a git node inside it whose files were not counted.
 fn preserve_for(
     scan: &ScanResult,
     children: &[Vec<usize>],
@@ -1103,14 +1128,22 @@ fn preserve_for(
     }
     found.sort_unstable();
     let mut out = PreserveGitAdmin::default();
+    let mut store = PreserveObjectStore {
+        verified: true,
+        ..PreserveObjectStore::default()
+    };
     let mut examples: Vec<String> = Vec::new();
+    let mut large: Vec<(u64, String)> = Vec::new();
     for i in found {
         let n = &scan.nodes[i];
-        let g = n
+        let (g, s) = n
             .repo
             .as_ref()
-            .and_then(|r| r.git_admin.as_ref())
+            .and_then(|r| Some((r.git_admin.as_ref()?, r.object_store.as_ref()?)))
             .ok_or_else(|| n.path.clone())?;
+        store.files = store.files.saturating_add(s.files);
+        store.bytes = store.bytes.saturating_add(s.bytes);
+        store.verified &= s.verified;
         let gd = if n.class == Class::BareRepo {
             PathBuf::from(&n.path)
         } else {
@@ -1121,23 +1154,38 @@ fn preserve_for(
             .strip_prefix(base)
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
-        for e in &g.examples {
-            examples.push(if prefix.is_empty() {
-                e.clone()
+        let under = |e: &str| {
+            if prefix.is_empty() {
+                e.to_string()
             } else {
                 format!("{prefix}/{e}")
-            });
-        }
+            }
+        };
+        examples.extend(g.examples.iter().map(|e| under(e)));
+        large.extend(
+            g.largest
+                .iter()
+                .filter(|f| f.bytes >= LARGE_PRESERVED)
+                .map(|f| (f.bytes, under(&f.path))),
+        );
         out.git_dirs.push(gd.to_string_lossy().into_owned());
         out.files = out.files.saturating_add(g.files);
         out.bytes = out.bytes.saturating_add(g.bytes);
     }
+    // The largest preserved files first, then the unusual names.
+    large.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut named: Vec<String> = large.into_iter().take(3).map(|(_, p)| p).collect();
     examples.sort();
-    examples.truncate(5);
-    out.examples = examples;
+    for e in examples {
+        if !named.contains(&e) {
+            named.push(e);
+        }
+    }
+    named.truncate(5);
+    out.examples = named;
     Ok(Some(Preserve {
         git_admin: out,
-        object_store: PreserveObjectStore::default(),
+        object_store: store,
     }))
 }
 

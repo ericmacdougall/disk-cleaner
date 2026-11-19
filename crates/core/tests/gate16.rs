@@ -515,7 +515,11 @@ fn y2_any_file_dropped_in_the_git_directory_is_asked_about_or_backed_up() {
             } else {
                 assert!(it_v.action.removes(), "{rel}: {:?}", it_v.action);
                 let files_v = admin_files(&res_v, &repo);
-                assert!(files_v.contains(&rel), "{rel} verified away: {}", it_v.reason);
+                assert!(
+                    files_v.contains(&rel),
+                    "{rel} verified away: {}",
+                    it_v.reason
+                );
                 let pre = it_v.preserve.as_ref().expect("preserve");
                 assert_eq!(pre.git_admin.files, files_v.len() as u64);
             }

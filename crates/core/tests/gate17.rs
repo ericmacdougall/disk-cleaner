@@ -97,7 +97,11 @@ fn assert_partition(res: &ScanResult, repo: &Path) {
     }
     let mut both: Vec<String> = a.iter().chain(s.iter()).cloned().collect();
     both.sort();
-    assert_eq!(both, every_file(repo), "the two classes must cover every file");
+    assert_eq!(
+        both,
+        every_file(repo),
+        "the two classes must cover every file"
+    );
 }
 
 /// A removing item for `repo` that carries both obligations, with counts matching the two public
@@ -163,7 +167,11 @@ fn z1_a_midx_sidecar_holding_notes_is_under_the_object_store_obligation() {
     let rel = format!("objects/pack/{MIDX_REV}");
 
     let res = scan_default(&root);
-    assert!(store(&res, &repo).contains(&rel), "{:?}", store(&res, &repo));
+    assert!(
+        store(&res, &repo).contains(&rel),
+        "{:?}",
+        store(&res, &repo)
+    );
     assert!(!admin(&res, &repo).contains(&rel));
     assert_partition(&res, &repo);
     let p = plan_of(&res);
@@ -273,7 +281,10 @@ fn z1_a_loose_object_with_a_valid_header_and_a_corrupt_remainder() {
     let (rel, path) = loose_blob(&repo, &some_text());
     let mut bytes = fs::read(&path).unwrap();
     let n = bytes.len();
-    assert!(n > 64, "the object is long enough to keep its header intact");
+    assert!(
+        n > 64,
+        "the object is long enough to keep its header intact"
+    );
     for b in &mut bytes[n - 16..] {
         *b = b'X';
     }
@@ -292,7 +303,8 @@ fn z1_bytes_after_a_valid_loose_object_are_found_by_verification() {
     let repo = clone_of(tmp.path(), &root, &remotes, "app");
     let (rel, path) = loose_blob(&repo, &some_text());
     let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-    f.write_all(b"notes hidden after the zlib stream\n").unwrap();
+    f.write_all(b"notes hidden after the zlib stream\n")
+        .unwrap();
     drop(f);
 
     let res = scan_default(&root);
@@ -311,7 +323,10 @@ fn z1_controls_are_unverified_by_default_and_verified_by_git() {
     let gc = clone_of(tmp.path(), &root, &remotes, "gc");
     git(&gc, &["gc", "-q"]);
     let bitmap = clone_of(tmp.path(), &root, &remotes, "bitmap");
-    git(&bitmap, &["repack", "-a", "-d", "-q", "--write-bitmap-index"]);
+    git(
+        &bitmap,
+        &["repack", "-a", "-d", "-q", "--write-bitmap-index"],
+    );
     let graph = clone_of(tmp.path(), &root, &remotes, "graph");
     git(&graph, &["commit-graph", "write", "--reachable"]);
     let split = clone_of(tmp.path(), &root, &remotes, "split");

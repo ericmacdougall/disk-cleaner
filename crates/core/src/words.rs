@@ -24,6 +24,22 @@ pub fn kib(bytes: u64) -> String {
     format!("{} KiB", bytes.div_ceil(1024))
 }
 
+/// Bytes in 1024-based units with one decimal: `size(1536)` is `1.5 KiB`, `size(5)` is `5 B`.
+pub fn size(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
 /// Up to `max` of `items`, comma separated, then `and N more` for the rest.
 pub fn some_of(items: &[String], max: usize) -> String {
     let shown = items
@@ -55,6 +71,9 @@ mod tests {
         assert_eq!(kib(1), "1 KiB");
         assert_eq!(kib(2048), "2 KiB");
         assert_eq!(kib(2049), "3 KiB");
+        assert_eq!(size(5), "5 B");
+        assert_eq!(size(1536), "1.5 KiB");
+        assert_eq!(size(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
 
     #[test]

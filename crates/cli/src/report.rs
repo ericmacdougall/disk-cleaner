@@ -257,6 +257,14 @@ pub fn plan_summary(p: &Plan) -> String {
         let _ = writeln!(o, "Active paths: {}", esc(&p.active.join(", ")));
     }
     let _ = writeln!(o, "Remote facts verified: no ({})", p.remote_facts_note);
+    if p.items.iter().any(|i| i.preserve.is_some()) {
+        let _ = writeln!(
+            o,
+            "Before a repository is removed, its own git files are saved with the manifest (the \
+             manifest is the restore record a later apply step writes), and its object store is \
+             verified against the remote or saved too."
+        );
+    }
     let _ = writeln!(
         o,
         "Reclaimable if every removing step completes: {} ({} from regenerable directories, \
@@ -304,6 +312,18 @@ pub fn plan_summary(p: &Plan) -> String {
             if !g.examples.is_empty() {
                 let _ = writeln!(o, "      including: {}", esc(&g.examples.join(", ")));
             }
+            let s = &pre.object_store;
+            let _ = writeln!(
+                o,
+                "      object store: {} ({}), {}",
+                count(s.files, "file", "files"),
+                human_bytes(s.bytes),
+                if s.verified {
+                    "verified by this scan; apply re-checks it against the remote"
+                } else {
+                    "not yet verified: verify against the remote or save before removing"
+                }
+            );
         }
     }
     o

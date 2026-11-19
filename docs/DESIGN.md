@@ -88,12 +88,24 @@ Safe to remove never means removed without a backup. The facts show that every c
 remote; they cannot show that nothing else in the git directory is unique (a custom hook, a
 recorded rerere resolution, a draft in `COMMIT_EDITMSG`, a note under `logs/`), and judging those
 files one kind at a time never converged. So every plan action that removes a git node is named for
-its contract (`backup-then-remove`, `recover-backup-then-remove`) and carries
-`preserve.git_admin`: every file of the git directory that is not a content-checked object file.
-Whatever applies a plan must make and verify a backup of those files, saved with the manifest,
-before it removes anything, and must refuse otherwise. A git directory whose own files exceed
-`max_git_admin_bytes` (64 MiB by default) asks instead, because that much is the user's data, not
-git's settings. No apply phase exists yet; the rule is part of the plan format
+its contract (`backup-then-remove`, `recover-backup-then-remove`) and carries `preserve`, which
+splits every file of the git directory, by name alone, into exactly one of two obligations:
+
+- `preserve.git_admin`, every file that does not have an object-store name: always backed up
+  (saved with the manifest, the restore record an apply step writes, and read back) before
+  anything is removed;
+- `preserve.object_store`, files under `objects/` named like loose objects, packs and their
+  indexes and sidecars, multi-pack-indexes and commit-graphs: each must be either fully verified
+  as git data whose objects are all on the re-verified remote, or backed up like the first class.
+
+No file is exempt because its first bytes look right: earlier versions tried that and a file with a
+valid header and someone's notes after it slipped through. The plan records
+`preserve.object_store.verified`, which is `true` only when `scan --verify-objects` had git itself
+(`verify-pack`, `multi-pack-index verify`, `commit-graph verify`, `fsck --full --strict`) verify the
+whole store and account for every file of the class; a file git does not account for moves to the
+first class and the repository asks. Even then the apply step re-verifies against the remote. A git
+directory whose own files exceed `max_git_admin_bytes` (64 MiB by default) asks instead, because that
+much is the user's data, not git's settings. No apply phase exists yet; the rule is part of the plan format
 (docs/SCAN-FORMAT.md, "The preserve obligation"), which also lists the existing asks the backup
 makes redundant and keeps them for now.
 

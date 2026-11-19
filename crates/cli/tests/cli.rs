@@ -1408,8 +1408,13 @@ fn z1_the_object_store_is_verified_only_on_request_and_the_manifest_is_defined()
     let scan_as = |name: &str, extra: &[&str]| -> PathBuf {
         let out = tmp.path().join(name);
         let mut c = bin();
-        c.args(["scan", root.to_str().unwrap(), "--out", out.to_str().unwrap()])
-            .args(extra);
+        c.args([
+            "scan",
+            root.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .args(extra);
         isolate(&mut c, &home);
         let o = run(&mut c);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
