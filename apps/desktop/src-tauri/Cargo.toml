@@ -32,6 +32,10 @@ sysinfo = { version = "0.33", default-features = false, features = ["disk", "sys
 tauri = { version = "2.12", features = [] }
 tauri-plugin-dialog = "2"
 
+[target.'cfg(unix)'.dependencies]
+# setsid for the analysis worker (worker::spawn_worker only).
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 

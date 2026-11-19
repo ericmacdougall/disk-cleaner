@@ -312,10 +312,11 @@ def check_dependencies(root: Path, findings: list[str]) -> None:
 
 
 def app_commands(root: Path) -> set[str]:
-    build = root / "apps/desktop/src-tauri/build.rs"
-    if not build.is_file():
+    """The app's command list: src/command_names.rs, which build.rs includes."""
+    src = root / "apps/desktop/src-tauri/src/command_names.rs"
+    if not src.is_file():
         return set()
-    m = re.search(r"COMMANDS\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\]", build.read_text(), re.S)
+    m = re.search(r"COMMANDS\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\]", src.read_text(), re.S)
     return set(re.findall(r'"([a-z0-9_]+)"', m.group(1))) if m else set()
 
 

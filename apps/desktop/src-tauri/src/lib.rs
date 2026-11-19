@@ -1,29 +1,149 @@
-//! PruneDisk desktop backend. Read-only: it scans and shows; it never deletes, moves or backs up.
+//! PruneDisk desktop backend. Read-only: it scans and shows; it never deletes, moves or backs
+//! up. The only process it starts is its own executable as the analysis worker (worker.rs).
+#![deny(unsafe_code)]
 
-use serde::Serialize;
+pub mod command_names;
+pub mod commands;
+pub mod state;
+pub mod worker;
 
-/// What the about line shows.
-#[derive(Serialize)]
-pub struct AppInfo {
-    pub version: &'static str,
-    pub schema_version: u32,
-    pub read_only: bool,
-}
+use commands::AppState;
+use state::Inner;
 
-#[tauri::command]
-fn app_info() -> AppInfo {
-    AppInfo {
-        version: env!("CARGO_PKG_VERSION"),
-        schema_version: disk_cleaner_core::SCHEMA_VERSION,
-        read_only: true,
+/// Start the app, or run as the analysis worker when started with `--analysis-worker`.
+pub fn main_entry() {
+    if let Some(args) = worker::worker_args_from(std::env::args_os()) {
+        worker::worker_main(&args);
     }
+    run();
 }
 
 /// Start the app.
 pub fn run() {
-    tauri::Builder::default()
+    let inner = Inner::new(None);
+    #[cfg(feature = "e2e")]
+    e2e_open(&inner);
+    let on_exit = std::sync::Arc::clone(&inner);
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![app_info])
-        .run(tauri::generate_context!())
+        .manage(AppState(inner))
+        .invoke_handler(tauri::generate_handler![
+            commands::app_info,
+            commands::list_volumes,
+            commands::choose_folders,
+            commands::open_scan_file,
+            commands::export_plan,
+            commands::start_scan,
+            commands::cancel_scan,
+            commands::current_state,
+            commands::tree_page,
+            commands::tree_toggle,
+            commands::tree_sort,
+            commands::tree_focus,
+            commands::tree_tiles,
+            commands::top_files,
+            commands::dev_summary,
+            commands::dev_page,
+            commands::session_folders,
+            commands::get_settings,
+            commands::save_settings,
+        ])
+        .build(tauri::generate_context!())
         .expect("PruneDisk could not start");
+    app.run(move |_, event| {
+        if let tauri::RunEvent::Exit = event {
+            // End any analysis worker and the git commands it started.
+            on_exit.shutdown();
+        }
+    });
+}
+
+/// Test-only (the `e2e` feature, never in release bundles): open the scan file named by
+/// `PRUNEDISK_E2E_SCAN` at start, through the normal import path.
+#[cfg(feature = "e2e")]
+fn e2e_open(inner: &Inner) {
+    if let Some(p) = std::env::var_os("PRUNEDISK_E2E_SCAN") {
+        if let Err(e) = inner.import_file(std::path::Path::new(&p)) {
+            eprintln!("e2e: cannot open the scan file: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_names::COMMANDS;
+
+    /// Spec AC-12: the registered command list is exactly this list.
+    #[test]
+    fn the_command_list_is_the_specified_one() {
+        let spec = [
+            "app_info",
+            "list_volumes",
+            "choose_folders",
+            "open_scan_file",
+            "export_plan",
+            "start_scan",
+            "cancel_scan",
+            "current_state",
+            "tree_page",
+            "tree_toggle",
+            "tree_sort",
+            "tree_focus",
+            "tree_tiles",
+            "top_files",
+            "dev_summary",
+            "dev_page",
+            "session_folders",
+            "get_settings",
+            "save_settings",
+        ];
+        assert_eq!(COMMANDS, spec);
+    }
+
+    #[test]
+    fn the_handler_registers_exactly_the_command_list() {
+        let src = include_str!("lib.rs");
+        let start = src.find("generate_handler![").unwrap();
+        let end = start + src[start..].find(']').unwrap();
+        let registered: Vec<&str> = src[start..end]
+            .split("commands::")
+            .skip(1)
+            .map(|s| s.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+            .map(|s| s.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap())
+            .collect();
+        assert_eq!(registered, COMMANDS);
+    }
+
+    #[test]
+    fn capabilities_grant_exactly_the_commands_and_event_listening() {
+        let cap: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let mut granted: Vec<String> = cap["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap().to_string())
+            .collect();
+        granted.sort();
+        let mut want: Vec<String> = COMMANDS
+            .iter()
+            .map(|c| format!("allow-{}", c.replace('_', "-")))
+            .chain(["core:event:allow-listen".into(), "core:event:allow-unlisten".into()])
+            .collect();
+        want.sort();
+        assert_eq!(granted, want);
+    }
+
+    /// Spec AC-12: the content security policy, exactly.
+    #[test]
+    fn the_csp_is_the_specified_one() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            conf["app"]["security"]["csp"].as_str().unwrap(),
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+             connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; \
+             form-action 'none'; frame-ancestors 'none'"
+        );
+    }
 }
