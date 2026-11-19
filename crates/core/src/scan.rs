@@ -1099,7 +1099,9 @@ fn check_enclosing_repos(
             why_not.extend(check.unverified_artifacts);
         }
         for (p, why) in why_not {
-            let hit = builds.iter_mut().find(|b| b.path == p || canon(&b.path) == p);
+            let hit = builds
+                .iter_mut()
+                .find(|b| b.path == p || canon(&b.path) == p);
             if let Some(b) = hit {
                 b.node
                     .ask_reason
