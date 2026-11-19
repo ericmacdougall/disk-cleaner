@@ -624,3 +624,30 @@ fn f11_alternates_that_is_a_symlink_is_not_followed() {
 fn _uses(_: Class, _: PlanOptions) {
     let _ = plan;
 }
+
+// ---------------------------------------------------------------- H1 (second merge gate)
+
+#[test]
+fn h1_credential_in_a_submodule_config_subsection_is_not_echoed() {
+    let (tmp, root, remotes) = workspace();
+    let srcs = tmp.path().join("srcs");
+    fs::create_dir_all(&srcs).unwrap();
+    let subsrc = pushed_repo(&srcs, &remotes, "subsrc");
+    let outer = pushed_repo(&root, &remotes, "outer");
+    add_submodule(&outer, &subsrc, "sub");
+    git(&outer, &["commit", "-q", "-m", "add submodule"]);
+    git(&outer, &["push", "-q", "origin", "main"]);
+    append(
+        &outer
+            .join(".git")
+            .join("modules")
+            .join("sub")
+            .join("config"),
+        "[credential \"https://user:SYNTHETIC_TOKEN@example.invalid\"]\n\thelper = store\n",
+    );
+    let res = scan_with(&root, network_everywhere());
+    assert!(all_unknown(&facts_of(&res, &outer)));
+    let json = serde_json::to_string(&res).unwrap();
+    assert!(!json.contains("SYNTHETIC_TOKEN"), "token leaked: {json}");
+    assert!(json.contains("credential.<redacted>.helper"), "{json}");
+}

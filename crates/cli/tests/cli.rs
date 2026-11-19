@@ -936,3 +936,78 @@ fn g1_inherited_git_config_never_runs_a_filter_and_is_not_applied() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+// ---------------------------------------------------------------- H1 (second merge gate)
+
+/// A config key's subsection can carry a credential URL. A repo with such a key is refused, and
+/// the refusal must name the section and variable only.
+#[test]
+fn h1_credential_in_a_config_subsection_never_reaches_any_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("scan");
+    let repo = root.join("app");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    write(&repo.join("README.md"), "x\n");
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let config = repo.join(".git").join("config");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("[credential \"https://user:SYNTHETIC_TOKEN@example.invalid\"]\n\thelper = store\n");
+    fs::write(&config, text).unwrap();
+    let out_file = tmp.path().join("scan.json");
+
+    let human_scan = run(bin().args([
+        "scan",
+        root.to_str().unwrap(),
+        "--out",
+        out_file.to_str().unwrap(),
+    ]));
+    assert!(human_scan.status.success());
+    let scan_stdout = stdout(&human_scan);
+    let o = run(bin().args(["scan", root.to_str().unwrap(), "--json"]));
+    let scan_json_stdout = stdout(&o);
+    let scan_file = fs::read_to_string(&out_file).unwrap();
+    let plan_args = |json: bool| {
+        let mut c = bin();
+        c.args(["plan", "--scan", out_file.to_str().unwrap()])
+            .args(["--active-window-days", "30", "--now", &far_future()]);
+        if json {
+            c.arg("--json");
+        }
+        run(&mut c)
+    };
+    let plan_human = stdout(&plan_args(false));
+    let plan_json = stdout(&plan_args(true));
+
+    for (what, text) in [
+        ("scan summary", &scan_stdout),
+        ("scan --json", &scan_json_stdout),
+        ("scan file", &scan_file),
+        ("plan summary", &plan_human),
+        ("plan --json", &plan_json),
+    ] {
+        assert!(!text.contains("SYNTHETIC_TOKEN"), "token leaked in {what}");
+        assert!(!text.contains("user:"), "userinfo leaked in {what}");
+    }
+    // The refusal itself is still reported, naming the section and variable only.
+    let v: serde_json::Value = serde_json::from_str(&scan_file).unwrap();
+    let notes = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|n| n.get("repo").and_then(|r| r.get("notes")))
+        .unwrap()
+        .to_string();
+    assert!(notes.contains("credential.<redacted>.helper"), "{notes}");
+    // And the repo is not offered for removal.
+    let pv: serde_json::Value = serde_json::from_str(&plan_json).unwrap();
+    let repo_path = repo.to_string_lossy().into_owned();
+    let item = pv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["path"].as_str() == Some(repo_path.as_str()))
+        .unwrap();
+    assert_eq!(item["action"], "ask");
+}
