@@ -1953,8 +1953,8 @@ pub fn collect_repo_info(
         let g = path.join(".git");
         matches!(lk(&g), Ok(Lk::Dir)).then_some(g)
     };
-    facts.no_local_admin_content = match own_git_dir {
-        Some(gd) => match local_admin_content(&gd, &config_keys) {
+    facts.no_local_admin_content = match own_git_dir.as_deref() {
+        Some(gd) => match local_admin_content(gd, &config_keys) {
             Ok(found) if found.is_empty() => Tri::Yes,
             Ok(found) => {
                 let shown: Vec<String> = found.iter().map(|n| diag(n)).collect();
@@ -1982,6 +1982,42 @@ pub fn collect_repo_info(
             Tri::Unknown
         }
     };
+
+    // Every file of the git directory that is not an object file, which a removal must back up
+    // first (`crate::preserve`). Object files are the one thing the backup leaves out, so each
+    // file named like one is checked by content: one that is not an object is the repository's
+    // own content, named like the others above.
+    if let Some(gd) = own_git_dir.as_deref() {
+        match crate::preserve::survey(gd) {
+            Ok(found) => {
+                if !found.not_objects.is_empty() {
+                    let shown: Vec<String> = found.not_objects.iter().map(|n| diag(n)).collect();
+                    notes.push(format!(
+                        "no_local_admin_content: files named like git objects are not git \
+                         objects: {}",
+                        crate::words::some_of(&shown, 5)
+                    ));
+                    let mut all = info.local_admin_content.clone();
+                    all.extend(shown.iter().cloned());
+                    all.sort();
+                    all.dedup();
+                    info.local_admin_content_count += shown.len() as u64;
+                    info.local_admin_content = all.into_iter().take(5).collect();
+                    facts.no_local_admin_content = Tri::No;
+                }
+                info.git_admin = Some(found.admin);
+            }
+            Err(e) => {
+                notes.push(format!(
+                    "no_local_admin_content: the git directory's own files could not all be \
+                     listed and checked ({e}), so they could not be counted for a backup"
+                ));
+                if facts.no_local_admin_content == Tri::Yes {
+                    facts.no_local_admin_content = Tri::Unknown;
+                }
+            }
+        }
+    }
 
     let (plain, issue) = layout_check(git, path, class);
     facts.plain_layout = plain;

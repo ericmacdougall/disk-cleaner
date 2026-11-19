@@ -411,7 +411,11 @@ fn y2_any_file_dropped_in_the_git_directory_is_asked_about_or_backed_up() {
     let mut cases: Vec<String> = Vec::new();
     for loc in &locations {
         for k in 0..3 {
-            let dot = if rng.step() % 4 == 0 { "." } else { "" };
+            let dot = if rng.step().is_multiple_of(4) {
+                "."
+            } else {
+                ""
+            };
             let mut name = format!("{dot}{}", rng.word(4, 10));
             let mut content = format!("{}\n", rng.word(8, 60));
             // Every third name is one the earlier checks accept, so the case can reach a
@@ -451,7 +455,7 @@ fn y2_any_file_dropped_in_the_git_directory_is_asked_about_or_backed_up() {
 
             let res = scan_with(&root, network_everywhere());
             let files = admin_files(&res, &repo);
-            assert!(files.iter().any(|f| *f == rel), "{rel} not in {files:?}");
+            assert!(files.contains(&rel), "{rel} not in {files:?}");
             let p = plan_of(&res);
             let it = item(&p, &repo);
             match it.action {

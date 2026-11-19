@@ -236,14 +236,14 @@ pub fn plan_summary(p: &Plan) -> String {
         let _ = writeln!(
             o,
             "Incomplete coverage was accepted by the user (accept_incomplete_coverage or \
-             --accept-incomplete-coverage): repositories may be archived although links or \
-             clones in places the scan could not read were not checked"
+             --accept-incomplete-coverage): repositories may be backed up then removed although \
+             links or clones in places the scan could not read were not checked"
         );
     } else if !p.coverage_complete {
         let _ = writeln!(
             o,
-            "Because coverage is incomplete, no repository is offered for archiving: each one \
-             asks (--accept-incomplete-coverage archives anyway, saying what was not read)"
+            "Because coverage is incomplete, no repository is offered for removal: each one \
+             asks (--accept-incomplete-coverage offers them anyway, saying what was not read)"
         );
     }
     if p.trusted_partial_process_check {
@@ -292,6 +292,19 @@ pub fn plan_summary(p: &Plan) -> String {
         );
         let _ = writeln!(o, "      {:?}: {}", it.state, esc(&it.state_reason));
         let _ = writeln!(o, "      {}", esc(&it.reason));
+        if let Some(pre) = &it.preserve {
+            let g = &pre.git_admin;
+            let _ = writeln!(
+                o,
+                "      back up first: {} ({}) from {}",
+                count(g.files, "file", "files"),
+                human_bytes(g.bytes),
+                esc(&g.git_dirs.join(", "))
+            );
+            if !g.examples.is_empty() {
+                let _ = writeln!(o, "      including: {}", esc(&g.examples.join(", ")));
+            }
+        }
     }
     o
 }

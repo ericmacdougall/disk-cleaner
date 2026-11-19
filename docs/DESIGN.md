@@ -35,7 +35,7 @@ Every directory gets one primary class. Size is attributed to the innermost clas
 
 | Class | Examples | Default disposition |
 |---|---|---|
-| `repo` | directory with a `.git` directory | keep; eligible for archive when idle and fully remote |
+| `repo` | directory with a `.git` directory | keep; eligible for backup-then-remove when idle and fully remote |
 | `worktree` | directory with a `.git` file (linked worktree) | as `repo`, checked against its own HEAD |
 | `bare-repo` | `*.git` with `HEAD`, `objects`, `refs` | never auto-removed while any worktree or clone depends on it |
 | `regenerable` | `node_modules`, `target`, `.venv`, `.next`, `DerivedData`, `Pods`, `__pycache__` | remove when the owning project is not active |
@@ -74,13 +74,28 @@ For each repo and each worktree the scanner records, each as yes / no / unknown:
   clone or link in a place the scan could not read may be the only thing that needs the
   repository, and disclosing the gap does not make removing it safe. A user who knows what those
   places hold opts in with `accept_incomplete_coverage` (`--accept-incomplete-coverage`), and each
-  archive decision then says what was not read.
+  removal decision then says what was not read.
 
 At apply time the remote facts are confirmed against the live remote (`git ls-remote`), because
 remote-tracking refs can be stale.
 
 A repo is **safe to remove** only when every fact is the safe value. Anything else is **ambiguous**
 and goes through recovery.
+
+### The preserve obligation
+
+Safe to remove never means removed without a backup. The facts show that every commit is on a
+remote; they cannot show that nothing else in the git directory is unique (a custom hook, a
+recorded rerere resolution, a draft in `COMMIT_EDITMSG`, a note under `logs/`), and judging those
+files one kind at a time never converged. So every plan action that removes a git node is named for
+its contract (`backup-then-remove`, `recover-backup-then-remove`) and carries
+`preserve.git_admin`: every file of the git directory that is not a content-checked object file.
+Whatever applies a plan must make and verify a backup of those files, saved with the manifest,
+before it removes anything, and must refuse otherwise. A git directory whose own files exceed
+`max_git_admin_bytes` (64 MiB by default) asks instead, because that much is the user's data, not
+git's settings. No apply phase exists yet; the rule is part of the plan format
+(docs/SCAN-FORMAT.md, "The preserve obligation"), which also lists the existing asks the backup
+makes redundant and keeps them for now.
 
 ### Activity
 
@@ -128,7 +143,7 @@ A policy is a rule set the user enables, for example:
 
 - regenerable directories in projects idle for N days: remove;
 - package caches not accessed for N days, or above N GB: remove;
-- repos idle for N days: recover if ambiguous, then archive and remove;
+- repos idle for N days: recover if ambiguous, then back up the git directory's own files and remove;
 - agent sessions older than N days and not tied to an active project: back up, verify, remove;
 - outputs older than N days: back up, verify, remove.
 
@@ -138,8 +153,9 @@ the rest for review. No default policy is automatic.
 ## 7. Manifest
 
 An append-only JSON Lines file per machine, mirrored to backup storage. One record per removed or
-archived item: path, class, size, hashes or git object ids, the safety facts and when they were
-verified, backup location, and the exact restore command. `disk-cleaner find <text>` searches it;
+backed-up item: path, class, size, hashes or git object ids, the safety facts and when they were
+verified, backup location (for a git node, where its git directory's own files were saved), and
+the exact restore command. `disk-cleaner find <text>` searches it;
 `disk-cleaner restore <id>` puts an item back (re-clone at the recorded commit, fetch a bundle,
 download an archive, or note that it is regenerable and how).
 

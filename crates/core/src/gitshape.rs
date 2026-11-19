@@ -43,12 +43,12 @@ fn hex(s: &str) -> bool {
 }
 
 /// A full object id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
-fn oid(s: &str) -> bool {
+pub(crate) fn oid(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && hex(s)
 }
 
 /// `<prefix><object id>.<ext>` with `ext` one of `exts`.
-fn named(name: &str, prefix: &str, exts: &[&str]) -> bool {
+pub(crate) fn named(name: &str, prefix: &str, exts: &[&str]) -> bool {
     match name.strip_prefix(prefix).and_then(|r| r.split_once('.')) {
         Some((id, ext)) => oid(id) && exts.contains(&ext),
         None => false,
@@ -120,12 +120,12 @@ fn ok(fine: bool) -> Verdict {
 }
 
 /// A loose-object fanout directory: two lowercase hex digits.
-fn fanout(d: &str) -> bool {
+pub(crate) fn fanout(d: &str) -> bool {
     d.len() == 2 && hex(d)
 }
 
 /// A loose object's file name: the rest of a SHA-1 or SHA-256 id.
-fn loose_object(f: &str) -> bool {
+pub(crate) fn loose_object(f: &str) -> bool {
     (f.len() == 38 || f.len() == 62) && hex(f)
 }
 

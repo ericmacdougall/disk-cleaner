@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -104,7 +104,7 @@ pub struct Facts {
     /// The repository has the plain layout (see `docs/SCAN-FORMAT.md`): a real `.git` directory
     /// with the expected entries, no alternates, commondir, worktrees, modules, annex or LFS
     /// content, and only refs under `refs/heads`, `refs/tags`, `refs/remotes` and `refs/stash`
-    /// that point at commits. Only a plain repo may be archived or recovered then archived.
+    /// that point at commits. Only a plain repo may be backed up then removed.
     pub plain_layout: Tri,
     /// The git directory holds nothing of its own outside the object store, refs and logs: no
     /// custom hook, no file in `info/` beyond the stock comment-only `exclude`, a stock or empty

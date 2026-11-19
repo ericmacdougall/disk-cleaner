@@ -86,9 +86,9 @@ struct PlanArgs {
     #[arg(long)]
     trust_partial_process_check: bool,
     /// Accept incomplete coverage: when the scan could not read some folders or did not enter
-    /// some mount points, still offer repositories for archiving, each reason saying what was not
-    /// read (same as the config setting `accept_incomplete_coverage = true`). Without it every
-    /// repository's dependents are unknown then, so each one asks.
+    /// some mount points, still offer repositories for removal after a backup, each reason
+    /// saying what was not read (same as the config setting `accept_incomplete_coverage =
+    /// true`). Without it every repository's dependents are unknown then, so each one asks.
     #[arg(long)]
     accept_incomplete_coverage: bool,
     /// Retired: strict coverage is now the default. Refused with a message naming
@@ -139,8 +139,8 @@ fn run_plan(a: PlanArgs) -> Result<()> {
         anyhow::bail!(
             "--require-full-coverage is no longer an option: incomplete coverage now makes \
              repositories ask by default; drop the flag, or pass --accept-incomplete-coverage \
-             (config: accept_incomplete_coverage = true) to archive despite folders the scan \
-             could not read"
+             (config: accept_incomplete_coverage = true) to offer them for removal despite \
+             folders the scan could not read"
         );
     }
     let scan_result = read_scan(&a.scan).context("cannot read scan file")?;

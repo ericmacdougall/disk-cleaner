@@ -19,6 +19,11 @@ pub fn agree<'a>(n: u64, one: &'a str, many: &'a str) -> &'a str {
     }
 }
 
+/// Bytes in whole KiB, rounded up: `kib(1)` is `1 KiB`, `kib(0)` is `0 KiB`.
+pub fn kib(bytes: u64) -> String {
+    format!("{} KiB", bytes.div_ceil(1024))
+}
+
 /// Up to `max` of `items`, comma separated, then `and N more` for the rest.
 pub fn some_of(items: &[String], max: usize) -> String {
     let shown = items
@@ -46,6 +51,10 @@ mod tests {
         assert_eq!(count(2, "entry", "entries"), "2 entries");
         assert_eq!(agree(1, "is", "are"), "is");
         assert_eq!(agree(3, "is", "are"), "are");
+        assert_eq!(kib(0), "0 KiB");
+        assert_eq!(kib(1), "1 KiB");
+        assert_eq!(kib(2048), "2 KiB");
+        assert_eq!(kib(2049), "3 KiB");
     }
 
     #[test]

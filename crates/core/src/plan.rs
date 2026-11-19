@@ -8,7 +8,7 @@
 
 use crate::model::*;
 use crate::procs::ProcessCheck;
-use crate::words::{agree, count, some_of};
+use crate::words::{agree, count, kib, some_of};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -209,13 +209,13 @@ pub struct Plan {
     /// The scan read every folder and entered every mount point (its `coverage.complete`).
     pub coverage_complete: bool,
     /// When coverage is incomplete: one sentence saying what was not read and that links or
-    /// clones there were not checked. With `accepted_incomplete_coverage` every archive and
-    /// recover-then-archive reason repeats it.
+    /// clones there were not checked. With `accepted_incomplete_coverage` every
+    /// backup-then-remove and recover-backup-then-remove reason repeats it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_note: Option<String>,
     /// The user accepted incomplete coverage (`accept_incomplete_coverage` /
     /// `--accept-incomplete-coverage`). Without it, incomplete coverage made every repository's
-    /// `no_dependents = yes` `unknown`, so none is archived.
+    /// `no_dependents = yes` `unknown`, so none is removed.
     #[serde(default)]
     pub accepted_incomplete_coverage: bool,
     pub active: Vec<String>,
@@ -489,7 +489,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     let ctx = build_ctx(scan, opts);
     let complete = scan.coverage.complete;
     // Strict coverage, the default: what was not read, unless the user accepted that it does not
-    // block archiving.
+    // block removal.
     let strict: Option<String> = if !opts.accept_incomplete_coverage && !complete {
         Some(coverage_gaps(&scan.coverage))
     } else {
@@ -543,10 +543,19 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 reclaim = 0;
             }
         }
+        if action.removes() && node.class.is_git() {
+            // Nothing removes a git node unless its git directory's own files are backed up
+            // first: they must have been counted, and be few enough to be git's own.
+            if let Some(why) = preserve_veto(node, opts.max_git_admin_bytes) {
+                reason = format!("{reason}; but {why}");
+                action = Action::Ask;
+                reclaim = 0;
+            }
+        }
         let vetoed = removing && action == Action::Ask;
         if let Some(gap) = strict.as_deref() {
             if !vetoed {
-                // A repository that would be archived now asks; one that asks for another reason
+                // A repository that would be removed now asks; one that asks for another reason
                 // also names what was not read and the opt-in. Other nodes are unaffected.
                 (action, reason, reclaim) = decide(scan, idx, state, &state_reason, Some(gap));
             }
@@ -644,8 +653,58 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         }
     }
 
+    // Every item that removes a git node, its own or one inside it, carries what must be backed
+    // up first and says so; one that cannot asks. No removing action is left without it.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); scan.nodes.len()];
+    for (i, p) in ctx.parent.iter().enumerate() {
+        if let Some(p) = *p {
+            children[p].push(i);
+        }
+    }
+    for it in items.iter_mut() {
+        if !it.action.removes() {
+            continue;
+        }
+        let why = match preserve_for(scan, &children, it.node) {
+            Ok(None) => continue,
+            Ok(Some(pre)) if it.class.is_git() => {
+                let g = &pre.git_admin;
+                let inside = g.git_dirs.len().saturating_sub(1) as u64;
+                let also = if inside > 0 {
+                    format!(
+                        ", with those of {} inside it",
+                        count(inside, "git repository", "git repositories")
+                    )
+                } else {
+                    String::new()
+                };
+                it.reason = format!(
+                    "{}; its git settings, hooks, logs and other local git files ({}, {}{also}) \
+                     are saved with the manifest first, then it is removed",
+                    it.reason,
+                    count(g.files, "file", "files"),
+                    kib(g.bytes)
+                );
+                it.preserve = Some(pre);
+                continue;
+            }
+            // The scan makes a directory that holds a git repository ask, so a removal that is
+            // not of a git node never reaches here; this keeps the rule total.
+            Ok(Some(_)) => "it holds a git repository whose git directory would be removed \
+                            without a backup"
+                .to_string(),
+            Err(path) => format!(
+                "the git directory of {path} inside it was not counted, so it could not be \
+                 backed up first"
+            ),
+        };
+        it.reason = format!("{}; but {why}", it.reason);
+        it.action = Action::Ask;
+        it.reclaimable_bytes = 0;
+    }
+
     // Every decision that rests on "nothing depends on it" says where the scan could not look.
-    // Last, so it is only added to items that are still archived or recovered.
+    // Last, so it is only added to items that are still removed or recovered.
     if let Some(gap) = coverage_reason(&scan.coverage, complete) {
         for it in items.iter_mut() {
             if matches!(
@@ -684,7 +743,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 .reclaimable_bytes
                 .saturating_add(it.reclaimable_bytes);
             // Only regenerable directories are ready without a recovery or verification step:
-            // an archive rests on remote facts that stay unverified until apply.
+            // a backup-then-remove rests on remote facts that stay unverified until apply.
             if it.action == Action::RemoveRegenerable {
                 totals.ready_bytes = totals.ready_bytes.saturating_add(it.reclaimable_bytes);
             }
@@ -784,8 +843,8 @@ pub fn coverage_note(c: &Coverage, complete: bool) -> Option<String> {
     ))
 }
 
-/// The ending of every archive and recover-then-archive reason when coverage is incomplete:
-/// `; 1 folder in this scan could not be read; dependents inside it were not checked`.
+/// The ending of every backup-then-remove and recover-backup-then-remove reason when coverage is
+/// incomplete: `; 1 folder in this scan could not be read; dependents inside it were not checked`.
 fn coverage_reason(c: &Coverage, complete: bool) -> Option<String> {
     if complete {
         return None;
@@ -977,6 +1036,91 @@ fn dependents_reason(node: &Node) -> String {
     )
 }
 
+/// Why a git node may not be removed even after a backup of its git directory's own files: they
+/// were not counted, or there are more of them than `max` bytes (the largest are named).
+fn preserve_veto(node: &Node, max: u64) -> Option<String> {
+    let Some(g) = node.repo.as_ref().and_then(|r| r.git_admin.as_ref()) else {
+        return Some(
+            "its git directory's own files were not counted (see the notes), so they could not \
+             be backed up first"
+                .to_string(),
+        );
+    };
+    if g.bytes <= max {
+        return None;
+    }
+    let largest: Vec<String> = g
+        .largest
+        .iter()
+        .map(|f| format!("{} ({})", f.path, kib(f.bytes)))
+        .collect();
+    Some(format!(
+        "its git directory holds {} of files of its own besides git objects, more than \
+         max_git_admin_bytes ({}): that is the user's data, not git's settings; the largest: {}; \
+         move them out or raise max_git_admin_bytes",
+        kib(g.bytes),
+        kib(max),
+        largest.join(", ")
+    ))
+}
+
+/// What removing `idx` must back up first: the own files of every git directory it removes (its
+/// own and those of git nodes inside it). `Err` names a git node inside it whose files were not
+/// counted.
+fn preserve_for(
+    scan: &ScanResult,
+    children: &[Vec<usize>],
+    idx: usize,
+) -> std::result::Result<Option<Preserve>, String> {
+    let base = Path::new(&scan.nodes[idx].path);
+    let mut stack = vec![idx];
+    let mut found: Vec<usize> = Vec::new();
+    while let Some(i) = stack.pop() {
+        if scan.nodes[i].class.is_git() {
+            found.push(i);
+        }
+        stack.extend(children[i].iter().copied());
+    }
+    if found.is_empty() {
+        return Ok(None);
+    }
+    found.sort_unstable();
+    let mut out = PreserveGitAdmin::default();
+    let mut examples: Vec<String> = Vec::new();
+    for i in found {
+        let n = &scan.nodes[i];
+        let g = n
+            .repo
+            .as_ref()
+            .and_then(|r| r.git_admin.as_ref())
+            .ok_or_else(|| n.path.clone())?;
+        let gd = if n.class == Class::BareRepo {
+            PathBuf::from(&n.path)
+        } else {
+            Path::new(&n.path).join(".git")
+        };
+        // Examples relative to the removed directory, `/`-separated.
+        let prefix = gd
+            .strip_prefix(base)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        for e in &g.examples {
+            examples.push(if prefix.is_empty() {
+                e.clone()
+            } else {
+                format!("{prefix}/{e}")
+            });
+        }
+        out.git_dirs.push(gd.to_string_lossy().into_owned());
+        out.files = out.files.saturating_add(g.files);
+        out.bytes = out.bytes.saturating_add(g.bytes);
+    }
+    examples.sort();
+    examples.truncate(5);
+    out.examples = examples;
+    Ok(Some(Preserve { git_admin: out }))
+}
+
 /// Why a repository whose git directory holds files of its own asks: up to five are named.
 fn local_admin_reason(node: &Node) -> String {
     let (mut found, total) = node
@@ -1116,7 +1260,7 @@ fn decide(
                 return (Action::Ask, format!("cannot judge activity: {why}"), 0);
             }
             if facts.plain_layout != Tri::Yes {
-                // Only a repository with the plain layout is ever archived: anything else may
+                // Only a repository with the plain layout is ever removed: anything else may
                 // keep data in places this tool does not look.
                 let issue = node
                     .repo
@@ -1196,7 +1340,7 @@ fn decide(
                     Action::RecoverBackupThenRemove,
                     format!(
                         "idle ({why}), but not fully saved elsewhere: {unsaved}; recover first, \
-                         then archive{}",
+                         then back up and remove{}",
                         scope_note(scan)
                     ),
                     node.bytes_total,
@@ -1205,11 +1349,11 @@ fn decide(
                 (
                     Action::BackupThenRemove,
                     format!(
-                        "idle ({why}); local remote-tracking refs say every commit (reflog \
-                         entries and pseudorefs such as ORIG_HEAD included) is on a network \
-                         remote, nothing is unsaved, no \
-                         operation is half done and no dependents were found{} \
-                         (unverified until apply re-checks the remote with git ls-remote)",
+                        "idle ({why}); everything is on the remote: local remote-tracking refs \
+                         say every commit (reflog entries and pseudorefs such as ORIG_HEAD \
+                         included) is on a network remote, nothing is unsaved, no operation is \
+                         half done and no dependents were found{} (unverified until apply \
+                         re-checks the remote with git ls-remote)",
                         scope_note(scan)
                     ),
                     node.bytes_total,

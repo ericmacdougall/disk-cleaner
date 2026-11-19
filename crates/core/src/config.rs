@@ -97,7 +97,7 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
                 "{RETIRED_COVERAGE_KEY} is no longer a setting: incomplete coverage now makes \
                  repositories ask by default; remove the key, or set \
                  accept_incomplete_coverage = true (or pass --accept-incomplete-coverage) to \
-                 archive despite folders the scan could not read"
+                 offer them for removal despite folders the scan could not read"
             ),
         });
     }
