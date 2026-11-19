@@ -5,62 +5,101 @@
 //! `git config --worktree --list`, which exits 128 when the file does not exist; the repository
 //! then had every fact unknown (71 repos and worktrees on the first real run). A missing file is
 //! no worktree-scoped keys. A file that exists is read and judged as before, and one that is not
-//! a regular file (a symlink, a directory) is refused, as `.git/modules` configs are. Every
-//! fixture is built with real git commands.
+//! a regular file (a symlink, a directory) is refused, as `.git/modules` configs are.
+//!
+//! Accepting a missing file must not let git read a git directory other than the scanned one:
+//! a directory git rejects as a repository makes it walk up to the next one. For a work tree
+//! `--show-toplevel` catches that; for a bare repo the git directory git uses must be the scanned
+//! directory. Every fixture is built with real git commands.
 
 mod common;
 
 use common::*;
-use disk_cleaner_core::{ScanResult, Tri};
+use disk_cleaner_core::{Class, ScanResult, Tri};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The repo's layout issue and notes, as one text.
-fn issues(res: &ScanResult, repo: &Path) -> String {
-    let info = node(res, repo).repo.as_ref().expect("repo info");
-    let mut text = info.layout_issue.clone().unwrap_or_default();
-    for n in &info.notes {
-        text.push('\n');
-        text.push_str(n);
-    }
-    text
+/// The refusal of a `config.worktree` that is a symlink, a directory or another kind of entry.
+const NOT_REGULAR: &str = "config.worktree is not a regular file";
+
+/// The refusal when this git directory has no `config.worktree` and git still lists keys of the
+/// worktree scope.
+const UNJUDGED: &str = "git would read worktree-scoped config that was not judged (not this git \
+                        directory's config.worktree); no other git command was run in this repo";
+
+/// The refusal when git uses another git directory than the scanned bare repo.
+const OTHER_GIT_DIR: &str =
+    "git's git directory is not the scanned directory; facts would describe another repository";
+
+/// The refusal of an unsafe key whose label (section and variable) is `label`.
+fn unsafe_key(label: &str) -> String {
+    format!(
+        "repo config can run programs or is not understood ({label}); no git command was run in \
+         this repo"
+    )
 }
 
-/// The config allowlist let git run: the facts that need git are known, and no note says a
-/// config could not be read or was refused.
-fn assert_inspected(res: &ScanResult, repo: &Path) {
-    let f = facts_of(res, repo);
-    let why = issues(res, repo);
-    assert_eq!(f.has_network_remote, Tri::Yes, "{}: {why}", repo.display());
-    assert_eq!(f.head_on_remote, Tri::Yes, "{}: {why}", repo.display());
-    assert_eq!(f.tree_clean, Tri::Yes, "{}: {why}", repo.display());
-    for bad in ["unable to read", "can run programs", "not a regular file"] {
+fn notes(res: &ScanResult, repo: &Path) -> Vec<String> {
+    node(res, repo).repo.as_ref().expect("repo info").notes.clone()
+}
+
+/// The config allowlist let git run: no note is a config refusal or a failed config read.
+fn assert_not_refused(res: &ScanResult, repo: &Path) {
+    let notes = notes(res, repo);
+    for n in &notes {
         assert!(
-            !why.contains(bad),
-            "{}: no config problem expected: {why}",
+            n != NOT_REGULAR
+                && n != UNJUDGED
+                && n != OTHER_GIT_DIR
+                && !n.contains("unable to read")
+                && !n.contains("can run programs"),
+            "{}: no config refusal expected: {notes:?}",
             repo.display()
         );
     }
+    let f = facts_of(res, repo);
+    assert_eq!(f.has_network_remote, Tri::Yes, "{}: {notes:?}", repo.display());
 }
 
-/// The repo was refused before git ran: every fact is unknown, and the reason contains `want`.
-/// `plain_layout` may be `no` instead: the scan's own walk sets it for a symlink in the git
-/// directory whatever the config check found, and a `no` never offers anything.
-fn assert_refused(res: &ScanResult, repo: &Path, want: &str) {
+/// As [`assert_not_refused`], and the facts that need a work tree and git are known.
+fn assert_inspected(res: &ScanResult, repo: &Path) {
+    assert_not_refused(res, repo);
     let f = facts_of(res, repo);
-    let why = issues(res, repo);
-    let unknown =
-        |(name, t): &(&str, Tri)| *t == Tri::Unknown || (*name == "plain_layout" && *t == Tri::No);
+    let notes = notes(res, repo);
+    assert_eq!(f.head_on_remote, Tri::Yes, "{}: {notes:?}", repo.display());
+    assert_eq!(f.tree_clean, Tri::Yes, "{}: {notes:?}", repo.display());
+}
+
+/// Every fact is unknown (`plain_layout` may be `no` when `layout_no` is set) and one note is
+/// exactly `want`.
+fn refused(res: &ScanResult, repo: &Path, want: &str, exact: bool, layout_no: bool) {
+    let f = facts_of(res, repo);
+    let notes = notes(res, repo);
+    let unknown = |(name, t): &(&str, Tri)| {
+        *t == Tri::Unknown || (layout_no && *name == "plain_layout" && *t == Tri::No)
+    };
     assert!(
         f.entries().iter().all(unknown),
-        "{}: every fact must be unknown: {f:?} ({why})",
+        "{}: every fact must be unknown: {f:?} ({notes:?})",
         repo.display()
     );
+    let hit = |n: &String| if exact { n == want } else { n.starts_with(want) };
     assert!(
-        why.contains(want),
-        "{}: the reason must contain {want:?}: {why}",
-        repo.display()
+        notes.iter().any(hit),
+        "{}: no note {} {want:?}: {notes:?}",
+        repo.display(),
+        if exact { "is" } else { "starts with" }
     );
+}
+
+fn assert_refused(res: &ScanResult, repo: &Path, want: &str) {
+    refused(res, repo, want, true, false);
+}
+
+/// For a symlink in the git directory: the scan's own walk sets `plain_layout` to `no` whatever
+/// the config check found, and a `no` never offers anything.
+fn assert_refused_symlink(res: &ScanResult, repo: &Path, want: &str) {
+    refused(res, repo, want, true, true);
 }
 
 /// A pushed repo `app` with `extensions.worktreeConfig` on (through `git config`, as a person
@@ -91,6 +130,24 @@ fn append(file: &Path, text: &str) {
     let mut s = fs::read_to_string(file).unwrap_or_default();
     s.push_str(text);
     fs::write(file, s).unwrap();
+}
+
+/// End the `.git` file of `wt` with CRLF, as an editor on Windows may save it.
+fn crlf_git_file(wt: &Path) {
+    let file = wt.join(".git");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.starts_with("gitdir: "), "{text:?}");
+    fs::write(&file, format!("{}\r\n", text.trim_end())).unwrap();
+}
+
+/// A directory with what makes the scan class it a bare repo (`HEAD`, `config`, `refs`,
+/// `objects`), whose `HEAD` holds `head`.
+fn bare_shaped(dir: &Path, head: &str) {
+    for d in ["refs/heads", "objects/info", "objects/pack"] {
+        fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    fs::write(dir.join("HEAD"), head).unwrap();
+    fs::write(dir.join("config"), "[core]\n\tbare = true\n").unwrap();
 }
 
 // ---------------------------------------------------------------- the defect
@@ -136,6 +193,87 @@ fn absent_in_the_main_worktree_and_present_in_a_linked_one_reads_each_as_it_is()
     assert_inspected(&res, &wt);
 }
 
+/// A real bare repo (a bare clone) with the extension and no file is inspected.
+#[test]
+fn control_a_real_bare_repo_with_the_extension_and_no_file_is_inspected() {
+    let (_tmp, root, remotes) = workspace();
+    pushed_repo(&remotes, &remotes, "src");
+    let bare = root.join("mirror.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            remotes.join("src.git").to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    git(&bare, &["config", "extensions.worktreeConfig", "true"]);
+    assert!(!bare.join("config.worktree").exists());
+    let res = scan_with(&root, network_everywhere());
+    assert_eq!(node(&res, &bare).class, Class::BareRepo);
+    assert_not_refused(&res, &bare);
+}
+
+/// A submodule checkout's `.git` file names its git directory relatively
+/// (`gitdir: ../.git/modules/sub`); the outer repo checks the submodule's config to compare its
+/// commit, and the checkout is its own node.
+#[test]
+fn a_submodule_checkout_with_a_relative_git_file_and_no_config_worktree_is_inspected() {
+    let (tmp, root, remotes) = workspace();
+    let srcs = tmp.path().join("srcs");
+    fs::create_dir_all(&srcs).unwrap();
+    let subsrc = pushed_repo(&srcs, &remotes, "subsrc");
+    let outer = pushed_repo(&root, &remotes, "outer");
+    git(
+        &outer,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            subsrc.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    git(&outer, &["commit", "-q", "-m", "add submodule"]);
+    git(&outer, &["push", "-q", "origin", "main"]);
+    let sub = outer.join("sub");
+    git(&sub, &["config", "extensions.worktreeConfig", "true"]);
+    let text = fs::read_to_string(sub.join(".git")).unwrap();
+    assert!(text.starts_with("gitdir: ../"), "{text:?}");
+    let modgd = outer.join(".git").join("modules").join("sub");
+    assert!(!modgd.join("config.worktree").exists());
+    let res = scan_with(&root, network_everywhere());
+    assert_eq!(facts_of(&res, &outer).tree_clean, Tri::Yes, "{:?}", notes(&res, &outer));
+    assert_not_refused(&res, &sub);
+}
+
+#[test]
+fn a_crlf_git_file_with_no_config_worktree_is_inspected() {
+    let (_tmp, root, repo) = extension_repo();
+    let (wt, gd) = linked(&root, &repo);
+    crlf_git_file(&wt);
+    assert!(!gd.join("config.worktree").exists());
+    let res = scan_with(&root, network_everywhere());
+    assert_inspected(&res, &wt);
+}
+
+/// The CRLF is not part of the git directory's name: the existing file is found and read there
+/// (were it looked for under a name ending in CR, it would seem missing while git lists its key).
+#[test]
+fn a_crlf_git_file_whose_config_worktree_exists_is_read_there() {
+    let (_tmp, root, repo) = extension_repo();
+    let (wt, gd) = linked(&root, &repo);
+    git(&wt, &["config", "--worktree", "core.abbrev", "12"]);
+    assert!(gd.join("config.worktree").is_file());
+    crlf_git_file(&wt);
+    let res = scan_with(&root, network_everywhere());
+    assert_inspected(&res, &wt);
+}
+
 // ---------------------------------------------------------------- an existing file is still judged
 
 #[test]
@@ -145,7 +283,7 @@ fn a_linked_worktrees_own_config_worktree_with_an_unsafe_key_is_refused() {
     git(&wt, &["config", "--worktree", "core.pager", "cat"]);
     assert!(gd.join("config.worktree").is_file());
     let res = scan_with(&root, network_everywhere());
-    assert_refused(&res, &wt, "can run programs");
+    assert_refused(&res, &wt, &unsafe_key("core.pager"));
     // The main worktree does not read the linked worktree's file.
     assert_inspected(&res, &repo);
 }
@@ -164,11 +302,12 @@ fn the_extension_in_another_case_still_reads_an_existing_file() {
     )
     .unwrap();
     let res = scan_with(&root, network_everywhere());
-    assert_refused(&res, &repo, "can run programs");
+    assert_refused(&res, &repo, &unsafe_key("core.pager"));
 }
 
 /// `core.bare` in the main worktree's file: git then sees no work tree, and the scanned
-/// directory is refused as before. (`core.worktree` there is gate3's
+/// directory is refused as before (the note carries git's own message after this prefix).
+/// (`core.worktree` there is gate3's
 /// `j2_worktree_config_overriding_core_worktree_makes_every_fact_unknown`.)
 #[test]
 fn core_bare_in_the_main_worktrees_config_worktree_is_still_refused() {
@@ -176,7 +315,7 @@ fn core_bare_in_the_main_worktrees_config_worktree_is_still_refused() {
     git(&repo, &["config", "--worktree", "core.bare", "true"]);
     assert!(repo.join(".git").join("config.worktree").is_file());
     let res = scan_with(&root, network_everywhere());
-    assert_refused(&res, &repo, "work tree");
+    refused(&res, &repo, "work tree: git exited", false, false);
 }
 
 #[test]
@@ -195,7 +334,7 @@ fn a_config_worktree_that_is_a_directory_is_refused() {
     let (_tmp, root, repo) = extension_repo();
     fs::create_dir(repo.join(".git").join("config.worktree")).unwrap();
     let res = scan_with(&root, network_everywhere());
-    assert_refused(&res, &repo, "config.worktree");
+    assert_refused(&res, &repo, NOT_REGULAR);
 }
 
 #[test]
@@ -204,7 +343,7 @@ fn a_linked_worktrees_config_worktree_that_is_a_directory_is_refused() {
     let (wt, gd) = linked(&root, &repo);
     fs::create_dir(gd.join("config.worktree")).unwrap();
     let res = scan_with(&root, network_everywhere());
-    assert_refused(&res, &wt, "config.worktree");
+    assert_refused(&res, &wt, NOT_REGULAR);
 }
 
 #[cfg(unix)]
@@ -221,7 +360,7 @@ mod unix {
         fs::write(&target, "[core]\n\tabbrev = 12\n").unwrap();
         symlink(&target, repo.join(".git").join("config.worktree")).unwrap();
         let res = scan_with(&root, network_everywhere());
-        assert_refused(&res, &repo, "config.worktree");
+        assert_refused_symlink(&res, &repo, NOT_REGULAR);
     }
 
     /// A dangling symlink is not a missing file.
@@ -234,7 +373,7 @@ mod unix {
         )
         .unwrap();
         let res = scan_with(&root, network_everywhere());
-        assert_refused(&res, &repo, "config.worktree");
+        assert_refused_symlink(&res, &repo, NOT_REGULAR);
     }
 
     #[test]
@@ -245,7 +384,7 @@ mod unix {
         fs::write(&target, "[core]\n\tabbrev = 12\n").unwrap();
         symlink(&target, gd.join("config.worktree")).unwrap();
         let res = scan_with(&root, network_everywhere());
-        assert_refused(&res, &wt, "config.worktree");
+        assert_refused_symlink(&res, &wt, NOT_REGULAR);
     }
 }
 
@@ -270,10 +409,44 @@ fn a_missing_file_where_git_reads_another_git_directorys_file_is_refused() {
     fs::write(gd.join("config"), "[core]\n\trepositoryformatversion = 0\n").unwrap();
     assert!(!gd.join("config.worktree").exists());
     let res = scan_with(&root, network_everywhere());
-    let why = issues(&res, &inner);
-    assert!(
-        !why.contains("work tree is not the scanned directory"),
-        "refused only after git ran with an unjudged config: {why}"
-    );
-    assert_refused(&res, &inner, "config");
+    assert_refused(&res, &inner, UNJUDGED);
+}
+
+/// Review F1 (a): a bare-shaped directory git does not accept (an empty `HEAD`) inside a repo
+/// with the extension and no file. git walks up to the outer repo; with nothing in its worktree
+/// scope the config check passes, and the facts would be the outer repo's.
+#[test]
+fn a_bare_shaped_dir_git_rejects_under_a_repo_with_the_extension_and_no_file_is_refused() {
+    let (_tmp, root, repo) = extension_repo();
+    let inner = repo.join("inner.git");
+    bare_shaped(&inner, "");
+    let res = scan_with(&root, network_everywhere());
+    assert_eq!(node(&res, &inner).class, Class::BareRepo);
+    assert_refused(&res, &inner, OTHER_GIT_DIR);
+}
+
+/// Review F1 (b): the same under a repo without the extension, a hole older than this change.
+#[test]
+fn a_bare_shaped_dir_git_rejects_under_a_repo_without_the_extension_is_refused() {
+    let (_tmp, root, remotes) = workspace();
+    let outer = pushed_repo(&root, &remotes, "outer");
+    let inner = outer.join("inner.git");
+    bare_shaped(&inner, "");
+    let res = scan_with(&root, network_everywhere());
+    assert_eq!(node(&res, &inner).class, Class::BareRepo);
+    assert_refused(&res, &inner, OTHER_GIT_DIR);
+}
+
+/// Review F1 (c): the bare twin of the walk-up test above. git reads the outer repo's unsafe
+/// `config.worktree`, so the config check refuses before any other git command.
+#[test]
+fn a_bare_shaped_dir_git_rejects_under_a_repo_whose_config_worktree_is_unsafe_is_refused() {
+    let (_tmp, root, repo) = extension_repo();
+    git(&repo, &["config", "--worktree", "core.pager", "cat"]);
+    let inner = repo.join("inner.git");
+    bare_shaped(&inner, "ref: nowhere\n");
+    assert!(!inner.join("config.worktree").exists());
+    let res = scan_with(&root, network_everywhere());
+    assert_eq!(node(&res, &inner).class, Class::BareRepo);
+    assert_refused(&res, &inner, UNJUDGED);
 }
