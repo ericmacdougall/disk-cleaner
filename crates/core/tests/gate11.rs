@@ -290,7 +290,7 @@ fn repo_node(path: &str, facts: Facts) -> Node {
         object_store: Some(disk_cleaner_core::ObjectStoreSurvey {
             files: 3,
             bytes: 12_288,
-            verified: false,
+            ..Default::default()
         }),
         ..RepoInfo::default()
     });

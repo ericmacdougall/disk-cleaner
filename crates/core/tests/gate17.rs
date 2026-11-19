@@ -334,7 +334,9 @@ fn z1_controls_are_unverified_by_default_and_verified_by_git() {
     let midx = clone_of(tmp.path(), &root, &remotes, "midx");
     git(&midx, &["repack", "-a", "-d", "-q"]);
     git(&midx, &["multi-pack-index", "write", "--bitmap"]);
-    let all = [&fresh, &gc, &bitmap, &graph, &split, &midx];
+    let rev = clone_of(tmp.path(), &root, &remotes, "rev");
+    git(&rev, &REV_REPACK);
+    let all = [&fresh, &gc, &bitmap, &graph, &split, &midx, &rev];
 
     let res = scan_default(&root);
     let p = plan_of(&res);
@@ -354,6 +356,11 @@ fn z1_controls_are_unverified_by_default_and_verified_by_git() {
             n.notes
         );
         assert_obligations(&res, item(&p, repo), repo, true);
+        let unread: Vec<String> = store(&res, repo)
+            .into_iter()
+            .filter(|f| unread_kind(f))
+            .collect();
+        assert!(unread.is_empty(), "{unread:?}");
     }
 }
 
@@ -466,4 +473,235 @@ fn z1_large_preserved_files_lead_the_examples() {
         Some(".git/hooks/zz-big.sample"),
         "{ex:?}"
     );
+}
+
+// ---------------------------------------------------------------- Z2: what git actually reads
+
+// With `--verify-objects`, a file counts toward a verified store only when a git command read and
+// validated all of it (checksum or complete parse). A derived file that no git command reads is
+// one of the git directory's own (backed up); a damaged one makes the repository ask.
+
+/// `repack -a -d` writing a reverse index (`pack.writeReverseIndex`).
+const REV_REPACK: [&str; 6] = [
+    "-c",
+    "pack.writeReverseIndex=true",
+    "repack",
+    "-a",
+    "-d",
+    "-q",
+];
+
+/// A file kind no git verification reads: a cruft pack's mtimes, a multi-pack-index's reverse
+/// index, and the incremental multi-pack-index layers.
+fn unread_kind(rel: &str) -> bool {
+    rel.ends_with(".mtimes")
+        || rel.contains("/multi-pack-index.d/")
+        || (rel.starts_with("objects/pack/multi-pack-index-") && rel.ends_with(".rev"))
+}
+
+/// The one file in `objects/pack` whose name starts with `prefix` and ends with `suffix`.
+fn pack_file(repo: &Path, prefix: &str, suffix: &str) -> PathBuf {
+    let dir = pack_dir(repo);
+    let mut found: Vec<PathBuf> = Vec::new();
+    for e in fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        let n = p.file_name().unwrap().to_string_lossy().into_owned();
+        if n.starts_with(prefix) && n.ends_with(suffix) {
+            found.push(p);
+        }
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "one {prefix}*{suffix} in {}",
+        dir.display()
+    );
+    found.pop().unwrap()
+}
+
+/// `path` below the git directory, `/`-separated.
+fn rel_of(repo: &Path, path: &Path) -> String {
+    let gd = repo.join(".git");
+    let rel = path.strip_prefix(&gd).unwrap();
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+const NOTES: &[u8] = b"my notes, kept nowhere else\n";
+
+fn append_notes(path: &Path) {
+    make_writable(path);
+    let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(NOTES).unwrap();
+}
+
+/// Overwrite everything between the first `keep` bytes and the trailing checksum.
+fn replace_body(path: &Path, keep: usize) {
+    make_writable(path);
+    let mut bytes = fs::read(path).unwrap();
+    let n = bytes.len();
+    assert!(n > keep + 40, "{} is long enough", path.display());
+    for b in &mut bytes[keep..n - 32] {
+        *b = b'n';
+    }
+    fs::write(path, &bytes).unwrap();
+}
+
+/// `magic` followed by notes.
+fn notes_after(magic: &[u8]) -> Vec<u8> {
+    let mut v = magic.to_vec();
+    v.extend_from_slice(NOTES);
+    v
+}
+
+/// With `--verify-objects`, `rel` is never under a verified store: the repository asks, or the
+/// file is listed by `git_admin_files` (backed up) and not by `object_store_files`.
+fn assert_preserved_or_asks(res: &ScanResult, repo: &Path, rel: &str) {
+    assert_partition(res, repo);
+    let p = plan_of(res);
+    let it = item(&p, repo);
+    if it.action == Action::Ask {
+        assert_eq!(it.reclaimable_bytes, 0);
+        return;
+    }
+    let a = admin(res, repo);
+    assert!(a.iter().any(|f| f == rel), "{rel} not in {a:?}");
+    assert!(!store(res, repo).iter().any(|f| f == rel));
+    let pre = it.preserve.as_ref().expect("preserve");
+    assert_eq!(pre.git_admin.files, a.len() as u64);
+}
+
+/// A clone repacked into one pack, with a multi-pack-index and its bitmap.
+fn midx_clone(tmp: &Path, root: &Path, remotes: &Path, name: &str) -> PathBuf {
+    let repo = clone_of(tmp, root, remotes, name);
+    git(&repo, &["repack", "-a", "-d", "-q"]);
+    git(&repo, &["multi-pack-index", "write", "--bitmap"]);
+    repo
+}
+
+/// The SHA-1 that ends the multi-pack-index: the id its sidecars are named by.
+fn midx_checksum(repo: &Path) -> String {
+    let bytes = fs::read(pack_dir(repo).join("multi-pack-index")).unwrap();
+    let n = bytes.len();
+    bytes[n - 20..].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn z2_a_pack_bitmap_appended_to_or_rewritten_is_never_verified() {
+    let (tmp, root, remotes) = workspace();
+    let appended = clone_of(tmp.path(), &root, &remotes, "appended");
+    let rewritten = clone_of(tmp.path(), &root, &remotes, "rewritten");
+    let mut rels = Vec::new();
+    for repo in [&appended, &rewritten] {
+        git(repo, &["repack", "-a", "-d", "-q", "--write-bitmap-index"]);
+        rels.push(rel_of(repo, &pack_file(repo, "pack-", ".bitmap")));
+    }
+    append_notes(&pack_file(&appended, "pack-", ".bitmap"));
+    replace_body(&pack_file(&rewritten, "pack-", ".bitmap"), 4);
+
+    let res = scan_verified(&root);
+    assert_preserved_or_asks(&res, &appended, &rels[0]);
+    assert_preserved_or_asks(&res, &rewritten, &rels[1]);
+}
+
+#[test]
+fn z2_a_bitmap_of_a_pack_under_a_multi_pack_index_is_checked_too() {
+    let (tmp, root, remotes) = workspace();
+    let repo = clone_of(tmp.path(), &root, &remotes, "app");
+    git(&repo, &["repack", "-a", "-d", "-q", "--write-bitmap-index"]);
+    git(&repo, &["multi-pack-index", "write"]);
+    let bitmap = pack_file(&repo, "pack-", ".bitmap");
+    let rel = rel_of(&repo, &bitmap);
+    append_notes(&bitmap);
+
+    let res = scan_verified(&root);
+    assert_preserved_or_asks(&res, &repo, &rel);
+}
+
+#[test]
+fn z2_a_reverse_index_appended_to_or_rewritten_is_never_verified() {
+    let (tmp, root, remotes) = workspace();
+    let appended = clone_of(tmp.path(), &root, &remotes, "appended");
+    let rewritten = clone_of(tmp.path(), &root, &remotes, "rewritten");
+    let mut rels = Vec::new();
+    for repo in [&appended, &rewritten] {
+        git(repo, &REV_REPACK);
+        rels.push(rel_of(repo, &pack_file(repo, "pack-", ".rev")));
+    }
+    append_notes(&pack_file(&appended, "pack-", ".rev"));
+    replace_body(&pack_file(&rewritten, "pack-", ".rev"), 12);
+
+    let res = scan_verified(&root);
+    assert_preserved_or_asks(&res, &appended, &rels[0]);
+    assert_preserved_or_asks(&res, &rewritten, &rels[1]);
+}
+
+/// fsck checks the multi-pack-index bitmap only when it loads the multi-pack-index, which a
+/// repository's own `core.multiPackIndex = false` would stop.
+#[test]
+fn z2_a_midx_bitmap_appended_to_is_never_verified_whatever_the_config() {
+    let (tmp, root, remotes) = workspace();
+    let on = midx_clone(tmp.path(), &root, &remotes, "on");
+    let off = midx_clone(tmp.path(), &root, &remotes, "off");
+    git(&off, &["config", "core.multiPackIndex", "false"]);
+    let mut rels = Vec::new();
+    for repo in [&on, &off] {
+        let bitmap = pack_file(repo, "multi-pack-index-", ".bitmap");
+        rels.push(rel_of(repo, &bitmap));
+        append_notes(&bitmap);
+    }
+
+    let res = scan_verified(&root);
+    assert_preserved_or_asks(&res, &on, &rels[0]);
+    assert_preserved_or_asks(&res, &off, &rels[1]);
+}
+
+/// No git command reads a multi-pack-index's reverse index: by default it is under the
+/// unverified object-store obligation, and with `--verify-objects` it is backed up.
+#[test]
+fn z2_a_midx_reverse_index_holding_notes_is_backed_up() {
+    let (tmp, root, remotes) = workspace();
+    let repo = midx_clone(tmp.path(), &root, &remotes, "app");
+    let name = format!("multi-pack-index-{}.rev", midx_checksum(&repo));
+    let path = pack_dir(&repo).join(&name);
+    if path.exists() {
+        append_notes(&path);
+    } else {
+        fs::write(&path, notes_after(b"RIDX")).unwrap();
+    }
+    let rel = format!("objects/pack/{name}");
+
+    let res = scan_default(&root);
+    assert!(store(&res, &repo).contains(&rel));
+
+    let res = scan_verified(&root);
+    assert_preserved_or_asks(&res, &repo, &rel);
+}
+
+/// No git command reads a cruft pack's mtimes.
+#[test]
+fn z2_cruft_mtimes_beside_a_verified_pack_are_backed_up() {
+    let (tmp, root, remotes) = workspace();
+    let repo = clone_of(tmp.path(), &root, &remotes, "app");
+    git(&repo, &["repack", "-a", "-d", "-q"]);
+    let mtimes = pack_file(&repo, "pack-", ".pack").with_extension("mtimes");
+    fs::write(&mtimes, notes_after(b"MTME")).unwrap();
+    let rel = rel_of(&repo, &mtimes);
+
+    let res = scan_default(&root);
+    assert!(store(&res, &repo).contains(&rel));
+
+    let res = scan_verified(&root);
+    assert_preserved_or_asks(&res, &repo, &rel);
+}
+
+#[test]
+fn z2_a_commit_graph_with_bytes_appended_is_never_verified() {
+    let (tmp, root, remotes) = workspace();
+    let repo = clone_of(tmp.path(), &root, &remotes, "app");
+    git(&repo, &["commit-graph", "write", "--reachable"]);
+    let info = repo.join(".git").join("objects").join("info");
+    append_notes(&info.join("commit-graph"));
+
+    let res = scan_verified(&root);
+    assert_preserved_or_asks(&res, &repo, "objects/info/commit-graph");
 }
