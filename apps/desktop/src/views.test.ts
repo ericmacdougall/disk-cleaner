@@ -338,6 +338,73 @@ describe("developer view paging (spec AC-4)", () => {
     expect(button(v.el, "Next").disabled).toBe(true);
     expect(Math.max(...b.calls.filter((c) => c.name === "devPage").map((c) => c.args[2] as number))).toBe(300);
   });
+
+  it("a failed page keeps the page shown, says so, and Next asks for that page again", async () => {
+    let failNext = true;
+    const statuses: string[] = [];
+    const b = mockBackend({
+      devSummary: async () => ({ ...SUMMARY, imported: false, groups }),
+      devPage: async (_v, cls, offset, limit) => {
+        if (offset === 100 && failNext) {
+          failNext = false;
+          throw { kind: "io", message: "the page could not be read" };
+        }
+        const n = Math.max(0, Math.min(limit, 350 - offset));
+        return Array.from({ length: n }, (_, i) => item(cls, offset + i));
+      },
+    });
+    const v = new DevView(b, 1, (t) => statuses.push(t));
+    document.body.replaceChildren(v.el);
+    await v.load();
+    button(v.el, "Next").click();
+    await flush();
+    expect(statuses).toContain("the page could not be read");
+    const items = v.el.querySelector(".dev-items")?.textContent ?? "";
+    expect(items).toContain("/syn/repo/item-0");
+    expect(items).toContain("1 to 100 of 350");
+    const alert = v.el.querySelector('[role="alert"]')?.textContent ?? "";
+    expect(alert).toContain("Could not load Repositories 101 to 200");
+    expect(alert).toContain("the page could not be read");
+    // Next still means the page after the one shown, not the one after the failed one.
+    button(v.el, "Next").click();
+    await flush();
+    const offsets = b.calls.filter((c) => c.name === "devPage").map((c) => c.args[2]);
+    expect(offsets).toEqual([0, 100, 100]);
+    expect(v.el.textContent).toContain("101 to 200 of 350");
+    expect(v.el.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("a failed class switch keeps the class shown selected and offers to try again", async () => {
+    let failCache = true;
+    const b = mockBackend({
+      devSummary: async () => ({ ...SUMMARY, imported: false, groups }),
+      devPage: async (_v, cls, offset, limit) => {
+        if (cls === "cache" && failCache) {
+          failCache = false;
+          throw { kind: "io", message: "the class could not be read" };
+        }
+        const count = cls === "repo" ? 350 : 3;
+        const n = Math.max(0, Math.min(limit, count - offset));
+        return Array.from({ length: n }, (_, i) => item(cls, offset + i));
+      },
+    });
+    const v = new DevView(b, 1, () => undefined);
+    document.body.replaceChildren(v.el);
+    await v.load();
+    button(v.el, "Caches").click();
+    await flush();
+    expect(button(v.el, "Repositories").getAttribute("aria-pressed")).toBe("true");
+    expect(button(v.el, "Caches").getAttribute("aria-pressed")).toBe("false");
+    expect(v.el.querySelector(".dev-items")?.textContent).toContain("/syn/repo/item-0");
+    expect(v.el.querySelector('[role="alert"]')?.textContent).toContain("Could not load Caches 1 to 3");
+    button(v.el, "Try again").click();
+    await flush();
+    expect(button(v.el, "Caches").getAttribute("aria-pressed")).toBe("true");
+    const items = v.el.querySelector(".dev-items")?.textContent ?? "";
+    expect(items).toContain("/syn/cache/item-0");
+    expect(items).toContain("1 to 3 of 3");
+    expect(v.el.querySelector('[role="alert"]')).toBeNull();
+  });
 });
 
 describe("agent session folders (spec AC-13)", () => {
@@ -352,7 +419,8 @@ describe("agent session folders (spec AC-13)", () => {
           alloc: 3 * 1024 * 1024,
           size: 3 * 1024 * 1024,
           files: 12,
-          newest_mtime: 1_767_225_600,
+          // Noon UTC on 2026-01-01: the same calendar day in any time zone from UTC-11 to UTC+11.
+          newest_mtime: 1_767_268_800,
           plan_note: "no plan action yet",
           enclosing: { action: "keep", path: "/syn/home" },
         },
@@ -363,6 +431,7 @@ describe("agent session folders (spec AC-13)", () => {
     await v.load();
     const text = v.el.querySelector(".dev-sessions")?.textContent ?? "";
     expect(text).toContain(".claude/projects: /syn/home/.claude/projects, 12 files, 3.0 MiB");
+    expect(text).toContain("last changed 2026-01-01");
     expect(text).toContain("no plan action yet");
     expect(text).toContain("Inside /syn/home (keep).");
   });
