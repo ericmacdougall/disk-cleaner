@@ -133,7 +133,17 @@ fn neg4_small_video_in_build_dir_is_listed_and_directory_flagged() {
 fn dependency_directories_do_not_get_flagged_for_fixture_archives() {
     let (_tmp, root, _) = workspace();
     write(&root.join("app").join("package.json"), "{}");
-    // Packages routinely ship test fixtures such as zips; that must not pin node_modules.
+    // Packages routinely ship test fixtures such as zips; that must not pin node_modules. The
+    // package's own package.json is what shows the zip is installed package content: without it
+    // the zip is an output outside any package and the directory asks (gate19).
+    write(
+        &root
+            .join("app")
+            .join("node_modules")
+            .join("pkg")
+            .join("package.json"),
+        "{}",
+    );
     write_bytes(
         &root
             .join("app")
