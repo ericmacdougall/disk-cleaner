@@ -570,10 +570,11 @@ directories and inside `.git` directories too) the scan records:
   root; at most 20,000;
 - every `.git` file that is not itself a scanned checkout (inside a regenerable or cache
   directory, inside a git directory). A scanned checkout's `.git` file is resolved with its
-  repository for the object store (see "Object sharing"), and the git directory it names is
-  checked too: one inside another repository's git directory (`git init --separate-git-dir
-  A/.git/sub`) makes that repository `no`, unless the checkout lies inside that repository's
-  own folder (a submodule, which goes with it).
+  repository for the object store (see "Object sharing"), and the git directory it names and the
+  store it leads to are checked here too: either one inside another repository's git directory
+  (`git init --separate-git-dir A/.git/sub`, or a `commondir` into `A/.git/sub`) makes that
+  repository `no`, unless the checkout lies inside that repository's own folder (a submodule,
+  which goes with it).
 
 Each kind of reference above is checked for every git directory the walk recognises, whatever
 the borrower was classified as. A git directory is recognised only by the entries named above,

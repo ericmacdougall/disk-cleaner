@@ -764,11 +764,20 @@ fn r16b_a_checkout_whose_object_store_lies_inside_another_repos_git_directory_ho
     );
     write(&w.join("w.txt"), "only here\n");
     git(&w, &["add", "w.txt"]);
-    git(&w, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "w"]);
+    git(
+        &w,
+        &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "w"],
+    );
     let head = git(&w, &["rev-parse", "HEAD"]);
     git(
         &a,
-        &["--git-dir", common.to_str().unwrap(), "cat-file", "-e", &head],
+        &[
+            "--git-dir",
+            common.to_str().unwrap(),
+            "cat-file",
+            "-e",
+            &head,
+        ],
     );
     let res = scan_with(&root, network_everywhere());
     assert!(has_node(&res, &w), "w is a scanned checkout");

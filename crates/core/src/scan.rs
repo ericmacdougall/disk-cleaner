@@ -2101,13 +2101,13 @@ fn link_inbound(ctx: &InboundCtx, refs: &Refs) -> Inbound {
             }
         }
     }
-    // `.git` files: the git directory each names, and the object store it leads to. A scanned
-    // checkout's object store is related to the scanned repositories with its repository
-    // (`link_repos`, which also reports a `.git` file it cannot resolve); the git directory it
-    // names is checked here, so one kept inside another repository's git directory (`git init
-    // --separate-git-dir`) is a reference to that repository. A checkout inside that repository's
-    // own folder (a submodule) goes with it and is not. A git directory outside the scan is left
-    // to `link_repos`, which reports an object store outside the scan.
+    // `.git` files: the git directory each names, and the object store it leads to. For a
+    // scanned checkout both are checked here too (`link_repos` relates its store to a scanned
+    // repository's own `objects` and reports one outside the scan or a `.git` file it cannot
+    // resolve), so a git directory or store kept inside another repository's git directory (`git
+    // init --separate-git-dir`, or a `commondir` into it) is a reference to that repository. A
+    // checkout inside that repository's own folder (a submodule) goes with it and is not. A
+    // target outside the scan is left to `link_repos`.
     for (dir, agg) in ctx.dirs {
         if !agg.has_git_file {
             continue;
@@ -2116,12 +2116,15 @@ fn link_inbound(ctx: &InboundCtx, refs: &Refs) -> Inbound {
             ctx.builds[o].path == *dir && ctx.builds[o].node.class == Class::Worktree
         });
         if checkout {
-            if let Ok((gd, _)) = resolve_gitfile(dir) {
-                let inside_provider = ctx
-                    .gitdir_holding(&gd)
-                    .is_some_and(|n| canon(dir).starts_with(canon(&ctx.builds[n].path)));
-                if !inside_provider && ctx.in_scan(&gd) {
-                    consider(ctx, &mut out, &dir.join(".git"), true, &gd);
+            if let Ok((gd, store)) = resolve_gitfile(dir) {
+                let real = canon(dir);
+                for target in [gd, store] {
+                    let inside_provider = ctx
+                        .gitdir_holding(&target)
+                        .is_some_and(|n| real.starts_with(canon(&ctx.builds[n].path)));
+                    if !inside_provider && ctx.in_scan(&target) {
+                        consider(ctx, &mut out, &dir.join(".git"), true, &target);
+                    }
                 }
             }
             continue;
