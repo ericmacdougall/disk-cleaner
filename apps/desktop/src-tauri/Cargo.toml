@@ -23,7 +23,6 @@ e2e = []
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-command-group = "5"
 disk-cleaner-core = { path = "../../../crates/core" }
 disk-cleaner-view = { path = "../../../crates/view" }
 serde = { version = "1", features = ["derive"] }
@@ -35,6 +34,10 @@ tauri-plugin-dialog = "2"
 [target.'cfg(unix)'.dependencies]
 # setsid for the analysis worker (worker::spawn_worker only).
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# A job object for the analysis worker (worker::spawn_worker only).
+command-group = "5"
 
 [dev-dependencies]
 tempfile = "3"

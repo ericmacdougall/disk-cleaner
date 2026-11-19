@@ -20,12 +20,19 @@ fn main() {
     writeln!(f, "{}", std::process::id()).expect("write pid");
     drop(f);
     let sleeper = std::env::args().nth(1).as_deref() == Some("--sleeper");
+    let mut child = None;
     if !sleeper && std::env::var_os("PRUNEDISK_FAKE_GIT_GRANDCHILD").is_some() {
         let exe = std::env::current_exe().expect("exe");
-        let _child = std::process::Command::new(exe)
-            .arg("--sleeper")
-            .spawn()
-            .expect("spawn");
+        child = Some(
+            std::process::Command::new(exe)
+                .arg("--sleeper")
+                .spawn()
+                .expect("spawn"),
+        );
     }
     std::thread::sleep(Duration::from_secs(600));
+    if let Some(mut c) = child {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
 }

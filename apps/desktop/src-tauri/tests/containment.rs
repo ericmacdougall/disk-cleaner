@@ -32,15 +32,34 @@ fn fake_git() -> PathBuf {
     p
 }
 
-/// A folder core takes for a repository (HEAD, objects, refs), so the scan runs git on it.
+/// A folder core takes for a plain repository, so the scan runs git on it: core's layout check
+/// wants HEAD, config, refs, objects, objects/info and objects/pack before it runs any git
+/// (a fixture without config never starts git; CI run 44608860767).
 fn repo_fixture(dir: &Path) -> PathBuf {
     let root = dir.join("root");
     let git = root.join("app").join(".git");
-    std::fs::create_dir_all(git.join("objects")).unwrap();
+    std::fs::create_dir_all(git.join("objects").join("info")).unwrap();
+    std::fs::create_dir_all(git.join("objects").join("pack")).unwrap();
     std::fs::create_dir_all(git.join("refs").join("heads")).unwrap();
     std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(
+        git.join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+    )
+    .unwrap();
     std::fs::write(root.join("app").join("main.rs"), "fn main() {}\n").unwrap();
     root
+}
+
+/// Why no git started: end the worker and return its exit and stderr.
+fn worker_report(w: &mut WorkerProcess) -> String {
+    w.handle.terminate();
+    w.handle.wait();
+    let mut err = String::new();
+    if let Some(mut s) = w.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut s, &mut err);
+    }
+    format!("worker stderr: {err:?}")
 }
 
 fn pids(file: &Path) -> Vec<u32> {
@@ -91,10 +110,13 @@ fn start(root: &Path, pid_file: &Path, gits: usize) -> (WorkerProcess, Vec<u32>)
     let stdin = w.stdin.as_mut().unwrap();
     stdin.write_all(&[GO]).unwrap();
     stdin.flush().unwrap();
-    assert!(
-        wait_for(|| pids(pid_file).len() >= gits, Duration::from_secs(60)),
-        "the fake git never started"
-    );
+    if !wait_for(|| pids(pid_file).len() >= gits, Duration::from_secs(60)) {
+        let report = worker_report(&mut w);
+        panic!(
+            "the fake git never started ({} of {gits} pids); {report}",
+            pids(pid_file).len()
+        );
+    }
     // Let a grandchild record itself too.
     std::thread::sleep(Duration::from_millis(200));
     (w, pids(pid_file))

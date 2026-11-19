@@ -368,19 +368,20 @@ mod tests {
     fn objects_in_arrays_are_charged_their_typed_size() {
         let objects = estimate(b"[{},{},{}]");
         let numbers = estimate(b"[0,00,0]");
-        assert!(TYPED_ELEMENT_COST >= 512, "{TYPED_ELEMENT_COST}");
+        const { assert!(TYPED_ELEMENT_COST >= 512) };
         assert!(
             objects.peak_bytes >= numbers.peak_bytes + 3 * (TYPED_ELEMENT_COST + LEAF_COST),
             "{} vs {}",
             objects.peak_bytes,
             numbers.peak_bytes
         );
-        // An object that is a value of another object is not an element.
+        // An object that is a value of another object is not an element (the top-level value
+        // is charged one generic element, as every value outside an object is).
         let text = br#"{"a":{}}"#;
         let nested = estimate(text);
         assert_eq!(
             nested.peak_bytes,
-            BASE_COST + 2 * text.len() as u64 + STRING_COST + 2 * LEAF_COST
+            BASE_COST + 2 * text.len() as u64 + ELEMENT_COST + STRING_COST + 2 * LEAF_COST
         );
     }
 

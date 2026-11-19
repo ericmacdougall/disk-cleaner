@@ -100,9 +100,9 @@ fn ends_with_layout(tree: &Tree, id: NodeId, layout: &Layout) -> bool {
         };
         let Some(parent) = tree.parent(cur) else {
             let mut tail = Path::new(tree.name(cur)).components().rev();
-            return std::iter::once(part).chain(parts).all(|p| {
-                matches!(tail.next(), Some(std::path::Component::Normal(c)) if c == p.as_str())
-            });
+            return std::iter::once(part).chain(parts).all(
+                |p| matches!(tail.next(), Some(std::path::Component::Normal(c)) if c == p.as_str()),
+            );
         };
         if tree.name(cur) != part.as_str() {
             return false;
