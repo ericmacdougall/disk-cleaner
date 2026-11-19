@@ -248,9 +248,9 @@ pre code { background: none; padding: 0; font: inherit; }
 <main id="main">
   <section class="hero" id="top" aria-labelledby="h-hero">
     <div class="wrap">
-      <p class="status-note"><strong>Early.</strong> Only a read-only command-line scanner and planner exists, and it is still in review. It deletes nothing. There is no desktop app, installer or store listing yet.</p>
+      <p class="status-note"><strong>Early.</strong> Only a read-only command-line scanner and planner exists. It is merged into the main branch but not released. It deletes nothing. There is no desktop app, installer or store listing yet.</p>
       <h1 id="h-hero">Know what is safe to remove.</h1>
-      <p class="lede">PruneDisk is a free, open-source disk analyzer for developer machines. Today a read-only command-line tool scans a disk, works out what each folder is (a git repo, a worktree, a rebuildable folder, a cache) and plans what could be removed, backed up first, or left alone. It deletes nothing. It is being built into a cleaner for Windows, macOS and Linux, which are the target platforms: the build on the review branch covers all three, and only macOS has been tested by hand so far.</p>
+      <p class="lede">PruneDisk is a free, open-source disk analyzer for developer machines. Today a read-only command-line tool scans a disk, works out what each folder is (a git repo, a worktree, a rebuildable folder, a cache) and plans what could be removed, backed up first, or left alone. It deletes nothing. It is being built into a cleaner for Windows, macOS and Linux, which are the target platforms: the project's automated build and tests run on all three, and only macOS has been tested by hand so far.</p>
       <div class="cta-row">
         <a class="btn" href="https://github.com/ericmacdougall/disk-cleaner">Follow the project on GitHub</a>
         <a class="btn secondary" href="#status">See what exists today</a>
@@ -259,7 +259,7 @@ pre code { background: none; padding: 0; font: inherit; }
       <figure>
         <svg viewBox="0 0 640 340" role="img" aria-labelledby="fig-t fig-d">
           <title id="fig-t">Illustration of a disk drawn as a treemap, colored by class</title>
-          <desc id="fig-d">A rectangle split into seven blocks. The largest is regenerable folders such as node_modules and target. Others are a git repo, linked worktrees, caches, agent session logs, output files and loose code. The sizes are invented.</desc>
+          <desc id="fig-d">A rectangle split into eight blocks of seven classes. The largest is regenerable folders such as node_modules and target. Others are a git repo, linked worktrees, caches, agent session logs, output files and loose code. The sizes are invented.</desc>
           <rect class="tile-regen" x="0" y="0" width="300" height="200" rx="6"/>
           <text class="tile-label" x="14" y="30">regenerable</text>
           <text class="tile-sub" x="14" y="52">node_modules, target, .venv</text>
@@ -310,14 +310,14 @@ pre code { background: none; padding: 0; font: inherit; }
   <section id="safety" aria-labelledby="h-safety">
     <div class="wrap">
       <h2 id="h-safety">How it decides what is safe</h2>
-      <p>Every directory gets one class. Each class has a default disposition. These are the rules in the project's <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/docs/DESIGN.md">design document</a>; the read-only scanner in review assigns repo, worktree, bare-repo, regenerable, cache and loose-code, and lists output files individually. Agent-session handling is designed but not built.</p>
+      <p>Every directory gets one class. Each class has a default disposition. These are the rules in the project's <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/docs/DESIGN.md">design document</a>; the read-only scanner assigns repo, worktree, bare-repo, regenerable, cache and loose-code (everything else is "other"), and lists output files individually. Agent-session handling is designed but not built. Nothing is removed yet: a default is what a plan proposes, and the step that applies a plan is planned.</p>
 
       <div class="table-wrap">
         <table class="stack" role="table">
           <caption role="caption">Classes and what happens to them by default</caption>
           <thead role="rowgroup"><tr role="row"><th scope="col" role="columnheader">Class</th><th scope="col" role="columnheader">What it is</th><th scope="col" role="columnheader">Default</th></tr></thead>
           <tbody role="rowgroup">
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-repo)"></span>repo</th><td role="cell" data-label="What it is">A directory with a <code>.git</code> directory.</td><td role="cell" data-label="Default">Keep. Can be archived when idle and fully on a remote.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-repo)"></span>repo</th><td role="cell" data-label="What it is">A directory with a <code>.git</code> directory.</td><td role="cell" data-label="Default">Keep. When idle and fully on a remote, the plan proposes backing it up, then removing it.</td></tr>
             <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-worktree)"></span>worktree</th><td role="cell" data-label="What it is">A linked git worktree.</td><td role="cell" data-label="Default">Like a repo, checked against its own HEAD.</td></tr>
             <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--text)"></span>bare-repo</th><td role="cell" data-label="What it is">A bare git repository.</td><td role="cell" data-label="Default">Never removed while a worktree or clone depends on it.</td></tr>
             <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-regen)"></span>regenerable</th><td role="cell" data-label="What it is"><code>node_modules</code>, <code>target</code>, <code>.venv</code>, <code>.next</code>, <code>DerivedData</code>.</td><td role="cell" data-label="Default">Remove when the owning project is not active.</td></tr>
@@ -331,7 +331,7 @@ pre code { background: none; padding: 0; font: inherit; }
       </div>
 
       <h3>What it checks before it calls a repo safe</h3>
-      <p>For every repo and worktree the scanner records seven facts. Each is yes, no or unknown. <strong>Unknown never counts as yes</strong>: a check that fails or times out means keep.</p>
+      <p>For every repo and worktree the scanner records eleven facts. Each is yes, no or unknown. <strong>Unknown never counts as yes</strong>: a check that fails or times out means keep.</p>
       <ul class="facts">
         <li>It has at least one network remote. A local path or a bundle file is not a backup.</li>
         <li>The checked-out commit is on a remote branch, including a detached HEAD.</li>
@@ -340,8 +340,12 @@ pre code { background: none; padding: 0; font: inherit; }
         <li>The working tree is clean: no changes and no untracked files.</li>
         <li>There are no ignored files that exist only here, such as <code>.env</code> or a local database.</li>
         <li>No other clone or worktree depends on this one.</li>
+        <li>Every commit the reflogs still remember, such as one left behind by a reset or a rebase, is on a remote.</li>
+        <li>No rebase, merge, cherry-pick or bisect is half finished.</li>
+        <li>The repository has a plain layout, with nothing unusual in its git directory.</li>
+        <li>The git directory holds nothing of its own, such as a custom hook or a setting only this copy has.</li>
       </ul>
-      <p>A repo is safe to remove only when all seven are yes. Anything else is ambiguous, and the plan says so. Remote facts come from local remote-tracking refs, which can be stale, so the plan marks them unverified. Re-checking them against the live remote at the moment of removal is planned for the step that applies a plan.</p>
+      <p>A repo can be proposed for removal only when all eleven are yes, and even then the plan says to back up its git directory first. When a fact is no, the plan either proposes recovering the missing work first or asks you; when a fact is unknown, it asks. It always says why. Remote facts come from local remote-tracking refs, which can be stale, so the plan marks them unverified. Re-checking them against the live remote at the moment of removal is planned for the step that applies a plan.</p>
 
       <div class="grid two">
         <div class="card"><h3>Plan, then apply</h3><p>Scanning and planning are read-only. A plan is a file you can read and edit. Apply, when it exists, will do exactly that plan.</p></div>
@@ -353,16 +357,16 @@ pre code { background: none; padding: 0; font: inherit; }
   <section id="status" aria-labelledby="h-status">
     <div class="wrap">
       <h2 id="h-status">What exists today and what is planned</h2>
-      <p>Last checked against the project repository on 18 November 2026. The repository is the source of truth; this table can lag it.</p>
+      <p>Last checked against the project repository on 19 November 2026. The repository is the source of truth; this table can lag it.</p>
       <div class="table-wrap">
         <table class="stack" role="table">
           <caption role="caption">Status of each part of the project</caption>
           <thead role="rowgroup"><tr role="row"><th scope="col" role="columnheader">Part</th><th scope="col" role="columnheader">Status</th><th scope="col" role="columnheader">Notes</th></tr></thead>
           <tbody role="rowgroup">
             <tr role="row"><th scope="row" role="rowheader">Design</th><td role="cell" data-label="Status"><span class="badge">Written</span></td><td role="cell" data-label="Notes">Draft design document in the repository.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader">CLI: scan and plan</th><td role="cell" data-label="Status"><span class="badge">In review</span></td><td role="cell" data-label="Notes">Read-only. On an open draft pull request, not merged. Produces JSON and a readable summary. Deletes nothing.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader">Recovery, backup, apply, restore</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Recovery branches, rclone backup connectors, removal with a manifest, restore. Not started.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader">Desktop app</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Sunburst, treemap and outline views. Not started.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">CLI: scan and plan</th><td role="cell" data-label="Status"><span class="badge">Merged, not released</span></td><td role="cell" data-label="Notes">Read-only. On the main branch; no release or download yet. Produces JSON and a readable summary. Deletes nothing.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">Recovery, backup, apply, restore</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Recovery branches, rclone backup connectors, removal with a manifest, restore. Nothing of it is on the main branch yet.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">Desktop app</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Sunburst, treemap and outline views. Nothing of it is on the main branch yet.</td></tr>
             <tr role="row"><th scope="row" role="rowheader">App stores and installers</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Nothing to download yet.</td></tr>
           </tbody>
         </table>
@@ -390,10 +394,14 @@ Repos and worktrees (3):
   [repo] ~/projects/example-app  2.4 GiB
       has_network_remote=yes head_on_remote=yes all_branches_on_remote=yes
       stash_empty=yes tree_clean=yes no_unique_ignored=yes no_dependents=yes
+      reflog_saved=yes no_pending_state=yes plain_layout=yes
+      no_local_admin_content=yes
       .git 310.2 MiB, regenerable 1.9 GiB, outputs 0 B
   [repo] ~/projects/example-notes  88.0 MiB
       has_network_remote=yes head_on_remote=NO all_branches_on_remote=NO
-      stash_empty=NO tree_clean=NO no_unique_ignored=UNKNOWN no_dependents=yes
+      stash_empty=NO tree_clean=NO no_unique_ignored=yes no_dependents=yes
+      reflog_saved=NO no_pending_state=yes plain_layout=yes
+      no_local_admin_content=yes
       .git 12.5 MiB, regenerable 0 B, outputs 0 B
   [worktree] ~/projects/example-app-fix  240.6 MiB
       ...
@@ -404,13 +412,17 @@ Regenerable and cache directories (4):
     ...
 
 $ disk-cleaner plan --scan scan.json
-Dry-run plan (nothing is changed).
-Remote facts verified: no (remote-tracking refs can be stale)
+Dry-run plan (nothing is changed). Active window: 7 days (from default).
+Running-process check: ok
+Scope: subtree. Dependents (linked worktrees, shared object stores) were looked ...
+Coverage: complete (every folder was read).
+Remote facts verified: no (remote facts come from local remote-tracking refs, ...)
 ...
 Items:
-  remove-regenerable      1.9 GiB  [regenerable] ~/projects/example-app/node_modules
-  recover-then-archive    0 B     [repo] ~/projects/example-notes
-      (reasons abridged)</code></pre>
+  remove-regenerable            1.1 GiB  [regenerable] ~/projects/example-service/target
+  recover-backup-then-remove   88.0 MiB  [repo] ~/projects/example-notes
+  ...
+      (states and reasons abridged)</code></pre>
       <p class="muted">The command is still called <code>disk-cleaner</code> today; it will be renamed <code>prunedisk</code>. The plan only describes what would happen. In the current version no command removes, moves or changes anything. The scanner writes a file only where you give <code>--out</code>.</p>
     </div>
   </section>
@@ -418,7 +430,7 @@ Items:
   <section id="follow" aria-labelledby="h-follow">
     <div class="wrap">
       <h2 id="h-follow">Follow along</h2>
-      <p>The project is developed in the open. The best way to follow it is the repository: the design document, the open pull request for the scanner, and the issue tracker. The repository is still named disk-cleaner; renaming the repository and the command to prunedisk is planned, not done. There is no mailing list, no account to create and nothing to install yet.</p>
+      <p>The project is developed in the open. The best way to follow it is the repository: the design document, the scanner's source and its scan format documentation, and the issue tracker. The repository is still named disk-cleaner; renaming the repository and the command to prunedisk is planned, not done. There is no mailing list, no account to create and nothing to install yet.</p>
       <p><a class="btn" href="https://github.com/ericmacdougall/disk-cleaner">github.com/ericmacdougall/disk-cleaner</a></p>
       <h3>License</h3>
       <p>MIT. Free to use, change and share. See the <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/LICENSE">license file</a>.</p>
