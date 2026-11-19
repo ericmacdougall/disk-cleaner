@@ -1,14 +1,13 @@
-//! Regression tests for the coordinator's round Z after the gate review of 36f9698 (PR #2).
+//! Regression tests for the coordinator's round Z after the gate review of 36f9698 (PR #2), as
+//! amended by gate round 15 at 087a1b3.
 //!
 //! Z1: a file in `objects/` was left out of the backup when its first bytes looked like an
 //! object file's (a `RIDX` sidecar holding notes, a pack or index with valid magic and junk
 //! after it, a loose object whose header inflates but whose remainder is corrupt). Now every
-//! file of a git directory is in exactly one of two obligations, decided by name alone:
-//! `preserve.git_admin` (always backed up) or `preserve.object_store` (verified against the
-//! remote or backed up; never exempt). The scan marks an object store verified only when
-//! `--verify-objects` ran git's own verification of all of it and git accounted for every file;
-//! a file git does not account for is the repository's own and makes it ask, and a store git
-//! finds damaged asks.
+//! file of a git directory is in exactly one of two backup obligations, decided by name alone:
+//! `preserve.git_admin` and `preserve.object_store`. Round 15 removed `scan --verify-objects`:
+//! this format defines no verification of object data, so both obligations are backups, and no
+//! file, however it was tampered with, is outside them.
 //!
 //! Every fixture uses real git.
 
@@ -33,14 +32,9 @@ fn item<'a>(p: &'a Plan, path: &Path) -> &'a PlanItem {
         .unwrap_or_else(|| panic!("no plan item for {}", path.display()))
 }
 
-/// The default scan (no object verification).
+/// The scan (there is no other mode).
 fn scan_default(root: &Path) -> ScanResult {
     scan_with(root, network_everywhere())
-}
-
-/// `scan --verify-objects`.
-fn scan_verified(root: &Path) -> ScanResult {
-    scan_with(root, network_everywhere().with_verify_objects(true))
 }
 
 /// A clone, inside the scan root, of a repository pushed to a bare remote outside it.
@@ -104,9 +98,9 @@ fn assert_partition(res: &ScanResult, repo: &Path) {
     );
 }
 
-/// A removing item for `repo` that carries both obligations, with counts matching the two public
-/// lists, the store's verification as `verified`, and a reason that says all of it.
-fn assert_obligations(res: &ScanResult, it: &PlanItem, repo: &Path, verified: bool) {
+/// A removing item for `repo` that carries both backup obligations, with counts matching the
+/// two public lists, no verification field, and a reason that says all of it.
+fn assert_obligations(res: &ScanResult, it: &PlanItem, repo: &Path) {
     assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
     let pre = it
         .preserve
@@ -117,40 +111,48 @@ fn assert_obligations(res: &ScanResult, it: &PlanItem, repo: &Path, verified: bo
     assert!(!s.is_empty(), "a clone has an object store");
     assert_eq!(pre.object_store.files, s.len() as u64, "{s:?}");
     assert!(pre.object_store.bytes > 0);
-    assert_eq!(pre.object_store.verified, verified, "{}", it.reason);
+    let v = serde_json::to_value(pre).unwrap();
+    assert!(v["object_store"].get("verified").is_none(), "{v}");
     for want in [
         "local git file",
         "are saved with the manifest first",
         "its object store (",
-        "must be verified against the remote or saved too",
+        "holds object data that must be backed up too before removal",
         "then it is removed",
     ] {
         assert!(it.reason.contains(want), "{want:?} not in {}", it.reason);
     }
-    let said = if verified {
-        "verified by this scan"
-    } else {
-        "not yet verified"
-    };
-    assert!(it.reason.contains(said), "{said:?} not in {}", it.reason);
-}
-
-/// The plan asks for `repo` and reclaims nothing.
-fn assert_asks(res: &ScanResult, repo: &Path) -> String {
-    let p = plan_of(res);
-    let it = item(&p, repo);
-    assert_eq!(it.action, Action::Ask, "{}", it.reason);
-    assert_eq!(it.reclaimable_bytes, 0);
-    let s = node(res, repo).repo.as_ref().unwrap().object_store.clone();
-    assert!(
-        !s.map(|s| s.verified).unwrap_or(false),
-        "a store that asks is not verified"
-    );
-    it.reason.clone()
+    for gone in [
+        "verified by this scan",
+        "not yet verified",
+        "verified against the remote or saved",
+    ] {
+        assert!(!it.reason.contains(gone), "{gone:?} in {}", it.reason);
+    }
 }
 
 fn pack_dir(repo: &Path) -> PathBuf {
     repo.join(".git").join("objects").join("pack")
+}
+
+/// `rel` (below the git directory) is in one of the two backup sets, the two sets partition the
+/// git directory, and the plan either asks (reclaiming nothing) or removes only with both
+/// obligations.
+fn assert_in_a_backup_set(res: &ScanResult, repo: &Path, rel: &str) {
+    assert_partition(res, repo);
+    let a = admin(res, repo);
+    let s = store(res, repo);
+    assert!(
+        a.iter().any(|f| f == rel) || s.iter().any(|f| f == rel),
+        "{rel} is in neither backup set: {a:?} {s:?}"
+    );
+    let p = plan_of(res);
+    let it = item(&p, repo);
+    if it.action == Action::Ask {
+        assert_eq!(it.reclaimable_bytes, 0);
+    } else {
+        assert_obligations(res, it, repo);
+    }
 }
 
 // ---------------------------------------------------------------- the reviewer's three cases
@@ -175,40 +177,20 @@ fn z1_a_midx_sidecar_holding_notes_is_under_the_object_store_obligation() {
     assert!(!admin(&res, &repo).contains(&rel));
     assert_partition(&res, &repo);
     let p = plan_of(&res);
-    assert_obligations(&res, item(&p, &repo), &repo, false);
+    assert_obligations(&res, item(&p, &repo), &repo);
 }
 
 const MIDX_BITMAP: &str = "multi-pack-index-1111111111111111111111111111111111111111.bitmap";
 
-/// With `--verify-objects`, a multi-pack-index `.rev` (a kind no git command reads) is backed up
-/// with the git directory's own files and named in the examples; a multi-pack-index `.bitmap`
-/// with no multi-pack-index (a kind git reads, but this one is of nothing git verified) is
-/// unaccounted, so the repository asks.
+/// A multi-pack-index `.bitmap` with an arbitrary payload and no multi-pack-index is in a
+/// backup set.
 #[test]
-fn z1_with_verify_objects_a_midx_sidecar_is_backed_up_or_asks() {
+fn z1_a_midx_bitmap_with_an_arbitrary_payload_is_in_a_backup_set() {
     let (tmp, root, remotes) = workspace();
-    let rev = clone_of(tmp.path(), &root, &remotes, "rev");
-    let mut notes = b"RIDX".to_vec();
-    notes.extend_from_slice(b"my only copy of these notes\n");
-    fs::write(pack_dir(&rev).join(MIDX_REV), &notes).unwrap();
-    let bitmap = clone_of(tmp.path(), &root, &remotes, "bitmap");
-    fs::write(pack_dir(&bitmap).join(MIDX_BITMAP), notes_after(b"BITM")).unwrap();
-
-    let res = scan_verified(&root);
-    let rel = format!("objects/pack/{MIDX_REV}");
-    assert_preserved_or_asks(&res, &rev, &rel);
-    let p = plan_of(&res);
-    let it = item(&p, &rev);
-    assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
-    let ex = &it.preserve.as_ref().unwrap().git_admin.examples;
-    assert!(ex.contains(&format!(".git/{rel}")), "{ex:?}");
-
-    let reason = assert_asks(&res, &bitmap);
-    assert!(reason.contains(MIDX_BITMAP), "{reason}");
-    assert_eq!(
-        facts_of(&res, &bitmap).no_local_admin_content,
-        disk_cleaner_core::Tri::No
-    );
+    let repo = clone_of(tmp.path(), &root, &remotes, "app");
+    fs::write(pack_dir(&repo).join(MIDX_BITMAP), notes_after(b"BITM")).unwrap();
+    let res = scan_default(&root);
+    assert_in_a_backup_set(&res, &repo, &format!("objects/pack/{MIDX_BITMAP}"));
 }
 
 const FAKE: &str = "pack-3333333333333333333333333333333333333333";
@@ -237,9 +219,6 @@ fn z1_a_pack_and_index_malformed_after_their_magic_are_never_exempt() {
 
     let res = scan_default(&root);
     assert_obligated_or_asks(&res, &repo, &[pack.as_str(), idx.as_str()]);
-
-    let res = scan_verified(&root);
-    assert_asks(&res, &repo);
 }
 
 /// Write a blob as a loose object with real git and return its path below the git directory.
@@ -269,8 +248,8 @@ fn make_writable(path: &Path) {
     fs::set_permissions(path, perm).unwrap();
 }
 
-/// Without verification, a damaged object file either makes some git command fail (the repo
-/// asks) or is counted under the object-store obligation, unverified. Never exempt.
+/// A damaged object file either makes some git command fail (the repo asks) or is counted under
+/// the object-store obligation. Never exempt.
 fn assert_obligated_or_asks(res: &ScanResult, repo: &Path, rels: &[&str]) {
     let s = store(res, repo);
     for rel in rels {
@@ -282,7 +261,7 @@ fn assert_obligated_or_asks(res: &ScanResult, repo: &Path, rels: &[&str]) {
     if it.action == Action::Ask {
         assert_eq!(it.reclaimable_bytes, 0);
     } else {
-        assert_obligations(res, it, repo, false);
+        assert_obligations(res, it, repo);
     }
 }
 
@@ -308,13 +287,10 @@ fn z1_a_loose_object_with_a_valid_header_and_a_corrupt_remainder() {
 
     let res = scan_default(&root);
     assert_obligated_or_asks(&res, &repo, &[rel.as_str()]);
-
-    let res = scan_verified(&root);
-    assert_asks(&res, &repo);
 }
 
 #[test]
-fn z1_bytes_after_a_valid_loose_object_are_found_by_verification() {
+fn z1_bytes_after_a_valid_loose_object_are_in_a_backup_set() {
     let (tmp, root, remotes) = workspace();
     let repo = clone_of(tmp.path(), &root, &remotes, "app");
     let (rel, path) = loose_blob(&repo, &some_text());
@@ -325,15 +301,12 @@ fn z1_bytes_after_a_valid_loose_object_are_found_by_verification() {
 
     let res = scan_default(&root);
     assert_obligated_or_asks(&res, &repo, &[rel.as_str()]);
-
-    let res = scan_verified(&root);
-    assert_asks(&res, &repo);
 }
 
 // ---------------------------------------------------------------- controls
 
 #[test]
-fn z1_controls_are_unverified_by_default_and_verified_by_git() {
+fn z1_controls_carry_both_backup_obligations() {
     let (tmp, root, remotes) = workspace();
     let fresh = clone_of(tmp.path(), &root, &remotes, "fresh");
     let gc = clone_of(tmp.path(), &root, &remotes, "gc");
@@ -358,35 +331,14 @@ fn z1_controls_are_unverified_by_default_and_verified_by_git() {
     let p = plan_of(&res);
     for repo in all {
         assert_partition(&res, repo);
-        assert_obligations(&res, item(&p, repo), repo, false);
-    }
-
-    let res = scan_verified(&root);
-    let p = plan_of(&res);
-    for repo in all {
-        let n = node(&res, repo).repo.as_ref().unwrap();
-        assert!(
-            n.object_store.as_ref().map(|s| s.verified).unwrap_or(false),
-            "{}: {:?}",
-            repo.display(),
-            n.notes
-        );
-        assert_obligations(&res, item(&p, repo), repo, true);
-        let unread: Vec<String> = store(&res, repo)
-            .into_iter()
-            .filter(|f| unread_kind(f))
-            .collect();
-        assert!(unread.is_empty(), "{unread:?}");
+        assert_obligations(&res, item(&p, repo), repo);
     }
 }
 
 const SPLIT_ID: &str = "4444444444444444444444444444444444444444";
 
-/// `git commit-graph verify` reads `objects/info/commit-graph` when it exists and opens the
-/// split chain only when it does not (builtin/commit-graph.c), so a split graph file beside a
-/// single commit-graph is never read by git, even when the chain file names it.
 #[test]
-fn z1_a_split_graph_file_beside_a_single_commit_graph_asks() {
+fn z1_a_split_graph_file_beside_a_single_commit_graph_is_in_a_backup_set() {
     let (tmp, root, remotes) = workspace();
     let repo = clone_of(tmp.path(), &root, &remotes, "app");
     git(&repo, &["commit-graph", "write", "--reachable"]);
@@ -401,31 +353,21 @@ fn z1_a_split_graph_file_beside_a_single_commit_graph_asks() {
     let rel = format!("objects/info/commit-graphs/{name}");
 
     let res = scan_default(&root);
-    assert_obligated_or_asks(&res, &repo, &[rel.as_str()]);
-
-    let res = scan_verified(&root);
-    let reason = assert_asks(&res, &repo);
-    assert!(reason.contains(&name), "{reason}");
+    assert_in_a_backup_set(&res, &repo, &rel);
 }
 
-/// An object that nothing reaches may exist nowhere else: the store is not verified, but the
-/// file is still under the object-store obligation, so the repository is not made to ask.
+/// An object that nothing reaches may exist nowhere else: it is under the object-store backup
+/// obligation.
 #[test]
-fn z1_an_unreachable_object_leaves_the_store_unverified() {
+fn z1_an_unreachable_object_is_under_the_object_store_obligation() {
     let (tmp, root, remotes) = workspace();
     let repo = clone_of(tmp.path(), &root, &remotes, "app");
     let (rel, _) = loose_blob(&repo, &some_text());
 
-    let res = scan_verified(&root);
+    let res = scan_default(&root);
     assert!(store(&res, &repo).contains(&rel));
-    let n = node(&res, &repo).repo.as_ref().unwrap();
-    assert!(
-        n.notes.iter().any(|x| x.contains("not reachable")),
-        "{:?}",
-        n.notes
-    );
     let p = plan_of(&res);
-    assert_obligations(&res, item(&p, &repo), &repo, false);
+    assert_obligations(&res, item(&p, &repo), &repo);
 }
 
 #[test]
@@ -440,30 +382,6 @@ fn z1_a_store_whose_files_were_not_counted_asks() {
     assert_eq!(it.action, Action::Ask, "{}", it.reason);
     assert!(it.preserve.is_none());
     assert!(it.reason.contains("object store"), "{}", it.reason);
-}
-
-/// A check that cannot run (here git cannot be started; a timeout ends the same way) proves
-/// nothing either way: the store is not verified, and nothing is reported damaged or
-/// unaccounted. Deterministic, unlike a short timeout, which a fast machine can beat.
-#[test]
-fn z1_a_verification_that_cannot_run_is_not_verified_and_not_damaged() {
-    let tmp = tempfile::tempdir().unwrap();
-    let gd = tmp.path().join(".git");
-    let git_bin = disk_cleaner_core::Git::new(
-        tmp.path().join("no-such-git"),
-        std::time::Duration::from_secs(5),
-    );
-    let id = "0123456789abcdef0123456789abcdef01234567";
-    let store = vec![
-        (format!("objects/ab/{}", &id[2..]), 4096),
-        (format!("objects/pack/pack-{id}.pack"), 4096),
-        (format!("objects/pack/pack-{id}.idx"), 4096),
-    ];
-    let v = disk_cleaner_core::preserve::verify(&git_bin, tmp.path(), &gd, &store);
-    assert!(!v.verified, "{v:?}");
-    assert_eq!(v.damaged, None, "{v:?}");
-    assert!(v.unaccounted.is_empty(), "{v:?}");
-    assert!(!v.unverified.is_empty(), "{v:?}");
 }
 
 // ---------------------------------------------------------------- click-test remark
@@ -491,11 +409,10 @@ fn z1_large_preserved_files_lead_the_examples() {
     );
 }
 
-// ---------------------------------------------------------------- Z2: what git actually reads
+// ---------------------------------------------------------------- Z2: tampered derived files
 
-// With `--verify-objects`, a file counts toward a verified store only when a git command read and
-// validated all of it (checksum or complete parse). A derived file that no git command reads is
-// one of the git directory's own (backed up); a damaged one makes the repository ask.
+// Every derived file of the object store, tampered with in any way, is in one of the two backup
+// sets (round 15: no verification can take a file out of them).
 
 /// `repack -a -d` writing a reverse index (`pack.writeReverseIndex`).
 const REV_REPACK: [&str; 6] = [
@@ -506,14 +423,6 @@ const REV_REPACK: [&str; 6] = [
     "-d",
     "-q",
 ];
-
-/// A file kind no git verification reads: a cruft pack's mtimes, a multi-pack-index's reverse
-/// index, and the incremental multi-pack-index layers.
-fn unread_kind(rel: &str) -> bool {
-    rel.ends_with(".mtimes")
-        || rel.contains("/multi-pack-index.d/")
-        || (rel.starts_with("objects/pack/multi-pack-index-") && rel.ends_with(".rev"))
-}
 
 /// The one file in `objects/pack` whose name starts with `prefix` and ends with `suffix`.
 fn pack_file(repo: &Path, prefix: &str, suffix: &str) -> PathBuf {
@@ -564,23 +473,6 @@ fn notes_after(magic: &[u8]) -> Vec<u8> {
     v
 }
 
-/// With `--verify-objects`, `rel` is never under a verified store: the repository asks, or the
-/// file is listed by `git_admin_files` (backed up) and not by `object_store_files`.
-fn assert_preserved_or_asks(res: &ScanResult, repo: &Path, rel: &str) {
-    assert_partition(res, repo);
-    let p = plan_of(res);
-    let it = item(&p, repo);
-    if it.action == Action::Ask {
-        assert_eq!(it.reclaimable_bytes, 0);
-        return;
-    }
-    let a = admin(res, repo);
-    assert!(a.iter().any(|f| f == rel), "{rel} not in {a:?}");
-    assert!(!store(res, repo).iter().any(|f| f == rel));
-    let pre = it.preserve.as_ref().expect("preserve");
-    assert_eq!(pre.git_admin.files, a.len() as u64);
-}
-
 /// A clone repacked into one pack, with a multi-pack-index and its bitmap.
 fn midx_clone(tmp: &Path, root: &Path, remotes: &Path, name: &str) -> PathBuf {
     let repo = clone_of(tmp, root, remotes, name);
@@ -597,7 +489,7 @@ fn midx_checksum(repo: &Path) -> String {
 }
 
 #[test]
-fn z2_a_pack_bitmap_appended_to_or_rewritten_is_never_verified() {
+fn z2_a_pack_bitmap_appended_to_or_rewritten_is_in_a_backup_set() {
     let (tmp, root, remotes) = workspace();
     let appended = clone_of(tmp.path(), &root, &remotes, "appended");
     let rewritten = clone_of(tmp.path(), &root, &remotes, "rewritten");
@@ -609,27 +501,13 @@ fn z2_a_pack_bitmap_appended_to_or_rewritten_is_never_verified() {
     append_notes(&pack_file(&appended, "pack-", ".bitmap"));
     replace_body(&pack_file(&rewritten, "pack-", ".bitmap"), 4);
 
-    let res = scan_verified(&root);
-    assert_preserved_or_asks(&res, &appended, &rels[0]);
-    assert_preserved_or_asks(&res, &rewritten, &rels[1]);
+    let res = scan_default(&root);
+    assert_in_a_backup_set(&res, &appended, &rels[0]);
+    assert_in_a_backup_set(&res, &rewritten, &rels[1]);
 }
 
 #[test]
-fn z2_a_bitmap_of_a_pack_under_a_multi_pack_index_is_checked_too() {
-    let (tmp, root, remotes) = workspace();
-    let repo = clone_of(tmp.path(), &root, &remotes, "app");
-    git(&repo, &["repack", "-a", "-d", "-q", "--write-bitmap-index"]);
-    git(&repo, &["multi-pack-index", "write"]);
-    let bitmap = pack_file(&repo, "pack-", ".bitmap");
-    let rel = rel_of(&repo, &bitmap);
-    append_notes(&bitmap);
-
-    let res = scan_verified(&root);
-    assert_preserved_or_asks(&res, &repo, &rel);
-}
-
-#[test]
-fn z2_a_reverse_index_appended_to_or_rewritten_is_never_verified() {
+fn z2_a_reverse_index_appended_to_or_rewritten_is_in_a_backup_set() {
     let (tmp, root, remotes) = workspace();
     let appended = clone_of(tmp.path(), &root, &remotes, "appended");
     let rewritten = clone_of(tmp.path(), &root, &remotes, "rewritten");
@@ -641,15 +519,13 @@ fn z2_a_reverse_index_appended_to_or_rewritten_is_never_verified() {
     append_notes(&pack_file(&appended, "pack-", ".rev"));
     replace_body(&pack_file(&rewritten, "pack-", ".rev"), 12);
 
-    let res = scan_verified(&root);
-    assert_preserved_or_asks(&res, &appended, &rels[0]);
-    assert_preserved_or_asks(&res, &rewritten, &rels[1]);
+    let res = scan_default(&root);
+    assert_in_a_backup_set(&res, &appended, &rels[0]);
+    assert_in_a_backup_set(&res, &rewritten, &rels[1]);
 }
 
-/// fsck checks the multi-pack-index bitmap only when it loads the multi-pack-index, which a
-/// repository's own `core.multiPackIndex = false` would stop.
 #[test]
-fn z2_a_midx_bitmap_appended_to_is_never_verified_whatever_the_config() {
+fn z2_a_midx_bitmap_appended_to_is_in_a_backup_set_whatever_the_config() {
     let (tmp, root, remotes) = workspace();
     let on = midx_clone(tmp.path(), &root, &remotes, "on");
     let off = midx_clone(tmp.path(), &root, &remotes, "off");
@@ -661,15 +537,13 @@ fn z2_a_midx_bitmap_appended_to_is_never_verified_whatever_the_config() {
         append_notes(&bitmap);
     }
 
-    let res = scan_verified(&root);
-    assert_preserved_or_asks(&res, &on, &rels[0]);
-    assert_preserved_or_asks(&res, &off, &rels[1]);
+    let res = scan_default(&root);
+    assert_in_a_backup_set(&res, &on, &rels[0]);
+    assert_in_a_backup_set(&res, &off, &rels[1]);
 }
 
-/// No git command reads a multi-pack-index's reverse index: by default it is under the
-/// unverified object-store obligation, and with `--verify-objects` it is backed up.
 #[test]
-fn z2_a_midx_reverse_index_holding_notes_is_backed_up() {
+fn z2_a_midx_reverse_index_holding_notes_is_in_a_backup_set() {
     let (tmp, root, remotes) = workspace();
     let repo = midx_clone(tmp.path(), &root, &remotes, "app");
     let name = format!("multi-pack-index-{}.rev", midx_checksum(&repo));
@@ -683,14 +557,11 @@ fn z2_a_midx_reverse_index_holding_notes_is_backed_up() {
 
     let res = scan_default(&root);
     assert!(store(&res, &repo).contains(&rel));
-
-    let res = scan_verified(&root);
-    assert_preserved_or_asks(&res, &repo, &rel);
+    assert_in_a_backup_set(&res, &repo, &rel);
 }
 
-/// No git command reads a cruft pack's mtimes.
 #[test]
-fn z2_cruft_mtimes_beside_a_verified_pack_are_backed_up() {
+fn z2_cruft_mtimes_beside_a_pack_are_in_a_backup_set() {
     let (tmp, root, remotes) = workspace();
     let repo = clone_of(tmp.path(), &root, &remotes, "app");
     git(&repo, &["repack", "-a", "-d", "-q"]);
@@ -700,19 +571,17 @@ fn z2_cruft_mtimes_beside_a_verified_pack_are_backed_up() {
 
     let res = scan_default(&root);
     assert!(store(&res, &repo).contains(&rel));
-
-    let res = scan_verified(&root);
-    assert_preserved_or_asks(&res, &repo, &rel);
+    assert_in_a_backup_set(&res, &repo, &rel);
 }
 
 #[test]
-fn z2_a_commit_graph_with_bytes_appended_is_never_verified() {
+fn z2_a_commit_graph_with_bytes_appended_is_in_a_backup_set() {
     let (tmp, root, remotes) = workspace();
     let repo = clone_of(tmp.path(), &root, &remotes, "app");
     git(&repo, &["commit-graph", "write", "--reachable"]);
     let info = repo.join(".git").join("objects").join("info");
     append_notes(&info.join("commit-graph"));
 
-    let res = scan_verified(&root);
-    assert_preserved_or_asks(&res, &repo, "objects/info/commit-graph");
+    let res = scan_default(&root);
+    assert_in_a_backup_set(&res, &repo, "objects/info/commit-graph");
 }

@@ -109,7 +109,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
     let json = fs::read_to_string(&out_file).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["schema_version"], 13);
+    assert_eq!(v["schema_version"], 14);
 
     let o = run(bin()
         .args([
@@ -1372,7 +1372,7 @@ fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
     let now = far_future();
 
     let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
-    assert_eq!(pv["schema_version"], 13);
+    assert_eq!(pv["schema_version"], 14);
     let it = item_of(&pv, &a);
     assert_eq!(it["action"], "backup-then-remove", "{it}");
     let pre = &it["preserve"]["git_admin"];
@@ -1392,11 +1392,13 @@ fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
     assert!(text.contains(&gd), "{text}");
 }
 
-/// Round Z: the object store is its own obligation, unverified unless `scan --verify-objects`
-/// (or the config setting `verify_objects = true`) had git verify it; the human plan says what
-/// "the manifest" is once, in its header.
+/// Round 15: there is no object verification. `scan --verify-objects` (and `scan --config`,
+/// which only carried its setting) is refused as an unknown argument, a config file that still
+/// sets `verify_objects` is refused, the plan states both backup obligations with no
+/// verification field, and a scan file that claims a verification is an invalid scan file
+/// (exit 1). The human plan says what "the manifest" is once, in its header.
 #[test]
-fn z1_the_object_store_is_verified_only_on_request_and_the_manifest_is_defined() {
+fn r15_object_data_is_backed_up_and_no_verification_is_accepted() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("scan");
     let a = root.join("a");
@@ -1405,44 +1407,67 @@ fn z1_the_object_store_is_verified_only_on_request_and_the_manifest_is_defined()
     fs::create_dir_all(&home).unwrap();
     let now = far_future();
 
-    let scan_as = |name: &str, extra: &[&str]| -> PathBuf {
-        let out = tmp.path().join(name);
-        let mut c = bin();
-        c.args([
-            "scan",
-            root.to_str().unwrap(),
-            "--out",
-            out.to_str().unwrap(),
-        ])
-        .args(extra);
-        isolate(&mut c, &home);
-        let o = run(&mut c);
-        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-        out
-    };
-    let store_of = |scan_file: &Path| -> serde_json::Value {
-        let pv = plan_value(&plan_json(scan_file, &home, &["--now", &now]));
-        let it = item_of(&pv, &a);
-        assert_eq!(it["action"], "backup-then-remove", "{it}");
-        it["preserve"]["object_store"].clone()
-    };
-
-    let plain = store_of(&scan_as("plain.json", &[]));
-    assert!(plain["files"].as_u64().unwrap_or(0) > 0, "{plain}");
-    assert_eq!(plain["verified"], false, "{plain}");
-
-    let flagged = store_of(&scan_as("flag.json", &["--verify-objects"]));
-    assert_eq!(flagged["verified"], true, "{flagged}");
-
     let cfg = tmp.path().join("verify.toml");
     write(&cfg, "verify_objects = true\n");
-    let configured = store_of(&scan_as(
-        "config.json",
-        &["--config", cfg.to_str().unwrap()],
-    ));
-    assert_eq!(configured["verified"], true, "{configured}");
+    let refused: [&[&str]; 2] = [&["--verify-objects"], &["--config", cfg.to_str().unwrap()]];
+    for extra in refused {
+        let mut c = bin();
+        c.args(["scan", root.to_str().unwrap()]).args(extra);
+        isolate(&mut c, &home);
+        let o = run(&mut c);
+        assert_eq!(o.status.code(), Some(2), "{extra:?} was accepted");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("unexpected argument"), "{extra:?}: {err}");
+        assert!(err.contains(extra[0]), "{extra:?}: {err}");
+    }
 
-    let scan_file = tmp.path().join("plain.json");
+    let scan_file = tmp.path().join("scan.json");
+    let v = scan_to_file(&root, &scan_file);
+    let o = plan_json_raw(
+        &scan_file,
+        &home,
+        &["--now", &now, "--config", cfg.to_str().unwrap()],
+    );
+    assert!(!o.status.success(), "a config with verify_objects was accepted");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("verify_objects"), "{err}");
+
+    let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
+    let it = item_of(&pv, &a);
+    assert_eq!(it["action"], "backup-then-remove", "{it}");
+    let store = &it["preserve"]["object_store"];
+    assert!(store["files"].as_u64().unwrap_or(0) > 0, "{store}");
+    assert!(store["bytes"].as_u64().unwrap_or(0) > 0, "{store}");
+    assert!(store.get("verified").is_none(), "{store}");
+
+    // A scan file that claims a verification is refused, whatever the claim.
+    let i = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|n| n["path"].as_str() == Some(a.to_str().unwrap()))
+        .expect("the repository node");
+    for (k, (block, key, val)) in [
+        ("object_store", "verified", serde_json::json!(true)),
+        ("object_store", "checked", serde_json::json!(false)),
+        ("", "verified", serde_json::json!(true)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut m = v.clone();
+        if block.is_empty() {
+            m["nodes"][i]["repo"][key] = val;
+        } else {
+            m["nodes"][i]["repo"][block][key] = val;
+        }
+        let (code, err) = plan_exit(&m, tmp.path(), &format!("forged{k}.json"));
+        assert_eq!(code, Some(1), "{block}.{key} accepted: {err}");
+        assert!(err.contains("invalid scan file"), "{block}.{key}: {err}");
+        assert!(err.contains(key), "{block}.{key}: {err}");
+        assert!(!err.contains("verified by this scan"), "{err}");
+    }
+
     let mut c = bin();
     c.args(["plan", "--scan", scan_file.to_str().unwrap(), "--now", &now])
         .arg("--trust-partial-process-check");
@@ -1452,6 +1477,20 @@ fn z1_the_object_store_is_verified_only_on_request_and_the_manifest_is_defined()
         text.contains("the manifest is the restore record a later apply step writes"),
         "{text}"
     );
-    assert!(text.contains("object store"), "{text}");
-    assert!(text.contains("not yet verified"), "{text}");
+    assert!(
+        text.contains("and its object store is backed up too"),
+        "{text}"
+    );
+    assert!(
+        text.contains("of object data, to be backed up before removal"),
+        "{text}"
+    );
+    for gone in [
+        "verified by this scan",
+        "not yet verified",
+        "verify against the remote",
+        "verified against the remote or saved",
+    ] {
+        assert!(!text.contains(gone), "{gone:?} in {text}");
+    }
 }
