@@ -108,8 +108,13 @@ fn a_repo_with_any_fact_not_yes_never_gets_a_removing_action() {
                 let s = synthetic(vec![repo_node("/r", class, with_fact(index, v))]);
                 let p = plan(&s, &opts(vec![], 30, now));
                 let a = p.items[0].action;
-                // An unusual layout (fact 9) is never recovered then archived: it asks.
-                let expected = if index == 9 { Action::Ask } else { expected };
+                // An unusual layout (fact 9) and other repos depending on this one (fact 6) are
+                // never recovered then archived: they ask, because recovery cannot fix them.
+                let expected = if index == 9 || (index == 6 && v == Tri::No) {
+                    Action::Ask
+                } else {
+                    expected
+                };
                 assert_eq!(a, expected, "fact {index} = {v:?} on {class:?}");
                 assert!(!matches!(
                     a,
