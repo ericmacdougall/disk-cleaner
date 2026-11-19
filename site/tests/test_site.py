@@ -14,6 +14,8 @@ SITE = ROOT / "site"
 INDEX = SITE / "index.html"
 BRAND_MD = SITE / "brand" / "BRAND.md"
 README = SITE / "README.md"
+ROOT_README = ROOT / "README.md"
+CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 PAGES_YML = ROOT / ".github" / "workflows" / "pages.yml"
 SITE_YML = ROOT / ".github" / "workflows" / "site.yml"
 ALLOWED_LINK_PREFIX = "https://github.com/ericmacdougall/"
@@ -570,7 +572,50 @@ class TestContent(unittest.TestCase):
     def test_platforms_are_stated_as_targets(self):
         flat = re.sub(r"\s+", " ", self.text)
         self.assertIn("target platforms", flat)
-        self.assertIn("only macOS has been tested by hand", flat)
+        # Which machines it was run on by hand is not recorded in the repository, so the page cannot
+        # vouch for it either way; CI coverage is checked against ci.yml instead.
+        self.assertNotIn("tested by hand", flat)
+        self.assertIn("automated build and tests run on all three", flat)
+        ci = read(CI_YML)
+        self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", ci)
+
+    def test_status_note_names_the_command(self):
+        note = re.search(r'<p class="status-note">(.*?)</p>', self.html, re.S).group(1)
+        self.assertIn("disk-cleaner", note, "the first thing a reader sees must give the real command name")
+
+    def test_rename_is_planned_not_promised(self):
+        for path in (INDEX, ROOT_README):
+            self.assertNotRegex(re.sub(r"\s+", " ", read(path)), r"(?i)will be renamed", path.name)
+
+    def test_plan_is_described_as_printed_today(self):
+        flat = re.sub(r"\s+", " ", self.text)
+        self.assertNotIn("A plan is a file you can read and edit", flat,
+                         "today plan prints to stdout; editing and approving a plan is design")
+        card = re.search(r"<h3>Plan, then apply</h3><p>(.*?)</p>", self.html).group(1)
+        self.assertIn("--json", card)
+        self.assertRegex(card, r"(?i)planned|design|when it exists")
+
+    def test_unknown_is_not_called_keep(self):
+        flat = re.sub(r"\s+", " ", self.text)
+        self.assertNotRegex(flat, r"(?i)times out means keep",
+                            "the plan answers an unknown fact with ask, not with the keep action")
+        self.assertNotRegex(re.sub(r"\s+", " ", read(ROOT_README)), r'(?i)counts as "keep"')
+
+    def test_skip_worktree_case_is_named(self):
+        para = re.search(r"all eleven are yes.*?</p>", re.sub(r"\s+", " ", self.html)).group(0)
+        self.assertIn("skip-worktree", para, "plan.rs asks when files are hidden from git, even if all facts are yes")
+        self.assertIn("skip-worktree", read(CORE_PLAN))
+
+    def test_download_wording_matches_ci(self):
+        flat = re.sub(r"\s+", " ", self.text)
+        # CI keeps unsigned binaries as workflow artifacts, so "no download" is not quite true; there is
+        # no release and no download page.
+        self.assertNotIn("no release or download yet", flat)
+        self.assertIn("no release or download page", flat)
+        days = re.search(r"retention-days:\s*(\d+)", read(CI_YML)).group(1)
+        readme = re.sub(r"\s+", " ", read(ROOT_README))
+        self.assertNotIn("no tagged release, installer or download yet", readme)
+        self.assertIn(f"{days} days", readme, "README must state how long CI keeps its binaries")
 
     def test_fact_count_matches_core(self):
         n = len(core_fact_names())
@@ -614,6 +659,11 @@ class TestContent(unittest.TestCase):
         self.assertIn("Planned", d["agent-session"])
         for cls, text in d.items():
             self.assertNotRegex(text, r"(?i)^remove by age", f"{cls}: an age or size policy is not built")
+        for cls in ("regenerable", "cache"):
+            # An unknown activity state is "not active" too, and plan.rs asks then.
+            self.assertNotIn("not active", d[cls], cls)
+            self.assertIn("idle", d[cls], cls)
+        self.assertRegex(d["regenerable"], r"ask if [^.]*cannot be judged")
 
     def test_card_headings_do_not_state_planned_features_as_fact(self):
         self.assertNotIn("Everything removed is findable", self.html)
@@ -702,6 +752,16 @@ class TestWorkflows(unittest.TestCase):
         for needle in ("push:", "pull_request:", '"site/**"', ".github/workflows/site.yml",
                        ".github/workflows/pages.yml", "ubuntu-latest", UNIT_CMD):
             self.assertIn(needle, y, needle)
+
+    def test_site_ci_runs_when_a_checked_source_changes(self):
+        # These tests read the root README, ci.yml and the core's model and plan sources, so a change to
+        # any of them must run them, on push and on pull requests alike.
+        y = read(SITE_YML)
+        for trigger in ("push", "pull_request"):
+            block = re.search(rf"^  {trigger}:\s*\n((?:    .*\n)+)", y, re.M).group(1)
+            for path in ("README.md", ".github/workflows/ci.yml", "crates/core/src/model.rs",
+                         "crates/core/src/plan.rs"):
+                self.assertIn(f'- "{path}"', block, f"{trigger}: {path}")
 
     def test_pages_runs_tests_before_upload(self):
         y = read(PAGES_YML)
