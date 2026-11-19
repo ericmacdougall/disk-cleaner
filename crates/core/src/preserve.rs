@@ -18,6 +18,11 @@
 //! and accounts for each object-store file against what git verified: a file git does not
 //! account for moves to the git directory's own files (and the repository asks).
 //!
+//! A file counts toward a verified store only when a git command reads and validates all of it.
+//! The kinds no git command reads (a cruft pack's `.mtimes`, a multi-pack-index's `.rev`, the
+//! incremental multi-pack-index layers, see [`unread_by_git`]) are therefore the git directory's
+//! own files when the scan verified the store (`checked`), and object-store files otherwise.
+//!
 //! [`sort`] is the one classifier: the scan's [`survey`], [`git_admin_files`] and
 //! [`object_store_files`] all go through it, so they always agree.
 
@@ -127,10 +132,15 @@ pub fn git_dir_of(node: &Node) -> io::Result<PathBuf> {
 /// the git directory with `/` separators, sorted. A removal must back up, and verify the backup
 /// of, every one of them before it removes anything. An error (an unreadable directory, a name
 /// that is not UTF-8, too many entries) means the list is not complete: nothing may be removed
-/// then.
+/// then. When the scan verified the node's object store (`repo.object_store.checked`), the kinds
+/// git never reads ([`unread_by_git`]) are listed here.
 pub fn git_admin_files(node: &Node) -> io::Result<Vec<String>> {
     let gd = git_dir_of(node)?;
-    Ok(sort(&gd)?.own.into_iter().map(|(p, _)| p).collect())
+    Ok(sort(&gd, checked(node))?
+        .own
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect())
 }
 
 /// Every file in `node`'s git directory whose name is that of an object-store file, the same
@@ -139,14 +149,25 @@ pub fn git_admin_files(node: &Node) -> io::Result<Vec<String>> {
 /// every non-directory entry of the git directory exactly once.
 pub fn object_store_files(node: &Node) -> io::Result<Vec<String>> {
     let gd = git_dir_of(node)?;
-    Ok(sort(&gd)?.store.into_iter().map(|(p, _)| p).collect())
+    Ok(sort(&gd, checked(node))?
+        .store
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect())
+}
+
+/// Did the scan have git verify this node's object store?
+fn checked(node: &Node) -> bool {
+    let store = node.repo.as_ref().and_then(|r| r.object_store.as_ref());
+    store.is_some_and(|s| s.checked)
 }
 
 /// Count `git_dir`'s two classes for the plan (see [`sort`]). With `verify_with` (git and the
-/// directory to run it in), the object store is verified first (see [`verify`]), and files git
-/// does not account for are counted as the git directory's own.
+/// directory to run it in), the kinds git never reads are the git directory's own, the object
+/// store is verified (see [`verify`]), and files git does not account for are counted as the git
+/// directory's own too.
 pub fn survey(git_dir: &Path, verify_with: Option<(&Git, &Path)>) -> io::Result<Survey> {
-    let mut sorted = sort(git_dir)?;
+    let mut sorted = sort(git_dir, verify_with.is_some())?;
     let verification = verify_with.map(|(git, cwd)| verify(git, cwd, git_dir, &sorted.store));
     if let Some(v) = &verification {
         let moved: BTreeSet<&str> = v.unaccounted.iter().map(String::as_str).collect();
@@ -161,6 +182,7 @@ pub fn survey(git_dir: &Path, verify_with: Option<(&Git, &Path)>) -> io::Result<
         files: sorted.store.len() as u64,
         bytes: sorted.store.iter().map(|(_, b)| *b).sum(),
         verified: verification.as_ref().is_some_and(|v| v.verified),
+        checked: verification.is_some(),
     };
     Ok(Survey {
         admin: admin_survey(&sorted.own),
@@ -238,6 +260,20 @@ fn store_name(parts: &[&str]) -> bool {
     }
 }
 
+/// Is this object-store file of a kind no git verification reads? A cruft pack's `.mtimes`
+/// (nothing checks it), a multi-pack-index's `.rev` (neither `multi-pack-index verify` nor fsck
+/// opens it) and the incremental multi-pack-index layers (`multi-pack-index verify` checks the
+/// tip's checksum only). Checked against git 2.56.1.
+pub fn unread_by_git(parts: &[&str]) -> bool {
+    match parts {
+        ["objects", "pack", "multi-pack-index.d", _] => true,
+        ["objects", "pack", f] => {
+            named(f, "pack-", &["mtimes"]) || named(f, "multi-pack-index-", &["rev"])
+        }
+        _ => false,
+    }
+}
+
 /// Allocated bytes of an entry (blocks on Unix, the length elsewhere).
 #[cfg(unix)]
 fn allocated(md: &fs::Metadata) -> u64 {
@@ -254,8 +290,9 @@ fn allocated(md: &fs::Metadata) -> u64 {
 /// by path alone. Symlinks are never followed; a symlink or any other non-directory entry is a
 /// file of the git directory's own (and, under an object-store name, also in `not_objects`).
 /// Bounded: more than [`MAX_ENTRIES`] entries is an error, as is any entry that cannot be listed
-/// or named in UTF-8.
-pub fn sort(git_dir: &Path) -> io::Result<Sorted> {
+/// or named in UTF-8. With `checked` (git verifies the store), the kinds git never reads
+/// ([`unread_by_git`]) are the git directory's own.
+pub fn sort(git_dir: &Path, checked: bool) -> io::Result<Sorted> {
     let mut out = Sorted::default();
     let mut seen = 0u64;
     let mut stack: Vec<(PathBuf, String)> = vec![(git_dir.to_path_buf(), String::new())];
@@ -286,11 +323,12 @@ pub fn sort(git_dir: &Path) -> io::Result<Sorted> {
             }
             let parts: Vec<&str> = child.split('/').collect();
             if store_name(&parts) {
-                if md.is_file() {
+                if !md.is_file() {
+                    out.not_objects.push(child.clone());
+                } else if !(checked && unread_by_git(&parts)) {
                     out.store.push((child, allocated(&md)));
                     continue;
                 }
-                out.not_objects.push(child.clone());
             }
             out.own.push((child, allocated(&md)));
         }
@@ -369,20 +407,24 @@ fn id_ext<'a>(name: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
 ///   length is a file git never reads, so it is unaccounted.
 /// - `git verify-pack <idx>` for each pack whose `.pack` and `.idx` are both present: the index
 ///   and the pack are each checked against their checksums and every object in the pack is
-///   read. A `.pack` or `.idx` without its partner is unaccounted, as are a pack's `.rev`,
-///   `.bitmap` and `.mtimes` without a verified pack.
-/// - `git multi-pack-index verify` when a multi-pack-index exists; its `.bitmap` and `.rev` are
-///   accounted only when named by its checksum. Incremental layers are accounted when their
-///   chain lists them, but this version does not verify them, so the store stays unverified.
-/// - `git commit-graph verify` when a commit-graph exists. git verifies the single
-///   `commit-graph` when there is one and the split chain only otherwise, so split graph files
-///   are accounted only when there is no single file and their chain lists them.
+///   read. A `.pack` or `.idx` without its partner is unaccounted, as are a pack's `.rev` and
+///   `.bitmap` without a verified pack.
+/// - `git multi-pack-index verify` when a multi-pack-index exists: its checksum and contents. Its
+///   `.bitmap` is accounted only when named by its checksum.
+/// - `git commit-graph verify` when a commit-graph exists: every layer's checksum and contents.
+///   git verifies the single `commit-graph` when there is one and the split chain only otherwise,
+///   so split graph files are accounted only when there is no single file and their chain lists
+///   them.
 /// - `git fsck --full --strict --no-dangling --unreachable --no-progress`: every loose object is
-///   inflated and hashed (no trailing bytes allowed) and every object is checked; any
-///   unreachable object leaves the store unverified, as it may exist nowhere else.
+///   inflated and hashed (no trailing bytes allowed) and every object is checked; every pack's
+///   `.rev` (size, header, checksum and each position) and every `.bitmap` of a pack or of the
+///   multi-pack-index (checksum over the whole file) is validated; any unreachable object leaves
+///   the store unverified, as it may exist nowhere else.
 ///
-/// The commit-graph and multi-pack-index checks run with their `core.*` switch on, so a config
-/// that turns the feature off cannot make the check pass without looking.
+/// A kind git never reads ([`unread_by_git`]) is unaccounted here: [`survey`] has already counted
+/// it with the git directory's own files. The checks run with `core.multiPackIndex` and
+/// `core.commitGraph` on, so a repository's config cannot make one pass without looking (fsck
+/// checks the multi-pack-index's bitmap only when it loads the multi-pack-index).
 pub fn verify(git: &Git, cwd: &Path, git_dir: &Path, store: &[(String, u64)]) -> Verification {
     let mut v = Verification::default();
     let mut damaged: Vec<String> = Vec::new();
@@ -410,18 +452,16 @@ pub fn verify(git: &Git, cwd: &Path, git_dir: &Path, store: &[(String, u64)]) ->
     let mut packs: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     let mut midx: Option<String> = None;
     let mut midx_side: Vec<(String, String)> = Vec::new();
-    let mut layers: Vec<(String, String)> = Vec::new();
     let mut graph: Option<String> = None;
     let mut graphs: Vec<(String, String)> = Vec::new();
     for (rel, _) in store {
         let parts: Vec<&str> = rel.split('/').collect();
+        if unread_by_git(&parts) {
+            unaccounted.push(rel.clone());
+            continue;
+        }
         match parts.as_slice() {
             ["objects", "pack", "multi-pack-index"] => midx = Some(rel.clone()),
-            ["objects", "pack", "multi-pack-index.d", f] => {
-                if let Some((id, _)) = id_ext(f, "multi-pack-index-") {
-                    layers.push((id.to_string(), rel.clone()));
-                }
-            }
             ["objects", "pack", f] => {
                 if let Some((id, _)) = id_ext(f, "multi-pack-index-") {
                     midx_side.push((id.to_string(), rel.clone()));
@@ -498,25 +538,6 @@ pub fn verify(git: &Git, cwd: &Path, git_dir: &Path, store: &[(String, u64)]) ->
             _ => {}
         }
     }
-    if !layers.is_empty() {
-        let chain = git_dir
-            .join("objects")
-            .join("pack")
-            .join("multi-pack-index.d")
-            .join("multi-pack-index-chain");
-        match chain_ids(&chain) {
-            Ok(ids) => unaccounted.extend(
-                layers
-                    .iter()
-                    .filter(|(id, _)| !ids.contains(id))
-                    .map(|(_, r)| r.clone()),
-            ),
-            Err(_) => unaccounted.extend(layers.iter().map(|(_, r)| r.clone())),
-        }
-        v.unverified.push(
-            "the incremental multi-pack-index layers are not verified by this version".to_string(),
-        );
-    }
 
     // Commit-graphs.
     if graph.is_some() || !graphs.is_empty() {
@@ -548,8 +569,13 @@ pub fn verify(git: &Git, cwd: &Path, git_dir: &Path, store: &[(String, u64)]) ->
         );
     }
 
-    // Every object, loose ones by their hash, and what nothing refers to.
+    // Every object, loose ones by their hash, the packs' reverse indexes and every bitmap, and
+    // what nothing refers to.
     let a = args(&[
+        "-c",
+        "core.multiPackIndex=true",
+        "-c",
+        "core.commitGraph=true",
         "fsck",
         "--full",
         "--strict",
@@ -632,6 +658,49 @@ mod tests {
         ] {
             assert!(!store_name(&parts(own)), "{own}");
         }
+    }
+
+    #[test]
+    fn kinds_git_never_reads_are_backed_up_once_git_verifies_the_store() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let unread = [
+            format!("objects/pack/pack-{id}.mtimes"),
+            format!("objects/pack/multi-pack-index-{id}.rev"),
+            format!("objects/pack/multi-pack-index.d/multi-pack-index-{id}.midx"),
+        ];
+        let read = [
+            format!("objects/pack/pack-{id}.rev"),
+            format!("objects/pack/pack-{id}.bitmap"),
+            format!("objects/pack/multi-pack-index-{id}.bitmap"),
+            "objects/pack/multi-pack-index".to_string(),
+            "objects/info/commit-graph".to_string(),
+        ];
+        for f in &unread {
+            assert!(unread_by_git(&parts(f)), "{f}");
+        }
+        for f in &read {
+            assert!(!unread_by_git(&parts(f)), "{f}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for f in unread.iter().chain(read.iter()) {
+            let p = dir.path().join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, b"x").unwrap();
+        }
+        let names = |v: Vec<(String, u64)>| -> Vec<String> {
+            v.into_iter().map(|(p, _)| p).collect()
+        };
+        let plain = sort(dir.path(), false).unwrap();
+        assert!(plain.own.is_empty(), "{:?}", plain.own);
+        assert_eq!(names(plain.store).len(), unread.len() + read.len());
+        let checked = sort(dir.path(), true).unwrap();
+        let mut own = names(checked.own);
+        own.sort();
+        let mut want = unread.to_vec();
+        want.sort();
+        assert_eq!(own, want);
+        assert_eq!(names(checked.store).len(), read.len());
     }
 
     #[test]

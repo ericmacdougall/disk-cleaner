@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -280,6 +280,11 @@ pub struct ObjectStoreSurvey {
     /// True only when the scan ran git's own verification of the whole store
     /// (`scan --verify-objects`) and it accounted for every one of these files.
     pub verified: bool,
+    /// The scan ran git's verification (`scan --verify-objects`), whatever it found. The kinds
+    /// git never reads (`crate::preserve::unread_by_git`) are then counted with the git
+    /// directory's own files, and `git_admin_files` lists them there.
+    #[serde(default)]
+    pub checked: bool,
 }
 
 /// What [`crate::preserve::survey`] counted of one git directory's own files: everything in it

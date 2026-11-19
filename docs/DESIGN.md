@@ -103,7 +103,10 @@ valid header and someone's notes after it slipped through. The plan records
 `preserve.object_store.verified`, which is `true` only when `scan --verify-objects` had git itself
 (`verify-pack`, `multi-pack-index verify`, `commit-graph verify`, `fsck --full --strict`) verify the
 whole store and account for every file of the class; a file git does not account for moves to the
-first class and the repository asks. Even then the apply step re-verifies against the remote. A git
+first class and the repository asks. Only a file whose whole content a git command validated
+(checksum or complete parse) can count as verified, so the derived files no git command reads (a
+cruft pack's `.mtimes`, a multi-pack-index's `.rev`, incremental multi-pack-index layers) are
+backed up with the first class whenever the scan verified the store. Even then the apply step re-verifies against the remote. A git
 directory whose own files exceed `max_git_admin_bytes` (64 MiB by default) asks instead, because that
 much is the user's data, not git's settings. No apply phase exists yet; the rule is part of the plan format
 (docs/SCAN-FORMAT.md, "The preserve obligation"), which also lists the existing asks the backup

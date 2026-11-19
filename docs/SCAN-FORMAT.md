@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **12** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **13** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -30,7 +30,11 @@ has no survey to back up from, so it is refused. Version 12 split every git dire
 classes by name, added `repo.object_store`, the plan field `preserve.object_store`, the scan option
 `--verify-objects` and the config key `verify_objects`, and dropped the content checks that
 exempted files whose first bytes looked like object files (see "The preserve obligation"); a
-version 11 scan left such files out of every obligation, so it is refused.
+version 11 scan left such files out of every obligation, so it is refused. Version 13 added
+`repo.object_store.checked` and, when the scan verified the store, counts the kinds no git command
+reads (a cruft pack's `.mtimes`, a multi-pack-index's `.rev`, the incremental multi-pack-index
+layers) with the git directory's own files; a version 12 scan could mark a store verified while
+such files were in it, so it is refused.
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 Such a node therefore gets an `ask_reason` and is never offered for removal (see "File names git
@@ -45,7 +49,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 12 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 13 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification, 13 `checked` and the files git never reads; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots that were walked, as spelled (a kept inner root under the spelling of the root that encloses it); overlapping roots are normalised first (see "Overlapping scan roots") |
@@ -241,7 +245,7 @@ with or without evidence.
 | `unchecked_pseudorefs` | present when not empty: one sentence per pseudoref that could not be read, parsed or compared, naming it and what is wrong (`ORIG_HEAD at the top of the git directory names a tag object, not a commit`); `reflog_saved` is `unknown` |
 | `local_admin_content`, `local_admin_content_count` | present when not empty: up to five examples, sorted, of what the git directory holds of its own (`hooks/pre-commit`, `info/notes.txt`, `description`, `config: user.email`), and how many were found in all; `no_local_admin_content` is `no` (see "Local content in the git directory") |
 | `git_admin` | present when the node's own git directory could be enumerated: `files` and `bytes` (allocated) of every file in it that is not of the object-store class (see "The preserve obligation"), `examples` (up to five, sorted, of those whose names are not ones every clone has) and `largest` (the three largest, `path` and `bytes`). Absent when there is no own git directory (a linked worktree) or the walk failed (a note says why); the plan then asks |
-| `object_store` | present with `git_admin`: `files` and `bytes` (allocated) of the git directory's object-store class, and `verified`, `true` only when `--verify-objects` had git verify the whole store and account for each of those files (see "The preserve obligation") |
+| `object_store` | present with `git_admin`: `files` and `bytes` (allocated) of the git directory's object-store class, `verified`, `true` only when `--verify-objects` had git verify the whole store and account for each of those files, and `checked`, `true` when `--verify-objects` ran at all (the files git never reads are then counted in `git_admin`; see "The preserve obligation") |
 | `sizes` | `total`, `git` (the `.git` directory), `regenerable`, `output` |
 
 Facts (the safe value is always `yes`):
@@ -818,6 +822,13 @@ and makes `no_local_admin_content` `no`, so the repository asks. `disk_cleaner_c
 and `disk_cleaner_core::object_store_files` list the two classes; together they list every file
 exactly once.
 
+One rule depends on the scan: when it ran `--verify-objects` (`repo.object_store.checked`), the
+object-store names that no git command reads (a cruft pack's `pack-<id>.mtimes`, a
+multi-pack-index's `multi-pack-index-<id>.rev`, and everything in `multi-pack-index.d/`; see the
+table below) are class (a), backed up, because no verification could ever cover them. Without
+`--verify-objects` they stay in class (b), unverified. The two functions take this from the node,
+so they list what the scan counted.
+
 **The rule.** Every plan item whose action removes a git node (repository, worktree or bare
 repository) carries `preserve`, covering its own git directory and those of the git nodes inside
 it. A removing item that is not a git node but holds one (the scan already makes such a directory
@@ -851,36 +862,52 @@ per-command timeout), in the repository:
 | `git rev-parse --show-object-format` | the hash length; a loose-object name of another length is a file git never reads |
 | `git verify-pack <pack>.idx`, for each pack whose `.pack` and `.idx` are both present | runs `index-pack --verify`: reads the whole pack, checks its trailer checksum and every object, and compares the index it computes with the `.idx` on disk; it writes nothing in this mode |
 | `git -c core.multiPackIndex=true multi-pack-index verify`, when a multi-pack-index exists | the multi-pack-index against its checksum and its packs |
-| `git -c core.commitGraph=true commit-graph verify`, when a commit-graph exists | the commit-graph (single or split) against its checksum and the objects |
-| `git fsck --full --strict --no-dangling --unreachable --no-progress` | every object; each loose object is inflated completely and its hash compared with its name, and bytes after the zlib stream are an error; `unreachable` lines name objects that no ref, reflog or the index reaches |
+| `git -c core.commitGraph=true commit-graph verify`, when a commit-graph exists | every layer of the commit-graph (single or split) against its checksum and the objects |
+| `git -c core.multiPackIndex=true -c core.commitGraph=true fsck --full --strict --no-dangling --unreachable --no-progress` | every object; each loose object is inflated completely and its hash compared with its name, and bytes after the zlib stream are an error; every pack's `.rev` and every `.bitmap` (see the table below); `unreachable` lines name objects that no ref, reflog or the index reaches. The `-c` switches stop a repository's own config from turning off a check (fsck checks the multi-pack-index's bitmap only when it loads the multi-pack-index) |
 
-Each file of class (b) must then be accounted for by what git verified: a loose object of the
-repository's hash length (fsck reads every one); a `.pack` and `.idx` pair that `verify-pack`
-accepted; a pack's `.rev`, `.bitmap` and `.mtimes` when that pack verified; a multi-pack-index that
-verified, and its `.bitmap` and `.rev` only when named by its checksum (the file's last 20 or 32
-bytes); a multi-pack-index layer only when its chain file lists it; a split commit-graph file only
-when its chain file lists it and there is no single `objects/info/commit-graph` (git verifies the
-single file when there is one and never opens the chain then). The sidecars (a pack's `.rev`,
-`.bitmap` and `.mtimes`, a multi-pack-index's `.bitmap` and `.rev`) are accounted for by the
-verified pack or multi-pack-index they belong to, not read: they are regenerable from it, as the
-rule above allows.
+**What counts toward a verified store.** A file of class (b) counts only when a git command above
+read and validated all of it: a checksum over the whole file, or a complete parse. A file whose
+content is changed, or which has bytes appended, then fails that command, and the repository asks.
+Checked against the source of git v2.56.1 (`odb/source-packed.c`, `pack-revindex.c`,
+`pack-bitmap.c`, `midx.c`, `commit-graph.c`, `builtin/commit-graph.c`), the version CI runs (2.56.1
+on Linux and macOS, 2.56.0.windows.4 on Windows):
+
+| Kind | Validated by | Outcome with `--verify-objects` |
+|---|---|---|
+| loose object `<xx>/<38 or 62 hex>` | `fsck --full`: inflated completely, hash equals the name, no bytes after the stream | verified store, if its name has the repository's hash length; otherwise unaccounted |
+| `pack-<id>.pack` and `pack-<id>.idx` | `verify-pack` (`index-pack --verify`): the pack's trailer checksum, every object, and the `.idx` compared with the one computed | verified store, as a pair; one without the other is unaccounted |
+| `pack-<id>.rev` | `fsck` (`verify_reverse_indices`): size equals header plus one entry per object plus trailer, signature, version, hash id, trailing checksum, and every position against the pack | verified store, when its pack verified; otherwise unaccounted |
+| `pack-<id>.bitmap` | `fsck` (`verify_bitmap_files`): checksum over the whole file, for every pack git lists (including those under a multi-pack-index); the bitmap structure is not parsed | verified store, when its pack verified; otherwise unaccounted |
+| `pack-<id>.mtimes` (cruft pack) | none: fsck, `verify-pack` and the others never open it | none: preserved (class (a), backed up) |
+| `multi-pack-index` | `multi-pack-index verify`: checksum and contents | verified store |
+| `multi-pack-index-<id>.bitmap` | `fsck` (`verify_bitmap_files`): checksum over the whole file, for the bitmap named by the current multi-pack-index's checksum | verified store, when named by that checksum; otherwise unaccounted |
+| `multi-pack-index-<id>.rev` | none: `multi-pack-index verify` and fsck never open it | none: preserved (class (a), backed up) |
+| `multi-pack-index.d/*` (incremental layers and their sidecars) | not established: `multi-pack-index verify` checks the checksum of the tip it loads only | none: preserved (class (a), backed up) |
+| `info/commit-graph` | `commit-graph verify`: checksum and contents | verified store |
+| `info/commit-graphs/graph-<id>.graph` | `commit-graph verify`: every layer of the chain, checksum and contents, when there is no single `info/commit-graph` | verified store, when its chain lists it and there is no single file; otherwise unaccounted (git never opens the chain beside a single file) |
+
+"Preserved" kinds are class (a) only once `--verify-objects` ran, so they are counted in
+`preserve.git_admin` (and under its cap), listed by `git_admin_files`, and backed up; they do not
+make the repository ask.
 
 - `verified` is `true` only when every command ran and passed, every class-(b) file was accounted
   for, no object is unreachable, and (in the plan) the item's action is `backup-then-remove`, so the
   facts say every ref's commits are on a network remote. A `recover-backup-then-remove` item is
   never verified: recovery changes the refs first.
-- A command that times out or cannot start, unreachable objects (they may exist nowhere else), an
-  unknown object format, or incremental multi-pack-index layers (which this version does not verify)
-  leave `verified` `false` with a note; the obligation still covers every file.
+- A command that times out or cannot start (the per-command git timeout, 30 seconds by default,
+  bounds each command, so a very large store may need `--git-timeout-secs`), unreachable objects
+  (they may exist nowhere else) or an unknown object format leave `verified` `false` with a note;
+  the obligation still covers every file.
 - A class-(b) file git does not account for (an index without its pack, a pack without its index, a
-  sidecar of no verified pack or not named by the multi-pack-index's checksum, a layer or graph file
-  no chain lists, a loose object of the wrong length) is moved to class (a), counted there, named in
+  sidecar of no verified pack or not named by the multi-pack-index's checksum, a graph file no
+  chain lists or beside a single commit-graph, a loose object of the wrong length) is moved to
+  class (a), counted there, named in
   `repo.local_admin_content`, and makes `no_local_admin_content` `no`, so the repository asks.
 - A command that ran and failed (git found the store damaged, or could not read it) makes
   `no_local_admin_content` `no` with the entry `objects (git found a problem: ...)`, so the
   repository asks: a damaged store is for a person to look at.
 
-The scan records the result in `repo.object_store` (`files`, `bytes`, `verified`). The commands
+The scan records the result in `repo.object_store` (`files`, `bytes`, `verified`, `checked`). The commands
 were confirmed against git's documentation and source (git-scm.com docs for `fsck`, `verify-pack`
 and `index-pack`, and `builtin/verify-pack.c`, `builtin/index-pack.c` and `object-file.c` on
 2026-11-19): `read_loose_object` checks the hash and reports "garbage at end of loose object", and

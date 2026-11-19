@@ -510,12 +510,7 @@ fn pack_file(repo: &Path, prefix: &str, suffix: &str) -> PathBuf {
             found.push(p);
         }
     }
-    assert_eq!(
-        found.len(),
-        1,
-        "one {prefix}*{suffix} in {}",
-        dir.display()
-    );
+    assert_eq!(found.len(), 1, "one {prefix}*{suffix} in {}", dir.display());
     found.pop().unwrap()
 }
 
