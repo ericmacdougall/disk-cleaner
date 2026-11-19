@@ -1,20 +1,27 @@
 # Apply phase specification
 
-Status: **draft for review**. Nothing in this document is implemented yet. It defines what
-`disk-cleaner apply`, `disk-cleaner restore` and `disk-cleaner manifest` must do before any code
-is written, and it is the contract the tests are written against. Section 14 lists the decisions
-that are still open; text that depends on one of them says so.
+Status: **draft for review, revision 3**. Nothing in this document is implemented yet. It defines
+what `disk-cleaner apply`, `disk-cleaner restore` and `disk-cleaner manifest` must do before any
+code is written, and it is the contract the tests are written against. Section 16 lists the
+decisions that are still open; text that depends on one of them says so. Section 22 answers the
+review of revision 2 finding by finding. Criterion and negative-case ids were renumbered in
+revision 3.
 
 Read with [DESIGN.md](DESIGN.md) and [SCAN-FORMAT.md](SCAN-FORMAT.md). Where this document and
 SCAN-FORMAT.md disagree about the plan format, SCAN-FORMAT.md wins and this document is wrong.
 
+Revision 3 removes surface rather than hardening it: every removed item is archived whole, so no
+removal depends on git's judgement that a file is clean; pushing recovery refs is an opt-in that is
+off by default and stays disabled until its hosting assumption is verified; there is no local
+vault; items in sync folders are kept; and removal is supported on macOS and Linux only.
+
 ## 1. Outcome
 
 A user who has a plan from `disk-cleaner plan` can run `disk-cleaner apply` and get back disk
-space without losing anything unique: every item is re-checked at the moment of acting, its unique
-content is saved first (recovery refs on the git remote where possible, and always a verified
-archive in the user's own storage), every action is written to a manifest that is itself backed up,
-and `disk-cleaner restore` puts any removed item back exactly as it was archived.
+space without losing anything: every item is re-checked at the moment of acting, the whole item is
+archived to the user's own rclone storage and read back before anything is removed, every action is
+written to a manifest that is itself in storage before the removal it describes, and
+`disk-cleaner restore` puts any removed item back exactly as it was archived.
 
 ## 2. Scope
 
@@ -22,880 +29,1013 @@ In scope:
 
 - `disk-cleaner apply`: executes the removing items of a plan (`remove-regenerable`,
   `backup-then-remove`, `recover-backup-then-remove`), dry run by default.
-- Recovery refs for unsaved commits, stashes and pseudorefs, pushed without writing to the
-  scanned repository and without running any of its programs.
-- Archives of both preserve sets and of the other content an action must save, streamed to an
-  rclone remote, read back and compared.
-- A local vault for secret-like files, which are not uploaded unless the user opts in.
+- A whole-item archive of every removed git item (working tree, ignored files and git
+  directories), streamed to an rclone remote, read back and compared.
+- Secret-like files: such an item is kept unless the user opts in to uploading them.
+- Pushing recovery refs for unsaved commits, as an explicit opt-in (section 8).
 - A journal that makes every step resumable and idempotent; a per-user lock so two applies never
-  run at once on one machine (and so never on one root).
-- The manifest (local and mirrored to storage), `disk-cleaner manifest list|find|orphans`, and
+  run at once on one machine.
+- The manifest (local and in storage), `disk-cleaner manifest list|find|verify|orphans`, and
   `disk-cleaner restore`.
-- Ask mode (per item, the default) and automatic mode (per action, opt-in).
-- Windows, macOS and Linux.
+- Ask mode (per item, the default) and automatic mode (per class, opt-in).
+- **Platforms.** macOS and Linux: dry run, backup, removal and restore. Windows: dry run,
+  `--backup-only` and restore; `--remove` is refused on Windows until handle-based deletion is
+  specified and tested there (D-13).
 
 Out of scope for this phase:
 
 - Acting on plan items whose action is `ask` or `keep`. Apply never does more than a fresh plan
-  would (see AC-4). Answering an `ask` item with a removal is a later decision (section 14, D-3).
-- Backing up and removing outputs, loose code and agent sessions: the plan has no removing
-  action for them yet. The archive and manifest formats here are class-agnostic so that a later
-  plan action can use them unchanged.
-- Batching many small items into one archive (the format allows it, see `archive.members`; v1
-  writes one archive per item).
-- Linked worktrees, bare repositories and repositories with submodules: the plan never gives
-  them a removing action in this schema (`plain_layout`), so `git worktree remove` is not needed.
-- The recycle bin (`trash`), scheduled runs, the desktop app, cold-storage classes that cannot be
-  read back immediately (section 13).
-- Encryption. Users who want it configure an rclone `crypt` remote; the tool does not manage keys.
+  would (AC-4).
+- Backing up and removing outputs, loose code and agent sessions: the plan has no removing action
+  for them yet. The archive and manifest formats are class-agnostic so that a later plan action can
+  use them unchanged. **Against the original requirements this phase is partial**: outputs,
+  agent-session and log backup to cold storage, and loose-code handling (connect an origin, back up
+  raw, remove or leave) are deferred, not met.
+- Items in sync folders or holding online-only placeholder files (section 7.4): kept.
+- Linked worktrees, bare repositories and repositories with submodules: the plan never gives them
+  a removing action in this schema (`plain_layout`).
+- A local vault, client-side encryption and key management (users who want encryption configure an
+  rclone `crypt` remote, see 9.2), the recycle bin, scheduled runs, the desktop app, cold-storage
+  classes that cannot be read back at once, batching many items into one archive, network file
+  systems as item locations (section 17).
 
 ## 3. Threat model
 
-**What is protected.** The user's unique data: commits that exist nowhere else, stashes,
-uncommitted and untracked work, the git directory's own files (hooks, config, notes, reflogs),
-ignored-but-unique files, and the history of what was removed. Also the user's credentials.
+**What is protected.** The user's unique data (commits that exist nowhere else, stashes,
+uncommitted, untracked and ignored files, the git directory's own files, extended attributes) and
+the history of what was removed. Also the user's credentials and identity.
 
 **Where harm comes from**, in order of likelihood:
 
-1. **Change between check and use.** The user, an editor, a build or a coding agent writes into an
-   item after the scan, after the re-check, during the upload, or between the last check and the
-   removal. This is the main risk and most controls in this document address it.
-2. **Storage that lies or fails.** A partial upload, a corrupted object, a lost response (the
-   upload succeeded but the tool saw an error), a rate limit, an object deleted later.
+1. **Change between check and use.** The user, an editor, a build, a coding agent or a sync client
+   writes into an item after the scan, after the re-check, during the upload, or between the last
+   check and the removal, on this machine or (through a sync folder) on another.
+2. **Storage that lies or fails.** A partial upload, a corrupted object, a lost response, a rate
+   limit, a backend that spools to local disk, an object deleted later by a lifecycle rule.
 3. **Interruption.** The process is killed, the machine sleeps or loses power, at any step.
-4. **Scanned content is untrusted.** A scanned folder may be an unpacked download: its git config,
-   hooks, `.gitattributes`, symlinks, junctions, hard links, special files and file names are
-   attacker-controlled. Apply must not run any program it names, follow any link out of the item,
-   cross into another file system, or write outside the item and the tool's own state.
-5. **The remote changed.** A branch was force-pushed or deleted, a remote URL was changed, the
-   remote is unreachable or refuses the push.
-6. **Disclosure.** A secret file or a credential URL uploaded to cloud storage or pushed to a git
-   remote that may be public; a credential printed to the terminal, a log or the manifest.
-7. **Operator mistakes.** A stale plan, a plan from another scan, a plan edited by hand to remove
-   more, running apply twice, two applies at once, a typed-ahead answer in ask mode.
+4. **Scanned content is untrusted.** A scanned folder may be an unpacked download. Its git config
+   (remote URLs, `insteadOf`, `pushurl`), hooks, `.gitattributes`, symlinks, mount points, hard
+   links, special files, attributes and file names are attacker-controlled. Apply must not run any
+   program it names, must not contact a host it names with the user's credentials, must not follow
+   any link out of the item, must not cross into another mount, and must not write outside the item
+   and the tool's own state.
+5. **The remote changed** (force push, deleted branch, changed URL, unreachable).
+6. **Disclosure.** A secret uploaded in plaintext, pushed to a git remote that may be public or may
+   run CI on what it receives, or printed to the terminal, a log or the manifest; the user's ssh
+   identities or credentials offered to a host they did not choose.
+7. **Operator mistakes.** A stale plan, a plan from another scan, a plan edited to remove more,
+   running apply twice, two applies at once, a typed-ahead answer, running as root.
 
-**Not defended against.** Another program running as the same user that deliberately deletes or
-corrupts data (it could do so without this tool); an administrator; a storage provider that reads
-the archives (confidentiality needs an rclone `crypt` remote); a storage provider or user that
-deletes or alters an archive after it was verified (restore detects alteration, it cannot undo it);
-hardware that corrupts data in memory.
+**Not defended against.** Another program running as the same user that deliberately destroys data;
+an administrator; a storage provider reading the archives (needs an rclone `crypt` remote); a
+storage provider or user deleting or altering an archive after it was verified (`manifest verify`
+and restore detect it, they cannot undo it); memory corruption.
 
 ## 4. Terms
 
 - **Item**: one plan item that apply acts on, identified by `item_id`, a hex SHA-256 of the scan
   identity, the node index and the path (stable across resumes).
 - **Run**: one invocation of `apply` (or its resumption), identified by a random `run_id`.
-- **State directory**: `<platform data dir>/disk-cleaner/` (`$XDG_DATA_HOME` or
-  `~/.local/share` on Linux, `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on
-  Windows), or `--state-dir`. It holds `machine.json`, `lock`, `journal/`, `manifest/`, `index/`,
-  `vault/` and `scratch/`. Created with owner-only permissions.
-- **Storage**: an rclone remote and path given by `--storage <remote>:<path>` (for example a
-  Backblaze B2, S3, Dropbox or local-disk remote the user configured with `rclone config`). The tool
-  never reads or writes rclone's credentials and never passes a credential on a command line.
-- **Machine id**: a random 128-bit id created on the first run and kept in `machine.json` with a
-  label (`--machine-label`, default the computer's name). Remote paths use the id, so two machines
-  with the same name never collide.
+- **State directory**: `<data dir>/disk-cleaner/`, where `<data dir>` is derived from the account's
+  home directory in the user database (not from `HOME` or `XDG_*`): `~/.local/share` on Linux,
+  `~/Library/Application Support` on macOS, the known-folder `LocalAppData` on Windows; or
+  `--state-dir`. It holds `machine.json`, `lock`, `journal/`, `manifest/`, `index/` and `scratch/`,
+  created with owner-only permissions.
+- **Storage**: an rclone remote and path, `--storage <remote>:<path>`, that the user configured with
+  `rclone config`. The tool never reads or writes rclone's credentials and never passes a credential
+  on a command line. Its type is read with `rclone listremotes --long`.
+- **Machine id**: a random 128-bit id created on the first run, kept in `machine.json` with an
+  optional label (`--machine-label`, default empty). Remote paths use the id only.
 - **Fingerprint**: for every entry below an item (the item directory included), its relative path
   (bytes), kind (directory, regular file, symlink), size, modification time in nanoseconds, change
-  time (Unix, not for the item directory itself, which the quarantine rename changes), device and
-  inode (Unix) or volume serial and file index (Windows), mode bits, link count and, for a symlink,
-  its target bytes. Any other kind of entry (fifo, socket, device) makes the item unsupported.
+  time (not for the item directory, which the quarantine rename changes), device, inode and mount
+  id where the platform provides one, mode bits, file flags (macOS `st_flags`), link count, the
+  names and sizes of its extended attributes, and, for a symlink, its target bytes. Any other kind
+  of entry (fifo, socket, device) makes the item unsupported, except the socket
+  `.git/fsmonitor--daemon.ipc`, which SCAN-FORMAT.md allows in a plain git directory: it is
+  recorded by name, not archived, and not recreated by restore.
 - **Live remote check**: asking the git remote itself (`git ls-remote`), not the local
-  remote-tracking refs, which can be stale.
-- **Quarantine**: renaming an item to `.disk-cleaner-removing-<item_id>` in the same parent
-  directory (same file system, so the rename is atomic) before deleting it.
+  remote-tracking refs.
+- **Quarantine**: renaming an item, with no-replace semantics, to `.disk-cleaner-removing-<item_id>`
+  in the same parent directory before deleting it.
+- **Secret-like file**: defined in 9.2.
 
 ## 5. Commands
 
 ```
 disk-cleaner apply --plan PLAN --scan SCAN --storage REMOTE:PATH
                    [--backup-only | --remove]
-                   [--auto ACTION[,ACTION...]] [--class CLASS[,CLASS...]] [--item PATH]...
-                   [--backup-regenerable] [--upload-secrets] [--no-recovery-push]
-                   [--push-worktree-snapshot]
-                   [--require-recovery-push] [--check-remote]
+                   [--auto CLASS[,CLASS...]] [--class CLASS[,CLASS...]] [--item PATH]...
+                   [--backup-regenerable] [--upload-secrets] [--require-encrypted-remote]
+                   [--push-recovery --push-remote NAME] [--check-remote]
                    [--max-plan-age HOURS] [--max-upload-bytes N] [--min-free BYTES]
                    [--part-size BYTES] [--state-dir DIR] [--machine-label TEXT]
-                   [--rclone PATH] [--json]
-disk-cleaner apply --resume RUN_ID [same flags as the run]
+                   [--rclone PATH] [--allow-root] [--json]
+disk-cleaner apply --resume RUN_ID
 disk-cleaner restore RECORD_ID [--to DIR] [--storage REMOTE:PATH] [--machine ID] [--json]
-disk-cleaner manifest list [--storage REMOTE:PATH] [--machine ID] [--json]
+disk-cleaner manifest list   [--storage REMOTE:PATH] [--machine ID] [--json]
 disk-cleaner manifest find TEXT [--files] [--storage REMOTE:PATH] [--machine ID] [--json]
-disk-cleaner manifest orphans --storage REMOTE:PATH [--json]
+disk-cleaner manifest verify --storage REMOTE:PATH [--machine ID] [--json]
+disk-cleaner manifest orphans --storage REMOTE:PATH [--machine ID] [--json]
 ```
 
 - No mode flag: **dry run**. `--backup-only`: everything up to and including the manifest, then
-  stop; nothing is removed. `--remove`: the full sequence. The two are mutually exclusive.
+  stop; nothing is removed. `--remove`: the full sequence (refused on Windows, exit 1). The two are
+  mutually exclusive.
 - `--auto` names the classes whose items run without a prompt: `regenerable`, `cache` (their
-  `remove-regenerable` items), `repo` (`backup-then-remove`) and `repo-recover`
-  (`recover-backup-then-remove`, a separate opt-in because it pushes refs). The config file key
-  `[apply] auto = [...]` does the same. Default: none, so every item is asked.
-- `--push-worktree-snapshot` (D-5): also push a snapshot commit of uncommitted and untracked work
-  (section 8.2). Off by default.
+  `remove-regenerable` items), `repo` (`backup-then-remove`), `repo-recover`
+  (`recover-backup-then-remove`). `[apply] auto = [...]` in the config file does the same. Default:
+  none, so every item is asked.
+- `--push-recovery` (section 8) needs `--push-remote NAME` (the repository's remote of that name)
+  in automatic mode; in ask mode the remote is confirmed per item. It is disabled in builds until
+  AC-13 has passed (D-5).
 - `--class` and `--item` narrow the selection; they never widen it.
-- Configuration lives in the same `config.toml` as the plan settings, under `[apply]`. Unknown
-  keys are an error, as for the plan.
+- `--resume RUN_ID` takes no other flags: the run's flags are in its journal.
+- Running as root (uid 0) is refused unless `--allow-root`.
+- Configuration lives in the same `config.toml` as the plan settings, under `[apply]`. Unknown keys
+  are an error, as for the plan.
 
-## 6. The sequence for one item
+## 6. The sequence
 
-Items are processed one at a time, innermost first (a `remove-regenerable` item inside a repository
-item is handled before the repository). Every transition is written to the journal (section 10)
-before the next step starts. Any failed check ends the item as **skipped** with a reason and the run
-continues with the next item; nothing that failed a check is ever removed.
+### 6.1 At the start of every apply
 
-**Nested items.** Removing an item removes everything inside it, so:
+Before selecting anything, every apply (dry runs excepted, which only report) takes the lock
+(10.2), then reconciles what earlier runs left behind:
 
-- a selected item inside another selected item is handled first; if it ends as anything but
-  removed (skipped, failed, kept, answered `n`, not selected because of `--class` or `--item`),
-  the enclosing item is skipped ("the nested <path> was kept"), whatever its own checks say;
-- the enclosing item's re-check (7.2) compares the scan's counts **net of** the nested items this
-  run removed: each such nested path must be absent and the journal must show it `deleted`, and
-  the scan's counts of those nodes are subtracted before comparing.
+- every quarantine directory named in an unfinished journal is finished or renamed back, as in the
+  resume table (10.1), and a path is never reported `gone` while a quarantine with its `item_id`
+  exists;
+- `removed` records written but not yet in a synced segment are synced;
+- scratch repositories are deleted (they hold only refs the tool made; their alternates entry would
+  otherwise make a later scan report a dependent on the user's repository).
 
-**One fingerprint chain.** Every comparison of the item is against one fingerprint, F0, taken at
-the start of step 2 before any fact is computed:
+### 6.2 For one item
 
-- at the end of step 2 the fingerprint is taken again and must equal F0, so the facts were computed
-  on exactly F0;
-- while archiving (step 6) every entry's metadata is compared with F0 as it is read, and the index
-  written is F0 (plus content digests); after the last part the fingerprint is taken again and
-  must equal F0;
-- at step 11 the quarantined directory must equal F0.
-
-An entry marked `reproducible` in the index (not archived, because the facts say it can be
-rebuilt) is therefore covered by the same chain: any change to it after the facts were computed
-fails one of these comparisons.
+Items are processed one at a time, innermost first. Every transition is written to the journal
+before the step it records takes effect. Any failed check ends the item as **skipped** with a reason
+and the run continues with the next item; nothing that failed a check is ever removed.
 
 1. **Select.** The item's plan action removes something and the item is within `--class` and
    `--item`.
-2. **Re-check** (section 7): re-scan, compare, process check, live remote check.
-3. **Ask** (ask mode only, section 11): show the re-check result and what will happen; the answer
-   binds to the fingerprint just taken.
-4. **Recover** (`recover-backup-then-remove` only, section 8): push recovery refs; verify them on
-   the live remote.
-5. **Vault** (section 9.5): copy secret-like files to the local vault and verify them.
-6. **Archive and upload** (section 9): stream, split into parts, upload, read back, compare; then
+2. **Re-check** (section 7): take the fingerprint F0, re-scan and re-plan, refuse places that are
+   never removed, check processes, check the live remote, take the fingerprint again.
+3. **Ask** (ask mode only, section 11).
+4. **Push recovery refs** (opt-in only, section 8).
+5. **Archive and upload** (section 9): stream, split into parts, upload, read back, compare; then
    the index object the same way.
-7. **Manifest** (section 12): write the item's `backed-up` record to a new segment, upload it,
-   read it back, compare.
-8. Stop here for `--backup-only` (outcome `backed-up-kept`).
-9. **Second existence check**: list each part, the index object and the manifest segment on the
-   storage and compare their sizes with what was verified; confirm the item path is still a
-   directory of the same identity (device and inode or file index).
-10. **Process check again**, immediately before the rename.
-11. **Quarantine**: rename the item; re-take the fingerprint of the renamed directory and compare it
-    with F0 (which is the archive index). Any difference: rename it back and end as
-    `backed-up-kept` (the archive stays, the manifest says why).
-12. **Delete** the quarantined directory (section 13.2).
-13. **Record** the `removed` record in the next manifest segment, synced at the next item's step
-    7 or at the end of the run, whichever comes first.
+6. **Manifest** (section 12): write the item's `backed-up` record to a new segment, upload it, read
+   it back, compare.
+7. Stop here for `--backup-only` (outcome `backed-up-kept`, by request).
+8. **Second existence check**: list each part, the index object and the manifest segment in
+   storage and compare their sizes with what was verified; confirm the item path is still the
+   directory of F0 (same device, inode and mount id).
+9. **Process check again.**
+10. **Quarantine**: rename with no-replace semantics; take the fingerprint of the renamed directory
+    through the handle opened on it, and compare with F0. Any difference: rename it back and end as
+    `backed-up-kept` (the archive stays, the manifest says why). If the rename back fails because
+    the original path was recreated, the quarantine stays, the record says where, and the summary
+    names both paths.
+11. **Delete** the quarantined directory (section 13.2).
+12. **Record** the `removed` record; it is synced with the next item's step 6, at the end of the
+    run, or by the next apply (6.1).
 
-`remove-regenerable` without `--backup-regenerable` (and without the answer `b` in ask mode) skips
-steps 4 to 7 and 9; step 11 compares with F0 all the same. Its manifest record says it was
-regenerable and names the rule.
+`remove-regenerable` without `--backup-regenerable` (and without the answer `b`) skips steps 4 to 6
+and 8; step 10 still compares with F0. Its record says it was regenerable and names the rule.
+
+### 6.3 Nested items
+
+Removing an item removes everything inside it:
+
+- a selected item inside another selected item is handled first. With `--remove`, if it ends as
+  anything but removed (skipped, failed, kept, answered `n`, outside `--class` or `--item`), the
+  enclosing item is skipped ("the nested <path> was kept"), whatever its own checks say;
+- with `--backup-only` the veto does not apply: nothing is removed, and the enclosing item's
+  archive holds the nested item like any other content;
+- the enclosing item's re-check compares the scan **net of** the nested items this run removed:
+  each removed nested path must be absent and the journal must show it `deleted`, and those nodes'
+  counts are subtracted before comparing. A nested **git** item that was removed changes the
+  enclosing item's `preserve` lists and facts, so the enclosing item is then always skipped (safe;
+  it is asked about again after a new scan).
+
+### 6.4 One fingerprint chain
+
+Every comparison of an item is against one fingerprint, F0, taken through directory handles at the
+start of step 2, before any fact is computed:
+
+- at the end of step 2 the fingerprint is taken again and must equal F0, so the facts were computed
+  on exactly F0;
+- while archiving, every entry's metadata is compared with F0 as it is opened, and the index
+  written is F0 plus content digests; after the last part the fingerprint is taken again and must
+  equal F0;
+- at step 10 the quarantined directory must equal F0.
+
+Every entry is archived (9.1), so the chain is the only thing that ties the removed directory to
+the archive, and it is complete.
 
 ## 7. Re-check (time of check, time of use)
 
 ### 7.1 Inputs are bound together
 
-- The plan and scan must have the same `schema_version` as this build supports.
+- The plan and scan must have the schema version this build supports.
 - The plan must have been made from this scan: today by `plan.scan_generated_at ==
   scan.generated_at` and, for every item, `scan.nodes[item.node].path == item.path` and the same
-  class; once core records it, by the SHA-256 of the scan file (section 14, D-2).
-- A plan older than `--max-plan-age` (default 24 hours) is refused. Facts that cannot be re-derived
-  for one item (dependents outside the item, the scan's coverage, see 7.2) are only as fresh as the
-  scan, so the age is bounded.
-- A resumed run must use the same plan and scan (their hashes are in the journal).
+  class; once core records it, by the SHA-256 of the scan file (D-2).
+- A plan with two items for one node or one path is refused.
+- A plan or scan dated more than 5 minutes in the future is refused.
+- The plan's age is checked at start and again before each item: an item is not started once the
+  plan is older than `--max-plan-age` (default 24 hours; D-9). The remaining items are listed as not
+  started.
+- A resumed run must use the same plan, scan and flags (their hashes are in the journal header).
 
-Any of these failing is exit code 1 before anything is done.
+Any of these failing at start is exit code 1 before anything is done.
 
 ### 7.2 The item is scanned again
 
-Immediately before acting, apply scans the item's own path again with the core scanner (same
-options as the scan file, git facts on, the hardened runner) and plans the result again with the
-plan's options. The item proceeds only if **all** of these hold, and the skip reason names the
-first that does not:
+Immediately before acting, apply re-scans the item with core's item re-scan (section 15, C-3), which
+walks only the item, reads the rule markers in its parent directory by name, applies the enclosing
+repository's ignore check to the item itself, uses the same options as the scan file and the
+hardened runner, and plans the result with the plan's options. The item proceeds only if all of
+these hold; the skip reason names the first that does not:
 
-- the path exists, is a directory (not a symlink, junction or file) and is on the same device
-  as in the scan;
-- the item neither contains nor lies inside the tool's own state directory (the vault may hold
-  the only copy of a secret) or the rclone storage path when that is a local directory;
-- the fresh scan finds the same set of nodes inside the item as the scan file (same paths and
-  classes), and every one of them gets the same action from the fresh plan as in the plan file
-  (nested items already removed in this run excepted, see section 6);
-- class, rule and every count of the node equal the scan's (`files_total`, `bytes_total`,
+- the path exists and is a directory (not a symlink, junction or file) on the same device and
+  mount as in the scan;
+- the fresh re-scan finds the same set of nodes inside the item as the scan file (paths and
+  classes), every one of them gets the same action from the fresh plan as in the plan file (nested
+  items already removed in this run excepted, 6.3), and no node has an `ask_reason`;
+- class, rule and every count of the item's node equal the scan's (`files_total`, `bytes_total`,
   `newest_mtime`, `output_bytes`, `unreadable`, `skipped_mounts`, `contains_outputs`,
-  `outputs_unlisted`), and it has no `ask_reason`;
-- the fresh plan gives the same action as the plan file. A hand-edited plan can only remove
-  items or turn them into `keep`; it cannot make apply do more (AC-4);
-- for a git node: every fact is the same value as in the plan item's `facts`, `head_commit` and
-  `last_commit_time` are equal, the remote names and URLs are equal, `git_admin` and
-  `object_store` counts are equal, `unsaved_pseudorefs`, `hidden_index_entries` and
-  `local_admin_content` are equal, and the list of git directories inside the item equals
-  `preserve.git_admin.git_dirs`;
-- for a regenerable or cache node: the project that owns it (its parent node in the scan, or the
-  node itself when it has none) has no file or commit newer than in the scan;
+  `outputs_unlisted`);
+- for a git node: every fact equals the plan item's `facts`; `head_commit`, `last_commit_time`,
+  the remote names and URLs, `git_admin` and `object_store` counts, `unsaved_pseudorefs`,
+  `hidden_index_entries` and `local_admin_content` are equal; the git directories inside the item
+  equal `preserve.git_admin.git_dirs`;
+- for a regenerable or cache node: its owning project (its parent node in the scan) has the same
+  activity evidence as in the scan, read with core's project activity function (C-3): newest
+  modification time excluding `.git` and nested nodes, and newest commit time;
 - the newest activity is still outside the active window.
 
-Dependents found elsewhere in the scan (a clone outside the item that borrows its objects) cannot
-be seen by a scan of the item alone; the scan file's `no_dependents` is used as it is, and a fresh
-`no` from the item's own scan wins. This is a documented limit (section 15).
+Dependents found elsewhere in the scan cannot be seen by a re-scan of the item; the scan file's
+`no_dependents` is used as it is, and a fresh `no` wins. This is a documented limit (section 17),
+bounded by the plan age.
 
 ### 7.3 Running processes
 
-The process check (`running_cwds`) runs at step 2 and again at step 10. A process whose working
+The process check (`running_cwds`) runs at step 2 and again at step 9. A process whose working
 directory is inside the item, or inside the project that owns a regenerable item, skips it. A
-check that could read no process skips every item; a partial check skips every item unless the
-plan recorded `trusted_partial_process_check`.
+check that could read no process skips every item; a partial check skips every item unless the plan
+recorded `trusted_partial_process_check`.
 
-### 7.4 Live remote check (git items)
+### 7.4 Places that are never removed in this release
+
+An item is skipped, with the reason, when:
+
+- **it is in a sync folder**: its path lies under `~/Library/CloudStorage`, `~/Library/Mobile
+  Documents`, `~/Desktop` or `~/Documents` on macOS (iCloud Desktop and Documents cannot be ruled
+  out cheaply), a Dropbox folder listed in Dropbox's own `info.json`, a OneDrive folder named by the
+  `OneDrive*` environment variables or registered as a Windows cloud-files sync root, or any
+  directory with a Syncthing `.stfolder` marker in it or an ancestor. Deleting there deletes on the
+  user's other machines, which this tool cannot check;
+- **it holds an online-only placeholder**: an entry with the macOS `SF_DATALESS` flag, or a Windows
+  file with the recall-on-open, recall-on-data-access, offline or pinned attributes, or a
+  cloud-files reparse point. Reading one triggers a download or fails;
+- **it holds or crosses a mount**: any directory inside the item that is a mount root (Linux:
+  `statx` `STATX_ATTR_MOUNT_ROOT`, or a mount id that differs from the item's, else
+  `/proc/self/mountinfo`; macOS: `st_dev` differs or `statfs` names it as a mount point), including
+  a Linux bind mount from the same file system. Where no mount information can be read, removal
+  is refused;
+- **it is on a network file system** (`statfs` type NFS, SMB/CIFS, AFP, FUSE and the like): change
+  detection by metadata is not reliable there;
+- **it holds or lies inside the tool's own state directory**, or the storage path when that is a
+  local directory (after resolving rclone `alias`, `union` and `crypt` wrappers with
+  `rclone config show <name>` reading only the `type` and `remote` keys);
+- **an entry cannot be deleted**: an immutable or append-only flag (`chflags uchg`/`schg`,
+  `chattr +i`/`+a`) or a directory the user cannot write;
+- **an entry's extended attributes cannot be archived** (9.3).
+
+A `local` storage remote on the same device as the item is warned about once per run: it is not a
+backup of that disk.
+
+### 7.5 Live remote check (git items)
 
 Remote facts in the plan are unverified. Before acting on a git item apply confirms them against
-the live remote. Network git commands never run in the scanned repository (section 8.1):
+the live remote, with the network runner of section 8.1:
 
 - The **effective URL** of each network remote is computed by the tool: the URL written in the
   repository's config, rewritten by the repository's own `url.<base>.insteadOf` and by the user's
-  global `url.<base>.insteadOf` (D-1), longest prefix first as git does. It must still be a network
-  URL (`is_network_url`) with an allowed transport: `https://` or ssh (`ssh://` or scp-style). Any
-  other transport (`file://`, a local path, `git://`, `ext::`, a remote helper `<x>::`) does not
-  count as a remote for this check.
-- `git ls-remote <effective URL>` lists the remote's refs. For every commit the plan's facts call
-  saved (HEAD, every local branch, every other local ref, every reflog and pseudoref commit), some
-  advertised ref must contain it: if the advertised tip is in the local object store, ancestry is
-  checked locally; if not, that tip is fetched into the tool's scratch repository (never the
-  user's) and checked there.
-- Every local tag must be advertised with the same object id (an annotated tag compared by its tag
-  object, not the commit it peels to).
-- A remote that cannot be reached, refuses authentication or times out makes the check unknown,
-  and the item is skipped. It never counts as saved.
+  global `url.<base>.insteadOf`, longest prefix first as git does. It must be `https://` or ssh
+  (`ssh://` or scp-style) and its host must be on the **host allowlist** (8.1). A URL or host that
+  starts with `-` is rejected.
+- A repository with no remote whose effective URL passes is skipped (kept), never trusted.
+- `git ls-remote --end-of-options <effective URL>` lists the remote's refs. For every commit the
+  plan's facts call saved (HEAD, every local branch and other local ref, every reflog and pseudoref
+  commit) some advertised tip must contain it, checked locally with
+  `merge-base --is-ancestor` in the user's repository (read-only). An advertised tip that is not in
+  the local object store makes the check unknown: the item is skipped ("the remote has commits this
+  clone does not have; fetch and scan again"). No fetch is ever made.
+- Every local tag must be advertised with the same object id (an annotated tag by its tag object).
+- A remote that cannot be reached, refuses authentication, asks for a host key or times out makes
+  the check unknown, and the item is skipped.
 
-`--check-remote` lets a dry run do this check too (it is read-only on the remote; a fetch into the
-scratch repository is not done in a dry run, so an advertised tip missing locally reads as
-"would need a fetch").
+The archive holds the whole repository either way; this check verifies the plan's premise, as
+SCAN-FORMAT.md requires. `--check-remote` lets a dry run do it (read-only on the remote).
 
-## 8. Recovery (`recover-backup-then-remove`)
+## 8. Network runner and recovery refs
 
-### 8.1 Nothing is written to the scanned repository
+### 8.1 The network runner
 
-All recovery work happens in a **scratch repository** that apply creates for the item under
-`<state>/scratch/<item_id>/`: a bare repository whose `objects/info/alternates` names the item's
-object directory, so it can read the user's commits without copying them and without writing a
-ref, object, index, reflog or config entry into the user's repository. Every git command runs
-through core's hardened runner (no hooks, no system or global config, no inherited `GIT_*`
-variables, no programs named by scanned content); network commands add only
-`protocol.https.allow=always`, `protocol.ssh.allow=always` and the credential helper decided in D-1,
-and pass an explicit URL and explicit refspecs, never a remote name (so a scanned `pushurl`,
-`remote.*.push` or `receive.*` setting cannot redirect them). The scratch repository is deleted
-when the item ends. It holds nothing unique (refs the tool made and objects fetched from the
-remote), so any scratch repository left by a crash is deleted when the next apply starts, before
-anything else: its alternates entry would otherwise make a later scan report a dependent on the
-user's repository.
+Every git command that contacts a remote uses core's network runner (C-1), built on the hardened
+runner (no hooks, no system or global config, no inherited `GIT_*` variables, no programs named by
+scanned content), adding only:
 
-The user's git directory is fingerprinted before and after recovery; any difference fails the
-item (and is a bug).
+- the transport allowlist: `protocol.allow=never`, `protocol.https.allow=always`,
+  `protocol.ssh.allow=always`;
+- a fully non-interactive environment: `GIT_TERMINAL_PROMPT=0`, `credential.interactive=never`,
+  `GCM_INTERACTIVE=Never`, no `SSH_ASKPASS`, and a tool-set
+  `GIT_SSH_COMMAND=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o UpdateHostKeys=no`
+  (an unknown host key fails, it never prompts);
+- the **host allowlist**: credentials are attached only for a host listed in `[apply] git_hosts`
+  (empty by default; the summary and the ask prompt say when a skip was caused by it). For a listed
+  host, the credential helpers are the user's own: the unscoped `credential.helper` and the
+  host-scoped `credential.<url>.helper` entries for that host, read once with
+  `git config --global --get-regexp` in an empty tool-owned directory, and passed with `-c`. For a
+  host that is not listed, apply runs no network command at all for that repository (it is
+  skipped). ssh is used only for listed hosts, with the user's agent and `~/.ssh` as usual;
+- an optional CA file, `[apply] git_ssl_ca_file`, passed as `http.sslCAInfo`;
+- `--end-of-options` before every URL and refspec (minimum git version 2.24; an older git disables
+  every network command, so git items are skipped);
+- an explicit URL and explicit refspecs, never a remote name, so a scanned `pushurl`,
+  `remote.*.push` or `receive.*` setting cannot redirect them;
+- `HOME` set to the account's real home directory only when a credential helper needs it (the
+  `store` helper reads `~/.git-credentials`); the global config is never read by the command itself
+  (`GIT_CONFIG_GLOBAL` stays the null device). Whether the common helpers work this way is checked
+  per OS by AC-11.
 
-### 8.2 What is pushed
+### 8.2 Recovery refs (opt-in)
 
-To the effective push URL of the first network remote (the repository's `pushurl` if written,
-otherwise its URL, rewritten as in 7.4), under `refs/heads/recovery/<machine label>/<yyyymmdd>/`:
+Off by default (D-5). The archive holds everything in every mode; recovery refs only make unsaved
+commits visible on the remote. With `--push-recovery`, for a `recover-backup-then-remove` item:
 
-- each local branch whose tip the live remote does not contain: `.../<branch>`;
-- each local tag the remote does not advertise with the same id: `refs/tags/recovery/<machine
-  label>/<yyyymmdd>/<tag>` (the tag object itself);
-- each stash entry: `.../stash-<n>` (the stash commit, which carries its index and untracked
-  parents);
-- each pseudoref in `unsaved_pseudorefs`: `.../pseudo-<NAME>`;
-- the newest commit of each unsaved reflog line of descent (`rev-list --reflog --not` the live
-  remote's tips, reduced to commits that are not ancestors of another): `.../reflog-<n>`;
-- uncommitted and untracked work is **not** pushed by default; it goes into the private archive
-  (section 9.1). This departs from the requirement as first written, which listed dirty and
-  untracked work among the things to push; see D-5. With `--push-worktree-snapshot` apply builds a
-  snapshot commit in the scratch repository: a temporary index filled from HEAD plus the working
-  tree's tracked changes and untracked files (not ignored files, not secret-like files, not files
-  over 50 MiB, each left-out file named in the record), committed with HEAD as parent, and pushed as
-  `.../worktree`. Nothing is written to the user's index, working tree or object store.
+- **What**: only commits that are already commits: each local branch whose tip the live remote
+  does not contain, a detached HEAD, and each pseudoref in `unsaved_pseudorefs` except `FETCH_HEAD`
+  (its commits came from a remote). Never stashes, reflog-only commits, uncommitted, untracked or
+  ignored files: those are in the archive only.
+- **Where**: the remote named by `--push-remote` (automatic mode) or confirmed per item in ask mode
+  (the prompt shows its effective push URL); never another remote. Its host must be on the host
+  allowlist. If an anonymous `ls-remote` (no credential helper, no ssh identity offered:
+  `-o IdentitiesOnly=yes -o IdentityFile=none`) succeeds, the remote is publicly readable and the
+  push is withheld ("public remote").
+- **Namespace**: `refs/disk-cleaner/recovery/<UTC yyyymmdd>/<run_id>/<name>`, outside
+  `refs/heads` and `refs/tags`. No machine name or label appears in a ref name. **Unverified
+  assumption**: hosting services accept such refs, list them in `ls-remote`, and fire no push
+  webhook, workflow or preview deployment for them. AC-13 verifies this against a real hosting
+  service; until it has passed, `--push-recovery` is disabled in the build.
+- **Content check before pushing**: the objects that would be sent (`rev-list --objects <tips>
+  --not <advertised tips>`) are listed; if any path matches the secret-like names of 9.2, or any
+  blob under 1 MiB matches the content rules of 9.2, that ref is withheld
+  (`recovery_push: withheld (secret-like content)`).
+- **How**: from a scratch repository under `<state>/scratch/<item_id>/`, a bare repository whose
+  `objects/info/alternates` names the item's object directory, so nothing is written to the user's
+  repository (refs, objects, index, reflog, config). Pushes never force: a name that already exists
+  on the remote with another id gets a numeric suffix.
+- **Verify**: `ls-remote` must advertise every pushed ref with exactly the pushed id.
+- **Failure** (refused, authentication, mismatch, withheld): recorded with a redacted reason. In ask
+  mode the user is told and asked again whether to continue with the archive alone. In automatic
+  mode the item is **kept** (`backed-up-kept`) when a push the user asked for did not happen.
 
-Names are sanitised to `[A-Za-z0-9._/-]`. Pushes never force: when a recovery ref of that name
-already exists on the remote with another id, the name gets a numeric suffix. Pushes never touch a
-ref outside the `recovery/` namespaces.
-
-After pushing, `ls-remote` must advertise every pushed ref with exactly the pushed id. Only then is
-the recovery recorded as `pushed`.
-
-### 8.3 When the push cannot be done
-
-No network remote, a refused push, an authentication failure or a mismatch after pushing is recorded
-in the manifest as `recovery_push: failed` with a redacted reason. It does **not** stop the item by
-default: the archive of a `recover-backup-then-remove` item holds the whole item (working tree and
-git directory) and is verified before removal, so nothing depends on the push. With
-`--require-recovery-push` (or `[apply] require_recovery_push = true`) a failed push skips the item.
-`--no-recovery-push` skips the push and says so in the record.
-
-### 8.4 The post-recovery check
-
-DESIGN.md section 4 step 5 says to re-run the facts after recovery. Because recovery writes nothing
-to the repository, `tree_clean` and `stash_empty` still read `no` afterwards. The check that
-replaces it: every ref pushed in 8.2 is advertised by the live remote with the pushed id (or the
-push failed and 8.3 applies), and the fingerprint taken at step 11 equals the archive index, which
-proves the archived working tree is the one being removed.
+The user's git directory is fingerprinted before and after; any difference fails the item.
 
 ## 9. Backup
 
 ### 9.1 What is archived
 
-| Action | Archive contents |
-|---|---|
-| `backup-then-remove` | Every git directory in `preserve.git_admin.git_dirs`, each enumerated again at apply time with `git_admin_files` and `object_store_files` (both preserve sets); the enumeration must succeed and must equal the counts of the plan, or the item is skipped. The rest of the item is not archived: the facts say it is reproducible from HEAD (clean tree) and regenerable directories. |
-| `recover-backup-then-remove` | The whole item: working tree, ignored files and every git directory, except nested items whose own action is `remove-regenerable` and which passed their own re-check in this run. |
-| `remove-regenerable` with `--backup-regenerable` or answer `b` | The whole item. |
+Every removed item is archived **whole**: every entry of the item directory, working tree, ignored
+files and git directories alike, except nested items whose own action is `remove-regenerable` and
+which were removed earlier in this run (6.3). No file is left out because git says it is clean or
+regenerable. `remove-regenerable` items are archived only with `--backup-regenerable` or the answer
+`b`.
 
-Secret-like files are taken out first (9.5). Every entry of the item, archived or not, is in the
-**index** with its fingerprint fields and, for a regular file that is archived, its SHA-256; an
-entry that is not archived is marked `reproducible` (clean tracked file or regenerable directory) so
-that step 11 can compare the whole item.
+The **preserve sets** are a checked subset: for every git directory in
+`preserve.git_admin.git_dirs`, `git_admin_files` and `object_store_files` are called again at apply
+time; the call must succeed and every file they list must appear in the index as archived, or the
+item is skipped.
 
-### 9.2 Archive format
+### 9.2 Secret-like files
 
-- A POSIX pax tar stream (`ustar` with pax extended headers for long names, large sizes,
-  nanosecond times and names that are not UTF-8 on Unix). Uncompressed in v1: git packs are
-  already compressed.
+A file is **secret-like** when any of these holds (best effort; anything not caught is uploaded,
+always to the user's own storage):
+
+- its name matches the scan's `[[state_file]]` list that is not `fixture_prone` (`.env`, `.env.*`,
+  Terraform state and variables, SSH key names) or one of: `id_rsa`, `id_dsa`, `id_ecdsa`,
+  `id_ed25519` (and their `*_sk` forms), `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`,
+  `*.ovpn`, `.netrc`, `_netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `.envrc`, `kubeconfig`,
+  `credentials`, `credentials.json`, `service-account*.json`, `secrets.yaml`, `secrets.yml`;
+- it is untracked and ignored only by the user's global excludes (`core.excludesFile` from the
+  user's global config, default `$XDG_CONFIG_HOME/git/ignore`), found with a dedicated
+  `ls-files --others --ignored --exclude-from=<that file>` run that reads the pattern file and runs
+  no program. SCAN-FORMAT.md requires these to be treated as possibly secret;
+- it is untracked or ignored, smaller than 1 MiB, and its first 64 KiB contain a private key block
+  (`-----BEGIN [A-Z ]*PRIVATE KEY-----`), a URL with a password (`scheme://user:pass@`), or a token
+  with a well-known prefix (`AKIA`, `ASIA`, `ghp_`, `gho_`, `ghs_`, `github_pat_`, `glpat-`,
+  `xoxa-`, `xoxb-`, `xoxp-`, `sk-`, `AIza`);
+- it is a file of a git directory (`config`, `FETCH_HEAD`, files under `logs/`, any other) that
+  contains a URL whose userinfo holds a password or a token (a bare user name, as in a default Azure
+  DevOps clone URL, is not a credential).
+
+**Default: an item with any secret-like file is kept** (skipped before upload, reason naming up to
+five of them, by relative path only). With `--upload-secrets` (or `[apply] upload_secrets = true`)
+they are archived like everything else. No local vault exists (D-4).
+
+**Encryption.** Before the first upload, apply reads the storage remote's type. When it is not
+`crypt` (directly or through `alias`/`union`), the run summary and every ask prompt say that the
+archive is stored unencrypted in the user's storage. `--require-encrypted-remote` (or
+`[apply] require_encrypted_remote = true`) refuses to upload to such a remote (exit 1).
+
+### 9.3 Archive format
+
+- A POSIX pax tar stream (`ustar` with pax extended headers for long names, large sizes, nanosecond
+  times and names that are not UTF-8 on Unix). Uncompressed.
 - Deterministic: entries in byte-wise order of relative path, directories before their contents,
-  owner and group recorded as 0 with empty names, mode bits and modification times as on disk.
-  The same content therefore gives the same bytes, which makes a retry comparable.
-- Directories, regular files and symlinks (the target is stored as written; it is never followed).
-  Two names of one file inside the item are stored as a tar hard-link entry. A hard link to a file
-  outside the item is stored as a regular file. Fifos, sockets and devices make the item
-  unsupported (skipped).
-- The stream is split into **parts** of at most `--part-size` bytes (default 8 GiB), cut at
-  arbitrary byte offsets; restore concatenates them. Parts keep each object below the streaming
-  limits of common backends (for example, rclone's S3 backend streams an object of unknown size in
-  at most 10,000 chunks of 5 MiB by default, about 48 GiB).
-- The index is a separate JSON Lines object, `<archive>.index.jsonl`, with a header line (format
-  version, item, part list) and one line per entry; a copy stays in `<state>/index/`.
+  owner and group 0 with empty names, mode bits, file flags and modification times as on disk. The
+  exact length of every part is computed from F0 before the upload starts.
+- Directories, regular files and symlinks (the target is stored as written, never followed). Two
+  names of one file inside the item are stored as a hard-link entry after the first name. A hard
+  link to a file outside the item is stored as a regular file. Fifos, sockets (except the fsmonitor
+  socket, see section 4) and devices make the item unsupported.
+- **Extended attributes** (macOS and Linux, including the macOS resource fork and Finder info) are
+  stored as pax `SCHILY.xattr.<name>` records, up to 64 KiB per attribute and 1 MiB per file. These
+  harmless attributes are dropped and listed by count: `com.apple.quarantine`,
+  `com.apple.provenance`, `com.apple.lastuseddate#PS`, and an all-zero `com.apple.FinderInfo`.
+  An attribute over the limits makes the item unsupported. On Windows, an alternate data stream
+  other than `Zone.Identifier` makes the item unsupported (Windows is backup-only in this release).
+  ACLs are not archived (section 17).
+- The stream is split into **parts** of at most `--part-size` bytes (default 8 GiB), at arbitrary
+  byte offsets; restore concatenates them.
+- The **index** is a separate JSON Lines object, `<archive>.index.jsonl`: a header (format version,
+  machine id, original path, action, HEAD for git items, the part list with sizes and SHA-256) and
+  one line per entry with its fingerprint fields and, for regular files, its SHA-256. A copy stays
+  in `<state>/index/`.
 
-### 9.3 Upload and verification
+### 9.4 Upload and verification
 
-- Each part is produced by one pass over the files: a reader walks the item (lstat only, opening
-  each regular file with no-follow semantics), the tar writer writes into a SHA-256 hasher and a
-  byte counter and into the stdin of `rclone rcat <storage>/<object>`. No copy of the archive is
-  staged on disk.
-- A file whose size or modification time changes while it is read, or that cannot be read, fails
-  the item (fail closed).
+- Each part is produced by one pass over the item through directory handles (section 13.2 rules:
+  `openat` with no-follow, `fstatat`, nothing resolved by path twice). The tar writer writes into a
+  SHA-256 hasher, a byte counter and the stdin of
+  `rclone rcat --size <exact part length> <storage>/<object>`. No copy of the archive is staged by
+  the tool. Whether every backend avoids spooling when `--size` is given is **unverified**; the
+  free-space check of section 18 therefore includes the volume of rclone's temporary directory and
+  requires room for one part there.
+- An entry whose metadata differs from F0 when opened, or whose size changes while read, or that
+  cannot be read, fails the item before the part completes (fail closed).
 - The part is then read back with `rclone cat` into a second hasher. It is **verified** only if
-  rcat exited 0, the bytes read back equal the bytes sent, and both SHA-256 digests are equal.
-  A listing (`rclone lsjson`) of the object must also report that size.
+  rcat exited 0, the bytes read back equal the bytes sent and the computed length, both digests are
+  equal, and `rclone lsjson` reports that size.
 - Object names are unique per attempt:
-  `disk-cleaner/v1/<machine id>/archives/<run_id>/<item_id>.a<attempt>.p<part>.tar`. An object is
-  never overwritten.
-- A failed attempt (nonzero exit, mismatch, no progress for `stall_timeout`, default 10 minutes) is
-  never retried in place; the whole item restarts with attempt + 1, at most 3 attempts per item.
-  Objects of failed attempts are orphans: they are listed by `manifest orphans` and never deleted
-  automatically.
-- A **lost response** (rcat reports failure or is killed although the object arrived complete) is
-  handled the same way: the attempt counts as failed; the complete object is an orphan.
+  `disk-cleaner/v1/<machine id>/archives/<run_id>/<item_id>.a<attempt>.p<part>.tar`. Nothing is ever
+  overwritten.
+- A failed attempt (nonzero exit, mismatch, no progress for 10 minutes) is never retried in place:
+  the item restarts from step 2 with attempt + 1, at most 3 attempts. Objects of failed attempts
+  (including a lost response, where the object arrived but the tool saw a failure) are orphans,
+  listed by `manifest orphans`, never deleted automatically.
 - After the last part, the index object is uploaded and verified the same way.
 
-### 9.4 Rate limits and budgets
+### 9.5 Rate limits and budgets
 
-rclone's own retries handle rate limiting within one call (`--retries 3 --low-level-retries 10`,
-and the user's own rclone flags). Three items in a row that fail at the storage stop the backup
-stage for the rest of the run (remaining items untouched, reported). `--max-upload-bytes` stops
-before an item whose archive would exceed the budget (the estimate is the scan's byte count).
+rclone's own retries handle rate limiting within one call. Three items in a row that fail at the
+storage stop the backup stage for the rest of the run. `--max-upload-bytes` stops before an item
+whose archive would exceed the budget; the estimate is the item's logical size from F0 (sparse files
+count at their full length).
 
-### 9.5 Secrets and the local vault
+## 10. Journal, resume, concurrency
 
-Secret-like files are:
-
-- files whose names match the scan's `[[state_file]]` list that is not `fixture_prone` (`.env`,
-  `.env.*`, Terraform state and variables, private SSH key names) plus `*.pem`, `*.key`, `*.p12`,
-  `*.pfx`, `*.jks`, `*.keystore`, `.netrc`, `_netrc`, `.npmrc`, `.pypirc`, `credentials.json`,
-  wherever they are in the item;
-- files in a git directory (`config`, `FETCH_HEAD`, files under `logs/`, any other own file) whose
-  bytes contain a URL with userinfo (`scheme://user:secret@` or a token as user name), found with
-  the same rule core's redaction uses;
-- untracked files that only a global ignore rule would have ignored cannot be recognised
-  (the hardened runner does not read global config), so they are treated like other untracked files;
-  this is a documented limit.
-
-By default each secret-like file is copied to `<state>/vault/<item_id>/<relative path>` (directories
-0700, files 0600 on Unix; on Windows the state directory's per-user location), its SHA-256 compared
-with the original, and it is left out of the archive. The manifest record lists its relative path
-and size only: no content and no hash leaves the machine (a hash of a short secret can be guessed).
-The vault keeps its own `vault/<item_id>/index.json` with the hashes.
-
-A vault copy satisfies the preserve obligation for a git directory file (D-4): the file is backed
-up and verified, on this machine. The archive then holds every other file of both preserve sets.
-
-`--upload-secrets` (or `[apply] upload_secrets = true`) puts secret-like files in the archive
-instead (still never in a git push). Limits: 64 MiB per item and 1 GiB for the whole vault
-(`[apply] vault_item_bytes`, `vault_total_bytes`); an item over a limit is skipped.
-
-Secrets inside committed history are not filtered: the object store is archived as it is (and its
-commits are on the user's own remote already, or in the recovery refs).
-
-## 10. Journal, interruption, resume
+### 10.1 Journal and resume
 
 - `<state>/journal/<run_id>.jsonl` is append-only. Each line is one transition of one item
-  (`selected`, `rechecked`, `answered`, `recovered`, `vaulted`, `part-uploaded`, `part-verified`,
-  `index-verified`, `recorded`, `segment-synced`, `checked-again`, `quarantined`,
-  `delete-started`, `deleted`, `skipped`, `failed`, `kept`) with the attempt, object names, sizes
-  and digests. Each line is flushed and `fsync`ed before the step it records takes effect;
-  renames are followed by an `fsync` of the parent directory where the platform supports it.
-- The journal header records the plan and scan SHA-256, the storage, the flags and the build.
-- `apply --resume RUN_ID` (or `apply` with the same plan, which finds the unfinished run and asks
-  whether to resume it) continues each unfinished item from its last durable state:
+  (`selected`, `rechecked`, `answered`, `pushed`, `part-uploaded`, `part-verified`,
+  `index-verified`, `recorded`, `segment-synced`, `checked-again`, `quarantine-intent`,
+  `quarantined`, `delete-started`, `deleted`, `removed-recorded`, `skipped`, `failed`, `kept`) with
+  the attempt, object names, sizes and digests. Each line is flushed and `fsync`ed before the step it
+  records takes effect; renames are followed by an `fsync` of the parent directory where the
+  platform supports it.
+- The header records the plan and scan SHA-256, the storage, the flags and the build.
+- `apply --resume RUN_ID` continues each unfinished item from its last durable state; every apply
+  also does this for the quarantines of all unfinished runs (6.1):
 
 | Last state | On resume |
 |---|---|
-| before `segment-synced` | Start the item again from the re-check with the next attempt number. Objects of the earlier attempt are orphans. |
-| `segment-synced`, not `quarantined` | Re-check (7.2), then the second existence check and the fingerprint comparison, then continue. |
-| `quarantined` (the line is written before the rename), the original path exists and no quarantine directory does | The rename never happened: continue as for `segment-synced`. |
-| `quarantined`, not `deleted` | If the quarantine directory exists and the original path does not: fingerprint it; equal to the index, or a subset of it when deletion had begun (`delete-started`), continue deleting; otherwise rename it back and record `kept`. If both exist, touch neither and report. |
-| `deleted` | Write the `removed` record if it is not in a synced segment. |
+| before `segment-synced` | Start the item again from step 2 with the next attempt. Earlier objects are orphans. |
+| `segment-synced` | Step 2 again (F0 must equal the index), then steps 8 to 12. |
+| `quarantine-intent`, original path present, no quarantine directory | The rename never happened: as `segment-synced`. |
+| `quarantine-intent` or `quarantined`, quarantine directory present, original absent | Fingerprint the quarantine: equal to the index, or (after `delete-started`) a subset of it, continue deleting; otherwise rename it back and record `kept`. |
+| both present | Touch neither; report both paths. |
+| `deleted` | Write and sync the `removed` record if no synced segment has it. |
 
-- Re-running a finished plan does nothing to finished items and reports them as already done; no
-  manifest record is written twice (records carry `item_id` and `run_id`, and the journal is checked
-  first).
-- Ctrl-C (SIGINT, Windows console control) finishes the current journal write, stops before the
-  next step, and exits 3 with the run id. A second Ctrl-C exits at once; the journal stays valid.
+- Records are identified by `(item_id, run_id, outcome)`. When storage holds two records with one
+  identity (a lost response on a segment upload, then a retry), readers use the latest record from a
+  verified segment, and `manifest list` shows one.
+- Applying a finished plan again changes nothing and reports items as already done.
+- Ctrl-C finishes the current journal write, stops before the next step, and exits 3 with the run
+  id. A second Ctrl-C exits at once; the journal stays valid.
 
-### 10.1 Concurrency
+### 10.2 Concurrency
 
-Two applies must never act on one root at the same time. Comparing roots between runs is
-unreliable (one root can lie inside another, be spelled through a symlink, or differ only by case),
-so the rule is stronger: **one apply per user per machine**.
-
-- An OS advisory lock on `<platform data dir>/disk-cleaner/apply.lock` (always this path, also
-  when `--state-dir` points elsewhere), and a second one on `<state>/lock`. Both are taken before
-  anything else (a dry run takes neither and writes nothing) and released by the operating system
-  when the process ends, so a crash never leaves a stale lock. The file holds the run id and
-  process id for the message; its content is never trusted as the lock itself.
-- A second apply exits 1 at once naming the run that holds the lock. `restore` and `manifest`
-  only read and take no lock, except that `restore` refuses a target inside an item that the
-  journal of a running apply has not finished.
-- Different users on one machine are not covered by the per-user lock; the quarantine rename
-  (atomic, so only one process can move an item) and the fingerprint comparison make the loser
-  skip the item.
+One apply per user per machine (D-11): an OS advisory lock on `<data dir>/disk-cleaner/apply.lock`
+(the path from the user database, also when `--state-dir` points elsewhere) and a second one on
+`<state>/lock`. Both are released by the operating system when the process ends. The file holds the
+run id and process id for the message; its content is never trusted as the lock. A second apply
+exits 1 at once naming the holder. A dry run takes no lock. Applies by different users, or by two
+machines sharing a network home, are not covered (section 17); the no-replace rename and the F0
+comparison make the loser skip the item.
 
 ## 11. Ask mode and automatic mode
 
-- **Ask** is the default for every action. On a terminal, each selected item is shown after its
-  re-check: path, action, size, why the plan says it is safe, what will be pushed, archived and
-  vaulted (counts and bytes), and anything the re-check found. Answers: `y` do it, `n` keep, `b`
-  back up then remove (regenerable only), `s` back up and keep, `a` yes to the rest of this action,
-  `q` stop (no further item is started). Pending typed-ahead input is discarded before each prompt
-  so a `y` typed early cannot answer the next item. End of input means `n`.
-- Without a terminal on stdin, ask mode answers `n` for every item and says so; it never waits.
-- The answer binds to the fingerprint taken at the re-check. If anything differs at step 11 the item
-  is not removed, whatever the answer.
-- **Automatic** applies to the actions named by `--auto` or `[apply] auto`; there is no default.
-  Automatic items are still re-checked, and skipped on any difference.
+- **Ask** is the default. On a terminal, each selected item is shown after its re-check: path,
+  action, size, why the plan says it is safe, what will be archived (files, bytes), the storage and
+  whether it is encrypted, secret-like files found, and, with `--push-recovery`, the remote, its
+  effective push URL, whether it is public, and the commits that would be pushed. Answers: `y` do
+  it, `n` keep, `b` back up then remove (regenerable only), `s` back up and keep, `a` yes to the rest
+  of this class, `q` stop (no further item is started). Pending typed-ahead input is discarded before
+  each prompt. End of input means `n`. Without a terminal on stdin, every item is `n`; nothing waits.
+- The answer binds to F0; any difference at step 10 keeps the item.
+- **Automatic** applies to the classes named by `--auto` or `[apply] auto`; default none. Automatic
+  items are re-checked and skipped on any difference.
 - A dry run never prompts.
 
 ## 12. Manifest
 
 ### 12.1 Records
 
-One JSON object per line. Every record has `record_id` (random), `item_id`, `run_id`,
-`machine_id`, `at`, `path`, `class`, `action`, `outcome` and `tool_version`. Outcomes:
-`backed-up` (written before removal), `removed`, `backed-up-kept` (backed up, then not removed: the
-reason says why), `regenerable-removed`. Other fields where they apply:
+One JSON object per line. Every record has `record_id`, `item_id`, `run_id`, `machine_id`, `at`,
+`path`, `class`, `action`, `outcome` and `tool_version`. Outcomes: `backed-up` (written before
+removal), `removed`, `backed-up-kept` (with the reason), `regenerable-removed`. Where they apply:
 
-- `bytes`, `files`; the facts used and when the live check confirmed them;
-- `git`: HEAD, branches and tags with their ids, the redacted remote URLs checked, the live check
-  result;
-- `recovery`: each pushed ref with its id and the redacted URL, or `failed` with a redacted reason;
-- `archive`: `format` (`pax-tar-v1`), `parts` (object name, bytes, SHA-256 each), `bytes`, `sha256`
-  of the whole stream, `index` (object name, bytes, SHA-256), `members` (the item paths it holds:
-  one in v1);
-- `vault`: relative paths and sizes (no hashes);
-- `restore`: the method (`archive`, `archive-then-checkout`, `regenerable`) and the exact
-  `disk-cleaner restore <record_id>` command; for git items, also the git-native alternative in words
-  (clone the recorded URL, fetch the recovery refs).
+- `bytes`, `files`, `xattrs_dropped`; the facts used and when the live check confirmed them;
+- `git`: HEAD, branches and tags with their ids, the redacted remote URLs checked and the result;
+- `recovery`: off, or each pushed ref with its id and redacted URL, or `withheld`/`failed` with a
+  redacted reason;
+- `archive`: `format` (`pax-tar-v1`), `parts` (object, bytes, SHA-256), `bytes`, `sha256` of the
+  whole stream, `index` (object, bytes, SHA-256), `encrypted_remote` (true or false), `members`
+  (one item path in this release);
+- `secrets_uploaded`: the count of secret-like files archived under `--upload-secrets` (no names);
+- `restore`: the method (`archive` or `regenerable`) and the exact `disk-cleaner restore
+  <record_id>` command.
 
-Nothing in a record is a credential: URLs pass core's `strip_url_credentials`, error text passes
-`redact_text`.
+URLs pass core's `strip_url_credentials`; error text passes `redact_text`. No record holds a
+secret.
 
-### 12.2 Where it lives and how it is backed up
+### 12.2 Where it lives
 
-- Locally: `<state>/manifest/<run_id>.<seq>.jsonl`, one **segment** per sync. Segments are never
-  modified after they are written. Each ends with a trailer line holding the record count and the
-  SHA-256 of the bytes before it, so truncation and corruption are detectable on their own.
+- Locally: `<state>/manifest/<run_id>.<seq>.jsonl`, one **segment** per sync, never modified after
+  it is written, ending with a trailer line holding the record count and the SHA-256 of the bytes
+  before it.
 - In storage: the same segment at `disk-cleaner/v1/<machine id>/manifest/<run_id>.<seq>.jsonl`,
-  uploaded with rcat, read back and compared like an archive part. A name is never reused, so a
-  lost state directory or another machine can never overwrite it. `machine.json` is uploaded once
-  to `disk-cleaner/v1/<machine id>/machine.json`; if one exists there with another id, apply stops.
-- A segment is synced before any removal that its records describe (step 7): **no item is removed
-  until a verified copy of its `backed-up` record exists in storage**. `removed` records are synced
-  in the next segment.
+  uploaded with rcat, read back and compared like a part. A name is never reused. `machine.json` is
+  uploaded once; if one exists there with another id, apply stops.
+- **No item is removed until a verified copy of its `backed-up` record is in storage.**
 
-### 12.3 Finding
+### 12.3 Commands
 
-- `manifest list` prints every record (newest first) from the local segments; with `--storage`
-  (and `--machine` when the storage holds several machines) it reads only the storage, so it works
-  on a new machine. A segment whose trailer does not match is reported as damaged and its records
-  are shown as unverified.
+- `manifest list` prints records newest first from the local segments; with `--storage` (and
+  `--machine` when the storage holds several machines) from storage only, so it works on a new
+  machine. A segment whose trailer does not match is reported as damaged and its records shown as
+  unverified.
 - `manifest find TEXT` matches paths, record ids, item ids and archive names; `--files` also searches
-  the archive indexes (local copies, or downloaded from storage when absent) for file paths.
-- `manifest orphans` lists objects under the machine's storage path that no record references
-  (failed attempts, lost responses). It deletes nothing.
+  the indexes (local copies, or downloaded when absent).
+- `manifest verify` lists every object the records reference and checks that it exists with the
+  recorded size (`lsjson`), so a lifecycle rule or a manual deletion is noticed; `--deep` also reads
+  each object back and compares its SHA-256.
+- `manifest orphans` lists objects under the machine's storage path that no record references. It
+  deletes nothing.
 
 ## 13. Removal and restore
 
 ### 13.1 Before removal
 
-Removal (steps 9 to 12) happens only after, in order: the re-check passed; recovery is recorded
-(pushed, failed and allowed, or not requested); the vault copies are verified; every part and the
+Removal (steps 8 to 11) happens only after, in order: the re-check passed; the recovery push, when
+requested, is recorded as pushed (or the user accepted its failure in ask mode); every part and the
 index object are verified; the manifest segment with the `backed-up` record is verified in storage;
 and the second existence check passed.
 
-### 13.2 Deleting
+### 13.2 Walking and deleting (macOS and Linux)
 
-- The quarantine rename is the point after which the original path no longer exists. On Windows a
-  rename that fails because a file is open is a skip (`in use`).
-- Deletion walks the quarantined directory itself: it never follows a symlink or junction (it
-  removes the link), never descends into a directory on another device (Unix `st_dev`; Windows: any
-  reparse point is removed as a link and never entered), and clears the read-only attribute only on
-  entries inside the quarantine (git marks object files read-only on Windows). If it meets another
-  device it stops, leaves the rest in quarantine and reports the item as `failed` (the data is in the
-  verified archive).
-- Removal never runs `git` in the item, and never touches anything outside the quarantine.
+- Archiving, fingerprinting and deletion all work relative to open directory handles: the item is
+  opened once with `O_DIRECTORY|O_NOFOLLOW`, every child with `openat(..., O_NOFOLLOW)` and
+  `fstatat(..., AT_SYMLINK_NOFOLLOW)`, every removal with `unlinkat`. No path is resolved a second
+  time, so swapping a directory for a symlink during the run cannot redirect a read or a delete.
+- A symlink is removed as a link, never followed. A directory whose device or mount id differs from
+  the item's, or that is a mount root, is never entered: deletion stops, leaves the rest in
+  quarantine and reports the item `failed` (the data is in the verified archive).
+- The quarantine rename uses `renameat2(RENAME_NOREPLACE)` on Linux and `renamex_np(RENAME_EXCL)`
+  on macOS; where the call is unavailable, removal is refused.
+- Read-only entries are made writable only inside the quarantine. Removal never runs `git` and never
+  touches anything outside the quarantine.
+- **Windows**: `--remove` is refused (D-13). Archiving on Windows opens every entry by handle with
+  `FILE_FLAG_OPEN_REPARSE_POINT` and never follows a reparse point.
 
 ### 13.3 Restore
 
 `disk-cleaner restore RECORD_ID [--to DIR]`:
 
 1. Finds the record (local manifest, or `--storage` alone on a new machine).
-2. The target is the original path or `--to`. It must not exist (no merge, no overwrite).
+2. The target is the original path or `--to`. It must not exist. Free space on its volume must be
+   at least the record's logical `bytes`, and extraction stops if the stream exceeds it.
 3. Each part is streamed with `rclone cat` into a hasher and a tar reader that extracts into
-   `<target parent>/.disk-cleaner-restoring-<record_id>`. Extraction refuses absolute names, `..`
-   components, names that are not valid for the target file system, writes through a symlink
-   (symlinks are created after all files), hard links to anything outside the staging directory,
-   and special files. The digests of each part and of the whole stream must equal the record's;
-   on any mismatch the staging directory is deleted and nothing is created at the target.
-4. Every entry is compared with the index (kind, size, SHA-256 of content, symlink target, mode
-   bits on Unix).
-5. Vault files are copied back from the local vault and compared with its hashes. On a machine
-   without that vault, restore completes and lists the missing secret-like files by name (exit 2).
-6. `archive-then-checkout` (a `backup-then-remove` repository): the repository config is checked
-   against core's allowlist, then the working tree is written with the hardened runner
-   (`git read-tree` and `git checkout-index -a`, no hooks), and restore verifies that `git status`
-   is clean, HEAD equals the record, and every recorded branch and tag has its recorded id.
-7. The staging directory is renamed to the target. A failure at any step leaves nothing at the
-   target and reports the staging path if it was kept for inspection.
+   `<target parent>/.disk-cleaner-restoring-<record_id>`. Every entry is created with create-new
+   semantics; "already exists" fails the restore. Extraction refuses absolute names, `..`
+   components, names invalid on the target file system, writes through a symlink (symlinks are
+   created after all files), hard links to anything outside the staging directory, and special
+   files. Directory modes are applied after their contents are written. On any digest mismatch the
+   staging directory is deleted and nothing is created at the target.
+4. Names that collide on the target file system (case, or Unicode normalisation: NFC and NFD forms
+   of one name) are refused before extraction, naming them.
+5. Every entry is compared with the index: kind, size, SHA-256, symlink target, mode bits and
+   extended attributes (where the target supports them; otherwise the restore lists the attributes
+   it could not set and exits 2).
+6. The staging directory is renamed to the target with no-replace semantics. A failure at any step
+   leaves nothing at the target.
 
-On a case-insensitive file system, an archive with two names that differ only by case is refused
-before extraction, naming them. Restore never contacts a git remote.
+Restore never runs `git` and never contacts a remote. `regenerable` records have nothing to restore:
+restore prints the rule and how the directory is normally rebuilt, and exits 0.
 
-`regenerable` records have nothing to restore: restore prints the rule and how the directory is
-normally rebuilt, and exits 0.
+## 14. Platform differences
 
-## 14. Open decisions
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Dry run, `--backup-only`, restore | yes | yes | yes |
+| `--remove` | yes | yes | refused (D-13) |
+| Mount detection | `st_dev`, `statfs` | `statx` mount root and mount id, else `/proc/self/mountinfo`; refuse if neither | volume serial and reparse points (backup only) |
+| Placeholders | `SF_DATALESS` | none expected (FUSE is a refused network file system) | recall, offline, pinned attributes; cloud-files reparse points |
+| Extended data | xattrs and resource forks archived | xattrs archived | ADS other than `Zone.Identifier`: item unsupported |
+| Long paths | n/a | n/a | verbatim `\\?\` paths, tested above 260 characters |
+| Case | APFS may be case-insensitive: restore refuses collisions | case-sensitive | case-insensitive: restore refuses collisions |
 
-Each needs main's decision (and the user's where it changes what leaves the machine). The text
-above follows the recommended option.
+Process checks use `sysinfo` on all three. On Windows, symlink restore needs Developer Mode or the
+privilege; otherwise restore fails and says so.
 
-- **D-1. Network access for git.** Core's hardened runner sets `protocol.allow=never` and reads no
-  global config, so it cannot run `ls-remote` or `push` as is, and https remotes would have no
-  credential helper. Recommended: an additive core API (`Git::network_command`, or apply passing
-  extra `-c` values to `Git::command`) that allows only https and ssh, runs only in the tool's
-  scratch repository with an explicit URL, and takes the credential helper from the user's own
-  global `credential.helper` (read once with `git config --global --get-all credential.helper` in
-  an empty tool-owned directory) and the user's global `url.*.insteadOf`. ssh uses the user's ssh
-  agent and `~/.ssh` as usual. Without a helper, an https remote that needs authentication fails the
-  live check (skip). Alternative: a tool-config key naming the helper, default none (safer, more
-  setup). **Unverified:** that the common helpers (`osxkeychain`, Git Credential Manager,
-  `libsecret`) work while the hardened runner points `HOME` and `XDG_CONFIG_HOME` at the null
-  device. The check that settles it: a CI probe per OS that runs `git credential fill` through the
-  network runner against a helper holding a dummy value; if a helper needs `HOME`, the network
-  runner restores only `HOME` (never the global config) for that command.
-- **D-2. Binding plan and scan.** The plan has no hash of its scan. Recommended: an additive core
-  plan field `scan_sha256`; until then, apply binds by `generated_at` plus per-item path and class
-  (7.1).
-- **D-3. Non-git items and `ask` items.** No plan action backs up a non-git item. Recommended for
-  this phase: apply acts only on removing actions; `remove-regenerable` items may be backed up first
-  on request; `ask` items are never acted on. Outputs, loose code and sessions wait for a core plan
-  action that reuses this archive and manifest format. Alternative: let ask mode answer certain ask
-  reasons with a backup-then-remove (never dependents, hidden index entries, pseudorefs that
-  could not be checked, incomplete coverage or unusual layouts).
-- **D-4. Secrets versus the preserve obligation.** Recommended: a verified local vault copy
-  satisfies the obligation for a git directory file holding a credential URL or with a secret-like
-  name; the vault is on the same disk, which the manifest and the summary say.
-- **D-5. Pushing uncommitted work.** Recommended: never push a snapshot of uncommitted or untracked
-  files by default (the remote may be public, and untracked files may hold anything); they go to the
-  private archive. Opt-in `--push-worktree-snapshot` builds a snapshot commit in the scratch
-  repository (temporary index, secret-like files and files over 50 MiB left out) and pushes it as
-  `.../worktree`. Existing commits (branches, stashes, pseudorefs, reflog tips) are pushed by
-  default, as the user asked for recovery branches. This **departs** from the requirement as first
-  written (dirty and untracked work were listed among the things to push); it needs an explicit
-  decision. Alternative: push the snapshot by default with the same exclusions, accepting that a
-  public remote receives untracked files.
-- **D-10. Automatic mode per class.** The requirement says automatic mode per class. Recommended:
-  `--auto` takes node classes (`regenerable`, `cache`, `repo`) plus `repo-recover`, so that pushing
-  recovery refs without a prompt is its own opt-in.
-- **D-11. Lock scope.** The requirement says two applies cannot run on one root. Recommended: one
-  apply per user per machine (10.1), which is stronger and avoids comparing root spellings.
-- **D-6. rclone command line, not the rc API.** DESIGN.md names rclone's remote-control API.
-  Recommended for v1: the `rclone` command (`rcat`, `cat`, `lsjson`) behind a `Store` trait, since
-  `rcat` streams from stdin without a daemon; the rc API can replace it later behind the same trait.
-- **D-7. Read-back is mandatory.** Recommended: always read every part back in full (egress costs
-  on some providers; cold-storage classes that cannot be read at once are unsupported in v1). No
-  provider-hash shortcut, since backends differ in which hashes they keep.
-- **D-8. Permanent deletion.** Recommended: delete after verified backup; the recycle bin later.
-- **D-9. Plan age.** Recommended default 24 hours.
+## 15. Core changes required (additive only)
 
-## 15. Documented limits
+- **C-1 (D-1)** A network runner: a `Git` method that builds on `Git::command` and adds only the
+  values of 8.1, with a test that it keeps every hardened setting.
+- **C-2 (D-2)** A plan field `scan_sha256`, written by `plan` and read by apply.
+- **C-3** An item re-scan and a project activity function: `rescan_item(path, &ScanOptions)` walks
+  only `path`, decides its rule from the markers in its parent directory (by name, `lstat` only) and
+  applies the enclosing repository's ignore check to `path` itself, returning the same nodes a full
+  scan would give for that subtree; `project_activity(node_path)` returns the newest modification
+  time excluding `.git` and nested nodes, and the newest commit time. A test shows that
+  `rescan_item(proj/node_modules)` yields one `regenerable` node equal to the full scan's.
+
+No scan or plan safety rule changes.
+
+## 16. Open decisions
+
+The text above follows the recommended option. D-4 and D-5 change what the user approved or asked
+for and need the user's own decision.
+
+- **D-1. Network access for git.** Recommended: section 8.1 (host allowlist, empty by default;
+  non-interactive; user's own helpers for listed hosts only). Alternative: no network access at all,
+  which makes every git item skip the live check (SCAN-FORMAT.md requires it), so no git item could
+  be removed.
+- **D-2. Binding plan and scan.** Recommended: C-2; until then, `generated_at` plus per-item path and
+  class (7.1).
+- **D-3. Non-git items and `ask` items.** Recommended: apply acts only on removing actions;
+  outputs, loose code and sessions wait for a core plan action (reported as deferred against the
+  requirements, section 2).
+- **D-4. Secrets.** Recommended: no local vault; an item holding a secret-like file is kept unless
+  `--upload-secrets`, with an unencrypted-storage warning and `--require-encrypted-remote`. Why: a
+  same-disk copy is not a backup, a vault adds key or file management that can lose the only copy,
+  and keeping the item loses nothing. Cost: items with `.env` files are not reclaimed until the user
+  opts in. Alternative: client-side encryption of secret-like files with a key kept in the OS
+  keychain and shown once, which adds a crypto dependency, key loss as a new way to lose data, and a
+  restore that needs the key. The user earlier approved a local vault for a private script; this
+  drops it, so the user should confirm.
+- **D-5. Recovery refs.** Recommended: off by default; opt-in as in 8.2, disabled in builds until
+  AC-13 passes. This departs from the requirement as first written (push recovery branches for
+  unsaved work, including dirty and untracked work); the archive holds all of it.
+- **D-6. rclone command line**, not the rc API that DESIGN.md names: `rcat --size`, `cat`, `lsjson`
+  behind a `Store` trait; minimum rclone version pinned in the code and checked at start.
+- **D-7. Full read-back is mandatory.** The dry-run summary estimates the egress.
+- **D-8. Permanent deletion**, only under 13.2 (handle-relative, mount-aware, no sync folders);
+  `manifest verify` notices objects lost later.
+- **D-9. Plan age** 24 hours, checked per item.
+- **D-10. Automatic mode per class**, with `repo-recover` separate.
+- **D-11. One apply per user per machine**, lock path from the user database, root refused unless
+  `--allow-root`.
+- **D-12. Whole-item archive** for every removed git item (more storage than the preserve sets
+  alone, no reliance on git's clean judgement).
+- **D-13. Windows is backup-only and restore** in this release.
+
+## 17. Documented limits
 
 - A process can still write into an item through a file it opened before the quarantine rename;
-  writes after the final fingerprint comparison and before deletion are lost. Only working
-  directories are checked, not open files.
-- Dependents outside the item (clones that borrow its objects, links into its git directory) are
-  as fresh as the scan; references from outside the scanned roots were never seen (SCAN-FORMAT.md,
-  known limits). The plan age bounds this.
-- The vault is on the same disk as the data it protects.
-- Secrets in committed history are archived as they are.
-- Extended attributes, macOS resource forks and Finder tags, Windows alternate data streams, ACLs,
-  owners and groups are not archived or restored. File permissions are restored as mode bits on Unix
-  only. Sparse files are restored dense.
-- Restoring symlinks on Windows needs Developer Mode or the privilege to create them; otherwise the
-  restore fails and says so.
-- Line endings: the checkout of a restored repository uses the repository's own config only, so a
-  system-wide `core.autocrlf` (Git for Windows) is not applied.
-- Verification proves the stored object equalled what was sent at the time; it cannot stop the
-  provider or the user deleting it later (restore detects a changed object).
-- Untracked files that only a global ignore rule ignored are not recognised as ignored.
-- The lock is per user (section 10.1). Applies run by two different users on the same files are
-  not prevented by it; the quarantine rename then lets only one of them remove an item.
-- Windows change time and file identity are read where the platform provides them; where not, the
-  fingerprint is weaker (size, modification time, attributes).
+  writes after the final comparison and before deletion are lost. Only working directories are
+  checked, not open files.
+- Dependents outside the item are as fresh as the scan (bounded by the plan age); references from
+  outside the scanned roots were never seen (SCAN-FORMAT.md, known limits).
+- Secret detection is best effort (9.2). Anything it misses is uploaded to the user's own storage,
+  unencrypted unless the remote is `crypt`.
+- ACLs, owners and groups are not archived; mode bits are restored on Unix only. Sparse files are
+  restored dense. A hard link to a file outside the item is restored as an independent file.
+- Sync-folder detection covers the providers listed in 7.4; another sync client is not recognised.
+  macOS `~/Desktop` and `~/Documents` are always treated as synced.
+- Verification proves the stored object equalled what was sent at the time; `manifest verify` notices
+  later loss, it cannot prevent it.
+- The lock does not cover two users, or two machines sharing a network home.
+- Whether `rclone rcat --size` avoids a local spool on every backend is unverified (9.4); the
+  temporary volume is checked for room for one part instead.
 
-## 16. Resource limits
+## 18. Resource limits
 
-- Archives are streamed; the only local disk use is the journal, the manifest segments, the index
-  copies, the vault and the scratch repository (refs plus any objects a live check fetches).
-- Before each item, apply checks free space on the state directory's volume and stops (before
-  starting the item) below `--min-free` (default the larger of 2 GiB and 2% of the volume).
-- Memory is bounded by fixed buffers (1 MiB per stream) and the index writer; nothing holds a
-  whole file or archive in memory.
+- Archives are streamed; local disk use is the journal, the manifest segments, the index copies and
+  scratch repositories (refs only, no fetch).
+- Before each item apply checks free space on the state directory's volume and on rclone's
+  temporary directory's volume, and stops (before starting the item) below `--min-free` (default the
+  larger of 2 GiB and 2% of the volume) plus, on the temporary volume, one part.
+- Memory is bounded by fixed buffers (1 MiB per stream); nothing holds a whole file in memory.
 - One item at a time; one rclone process at a time.
+- Bytes freed are measured as the change in free space, alongside the sum of sizes.
 
-## 17. Exit codes and output
+## 19. Exit codes and output
 
-- 0: dry run completed, or every selected item ended as removed, backed-up-kept by request, or was
-  already done.
-- 1: refused before acting (usage, inputs not bound, plan too old, lock held, rclone missing or too
-  old, storage path unusable).
-- 2: completed, but at least one item was skipped or failed (each listed with its reason).
+- 0: dry run completed, or every selected item ended removed, `backed-up-kept` by request
+  (`--backup-only`, answer `s`), answered `n`, or was already done.
+- 1: refused before acting (usage, inputs not bound, plan too old, lock held, root without
+  `--allow-root`, `--remove` on Windows, rclone or git missing or too old, storage unusable,
+  `--require-encrypted-remote` with a plain remote).
+- 2: completed, but at least one item was skipped, failed, or ended `backed-up-kept` for any reason
+  other than a request.
 - 3: interrupted; the run id is printed for `--resume`.
 
-The summary lists every item with its outcome and reason, bytes freed, bytes uploaded, and where the
-manifest is. `--json` writes the same as JSON. No output, journal line or manifest record holds a
-secret value or a credential URL.
+The summary lists every item with its outcome and reason, bytes freed (measured and summed), bytes
+uploaded, whether the storage is encrypted, and where the manifest is. `--json` writes the same as
+JSON. No output, journal line or record holds a secret value or a credential URL.
 
-## 18. Acceptance criteria
+## 20. Acceptance criteria
 
 Tests live in `crates/apply/tests/` and run in CI on ubuntu, macOS and Windows. Unless stated, they
-use temporary directories, a local bare repository as the git remote (reached through a test-only
-transport policy injected through the library API; the binary always uses the production policy),
-and the in-process `LocalDirStore` or `FaultStore` (a wrapper that injects partial writes, flipped
-bytes on read, success reported as failure, objects deleted after verification, stalls). A separate
-CI job runs the same flows through the real `rclone` binary against an rclone `local` remote defined
-in a temporary config file (no credentials anywhere).
+use temporary directories, the in-process `LocalDirStore` or `FaultStore` (a wrapper that injects
+partial writes, flipped bytes on read, success reported as failure, objects deleted after
+verification, stalls), and local git repositories. The network paths are exercised through the
+production runner against local servers (AC-10). A separate job runs the flows through the real
+`rclone` binary against an rclone `local` remote defined in a temporary config file (no credentials
+anywhere). A library step hook lets a test act between any two steps; the binary never enables it.
 
 - **AC-1** Dry run is the default: without `--backup-only` or `--remove`, apply prints what it would
-  do for each item with the fresh re-check result and writes nothing: no state directory, no
-  storage object, no ref or file in any scanned or remote repository. Verify by: `dry_run.rs`
-  snapshots the tree, the state directory path, the store and the remote's refs before and after
-  and asserts equality and zero store writes.
-- **AC-2** `--backup-only` does steps 1 to 8 and removes nothing; `--remove` does the whole
-  sequence; no other flag removes anything. Verify by: `modes.rs` runs each mode on the same
-  fixture and checks outcomes, store contents and the tree.
-- **AC-3** Plan and scan are bound (schema, scan identity, per-item path and class) and a plan
-  older than `--max-plan-age` is refused, all before anything is done (exit 1). Verify by:
-  `inputs.rs`.
-- **AC-4** Only `remove-regenerable`, `backup-then-remove` and `recover-backup-then-remove` items
-  are acted on, and only when a fresh plan of the item gives the same action. Verify by:
-  `inputs.rs` with plans whose `ask` and `keep` items were edited into removing actions.
-- **AC-5** Each item is scanned again immediately before acting and skipped, naming the first
-  difference, when anything in 7.2 differs. Verify by: `recheck.rs`, one case per field in 7.2.
-- **AC-6** The process check runs at the re-check and again immediately before the quarantine; a
-  process working inside the item skips it. Verify by: `recheck.rs` starts a child process with its
-  working directory inside the item at each point (through a library step hook).
-- **AC-7** Git items pass the live remote check of 7.4 before any recovery, upload or removal.
-  Verify by: `remote.rs` with a local bare repository behind the test transport policy, plus a unit
-  test that the production policy refuses `file://`, local paths, `git://`, `ext::` and helpers.
-- **AC-8** One fingerprint chain (section 6): F0 before the facts, equal after them, equal to every
-  entry as archived and to the index, equal after archiving, equal at quarantine; any break skips
-  the item before upload completes or, at quarantine, renames it back, keeps and records it.
-  Verify by: `toctou.rs` writes, deletes, touches and renames entries (archived ones and
-  `reproducible` ones) through the step hook between every pair of steps from 2 to 11.
-- **AC-9** Recovery pushes the refs of 8.2 to the effective push URL under `recovery/`, without
-  force and without running hooks, verifies each with `ls-remote`, and leaves the user's git
-  directory byte-identical. Verify by: `recovery.rs` with every kind of unsaved state; fingerprint of
-  the git directory before and after; a hook that would write a marker file.
-- **AC-10** A failed or impossible push is recorded and does not block the item unless
-  `--require-recovery-push`; the archive then holds the whole item. Verify by: `recovery.rs`.
-- **AC-11** The archive holds exactly the content of 9.1 for each action, enumerated at apply time
-  with `git_admin_files` and `object_store_files` for git directories. Verify by: `archive.rs`
-  compares the extracted archive with the fixture and the two core lists.
-- **AC-12** The archive is a deterministic pax tar split into parts as in 9.2, with a separate
-  index. Verify by: `archive.rs` archives the same tree twice (identical bytes), checks long names,
-  non-UTF-8 names (Unix), symlinks, internal hard links and a part size small enough to split a file.
-- **AC-13** A part counts as verified only after rcat succeeded and the read-back byte count and
-  SHA-256 equal what was sent, and the listing shows that size; object names are never reused.
-  Verify by: `upload.rs` with `FaultStore`, and `rclone_local.rs` with the real rclone binary.
-- **AC-14** The index object is uploaded and verified like a part. Verify by: `upload.rs`.
-- **AC-15** Secret-like files (9.5) are copied to the vault, verified, and left out of the archive;
-  the manifest lists names and sizes only. Verify by: `secrets.rs` plants fake secret values and
-  searches every stored object, segment, journal line and output for them.
-- **AC-16** `--upload-secrets` puts them in the archive instead; they are never pushed to a git
-  remote. Verify by: `secrets.rs`.
-- **AC-17** An item over the vault limits is skipped. Verify by: `secrets.rs`.
-- **AC-18** Manifest records carry the fields of 12.1; segments are immutable, end with a valid
-  trailer, and are mirrored to storage with read-back verification. Verify by: `manifest.rs`.
-- **AC-19** Nothing is removed before every condition of 13.1 holds, in that order, including the
-  second existence check of step 9. Verify by: `ordering.rs` records the order of store, journal and
-  file-system operations and fails on any removal that precedes a required step.
-- **AC-20** `manifest list`, `find` (with `--files`) and `orphans` work from the local state and from
-  storage alone. Verify by: `manifest.rs` with an empty state directory and `--storage`.
-- **AC-21** Deletion follows 13.2: no symlink or junction followed, no device crossed, read-only
-  entries removed, nothing outside the quarantine touched. Verify by: `remove.rs` (symlinks to an
-  outside directory on all platforms, a junction on Windows, a read-only tree), and the Linux mount
-  job with a tmpfs inside an item.
-- **AC-22** A `remove-regenerable` item is removed only while it is still regenerable by a fresh
-  plan, with no backup unless asked. Verify by: `regenerable.rs`.
-- **AC-23** Every transition is journaled before it takes effect, and a run stopped at any
-  transition resumes to the same end state, with no item removed without its verified archive and
-  synced record and no record written twice. Verify by: `resume.rs` stops the run at each
-  transition in turn (step hook returning a stop) and resumes in a new instance; plus one test that
-  kills the real binary during an rclone upload and resumes.
-- **AC-24** Applying a finished plan again changes nothing and reports items as already done.
-  Verify by: `resume.rs`.
-- **AC-25** Only one apply runs per user per machine, whatever the roots and state directories
-  (section 10.1); a second exits 1 naming the run that holds the lock, and a killed holder leaves no
-  stale lock. Verify by: `lock.rs` with two processes (same and different `--state-dir`), and a
-  killed holder.
-- **AC-26** Archives are streamed without staging; apply stops before an item when free space is
-  below `--min-free`, when the upload budget would be exceeded, or after three failing items at the
-  storage. Verify by: `limits.rs` with an injected free-space reader and `FaultStore`.
-- **AC-27** Ask mode behaves as in 11: per-item prompt, typed-ahead input discarded, no terminal
-  means keep, end of input means keep, `q` stops before the next item. Verify by: `ask.rs` drives
-  the prompt through the library's prompt interface and the binary through a pipe.
-- **AC-28** Automatic mode runs only the items of the classes named by `--auto` or `[apply] auto`
-  (`repo-recover` separately from `repo`); the default is none. Verify by: `ask.rs`.
-- **AC-29** Restore follows 13.3 and the restored item equals the archived one, entry for entry
-  (and for a repository: clean status, HEAD and refs as recorded). Verify by: `restore.rs` round
-  trips for each action, including a repository restored with checkout.
-- **AC-30** Restore works on a new machine from storage alone and lists vault files it could not
-  restore. Verify by: `restore.rs` with an empty state directory.
-- **AC-31** Platform behaviour of section 15 and 13: paths longer than 260 characters on Windows,
-  read-only files, case collisions refused on case-insensitive targets, names invalid on Windows
-  refused on restore. Verify by: `platform.rs` in the three-OS CI matrix.
-- **AC-32** Exit codes and the summary follow section 17; no secret value or credential URL appears
+  do with the fresh re-check result and writes nothing: no state directory, no storage object, no
+  ref or file anywhere. Verify by: `dry_run.rs` snapshots tree, state path, store and remote refs
+  before and after; zero store writes.
+- **AC-2** `--backup-only` does steps 1 to 7 and removes nothing; `--remove` does the whole sequence
+  on macOS and Linux and is refused (exit 1, nothing done) on Windows. Verify by: `modes.rs` in the
+  three-OS matrix.
+- **AC-3** Plan and scan are bound (7.1): schema, scan identity, per-item path and class, no
+  duplicate items, no future dates; the plan age is enforced at start and before each item. Verify
+  by: `inputs.rs` with a clock injected through the library.
+- **AC-4** Only removing actions are acted on, and only when a fresh plan of the item gives the same
+  action. Verify by: `inputs.rs` with `ask` and `keep` items edited into removing actions.
+- **AC-5** The item is re-scanned with core's item re-scan and skipped, naming the first difference,
+  when anything in 7.2 differs; a regenerable item is classified by its parent's markers. Verify by:
+  `recheck.rs`, one case per field of 7.2, and a core test that `rescan_item(proj/node_modules)`
+  equals the full scan's node (C-3).
+- **AC-6** The process check runs at step 2 and step 9; a process working inside the item skips it.
+  Verify by: `recheck.rs` starts a child process inside the item at each point.
+- **AC-7** Items in the places of 7.4 are skipped: sync folders (each listed marker), placeholders,
+  mount roots including a same-file-system bind mount, network file systems, the tool's state or
+  local storage, immutable entries. Verify by: `places.rs` with markers and flags created in
+  temporary directories; the Linux mount job with a tmpfs and a bind mount inside an item; macOS
+  `SF_DATALESS` simulated through the library's metadata interface (setting it needs a file
+  provider) plus a unit test of the flag check.
+- **AC-8** The fingerprint chain of 6.4 holds: any change between step 2 and step 10 skips the item
+  or, at quarantine, renames it back and records it. Verify by: `toctou.rs` writes, deletes, touches,
+  renames and swaps entries through the step hook between every pair of steps.
+- **AC-9** The live remote check of 7.5 runs before any push, upload or removal; a missing tip, a
+  moved branch, a changed tag, an unlisted host or a failure skips the item, and no fetch is made.
+  Verify by: `remote.rs` through the production runner against the local servers of AC-10.
+- **AC-10** The production network runner (8.1) works end to end and no wider: against a test
+  repository served over https on localhost (with a CA file in `git_ssl_ca_file`) and over ssh from
+  a local sshd, a listed host succeeds; a dummy credential helper logs every host it is asked about
+  and is never asked about an unlisted host; an unknown ssh host key fails without a prompt; a URL
+  or host starting with `-` is rejected. Verify by: the `network` CI job on ubuntu (sshd in a
+  container) and macOS (https), running `network.rs`.
+- **AC-11** Credential helpers are found and work under the network runner: on each OS a helper
+  configured globally, unscoped and host-scoped (`credential.https://HOST.helper`), is passed only
+  for its host, and `git credential fill` through the runner returns its dummy value (Linux:
+  `store`, which needs `HOME`; macOS: `osxkeychain` with a dummy item in a temporary keychain;
+  Windows: Git Credential Manager in non-interactive mode or, where the runner image lacks it, a
+  scripted helper, recorded as such). Verify by: `helpers.rs` in the three-OS matrix.
+- **AC-12** With `--push-recovery`, recovery refs follow 8.2: only branch, detached-HEAD and
+  pseudoref commits (never `FETCH_HEAD`, stashes, reflog-only commits or uncommitted work); only to
+  the named or confirmed remote; under `refs/disk-cleaner/recovery/`; withheld for a public remote or
+  secret-like content; never forced; verified with `ls-remote`; no hook runs; the user's git
+  directory is unchanged; in automatic mode a push that did not happen keeps the item. Without the
+  flag nothing is pushed. Verify by: `recovery.rs` through the local servers of AC-10.
+- **AC-13** The recovery namespace is accepted by a real hosting service, listed by `ls-remote`, and
+  triggers no workflow, webhook delivery or deployment. Verify by: `scripts/probe-ref-namespace`
+  run by a person against a disposable GitHub repository that has an `on: push` workflow for all
+  refs and a webhook to a request bin: push a ref under the namespace with a scoped token, wait 10
+  minutes, record zero workflow runs and zero deliveries. Until a passing record exists in the
+  repository, the build keeps `--push-recovery` disabled.
+- **AC-14** Every removed item is archived whole (9.1), and both preserve sets, enumerated at apply
+  time with `git_admin_files` and `object_store_files`, are inside the archive. Verify by:
+  `archive.rs` extracts the archive and compares it entry by entry with a snapshot of the fixture,
+  and checks the two core lists against the index.
+- **AC-15** Secret-like files (9.2) keep their item by default; `--upload-secrets` archives them; a
+  non-`crypt` remote is warned about and `--require-encrypted-remote` refuses it. Verify by:
+  `secrets.rs` plants fake values (names, global-ignore matches, content patterns, a password URL in
+  `.git/config`) and searches every stored object, segment, journal line and output for them.
+- **AC-16** The archive is a deterministic pax tar as in 9.3, with extended attributes recorded and
+  the listed harmless ones dropped, split into parts whose length is known before upload, with a
+  self-describing index. Verify by: `archive.rs` archives a tree twice (identical bytes), checks long
+  and non-UTF-8 names, symlinks, internal hard links, xattrs and a resource fork (macOS), and a part
+  size small enough to split a file.
+- **AC-17** A part counts as verified only after `rcat --size` succeeded, the read-back length and
+  SHA-256 equal what was sent, and the listing shows that size; names are never reused; at most 3
+  attempts. Verify by: `upload.rs` with `FaultStore`, and `rclone_local.rs` with the real rclone
+  binary, which also checks the `--size` argument.
+- **AC-18** The index object is uploaded and verified like a part. Verify by: `upload.rs`.
+- **AC-19** Records carry the fields of 12.1, segments are immutable with a valid trailer and are
+  mirrored with read-back verification, and duplicate records collapse by identity. Verify by:
+  `manifest.rs`.
+- **AC-20** Nothing is removed before every condition of 13.1 holds, in that order. Verify by:
+  `ordering.rs` records store, journal and file-system operations and fails on any removal that
+  precedes a required step.
+- **AC-21** `manifest list`, `find` (with `--files`), `verify` (with `--deep`) and `orphans` work
+  from local state and from storage alone. Verify by: `manifest.rs` with an empty state directory.
+- **AC-22** Walking and deletion follow 13.2: handle-relative, no symlink followed, no mount
+  entered, no-replace rename, nothing outside the quarantine touched. Verify by: `remove.rs` (a
+  symlink to an outside directory; a subdirectory swapped for such a symlink during archiving and
+  during deletion through the step hook; a read-only tree; an occupied rename target) and the Linux
+  bind-mount job.
+- **AC-23** A `remove-regenerable` item is removed only while a fresh plan still says so, with no
+  backup unless asked. Verify by: `regenerable.rs`.
+- **AC-24** Every transition is journaled before it takes effect; a run stopped at any transition
+  resumes to the same end state; every apply first reconciles unfinished quarantines, unsynced
+  records and scratch repositories; a resume refuses changed inputs. Verify by: `resume.rs` stops at
+  each transition in turn and resumes in a new instance, starts a new apply instead of resuming, and
+  kills the real binary during an rclone upload.
+- **AC-25** Applying a finished plan again changes nothing and reports items as done. Verify by:
+  `resume.rs`.
+- **AC-26** One apply per user per machine (10.2), the lock path independent of `HOME` and
+  `XDG_*`, no stale lock after a kill, root refused without `--allow-root`. Verify by: `lock.rs`
+  with two processes under different environments and state directories, and a killed holder.
+- **AC-27** Apply stops before an item when free space on the state or temporary volume is below
+  section 18's floor, when the upload budget (logical size) would be exceeded, or after three
+  failing items. Verify by: `limits.rs` with an injected free-space reader and `FaultStore`.
+- **AC-28** Ask mode follows 11: the prompt's contents, typed-ahead input discarded, no terminal or
+  end of input means keep, `q` stops before the next item. Verify by: `ask.rs` through the library's
+  prompt interface and the binary through a pipe.
+- **AC-29** Automatic mode runs only the classes named by `--auto` or `[apply] auto`; none by
+  default. Verify by: `ask.rs`.
+- **AC-30** Restore follows 13.3, and the restored item equals the original fixture snapshot taken
+  before removal, entry for entry, attributes included. Verify by: `restore.rs` round trips for each
+  action.
+- **AC-31** Restore works on a new machine from storage alone. Verify by: `restore.rs` with an empty
+  state directory and `--storage`.
+- **AC-32** Nested items follow 6.3, including `--backup-only` and a nested git item. Verify by:
+  `nested.rs` (a repository holding a removable `node_modules`: inner removed; inner answered `n`;
+  backup-only; a nested repository).
+- **AC-33** Platform behaviour of section 14: Windows backup and restore with paths over 260
+  characters, read-only files, case and normalisation collisions refused on restore. Verify by:
+  `platform.rs` in the three-OS matrix.
+- **AC-34** Exit codes and the summary follow section 19; no secret value or credential URL appears
   in any output, journal or record. Verify by: `output.rs` with a remote URL holding a fake token.
-- **AC-33** Every git command goes through core's hardened runner, and network commands add only
-  the values of 8.1; no program named by scanned content runs during re-check, recovery or restore.
-  Verify by: `hardening.rs` with hooks, a `.gitattributes` filter, and config keys that name
-  programs, each of which would write a marker file.
-- **AC-34** With `--push-worktree-snapshot`, the snapshot commit of 8.2 is built in the scratch
-  repository, leaves out ignored, secret-like and oversized files (named in the record), is pushed
-  as `.../worktree` and verified; without the flag no snapshot is built or pushed. Verify by:
-  `recovery.rs` compares the pushed tree with the working tree minus the exclusions, and checks the
-  user's index and git directory are unchanged.
-- **AC-35** Nested items follow section 6: an inner item is handled first, an inner item that was not
-  removed vetoes the enclosing item, and the enclosing item's re-check compares counts net of the
-  inner items removed in this run. Verify by: `nested.rs` with a repository holding a removable
-  `node_modules`, run once with the inner item removed and once with it answered `n`.
+- **AC-35** Every git command goes through core's hardened runner or the network runner; no program
+  named by scanned content runs during re-check, live check or push. Verify by: `hardening.rs` with
+  hooks, a `.gitattributes` filter, and config keys naming programs, each writing a marker file.
 
-## 19. Negative cases
+## 21. Negative cases
 
-- **NEG-1 (AC-1)** A dry run with storage that is unreachable still completes and makes zero store
-  calls; a dry run never prompts.
-- **NEG-2 (AC-2)** `--backup-only --remove` together is a usage error (exit 1).
-- **NEG-3 (AC-3)** A plan made from another scan, a plan older than the limit, an item whose path or
-  class differs from the scan node: refused, exit 1, nothing done.
-- **NEG-4 (AC-4)** A plan edited from `ask` or `keep` to `backup-then-remove`: the item is skipped
-  ("the plan's action differs from a fresh plan").
-- **NEG-5 (AC-5)** After the scan: a new file in the item; a new commit (HEAD changed); a new branch
-  or tag; a new stash; a new hook in the git directory; `git remote set-url`; the item replaced by a
-  symlink to another directory; the item replaced by a file; the item deleted; a mount placed at the
-  item. Each is skipped with its reason; a deleted item is reported `gone` and is not an error.
-- **NEG-6 (AC-6)** A process that starts inside the item after the re-check and before the
-  quarantine skips it; a process check that can read nothing skips every item.
-- **NEG-7 (AC-7)** The remote branch is reset so HEAD is no longer contained; a tag on the remote
-  points at another object; the remote is unreachable or refuses authentication; an `insteadOf`
-  rule rewrites the URL to a local path; the URL uses `ext::`, `file://` or a helper. Each skips the
-  item and no recovery, upload or removal happens.
-- **NEG-8 (AC-8)** A file is written into the item after the archive was verified and before the
-  quarantine: the item is renamed back, kept, and recorded `backed-up-kept`.
-- **NEG-29 (AC-8)** A clean tracked file of a `backup-then-remove` repository (not archived,
-  `reproducible`) is edited after the facts were computed and before archiving, or during it: the
-  chain breaks, nothing is removed.
-- **NEG-9 (AC-9)** A repository whose hooks (`pre-push`, `post-checkout`, `reference-transaction`)
-  would write a marker: no marker appears; the user's git directory is unchanged; a recovery ref
-  name that already exists on the remote with another id gets a suffix and nothing is forced.
-- **NEG-10 (AC-10)** No network remote: the push is recorded as not possible and the archive path
-  is used; with `--require-recovery-push` the item is skipped.
-- **NEG-11 (AC-11)** A git directory file that cannot be read, a name core cannot enumerate, a fifo
-  in the item: skipped before any upload counts, nothing removed.
-- **NEG-12 (AC-13)** The store fails after part of a part was written: the attempt fails, a new
-  attempt uses new names, and after three attempts the item is skipped; nothing removed.
-- **NEG-13 (AC-13)** One byte differs on read-back, or the read-back is shorter: not verified,
-  nothing removed.
-- **NEG-14 (AC-13)** The upload succeeds but the tool sees a failure (lost response) or a stall:
-  treated as failed; the stored object appears in `manifest orphans`; no record references it.
-- **NEG-15 (AC-15)** `.env`, `id_ed25519`, `prod.tfstate` in the item and a token URL in
-  `.git/config`, `.git/FETCH_HEAD` and `.git/logs/HEAD`: none of the fake values appears in any
-  stored object, segment, journal line or output; the vault holds them with equal hashes.
-- **NEG-16 (AC-17)** Secret-like files over the vault limit: the item is skipped.
-- **NEG-17 (AC-19)** The manifest segment upload fails: the item is backed up and kept, never
-  removed. An archive part deleted from storage between verification and the second existence
-  check: skipped, nothing removed.
-- **NEG-18 (AC-20)** A truncated or altered segment in storage is reported as damaged and its
-  records are marked unverified; other segments still list.
-- **NEG-19 (AC-21)** A symlink in the item to a directory outside it: the outside directory is
-  unchanged after removal. A mount point inside a quarantined item: deletion stops there and reports
-  `failed`. A Windows junction to an outside directory: the junction is removed, its target is
-  unchanged.
-- **NEG-20 (AC-22)** A regenerable directory that gained a `.git`, an output file or a `.env` after
-  the scan: skipped.
-- **NEG-21 (AC-23)** A run stopped at each transition and resumed: never an item missing from disk
-  without a verified archive and a synced `backed-up` record; never two records for one item and
-  outcome; a quarantine left behind is completed or renamed back. A resume with a different plan or
-  scan is refused.
-- **NEG-22 (AC-25)** Two applies at once, with the same or with different state directories: the
-  second exits 1 at once. A holder killed with SIGKILL: the next apply starts.
-- **NEG-23 (AC-26)** Free space below the floor, the upload budget reached, three failing items:
-  each stops before the next item, and the remaining items are untouched and listed.
-- **NEG-24 (AC-27)** No terminal: every item kept, nothing waits. `y` typed before the prompt
-  appears: discarded. The item changes between the answer and step 11: not removed.
-- **NEG-25 (AC-29)** Restore with a corrupted part: nothing at the target, staging removed, exit 1.
-  An archive holding `../x`, an absolute name, a symlink followed by a file written through it, or a
-  hard link to outside: refused, nothing written outside the staging directory. An existing target:
-  refused. A restored repository whose HEAD or refs differ from the record: nothing at the target.
-- **NEG-26 (AC-31)** Two names differing only by case restored onto a case-insensitive file system,
-  or a name invalid on Windows restored there: refused, naming them.
-- **NEG-27 (AC-32)** A remote URL with an embedded fake token appears nowhere in output, journal or
+- **NEG-1 (AC-1)** A dry run with unreachable storage still completes with zero store calls and no
+  prompt.
+- **NEG-2 (AC-2)** `--backup-only --remove` together: usage error. `--remove` on Windows: exit 1,
+  nothing touched.
+- **NEG-3 (AC-3)** A plan from another scan; a plan older than the limit; a plan that ages past the
+  limit during a run (the remaining items are not started); a duplicate item; a plan dated in the
+  future: refused as stated, nothing done to the refused items.
+- **NEG-4 (AC-4)** A plan edited from `ask` or `keep` to `backup-then-remove`: skipped.
+- **NEG-5 (AC-5)** After the scan: a new file; a new commit; a new branch or tag; a new stash; a new
+  hook; `git remote set-url`; the item replaced by a symlink or a file; the item deleted (reported
+  `gone`, not an error, and never when a quarantine with its id exists). Each is skipped with its
+  reason.
+- **NEG-6 (AC-6)** A process that starts inside the item before the quarantine: skipped. A process
+  check that can read nothing: every item skipped.
+- **NEG-7 (AC-7)** An item under each sync-folder marker; a dataless or recall-on-access file; a
+  tmpfs and a bind mount inside the item; an item on NFS or FUSE; an item containing the state
+  directory or a local storage path (also through an `alias` remote); an immutable file: each
+  skipped, nothing uploaded counts and nothing removed.
+- **NEG-8 (AC-8)** A file written, or a clean tracked file edited, between any two steps from 2 to
+  10: the item is not removed.
+- **NEG-9 (AC-9)** The remote branch reset so HEAD is not contained; a remote tip this clone does not
+  have; a tag moved on the remote; an unreachable remote; an `insteadOf` rule to a local path; an
+  `ext::` or `file://` URL: skipped, no fetch made.
+- **NEG-10 (AC-10)** A scanned remote on an unlisted host with a dummy helper configured: the helper
+  is never called and no connection is made. A URL `-oProxyCommand=...` or host `-x`: rejected. An
+  ssh server with an unknown host key: the check fails at once, nothing prompts.
+- **NEG-11 (AC-11)** A host-scoped helper for host A and a repository on host B (listed): the helper
+  for A is not passed.
+- **NEG-12 (AC-12)** A `git stash -a` holding `.env` and a local commit adding `id_ed25519`, with
+  `--push-recovery`: the stash is not pushed and the commit's ref is withheld; neither secret is in
+  any object the remote received. A remote readable anonymously: push withheld. An automatic-mode
+  push that fails: item kept. An existing recovery ref of the same name: a suffix, never forced.
+- **NEG-13 (AC-13)** Without a passing probe record, `--push-recovery` exits 1 saying it is not yet
+  verified.
+- **NEG-14 (AC-14)** A git directory file that cannot be read, a name core cannot enumerate, a fifo
+  in the item, a preserve-set file missing from the index: skipped before any upload counts.
+- **NEG-15 (AC-15)** `.env`, `id_ecdsa`, a globally ignored `secrets.local`, an `unusual.txt` holding
+  a private key block, and `https://user:token@host` in `.git/config`, `FETCH_HEAD` and
+  `logs/HEAD`: the item is kept by default and none of the values appears in any stored object,
+  segment, journal line or output; with `--upload-secrets` they are archived; with
+  `--require-encrypted-remote` and a plain remote, exit 1 before any upload.
+- **NEG-16 (AC-16)** An xattr over 64 KiB, or a Windows ADS other than `Zone.Identifier`: item
+  unsupported, skipped.
+- **NEG-17 (AC-17)** The store fails mid-part; one byte differs on read-back; the read-back is short;
+  the upload succeeds but the tool sees a failure (lost response); the transfer stalls: never
+  verified, new attempt with new names, at most 3, orphans listed, nothing removed.
+- **NEG-18 (AC-20)** The segment upload fails: backed up and kept. A part deleted from storage
+  between verification and the second existence check: skipped, nothing removed.
+- **NEG-19 (AC-21)** A truncated or altered segment in storage: reported damaged, its records
+  unverified; `manifest verify` reports an object deleted after verification.
+- **NEG-20 (AC-22)** A subdirectory swapped for a symlink to an outside directory during archiving:
+  no outside file is read (none appears in any stored object). The same swap during deletion: the
+  outside directory is unchanged. An occupied quarantine name: the rename fails, nothing replaced.
+- **NEG-21 (AC-23)** A regenerable directory that gained a `.git`, an output file or a `.env`:
+  skipped.
+- **NEG-22 (AC-24)** A run stopped at each transition and resumed, or followed by a new apply without
+  `--resume`: never an item missing from disk without a verified archive and a synced `backed-up`
+  record; never two records for one identity in `manifest list`; every quarantine completed or
+  renamed back; leftover scratch repositories deleted. A resume with a different plan, scan or flags:
+  refused. `quarantine-intent` written but the rename not done: the item is checked again from
+  `segment-synced`.
+- **NEG-23 (AC-26)** Two applies at once with different `HOME`, `XDG_DATA_HOME` and `--state-dir`:
+  the second exits 1. A killed holder: the next apply starts. Run as root without `--allow-root`:
+  exit 1.
+- **NEG-24 (AC-27)** Free space below the floor on the temporary volume only; the budget reached;
+  three failing items: each stops before the next item, remaining items untouched and listed.
+- **NEG-25 (AC-28)** No terminal: every item kept, nothing waits. `y` typed before the prompt:
+  discarded. The item changes after the answer: not removed.
+- **NEG-26 (AC-30)** A corrupted part: nothing at the target, staging removed. An archive with
+  `../x`, an absolute name, a symlink then a file through it, or a hard link to outside: refused,
+  nothing written outside staging. An existing target, or an entry that already exists in staging:
+  refused. Too little free space: refused before extraction.
+- **NEG-27 (AC-33)** Two names differing only by case, or NFC and NFD forms of one name, restored to
+  a case-insensitive or normalising file system; a name invalid on Windows restored there: refused,
+  naming them.
+- **NEG-28 (AC-34)** A remote URL with an embedded fake token: absent from output, journal and
   records.
-- **NEG-28 (AC-33)** A repository with a `.gitattributes` filter, hooks, and config naming programs:
-  no marker file is written during re-check, recovery, push, fetch or restore checkout.
-- **NEG-30 (AC-34)** Without the flag, a dirty repository: no `.../worktree` ref on the remote. With
-  it, an untracked `.env` and a 60 MiB untracked file: neither is in the pushed tree, both are named
-  in the record, and the `.env` is in the vault.
-- **NEG-31 (AC-35)** A repository whose nested `node_modules` item is answered `n`, skipped or
-  outside `--class`: the repository is skipped and nothing in it is removed.
-- **NEG-32 (AC-5)** An item that contains the tool's state directory, or a local storage path, or
-  lies inside one: skipped.
-- **NEG-33 (AC-23)** The journal says `quarantined` but the process died before the rename: on
-  resume the item is checked again from `segment-synced` and nothing is lost or removed twice.
-  A scratch repository left by the crash is deleted before the resumed run does anything else.
+- **NEG-29 (AC-35)** A repository with a `.gitattributes` filter, hooks and config naming programs:
+  no marker file is written during re-check, live check or push.
+- **NEG-30 (AC-32)** A repository whose nested `node_modules` is answered `n` or is outside
+  `--class`, with `--remove`: the repository is skipped. The same with `--backup-only`: the
+  repository is archived with the `node_modules` inside.
 
-## 20. Test and build plan
+## 22. Review of revision 2: findings and changes
 
-- New crate `crates/apply` (library: re-check, recovery, archive, store, manifest, journal, lock,
-  restore) and CLI wiring in `crates/cli`. Core changes are additive only (D-1, D-2).
+| Finding | Change in revision 3 | Criteria and negative cases |
+|---|---|---|
+| M1 credentials and prompts to hosts named by scanned config | Host allowlist (empty by default), helpers only for listed hosts, non-interactive runner, ssh batch mode and strict host keys, `--end-of-options`, `-` rejected, unlisted host means skip (8.1, 7.5) | AC-9, AC-10, AC-11; NEG-9, NEG-10, NEG-11 |
+| M2 stash parents and secret-bearing commits pushed | Push off by default; never stashes, reflog-only commits or uncommitted work; content check withholds a ref (8.2) | AC-12; NEG-12 |
+| M3 refs that trigger CI, wrong remote, public remote, machine name | Namespace outside heads and tags, gated by a real-host probe; remote named or confirmed; public remote withheld; no machine name (8.2) | AC-12, AC-13; NEG-12, NEG-13 |
+| M4 bind mounts and symlink races | Handle-relative walk and delete, mount roots and ids, no-replace rename, refuse without mount information (13.2, 7.4) | AC-7, AC-22; NEG-7, NEG-20 |
+| M5 sync folders and placeholders | Such items are kept (7.4) | AC-7; NEG-7 |
+| M6 "reproducible" files trusted on git's stat check; restore fidelity | Whole-item archive; restore compared with the original snapshot; no checkout in restore (9.1, 13.3, D-12) | AC-14, AC-30; NEG-8 |
+| M7 same-disk vault as the only copy | No vault; secret-like files keep the item unless uploaded (9.2, D-4) | AC-15; NEG-15 |
+| M8 globally ignored files | Treated as secret-like (9.2) | AC-15; NEG-15 |
+| M9 detection by name only, unencrypted upload | More names, bounded content check, encryption warning, `--require-encrypted-remote` (9.2) | AC-15; NEG-15 |
+| M10 regenerable items cannot be re-scanned alone | Core item re-scan and project activity (C-3, 7.2) | AC-5, AC-23 |
+| M11 production network path untested | Local https and ssh servers through the production runner; helper probe as a criterion | AC-10, AC-11 |
+| M12 rclone spools to disk | `rcat --size` with the exact length; temporary volume in the free-space check (9.4, 18) | AC-17, AC-27; NEG-24 |
+| M13 xattrs, forks, ADS dropped silently | Archived in pax records; harmless ones dropped by list; otherwise unsupported (9.3) | AC-16, AC-30; NEG-16 |
+| Improvement 1 backup-only and the nested veto | Veto applies only with `--remove` (6.3) | AC-32; NEG-30 |
+| Improvement 2 nested git items | Enclosing item skipped, stated (6.3) | AC-32 |
+| Improvement 3 stranded quarantine | Every apply reconciles first (6.1) | AC-24; NEG-22 |
+| Improvement 4 rename semantics | No-replace rename; failed rename back keeps the quarantine (6.2, 13.2) | AC-22; NEG-20 |
+| Improvement 5 duplicate and stranded records | Identity and dedupe; next apply syncs (10.1, 6.1) | AC-19, AC-24 |
+| Improvement 6 self-describing archives | Index header carries path, machine, action, HEAD and parts (9.3) | AC-16 |
+| Improvement 7 fsmonitor socket | Recorded by name, not archived (section 4) | AC-14 |
+| Improvement 8 restore hardening | Create-new, normalisation collisions, free space, directory modes last (13.3) | AC-30; NEG-26, NEG-27 |
+| Improvement 9 sparse files | Budget by logical size (9.5) | AC-27 |
+| Improvement 10 lock path and root | Lock path from the user database; root refused (10.2, 5) | AC-26; NEG-23 |
+| Improvement 11 clocks | Future dates refused; age per item; UTC dates (7.1, 8.2) | AC-3; NEG-3 |
+| Improvement 12 silent push degrade | Automatic mode keeps the item; ask mode asks (8.2) | AC-12; NEG-12 |
+| Improvement 13 storage guards | Same-device warning; wrappers resolved (7.4) | AC-7; NEG-7 |
+| Improvement 14 vault housekeeping | No vault | n/a |
+| Improvement 15 exit codes and resume flags | Section 19; resume takes no flags | AC-24, AC-34 |
+| Improvement 16 FETCH_HEAD | Never pushed (8.2) | AC-12 |
+| Improvement 17 unbounded fetch | No fetch at all (7.5) | AC-9; NEG-9 |
+| Improvement 18 deletion pre-checks | Immutable flags refused before quarantine (7.4) | AC-7; NEG-7 |
+| Improvement 19 duplicate items | Refused (7.1) | AC-3; NEG-3 |
+| Improvement 20 bytes freed | Measured as free-space change (18) | AC-34 |
+| Improvement 21 prompt contents | Section 11 | AC-28 |
+| Improvement 22 outside hard links | Section 17 | n/a |
+| Improvement 23 requirements coverage | Section 2 reports this phase as partial | n/a |
+| Contradiction: plan header "saved with the manifest" | Every git file is in the archive the manifest references, so it holds | AC-14, AC-20 |
+| Contradiction: DESIGN.md sections 4 to 6 and 10 | Updated in the same change to point here | n/a |
+
+## 23. Test and build plan
+
+- New crate `crates/apply` (library: re-check, places, network runner use, recovery, archive, store,
+  manifest, journal, lock, restore) and CLI wiring in `crates/cli`. Core changes are additive only
+  (section 15).
 - Tests are written first; each behaviour gets a red CI run before its implementation lands.
-- Builds and tests run in GitHub Actions on ubuntu, macOS and Windows. The rclone job installs a
-  pinned rclone release and checks its published SHA-256 before use.
+- Builds and tests run in GitHub Actions on ubuntu, macOS and Windows; extra jobs: Linux mounts
+  (tmpfs and bind mount, with `sudo`), `network` (local https and sshd), real rclone (a pinned
+  release whose published SHA-256 is checked before use). AC-13 is a recorded manual probe.
 - No test touches any directory outside its own temporary directory, and no test uses a network
-  remote or a credential.
+  remote or a real credential.

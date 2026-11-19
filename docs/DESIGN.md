@@ -120,6 +120,12 @@ including their regenerable directories.
 
 ## 4. Recovery for ambiguous repos
 
+The apply phase is specified in [APPLY-SPEC.md](APPLY-SPEC.md), which supersedes this section and
+sections 5 and 6 where they differ. In short: every removed repository is archived whole to the
+user's storage and read back first; pushing recovery refs is an opt-in that stays disabled until
+its hosting assumptions are verified; nothing is ever written into the user's repository; there is
+no bundle fallback (the archive holds everything). The text below is the original intent.
+
 Modes: `ask` (per item), `auto` (apply the default action), `report` (list only).
 
 Default action for a repo with unsaved work:
@@ -138,14 +144,16 @@ Linked worktrees are removed with `git worktree remove` semantics so the parent 
 
 ## 5. Backup connectors
 
-Storage is delegated to [rclone](https://rclone.org) (MIT), driven through its remote-control API.
+Storage is delegated to [rclone](https://rclone.org) (MIT). The apply phase drives the `rclone`
+command (`rcat --size`, `cat`, `lsjson`) behind a storage interface; the remote-control API may
+replace it later (APPLY-SPEC.md, D-6).
 That gives Dropbox, S3 and Glacier classes, Backblaze B2, Google Drive, OneDrive, SFTP, a local or
 external disk and many more without writing a client for each. The app helps the user create and
 test a remote; rclone owns the credentials.
 
 - **Cold storage** for outputs, raw loose code, bundles and old agent sessions.
-- **Verification**: an upload counts only after a checksum comparison (`rclone check`, or a size and
-  hash listing where the backend has no common hash). Rate-limit responses pause and resume; a
+- **Verification**: an upload counts only after the whole object is read back and its SHA-256
+  compared with what was sent (APPLY-SPEC.md, 9.4). Rate-limit responses pause and resume; a
   partial run is never recorded as a backup.
 - **Agent session backup** runs on a schedule, is incremental, and reports its own freshness. A
   stale backup blocks removal of any session data.
@@ -156,7 +164,8 @@ A policy is a rule set the user enables, for example:
 
 - regenerable directories in projects idle for N days: remove;
 - package caches not accessed for N days, or above N GB: remove;
-- repos idle for N days: recover if ambiguous, then back up the git directory's own files and remove;
+- repos idle for N days: archive the whole repository to storage, verify, then remove (recovery
+  refs only on request);
 - agent sessions older than N days and not tied to an active project: back up, verify, remove;
 - outputs older than N days: back up, verify, remove.
 
@@ -214,9 +223,8 @@ macOS) are later optimisations behind the same scanner interface.
 
 ```
 crates/
-  core/      scan, classify, facts, plan, manifest (no UI, no network)
-  git/       repo facts and recovery, wrapping the git CLI
-  storage/   rclone rc client, verification
+  core/      scan, classify, facts, plan (no UI, no network)
+  apply/     re-check, archive, storage (rclone), manifest, journal, removal, restore
   cli/       disk-cleaner binary
 app/         Tauri shell and web UI
 rules/       artifact and cache rules (data)
