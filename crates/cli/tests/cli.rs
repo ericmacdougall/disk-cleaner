@@ -109,7 +109,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
     let json = fs::read_to_string(&out_file).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["schema_version"], 5);
+    assert_eq!(v["schema_version"], 6);
 
     let o = run(bin()
         .args([
@@ -1136,4 +1136,220 @@ fn l1_changing_one_index_at_a_time_gives_an_error_or_a_plan_never_a_crash() {
         }
     }
     assert!(cases > 5);
+}
+
+// ---------------------------------------------------------------- R1, R2 (coverage)
+
+/// A repository every safety fact calls saved: its only commit is on the remote-tracking ref of
+/// a network remote. No network is contacted; the ref is written locally.
+fn archivable_repo(repo: &Path) {
+    fs::create_dir_all(repo).unwrap();
+    git(repo, &["init", "-q", "-b", "main"]);
+    write(&repo.join("README.md"), "hello\n");
+    git(repo, &["add", "README.md"]);
+    git(repo, &["commit", "-q", "-m", "init"]);
+    git(
+        repo,
+        &["remote", "add", "origin", "https://example.invalid/a.git"],
+    );
+    git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+}
+
+fn scan_to_file(root: &Path, out: &Path) -> serde_json::Value {
+    let o = run(bin().args([
+        "scan",
+        root.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]));
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    serde_json::from_str(&fs::read_to_string(out).unwrap()).unwrap()
+}
+
+fn plan_value(o: &Output) -> serde_json::Value {
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    serde_json::from_str(&stdout(o)).expect("plan json")
+}
+
+fn item_of<'a>(plan: &'a serde_json::Value, path: &Path) -> &'a serde_json::Value {
+    let want = path.to_string_lossy();
+    plan["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["path"].as_str() == Some(&*want))
+        .unwrap_or_else(|| panic!("no plan item for {want}"))
+}
+
+/// Running processes must be inspectable; otherwise every removal asks and the assertions that
+/// follow would say nothing.
+fn assert_process_check_usable(plan: &serde_json::Value) {
+    assert_ne!(
+        plan["process_check"], "unknown",
+        "running processes must be inspectable for this test: {}",
+        plan["process_check_note"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn r1_unreadable_folder_clone_is_disclosed_and_strict_coverage_asks() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("scan");
+    let a = root.join("a");
+    archivable_repo(&a);
+    // A shared clone of A in a folder the scan cannot read: it borrows A's objects.
+    let vault = root.join("vault");
+    let dep = vault.join("dep");
+    fs::create_dir_all(&vault).unwrap();
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--shared",
+            a.to_str().unwrap(),
+            dep.to_str().unwrap(),
+        ],
+    );
+    git(&dep, &["cat-file", "-e", "HEAD^{tree}"]);
+    assert!(dep.join(".git/objects/info/alternates").is_file());
+
+    fs::set_permissions(&vault, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable_anyway = fs::read_dir(&vault).is_ok(); // running as root
+    let scan_file = tmp.path().join("scan.json");
+    let sv = scan_to_file(&root, &scan_file);
+    fs::set_permissions(&vault, fs::Permissions::from_mode(0o755)).unwrap();
+    if readable_anyway {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must not run this test as a user who can read a mode-000 folder"
+        );
+        eprintln!("running as a user who reads mode-000 folders: test not meaningful here");
+        return;
+    }
+
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let now = far_future();
+
+    // Default: the clone was not seen (it cannot be), so A is still offered, but every reason
+    // that could be affected says what was not read.
+    let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
+    assert_process_check_usable(&pv);
+    let it = item_of(&pv, &a);
+    let reason = it["reason"].as_str().unwrap();
+    assert_eq!(it["action"], "archive", "{reason}");
+    assert!(
+        reason.contains(
+            "1 folder in this scan could not be read; dependents inside it were not checked"
+        ),
+        "the archive reason must carry the coverage sentence: {reason}"
+    );
+    assert_eq!(pv["coverage_complete"], false);
+    assert_eq!(pv["required_full_coverage"], false);
+    let note = pv["coverage_note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("1 folder could not be read") && note.contains("links or clones inside"),
+        "{note}"
+    );
+
+    // The scan file records where coverage stopped.
+    let cov = &sv["coverage"];
+    assert_eq!(cov["complete"], false, "{cov}");
+    assert_eq!(cov["unreadable_dirs"], 1, "{cov}");
+    assert_eq!(cov["mount_points_skipped"], 0, "{cov}");
+    let examples: Vec<&str> = cov["unreadable_dir_examples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
+    assert_eq!(examples, vec![&*vault.to_string_lossy()]);
+
+    // The human plan says it in the header.
+    let mut c = bin();
+    c.args(["plan", "--scan", scan_file.to_str().unwrap(), "--now", &now]);
+    isolate(&mut c, &home);
+    let text = stdout(&run(&mut c));
+    assert!(text.contains("1 folder could not be read"), "{text}");
+
+    // Strict, by flag: incomplete coverage makes A's dependents unknown, so it asks.
+    let pv = plan_value(&plan_json(
+        &scan_file,
+        &home,
+        &["--now", &now, "--require-full-coverage"],
+    ));
+    let it = item_of(&pv, &a);
+    let reason = it["reason"].as_str().unwrap();
+    assert_eq!(it["action"], "ask", "{reason}");
+    assert_eq!(it["reclaimable_bytes"], 0);
+    assert_eq!(it["facts"]["no_dependents"], "unknown");
+    assert!(reason.contains("full coverage"), "{reason}");
+    assert_eq!(pv["required_full_coverage"], true);
+
+    // Strict, by config.
+    let cfg = tmp.path().join("strict.toml");
+    fs::write(&cfg, "require_full_coverage = true\n").unwrap();
+    let pv = plan_value(&plan_json(
+        &scan_file,
+        &home,
+        &["--now", &now, "--config", cfg.to_str().unwrap()],
+    ));
+    assert_eq!(item_of(&pv, &a)["action"], "ask");
+    assert_eq!(pv["required_full_coverage"], true);
+
+    let mut c = bin();
+    c.args([
+        "plan",
+        "--scan",
+        scan_file.to_str().unwrap(),
+        "--now",
+        &now,
+        "--require-full-coverage",
+    ]);
+    isolate(&mut c, &home);
+    let text = stdout(&run(&mut c));
+    assert!(
+        text.contains("Full coverage was required"),
+        "the header must say the user asked for it: {text}"
+    );
+}
+
+#[test]
+fn r1_a_fully_readable_scan_is_complete_and_adds_no_coverage_sentence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("scan");
+    let a = root.join("a");
+    archivable_repo(&a);
+    let scan_file = tmp.path().join("scan.json");
+    let sv = scan_to_file(&root, &scan_file);
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let now = far_future();
+
+    let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
+    assert_process_check_usable(&pv);
+    let it = item_of(&pv, &a);
+    let reason = it["reason"].as_str().unwrap();
+    assert_eq!(it["action"], "archive", "{reason}");
+    assert_eq!(pv["coverage_complete"], true);
+    assert!(pv["coverage_note"].is_null(), "{}", pv["coverage_note"]);
+    assert!(
+        !reason.contains("could not be read") && !reason.contains("not entered"),
+        "{reason}"
+    );
+    let cov = &sv["coverage"];
+    assert_eq!(cov["complete"], true, "{cov}");
+    assert_eq!(cov["unreadable_dirs"], 0, "{cov}");
+
+    // Strict mode changes nothing when coverage is complete.
+    let pv = plan_value(&plan_json(
+        &scan_file,
+        &home,
+        &["--now", &now, "--require-full-coverage"],
+    ));
+    assert_eq!(item_of(&pv, &a)["action"], "archive");
+    assert_eq!(pv["required_full_coverage"], true);
 }
