@@ -82,6 +82,29 @@ fn alive(list: &[u32]) -> Vec<u32> {
         .collect()
 }
 
+/// Who is still running, for a failure message: role, name, status, parent and session.
+fn describe(list: &[u32], worker: u32) -> String {
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    alive(list)
+        .iter()
+        .map(|p| {
+            let role = if *p == worker { "worker" } else { "fake git" };
+            match sys.process(Pid::from_u32(*p)) {
+                Some(x) => format!(
+                    "{p} ({role}, {:?}, {:?}, parent {:?}, session {:?})",
+                    x.name(),
+                    x.status(),
+                    x.parent(),
+                    x.session_id()
+                ),
+                None => format!("{p} ({role}, gone)"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn wait_for(cond: impl Fn() -> bool, limit: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < limit {
@@ -163,8 +186,8 @@ fn the_worker_and_every_git_it_started_end() {
                 || alive(&gits).is_empty() && alive(&[worker]).is_empty(),
                 Duration::from_secs(5)
             ),
-            "still running after cancel: {:?}",
-            alive(&[&gits[..], &[worker]].concat())
+            "still running after cancel: {}",
+            describe(&[&gits[..], &[worker]].concat(), worker)
         );
         drop(w.stdin.take());
     }
@@ -182,8 +205,8 @@ fn the_worker_and_every_git_it_started_end() {
                     || alive(&gits).is_empty() && alive(&[worker]).is_empty(),
                     Duration::from_secs(5)
                 ),
-                "still running after stdin closed: {:?}",
-                alive(&[&gits[..], &[worker]].concat())
+                "still running after stdin closed: {}",
+                describe(&[&gits[..], &[worker]].concat(), worker)
             );
             w.handle.wait();
         }
@@ -196,8 +219,8 @@ fn the_worker_and_every_git_it_started_end() {
                     || alive(&gits).is_empty() && alive(&[worker]).is_empty(),
                     Duration::from_secs(5)
                 ),
-                "still running after the job handle closed: {:?}",
-                alive(&[&gits[..], &[worker]].concat())
+                "still running after the job handle closed: {}",
+                describe(&[&gits[..], &[worker]].concat(), worker)
             );
         }
     }

@@ -210,6 +210,10 @@ jobs:
         run: |
           cargo build --locked --example fake_git
           cargo test --locked --no-fail-fast -- --nocapture
+      - name: Containment test repeated (10 runs, no failure allowed)
+        if: ${{ !cancelled() }}
+        working-directory: apps/desktop/src-tauri
+        run: ../../../scripts/repeat-containment.sh 10
 
   containment:
     name: worker containment (${{ matrix.os }})
@@ -244,6 +248,11 @@ jobs:
         run: |
           cargo build --locked --example fake_git
           cargo test --locked --no-fail-fast -- --nocapture
+      - name: Containment test repeated (10 runs, no failure allowed)
+        if: ${{ !cancelled() }}
+        working-directory: apps/desktop/src-tauri
+        shell: bash
+        run: ../../../scripts/repeat-containment.sh 10
 
   bundles:
     name: bundle (${{ matrix.name }})

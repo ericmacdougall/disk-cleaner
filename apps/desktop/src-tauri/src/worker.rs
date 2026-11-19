@@ -214,9 +214,11 @@ pub fn spawn_worker(exe: &Path, args: &WorkerArgs) -> std::io::Result<WorkerProc
     #[cfg(windows)]
     let mut child: ChildProc = {
         use command_group::CommandGroup;
-        // Started in a new job object with kill-on-close; an error here means the worker
-        // could not be contained, and no worker is left running.
-        cmd.group_spawn().map_err(|e| {
+        // Started suspended in a new job object with kill-on-close (command-group's
+        // `group_spawn` leaves JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE off unless kill_on_drop is
+        // set, so closing the handle would end nothing: CI run 44625966165). An error here
+        // means the worker could not be contained, and no worker is left running.
+        cmd.group().kill_on_drop(true).spawn().map_err(|e| {
             std::io::Error::other(format!("cannot contain the analysis process: {e}"))
         })?
     };
