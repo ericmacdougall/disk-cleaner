@@ -1185,8 +1185,7 @@ pub fn collect_repo_info(
                 facts.no_dependents = Tri::No;
                 notes.push(
                     "no_dependents: this repository sets extensions.preciousObjects, which \
-                     declares that other repositories borrow its objects"
-                        .to_string(),
+                     declares that other repositories borrow its objects",
                 );
             }
             Ok(_) => {}

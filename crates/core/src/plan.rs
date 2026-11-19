@@ -750,14 +750,18 @@ fn coverage_reason(c: &Coverage, complete: bool) -> Option<String> {
                 .to_string(),
         );
     }
-    let mut text = String::new();
-    for (k, (noun, verb)) in parts.iter().enumerate() {
-        if k == 0 {
-            text.push_str(&format!("{noun} in this scan {verb}"));
-        } else {
-            text.push_str(&format!(" and {noun} {verb}"));
-        }
-    }
+    let text = parts
+        .iter()
+        .enumerate()
+        .map(|(k, (noun, verb))| {
+            if k == 0 {
+                format!("{noun} in this scan {verb}")
+            } else {
+                format!("{noun} {verb}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" and ");
     Some(format!(
         "; {text}; dependents inside {} were not checked",
         it_or_them(total)
