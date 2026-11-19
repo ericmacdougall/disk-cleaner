@@ -287,6 +287,11 @@ fn repo_node(path: &str, facts: Facts) -> Node {
             bytes: 49_152,
             ..Default::default()
         }),
+        object_store: Some(disk_cleaner_core::ObjectStoreSurvey {
+            files: 3,
+            bytes: 12_288,
+            verified: false,
+        }),
         ..RepoInfo::default()
     });
     n

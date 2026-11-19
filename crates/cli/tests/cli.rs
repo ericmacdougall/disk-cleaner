@@ -109,7 +109,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
     let json = fs::read_to_string(&out_file).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["schema_version"], 11);
+    assert_eq!(v["schema_version"], 12);
 
     let o = run(bin()
         .args([
@@ -1372,7 +1372,7 @@ fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
     let now = far_future();
 
     let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
-    assert_eq!(pv["schema_version"], 11);
+    assert_eq!(pv["schema_version"], 12);
     let it = item_of(&pv, &a);
     assert_eq!(it["action"], "backup-then-remove", "{it}");
     let pre = &it["preserve"]["git_admin"];
@@ -1390,4 +1390,63 @@ fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
     assert!(text.contains("backup-then-remove"), "{text}");
     assert!(text.contains("back up first:"), "{text}");
     assert!(text.contains(&gd), "{text}");
+}
+
+/// Round Z: the object store is its own obligation, unverified unless `scan --verify-objects`
+/// (or the config setting `verify_objects = true`) had git verify it; the human plan says what
+/// "the manifest" is once, in its header.
+#[test]
+fn z1_the_object_store_is_verified_only_on_request_and_the_manifest_is_defined() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("scan");
+    let a = root.join("a");
+    archivable_repo(&a);
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let now = far_future();
+
+    let scan_as = |name: &str, extra: &[&str]| -> PathBuf {
+        let out = tmp.path().join(name);
+        let mut c = bin();
+        c.args(["scan", root.to_str().unwrap(), "--out", out.to_str().unwrap()])
+            .args(extra);
+        isolate(&mut c, &home);
+        let o = run(&mut c);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        out
+    };
+    let store_of = |scan_file: &Path| -> serde_json::Value {
+        let pv = plan_value(&plan_json(scan_file, &home, &["--now", &now]));
+        let it = item_of(&pv, &a);
+        assert_eq!(it["action"], "backup-then-remove", "{it}");
+        it["preserve"]["object_store"].clone()
+    };
+
+    let plain = store_of(&scan_as("plain.json", &[]));
+    assert!(plain["files"].as_u64().unwrap_or(0) > 0, "{plain}");
+    assert_eq!(plain["verified"], false, "{plain}");
+
+    let flagged = store_of(&scan_as("flag.json", &["--verify-objects"]));
+    assert_eq!(flagged["verified"], true, "{flagged}");
+
+    let cfg = tmp.path().join("verify.toml");
+    write(&cfg, "verify_objects = true\n");
+    let configured = store_of(&scan_as(
+        "config.json",
+        &["--config", cfg.to_str().unwrap()],
+    ));
+    assert_eq!(configured["verified"], true, "{configured}");
+
+    let scan_file = tmp.path().join("plain.json");
+    let mut c = bin();
+    c.args(["plan", "--scan", scan_file.to_str().unwrap(), "--now", &now])
+        .arg("--trust-partial-process-check");
+    isolate(&mut c, &home);
+    let text = stdout(&run(&mut c));
+    assert!(
+        text.contains("the manifest is the restore record a later apply step writes"),
+        "{text}"
+    );
+    assert!(text.contains("object store"), "{text}");
+    assert!(text.contains("not yet verified"), "{text}");
 }

@@ -5,9 +5,10 @@
 //! `git_admin_files` lists, and a git directory holding more than `max_git_admin_bytes` of them
 //! asks. Y2: the four findings (a recorded rerere resolution after an aborted merge, an edited or
 //! invented `.sample` hook, a draft in `COMMIT_EDITMSG`, a file under `logs/refs/`) are covered
-//! by that backup, and so is any file dropped anywhere in the git directory. Y4: object files,
-//! the one thing the backup leaves out, are checked by content: a file named like an object that
-//! is not one asks.
+//! by that backup, and so is any file dropped anywhere in the git directory. Y4 (as amended by
+//! round Z): a file named like an object file is never exempt: it is under the object-store
+//! obligation (verify against the remote or back up), and `--verify-objects` makes a damaged or
+//! unaccounted one ask.
 //!
 //! Every fixture uses real git.
 
@@ -15,7 +16,8 @@ mod common;
 
 use common::*;
 use disk_cleaner_core::{
-    git_admin_files, plan, Action, Facts, Plan, PlanItem, PlanOptions, ScanResult, Tri,
+    git_admin_files, object_store_files, plan, Action, Facts, Plan, PlanItem, PlanOptions,
+    ScanResult, Tri,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -98,12 +100,18 @@ fn assert_backed_up(res: &ScanResult, repo: &Path, rel: &str) {
     let p = plan_of(res);
     let it = item(&p, repo);
     assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
-    assert_preserves(it, repo, &files);
+    assert_preserves(res, it, repo, &files);
 }
 
-/// A removing item for `repo` carries the preserve obligation for its git directory, counting
-/// exactly `files`, and says so in its reason.
-fn assert_preserves(it: &PlanItem, repo: &Path, files: &[String]) {
+/// What `object_store_files` lists for the scanned node at `repo`.
+fn store_files(res: &ScanResult, repo: &Path) -> Vec<String> {
+    object_store_files(node(res, repo)).expect("the object store's files can be listed")
+}
+
+/// A removing item for `repo` carries both obligations for its git directory, counting exactly
+/// `files` (its own files) and the object store's files, unverified (the scans here are default
+/// scans), and says so in its reason.
+fn assert_preserves(res: &ScanResult, it: &PlanItem, repo: &Path, files: &[String]) {
     let pre = it
         .preserve
         .as_ref()
@@ -116,12 +124,17 @@ fn assert_preserves(it: &PlanItem, repo: &Path, files: &[String]) {
     );
     assert_eq!(pre.git_admin.files, files.len() as u64, "{files:?}");
     assert!(pre.git_admin.files > 0 && pre.git_admin.bytes > 0);
-    assert!(
-        it.reason
-            .contains("saved with the manifest first, then it is removed"),
-        "{}",
-        it.reason
-    );
+    let store = store_files(res, repo);
+    assert_eq!(pre.object_store.files, store.len() as u64, "{store:?}");
+    assert!(!pre.object_store.verified, "{}", it.reason);
+    for want in [
+        "are saved with the manifest first",
+        "its object store (",
+        "not yet verified",
+        "then it is removed",
+    ] {
+        assert!(it.reason.contains(want), "{want:?} not in {}", it.reason);
+    }
 }
 
 /// Every path inside the git directory, sorted, `/`-separated (for failure messages).
@@ -187,10 +200,17 @@ fn y1_a_clean_pushed_clone_is_backed_up_then_removed() {
             .any(|f| f.starts_with("objects/") && f.len() == 49),
         "loose objects are not the git directory's own files: {files:?}"
     );
+    let store = store_files(&res, &repo);
+    assert!(
+        store
+            .iter()
+            .any(|f| f.starts_with("objects/pack/pack-") && f.ends_with(".pack")),
+        "a clone's pack is in its object store: {store:?}"
+    );
     let p = plan_of(&res);
     let it = item(&p, &repo);
     assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
-    assert_preserves(it, &repo, &files);
+    assert_preserves(&res, it, &repo, &files);
     // Recovered or not, only regenerable directories are ready without a verification step.
     assert_eq!(p.totals.ready_bytes, 0);
 }
@@ -352,7 +372,7 @@ fn y2_a_hidden_file_under_logs_refs_is_backed_up() {
         Action::Ask => assert_eq!(it.reclaimable_bytes, 0),
         _ => {
             assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
-            assert_preserves(it, &repo, &files);
+            assert_preserves(&res, it, &repo, &files);
         }
     }
 }
@@ -370,6 +390,13 @@ impl Rng {
         x ^= x << 17;
         self.0 = x;
         x
+    }
+
+    fn hex(&mut self, n: usize) -> String {
+        const HEX: &[u8] = b"0123456789abcdef";
+        (0..n)
+            .map(|_| HEX[(self.step() as usize) % HEX.len()] as char)
+            .collect()
     }
 
     fn word(&mut self, min: usize, max: usize) -> String {
@@ -428,6 +455,10 @@ fn y2_any_file_dropped_in_the_git_directory_is_asked_about_or_backed_up() {
                         content = format!("{head}\n");
                     }
                     l if l == rr_loc => name = format!("postimage.{}", rng.step() % 10),
+                    // Names of object-store files: never exempt, whatever they hold.
+                    "objects/ab" => name = rng.hex(38),
+                    "objects/pack" => name = format!("pack-{}.pack", rng.hex(40)),
+                    "objects/info" => name = "commit-graph".to_string(),
                     _ => {}
                 }
             }
@@ -453,9 +484,15 @@ fn y2_any_file_dropped_in_the_git_directory_is_asked_about_or_backed_up() {
             let path = gd.join(&rel);
             write(&path, &content);
 
+            // Default scan: asked about, or in exactly one of the two obligations (the object
+            // store unverified).
             let res = scan_with(&root, network_everywhere());
             let files = admin_files(&res, &repo);
-            assert!(files.contains(&rel), "{rel} not in {files:?}");
+            let store = store_files(&res, &repo);
+            assert!(
+                files.contains(&rel) != store.contains(&rel),
+                "{rel} must be in exactly one class: {files:?} {store:?}"
+            );
             let p = plan_of(&res);
             let it = item(&p, &repo);
             match it.action {
@@ -464,12 +501,29 @@ fn y2_any_file_dropped_in_the_git_directory_is_asked_about_or_backed_up() {
                     asked += 1;
                 }
                 Action::BackupThenRemove | Action::RecoverBackupThenRemove => {
-                    assert_preserves(it, &repo, &files);
+                    assert_preserves(&res, it, &repo, &files);
                     removed += 1;
                 }
                 other => panic!("{rel}: unexpected {other:?}: {}", it.reason),
             }
-            cases.push(format!("{rel} -> {}", it.action.as_str()));
+            // With --verify-objects: asked about, or among the files always backed up.
+            let res_v = scan_with(&root, network_everywhere().with_verify_objects(true));
+            let p_v = plan_of(&res_v);
+            let it_v = item(&p_v, &repo);
+            if it_v.action == Action::Ask {
+                assert_eq!(it_v.reclaimable_bytes, 0, "{rel}");
+            } else {
+                assert!(it_v.action.removes(), "{rel}: {:?}", it_v.action);
+                let files_v = admin_files(&res_v, &repo);
+                assert!(files_v.contains(&rel), "{rel} verified away: {}", it_v.reason);
+                let pre = it_v.preserve.as_ref().expect("preserve");
+                assert_eq!(pre.git_admin.files, files_v.len() as u64);
+            }
+            cases.push(format!(
+                "{rel} -> {} / verified: {}",
+                it.action.as_str(),
+                it_v.action.as_str()
+            ));
 
             match created {
                 Some(d) => fs::remove_dir_all(&d).unwrap(),
@@ -508,21 +562,36 @@ fn is_pack_object(f: &str) -> bool {
     f.starts_with("objects/pack/pack-") && matches!(ext, "pack" | "idx" | "rev" | "bitmap")
 }
 
-/// The plan asks, names `rel`, reclaims nothing, and the fact says the git directory holds
-/// content of its own; `rel` is also among the files a backup would save.
-fn assert_not_an_object(res: &ScanResult, repo: &Path, rel: &str) {
-    let p = plan_of(res);
+/// A file named like an object file is never exempt. A default scan counts it under the
+/// object-store obligation (unverified) or the repository asks; `--verify-objects` finds it
+/// damaged or unaccounted and the repository asks, naming it when `named`.
+fn assert_never_exempt(root: &Path, repo: &Path, rel: &str, named: bool) {
+    let res = scan_with(root, network_everywhere());
+    let store = store_files(&res, repo);
+    assert!(store.iter().any(|f| f == rel), "{rel} not in {store:?}");
+    assert!(!admin_files(&res, repo).iter().any(|f| f == rel));
+    let p = plan_of(&res);
+    let it = item(&p, repo);
+    if it.action == Action::Ask {
+        assert_eq!(it.reclaimable_bytes, 0);
+    } else {
+        assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
+        assert_preserves(&res, it, repo, &admin_files(&res, repo));
+    }
+
+    let res = scan_with(root, network_everywhere().with_verify_objects(true));
+    let p = plan_of(&res);
     let it = item(&p, repo);
     assert_eq!(it.action, Action::Ask, "{}\n{}", it.reason, listing(repo));
     assert_eq!(it.reclaimable_bytes, 0);
-    assert!(it.reason.contains(rel), "{}", it.reason);
-    assert_eq!(fact(res, repo, "no_local_admin_content"), "no");
-    let files = admin_files(res, repo);
-    assert!(files.iter().any(|f| f == rel), "{rel} not in {files:?}");
+    if named {
+        assert!(it.reason.contains(rel), "{}", it.reason);
+        assert_eq!(fact(&res, repo, "no_local_admin_content"), "no");
+    }
 }
 
 #[test]
-fn y4_a_text_file_named_like_a_loose_object_asks() {
+fn y4_a_text_file_named_like_a_loose_object_is_never_exempt() {
     let (tmp, root, remotes) = workspace();
     let repo = clone_of(tmp.path(), &root, &remotes, "app");
     let name = "cdef0123456789abcdef0123456789abcdef01";
@@ -530,12 +599,11 @@ fn y4_a_text_file_named_like_a_loose_object_asks() {
         &repo.join(".git").join("objects").join("ab").join(name),
         "not a zlib stream, just my notes\n",
     );
-    let res = scan_with(&root, network_everywhere());
-    assert_not_an_object(&res, &repo, &format!("objects/ab/{name}"));
+    assert_never_exempt(&root, &repo, &format!("objects/ab/{name}"), false);
 }
 
 #[test]
-fn y4_a_pack_holding_text_asks() {
+fn y4_a_pack_holding_text_is_never_exempt() {
     let (tmp, root, remotes) = workspace();
     let repo = clone_of(tmp.path(), &root, &remotes, "app");
     let (_, idx) = only_pack(&repo);
@@ -544,20 +612,18 @@ fn y4_a_pack_holding_text_asks() {
     let dir = repo.join(".git").join("objects").join("pack");
     fs::copy(&idx, dir.join(format!("{fake}.idx"))).unwrap();
     write(&dir.join(format!("{fake}.pack")), "not a pack\n");
-    let res = scan_with(&root, network_everywhere());
-    assert_not_an_object(&res, &repo, &format!("objects/pack/{fake}.pack"));
+    assert_never_exempt(&root, &repo, &format!("objects/pack/{fake}.pack"), false);
 }
 
 #[test]
-fn y4_an_index_without_its_pack_asks() {
+fn y4_an_index_without_its_pack_is_never_exempt() {
     let (tmp, root, remotes) = workspace();
     let repo = clone_of(tmp.path(), &root, &remotes, "app");
     let (_, idx) = only_pack(&repo);
     let fake = "pack-2222222222222222222222222222222222222222";
     let dir = repo.join(".git").join("objects").join("pack");
     fs::copy(&idx, dir.join(format!("{fake}.idx"))).unwrap();
-    let res = scan_with(&root, network_everywhere());
-    assert_not_an_object(&res, &repo, &format!("objects/pack/{fake}.idx"));
+    assert_never_exempt(&root, &repo, &format!("objects/pack/{fake}.idx"), true);
 }
 
 #[test]
@@ -579,7 +645,7 @@ fn y4_control_gc_and_repack_keep_backup_then_remove_and_leave_objects_out() {
             listing(repo)
         );
         let files = admin_files(&res, repo);
-        assert_preserves(it, repo, &files);
+        assert_preserves(&res, it, repo, &files);
         for f in &files {
             assert!(!is_pack_object(f), "listed as the git directory's own: {f}");
         }
@@ -614,7 +680,7 @@ fn y4_control_loose_objects_at_every_compression_level_are_objects() {
         listing(&repo)
     );
     let files = admin_files(&res, &repo);
-    assert_preserves(it, &repo, &files);
+    assert_preserves(&res, it, &repo, &files);
     let loose = files
         .iter()
         .filter(|f| f.starts_with("objects/") && f.len() == "objects/ab/".len() + 38)
