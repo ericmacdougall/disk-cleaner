@@ -611,7 +611,7 @@ fn r16_guard_a_bare_repository_with_symlinked_packs_holds_its_provider() {
 }
 
 /// In a separately walked root: a git directory whose `objects` is a symlink into `a`, and a
-/// checkout whose `.git` file names a git directory whose `commondir` is `a` (guards).
+/// checkout whose `.git` file names `a`'s git directory (guards).
 #[test]
 fn r16_guard_symlink_and_dot_git_file_borrowers_in_a_separately_walked_root() {
     for kind in ["symlink", "dot-git-file"] {
@@ -626,11 +626,11 @@ fn r16_guard_symlink_and_dot_git_file_borrowers_in_a_separately_walked_root() {
             fs::remove_dir_all(&objs).unwrap();
             symlink(a.join(".git").join("objects"), &objs).unwrap();
         } else {
-            let g = sub.join("g");
-            commondir_borrower(&g, "../../a/.git", &a, false);
+            // Named straight at `a`'s git directory, so only the `.git` file refers to `a`.
+            let gd = a.join(".git");
             write(
                 &sub.join("w").join(".git"),
-                &format!("gitdir: {}\n", g.to_str().unwrap()),
+                &format!("gitdir: {}\n", gd.to_str().unwrap()),
             );
         }
         let res = scan_roots(vec![root.clone(), sub]);
@@ -671,6 +671,77 @@ fn r16_dot_git_files_that_are_no_checkout_are_followed_or_unresolved() {
     }
 }
 
+// Git accepts a `HEAD` that is a symbolic link into `refs/`, so a git directory is not
+// recognised by a regular-file `HEAD` alone.
+
+/// Make `dir` a git directory holding only a `HEAD` symlink (`refs/heads/main`) and a `commondir`
+/// file holding `rel`, then show that git reads `a`'s history through it.
+fn symlinked_head_borrower(dir: &Path, rel: &str, a: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    symlink("refs/heads/main", dir.join("HEAD")).unwrap();
+    write(&dir.join("commondir"), &format!("{rel}\n"));
+    assert_reads_history(dir, a);
+}
+
+/// A git directory beside `a` whose `HEAD` is a symlink and whose `commondir` names `a`.
+#[test]
+fn r16b_a_git_directory_with_a_symlinked_head_whose_commondir_is_another_repo_holds_it() {
+    let (_tmp, root, remotes) = workspace();
+    let a = pushed_repo(&root, &remotes, "a");
+    symlinked_head_borrower(&root.join("m"), "../a/.git", &a);
+    let res = scan_with(&root, network_everywhere());
+    assert_held(&res, &a);
+}
+
+/// A `.git` directory inside an artifact whose `HEAD` is a symlink and whose `commondir` names
+/// `a` (the round 15 build checked every `.git` inside an artifact, whatever its `HEAD`).
+#[test]
+fn r16b_a_dot_git_inside_an_artifact_with_a_symlinked_head_holds_its_provider() {
+    let (_tmp, root, remotes) = workspace();
+    let a = pushed_repo(&root, &remotes, "a");
+    let js = root.join("js");
+    write(&js.join("package.json"), "{}\n");
+    let gd = js.join("node_modules").join("x").join(".git");
+    symlinked_head_borrower(&gd, "../../../../a/.git", &a);
+    let res = scan_with(&root, network_everywhere());
+    assert_held(&res, &a);
+    assert!(not_removing(action_for(&res, &js.join("node_modules"))));
+}
+
+/// A scanned checkout made with `git init --separate-git-dir` whose git directory (its own
+/// objects and refs, its only copy of its history) lies inside `a`'s git directory: removing `a`
+/// removes that history.
+#[test]
+fn r16b_a_checkout_whose_git_directory_lies_inside_another_repos_git_directory_holds_it() {
+    let (_tmp, root, remotes) = workspace();
+    let a = pushed_repo(&root, &remotes, "a");
+    let w = root.join("w");
+    let sep = a.join(".git").join("sub");
+    git(
+        &root,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            sep.to_str().unwrap(),
+            w.to_str().unwrap(),
+        ],
+    );
+    git(&w, &["config", "commit.gpgsign", "false"]);
+    commit_file(&w, "w.txt", "only here\n");
+    assert!(w.join(".git").is_file(), "w must use a .git file");
+    let head = git(&w, &["rev-parse", "HEAD"]);
+    git(
+        &a,
+        &["--git-dir", sep.to_str().unwrap(), "cat-file", "-e", &head],
+    );
+    let res = scan_with(&root, network_everywhere());
+    assert!(has_node(&res, &w), "w is a scanned checkout");
+    assert_held(&res, &a);
+}
+
 // ---------------------------------------------------------------- round 16: controls
 
 #[test]
@@ -694,4 +765,32 @@ fn r16_control_a_alone_and_beside_an_unrelated_bare_repository_is_backed_up_then
             "{with_bare}"
         );
     }
+}
+
+/// A submodule checkout inside its parent: its git directory lies in the parent's
+/// `.git/modules`, but the checkout goes with the parent, so the parent keeps no dependent.
+#[test]
+fn r16b_control_a_submodule_checkout_inside_its_parent_is_no_dependent() {
+    let (tmp, root, remotes) = workspace();
+    let srcs = tmp.path().join("srcs");
+    fs::create_dir_all(&srcs).unwrap();
+    let subsrc = pushed_repo(&srcs, &remotes, "subsrc");
+    let outer = pushed_repo(&root, &remotes, "outer");
+    git(
+        &outer,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            subsrc.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    git(&outer, &["commit", "-q", "-m", "add submodule"]);
+    git(&outer, &["push", "-q", "origin", "main"]);
+    assert!(outer.join("sub").join(".git").is_file());
+    let res = scan_with(&root, network_everywhere());
+    assert_eq!(facts_of(&res, &outer).no_dependents, Tri::Yes);
 }
