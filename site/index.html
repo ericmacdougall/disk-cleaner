@@ -353,11 +353,11 @@ pre code { background: none; padding: 0; font: inherit; }
         <li>There are no ignored files that exist only here, such as <code>.env</code> or a local database.</li>
         <li>No other clone or worktree depends on this one.</li>
         <li>Every commit the reflogs still remember, such as one left behind by a reset or a rebase, is on a remote.</li>
-        <li>No rebase, merge, cherry-pick or bisect is half finished.</li>
+        <li>No rebase, merge, cherry-pick, revert or bisect is half finished, and the git directory holds no Git LFS or git-annex objects, which may exist only here.</li>
         <li>The repository has a plain layout, with nothing unusual in its git directory.</li>
         <li>The git directory holds nothing of its own, such as a custom hook or a setting only this copy has.</li>
       </ul>
-      <p>For an idle repo the plan proposes <code>backup-then-remove</code> when all eleven are yes: back up its git directory, then remove it. When some facts are no and none is unknown, it proposes <code>recover-backup-then-remove</code>: recover the missing work first, then back up and remove. When any fact is unknown, or the repo has dependents, an unusual layout, files of its own in its git directory, or files git is told to hide edits to (skip-worktree or assume-unchanged), it asks you (<code>ask</code>), even when every fact is yes. It always says why. Remote facts come from local remote-tracking refs, which can be stale, so the plan marks them unverified. Re-checking them against the live remote at the moment of removal is planned for the step that applies a plan.</p>
+      <p>For an idle repo the plan proposes <code>backup-then-remove</code> when all eleven are yes: back up its git directory, then remove it. When some facts are no and none is unknown, it proposes <code>recover-backup-then-remove</code>: recover the missing work first, then back up and remove. When any fact is unknown, or the repo has dependents, an unusual layout or files of its own in its git directory, it asks you (<code>ask</code>). It also asks when git is told to hide edits to some files (skip-worktree or assume-unchanged), even if every fact is yes. It always says why. Remote facts come from local remote-tracking refs, which can be stale, so the plan marks them unverified. Re-checking them against the live remote at the moment of removal is planned for the step that applies a plan.</p>
 
       <div class="grid two">
         <div class="card"><h3>Plan, then apply</h3><p>Scanning and planning are read-only. Today the plan is printed, as a summary or as JSON with <code>--json</code>, which you can save and read. In the design a plan is a file you edit and approve, and apply, when it exists, will do exactly that plan.</p></div>
@@ -389,7 +389,7 @@ pre code { background: none; padding: 0; font: inherit; }
   <section id="example" aria-labelledby="h-example">
     <div class="wrap">
       <h2 id="h-example">What the scanner prints</h2>
-      <p>The shape below follows the summary the command-line scanner prints and the format in the project's scan documentation. The paths and sizes are invented for this page, and long lines are shortened. It is not output from a real machine. In it, example-app was changed two days ago, so it is active and kept with its <code>node_modules</code>, while the folders of example-service and the example-notes repo have been idle for weeks.</p>
+      <p>The shape below follows the summary the command-line scanner prints and the format in the project's scan documentation. The paths and sizes are invented for this page. Some sections are left out, such as the list of biggest files, long lines are shortened, and the facts the tool prints on one line are wrapped here. It is not output from a real machine. In it, example-app-fix is a linked worktree of example-app, so example-app has a dependent. example-app was changed two days ago, so it is active and kept with its <code>node_modules</code>, while the folders of example-service and the example-notes repo have been idle for weeks.</p>
 <pre tabindex="0" role="region" aria-label="Example scanner output"><code>$ disk-cleaner scan ~/projects --out scan.json
 Scanned ~/projects
 18402 files, 1311 directories, 4.3 GiB allocated (4.1 GiB logical)
@@ -405,7 +405,7 @@ Space by class (innermost classified ancestor):
 Repos and worktrees (3):
   [repo] ~/projects/example-app  2.4 GiB
       has_network_remote=yes head_on_remote=yes all_branches_on_remote=yes
-      stash_empty=yes tree_clean=yes no_unique_ignored=yes no_dependents=yes
+      stash_empty=yes tree_clean=yes no_unique_ignored=yes no_dependents=NO
       reflog_saved=yes no_pending_state=yes plain_layout=yes
       no_local_admin_content=yes
       .git 310.2 MiB, regenerable 1.9 GiB, outputs 0 B

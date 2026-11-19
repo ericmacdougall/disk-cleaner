@@ -1,7 +1,7 @@
 name: Site tests
 
-# The tests also read the root README, ci.yml and the core's model and plan sources to check the page's
-# claims against them, so a change to any of those runs them too.
+# The tests also read the root README, ci.yml, the core's model, plan and facts sources and the CLI's
+# report to check the page's claims against them, so a change to any of those runs them too.
 on:
   push:
     paths:
@@ -12,6 +12,8 @@ on:
       - ".github/workflows/ci.yml"
       - "crates/core/src/model.rs"
       - "crates/core/src/plan.rs"
+      - "crates/core/src/facts.rs"
+      - "crates/cli/src/report.rs"
   pull_request:
     paths:
       - "site/**"
@@ -21,6 +23,8 @@ on:
       - ".github/workflows/ci.yml"
       - "crates/core/src/model.rs"
       - "crates/core/src/plan.rs"
+      - "crates/core/src/facts.rs"
+      - "crates/cli/src/report.rs"
 
 permissions:
   contents: read
