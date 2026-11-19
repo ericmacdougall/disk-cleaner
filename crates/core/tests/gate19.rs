@@ -16,7 +16,8 @@ mod common;
 
 use common::*;
 use disk_cleaner_core::{
-    plan, scan, Action, FactsConfig, Plan, PlanItem, PlanOptions, ScanOptions, ScanResult,
+    plan, scan, scan_from_json, Action, FactsConfig, Plan, PlanItem, PlanOptions, ScanOptions,
+    ScanResult,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -235,6 +236,85 @@ fn r15b_the_threshold_applies_only_inside_a_package_directory() {
     assert_asks_naming(&res, &nm, &in_pkg);
 }
 
+/// A small output whose path has a build-directory name in it (`bin`, `build`, `deps`, or a
+/// scan root below a directory named `build`) was kept by the walk on a different path that
+/// listed it only inside a build directory or at an artifact's top: it went unlisted.
+#[test]
+fn r15b_a_small_output_below_a_build_named_directory_inside_an_artifact_asks() {
+    let (_tmp, root, _) = workspace();
+    let mut cases: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+    let py = project(&root, "py", "requirements.txt");
+    let venv = py.join(".venv");
+    stock_venv(&venv);
+    let in_bin = venv.join("bin").join("model.pt");
+    write_bytes(&in_bin, SMALL);
+    cases.push((venv.clone(), in_bin));
+
+    let py2 = project(&root, "py2", "requirements.txt");
+    let venv2 = py2.join(".venv");
+    stock_venv(&venv2);
+    let in_deps = venv2.join("data").join("deps").join("model.pt");
+    write_bytes(&in_deps, NEAR);
+    cases.push((venv2, in_deps));
+
+    let js = project(&root, "js", "package.json");
+    let nm = js.join("node_modules");
+    stock_node_modules(&nm);
+    let in_build = nm.join(".stuff").join("build").join("clip.mp4");
+    write_bytes(&in_build, SMALL);
+    cases.push((nm, in_build));
+
+    // Everything below a plain directory named `build` (not itself an artifact: nothing beside
+    // it marks a project).
+    let under = root.join("build");
+    let py3 = project(&under, "py3", "requirements.txt");
+    let venv3 = py3.join(".venv");
+    stock_venv(&venv3);
+    let loose = venv3.join("data").join("model.pt");
+    write_bytes(&loose, SMALL);
+    cases.push((venv3, loose));
+
+    let res = scan_at(&root);
+    for (artifact, file) in &cases {
+        assert_asks_naming(&res, artifact, file);
+    }
+}
+
+/// A `.pth` file straight in `site-packages` is a Python path file, but `.pth` is also a
+/// model-weight extension and nothing there is package evidence: the environment asks. This pins
+/// the documented over-ask, so a change to it is deliberate (a guard, not a failing-first case).
+#[test]
+fn r15b_known_over_ask_a_pth_file_straight_in_site_packages() {
+    let (_tmp, root, _) = workspace();
+    let py = project(&root, "py", "requirements.txt");
+    let venv = py.join(".venv");
+    stock_venv(&venv);
+    let pth = venv
+        .join("lib")
+        .join("python3.12")
+        .join("site-packages")
+        .join("_virtualenv.pth");
+    write(&pth, "import _virtualenv\n");
+    let res = scan_at(&root);
+    assert_asks_naming(&res, &venv, &pth);
+}
+
+/// A version 14 scan file may leave a small nested output in an artifact unlisted, so it is
+/// refused; the current version is 15.
+#[test]
+fn r15b_a_version_14_scan_file_is_refused() {
+    let (_tmp, root, _) = workspace();
+    let py = project(&root, "py", "requirements.txt");
+    stock_venv(&py.join(".venv"));
+    let res = scan_at(&root);
+    assert_eq!(res.schema_version, 15);
+    let mut v = serde_json::to_value(&res).unwrap();
+    assert!(scan_from_json(&v.to_string()).is_ok());
+    v["schema_version"] = serde_json::json!(14);
+    assert!(scan_from_json(&v.to_string()).is_err());
+}
+
 // ---------------------------------------------------------------- controls
 
 /// The same small files inside an installed package's directory are not listed, and stock
@@ -249,6 +329,9 @@ fn r15b_control_small_outputs_inside_a_package_directory_do_not_ask() {
         stock_node_modules(&nm);
         write_bytes(&nm.join("pkg").join("model.pt"), size);
         write_bytes(&nm.join("pkg").join("media").join("clip.mp4"), size);
+        // Packages ship built files under names that build directories use.
+        write_bytes(&nm.join("pkg").join("dist").join("logo.png"), size);
+        write_bytes(&nm.join("pkg").join("build").join("addon.bin"), size);
         artifacts.push(nm);
 
         let py = project(&root, &format!("py{i}"), "requirements.txt");
@@ -256,6 +339,7 @@ fn r15b_control_small_outputs_inside_a_package_directory_do_not_ask() {
         stock_venv(&venv);
         write_bytes(&site_pkg(&venv).join("model.pt"), size);
         write_bytes(&site_pkg(&venv).join("data").join("data.parquet"), size);
+        write_bytes(&site_pkg(&venv).join("bin").join("tool.bin"), size);
         artifacts.push(venv);
     }
     let js = project(&root, "stock-js", "package.json");
