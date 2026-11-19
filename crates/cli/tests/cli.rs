@@ -659,3 +659,269 @@ fn bad_scan_file_and_missing_root_fail_cleanly() {
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("cannot"));
 }
+
+// ---------------------------------------------------------------- G1: inherited git config
+
+/// Every file under `dir` (including `.git`) with its bytes, sorted. Git's transient
+/// background-maintenance lock is skipped; anything else that appears or changes is a write.
+fn snapshot_tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            let p = e.path();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(p);
+            } else if p.file_name().is_some_and(|n| n == "maintenance.lock") {
+                continue;
+            } else {
+                out.push((p.clone(), fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn touch_later(path: &Path) {
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+}
+
+/// The filter command a hostile config would name: it leaves `marker-<tag>` two levels above
+/// the repo (outside the scanned tree) and passes the content through.
+fn filter_cmd(tag: &str) -> String {
+    format!("echo ran >> ../../marker-{tag}; cat")
+}
+
+/// Config-file text defining the `probe` clean filter and the `probeproc` process filter, and a
+/// global ignore file that hides an untracked file.
+fn hostile_config(tag: &str, excludes: &Path) -> String {
+    format!(
+        "[filter \"probe\"]\n\tclean = \"{}\"\n[filter \"probeproc\"]\n\tprocess = \"{}\"\n\
+         [core]\n\texcludesFile = \"{}\"\n",
+        filter_cmd(tag),
+        filter_cmd(&format!("{tag}-process")),
+        excludes.to_string_lossy().replace('\\', "/"),
+    )
+}
+
+fn repo_fact(scan: &serde_json::Value, repo: &Path, fact: &str) -> String {
+    let want = repo.to_string_lossy();
+    scan["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["path"].as_str() == Some(want.as_ref()))
+        .unwrap_or_else(|| panic!("no node for {want}"))["repo"]["facts"][fact]
+        .as_str()
+        .unwrap_or("missing")
+        .to_string()
+}
+
+type Setup = Box<dyn Fn(&mut Command)>;
+
+#[test]
+fn g1_inherited_git_config_never_runs_a_filter_and_is_not_applied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = tmp.path();
+    let root = t.join("scan");
+
+    // Repo 1: `.gitattributes` routes files through filters named `probe` and `probeproc`; its
+    // own config is plain data. Tracked files are changed in place (same size, newer mtime), so
+    // `git status` has to hash them through whatever driver is configured.
+    let filtered = root.join("app");
+    fs::create_dir_all(&filtered).unwrap();
+    git(&filtered, &["init", "-q", "-b", "main"]);
+    write(
+        &filtered.join(".gitattributes"),
+        "*.txt filter=probe\n*.dat filter=probeproc\n",
+    );
+    write(&filtered.join("a.txt"), "one\n");
+    write(&filtered.join("b.dat"), "one\n");
+    git(&filtered, &["add", ".gitattributes", "a.txt", "b.dat"]);
+    git(&filtered, &["commit", "-q", "-m", "init"]);
+    write(&filtered.join("a.txt"), "two\n");
+    write(&filtered.join("b.dat"), "two\n");
+    touch_later(&filtered.join("a.txt"));
+    touch_later(&filtered.join("b.dat"));
+
+    // Repo 2: clean apart from one untracked file that only a global ignore file hides.
+    let hidden = root.join("notes");
+    fs::create_dir_all(&hidden).unwrap();
+    git(&hidden, &["init", "-q", "-b", "main"]);
+    write(&hidden.join("README.md"), "hello\n");
+    git(&hidden, &["add", "README.md"]);
+    git(&hidden, &["commit", "-q", "-m", "init"]);
+    write(&hidden.join("local-notes.txt"), "only copy\n");
+    let excludes = t.join("global-ignore");
+    write(&excludes, "local-notes.txt\n");
+
+    let empty_home = t.join("empty-home");
+    fs::create_dir_all(&empty_home).unwrap();
+    let no_xdg = t.join("empty-xdg");
+
+    // One configuration source per run, each with its own marker.
+    let mut vectors: Vec<(&str, Setup)> = Vec::new();
+    {
+        let home = t.join("v-home");
+        write(&home.join(".gitconfig"), &hostile_config("home", &excludes));
+        let x = no_xdg.clone();
+        vectors.push((
+            "home",
+            Box::new(move |c: &mut Command| {
+                c.env("HOME", &home).env("XDG_CONFIG_HOME", &x);
+            }),
+        ));
+    }
+    {
+        let xdg = t.join("v-xdg");
+        write(
+            &xdg.join("git").join("config"),
+            &hostile_config("xdg", &excludes),
+        );
+        let h = empty_home.clone();
+        vectors.push((
+            "xdg",
+            Box::new(move |c: &mut Command| {
+                c.env("HOME", &h).env("XDG_CONFIG_HOME", &xdg);
+            }),
+        ));
+    }
+    {
+        let file = t.join("v-global.gitconfig");
+        write(&file, &hostile_config("global", &excludes));
+        let (h, x) = (empty_home.clone(), no_xdg.clone());
+        vectors.push((
+            "global",
+            Box::new(move |c: &mut Command| {
+                c.env("HOME", &h)
+                    .env("XDG_CONFIG_HOME", &x)
+                    .env("GIT_CONFIG_GLOBAL", &file);
+            }),
+        ));
+    }
+    {
+        let file = t.join("v-system.gitconfig");
+        write(&file, &hostile_config("system", &excludes));
+        let (h, x) = (empty_home.clone(), no_xdg.clone());
+        vectors.push((
+            "system",
+            Box::new(move |c: &mut Command| {
+                c.env("HOME", &h)
+                    .env("XDG_CONFIG_HOME", &x)
+                    .env("GIT_CONFIG_SYSTEM", &file);
+            }),
+        ));
+    }
+    {
+        let ex = excludes.to_string_lossy().replace('\\', "/");
+        let (h, x) = (empty_home.clone(), no_xdg.clone());
+        vectors.push((
+            "count",
+            Box::new(move |c: &mut Command| {
+                c.env("HOME", &h)
+                    .env("XDG_CONFIG_HOME", &x)
+                    .env("GIT_CONFIG_COUNT", "2")
+                    .env("GIT_CONFIG_KEY_0", "filter.probe.clean")
+                    .env("GIT_CONFIG_VALUE_0", filter_cmd("count"))
+                    .env("GIT_CONFIG_KEY_1", "core.excludesFile")
+                    .env("GIT_CONFIG_VALUE_1", &ex);
+            }),
+        ));
+    }
+    {
+        let ex = excludes.to_string_lossy().replace('\\', "/");
+        let (h, x) = (empty_home.clone(), no_xdg.clone());
+        vectors.push((
+            "params",
+            Box::new(move |c: &mut Command| {
+                c.env("HOME", &h).env("XDG_CONFIG_HOME", &x).env(
+                    "GIT_CONFIG_PARAMETERS",
+                    format!(
+                        "'filter.probe.clean={}' 'core.excludesFile={}'",
+                        filter_cmd("params"),
+                        ex
+                    ),
+                );
+            }),
+        ));
+    }
+
+    let markers = || -> Vec<String> {
+        fs::read_dir(t)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("marker-"))
+            .collect()
+    };
+    assert!(markers().is_empty(), "fixture setup ran a filter");
+    let before = (snapshot_tree(&filtered), snapshot_tree(&hidden));
+
+    let mut failures: Vec<String> = Vec::new();
+    for (tag, setup) in &vectors {
+        let out_file = t.join(format!("scan-{tag}.json"));
+        let mut c = bin();
+        c.args([
+            "scan",
+            root.to_str().unwrap(),
+            "--out",
+            out_file.to_str().unwrap(),
+        ]);
+        for v in [
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            c.env_remove(v);
+        }
+        c.env("APPDATA", t.join("appdata"));
+        setup(&mut c);
+        let o = run(&mut c);
+        if !o.status.success() {
+            failures.push(format!(
+                "{tag}: scan failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            ));
+            continue;
+        }
+        let ran = markers();
+        if !ran.is_empty() {
+            failures.push(format!("{tag}: a configured filter ran: {ran:?}"));
+            for m in ran {
+                let _ = fs::remove_file(t.join(m));
+            }
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&out_file).unwrap()).unwrap();
+        // The filter attribute has no driver once inherited config is ignored, so git passes the
+        // content through and sees the change: not clean, and not unknown.
+        let clean = repo_fact(&v, &filtered, "tree_clean");
+        if clean != "no" {
+            failures.push(format!(
+                "{tag}: filtered repo tree_clean = {clean}, want no"
+            ));
+        }
+        // An inherited ignore rule must not hide the untracked file.
+        let clean = repo_fact(&v, &hidden, "tree_clean");
+        if clean != "no" {
+            failures.push(format!(
+                "{tag}: globally ignored untracked file was hidden (tree_clean = {clean})"
+            ));
+        }
+    }
+    let after = (snapshot_tree(&filtered), snapshot_tree(&hidden));
+    if before != after {
+        failures.push("repository bytes changed during the scans".to_string());
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

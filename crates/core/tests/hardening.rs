@@ -1,4 +1,5 @@
-//! Regression tests for the adversarial review of PR #2 (findings F1-F7, F11).
+//! Regression tests for the adversarial review of PR #2 (findings F1-F7, F11; F11 was tightened
+//! for merge-gate finding G3).
 //! Each test fails on the code the review was written against and passes after the fix.
 
 mod common;
@@ -559,25 +560,42 @@ fn f11_alternates_that_is_a_symlink_is_not_followed() {
     use std::os::unix::fs::symlink;
     let (tmp, root, remotes) = workspace();
     let src = pushed_repo(&root, &remotes, "source");
+    // A real borrower: `--shared` leaves its object store empty, so every object it has comes
+    // from the source through the alternates file, which is then replaced by a symlink to a copy.
     let borrower = root.join("borrower");
-    init_repo(&borrower);
-    let target = tmp.path().join("alternates.txt");
-    fs::write(
-        &target,
-        format!("{}\n", src.join(".git").join("objects").display()),
-    )
-    .unwrap();
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--shared",
+            src.to_str().unwrap(),
+            borrower.to_str().unwrap(),
+        ],
+    );
     let info = borrower.join(".git").join("objects").join("info");
-    fs::create_dir_all(&info).unwrap();
+    let target = tmp.path().join("alternates.txt");
+    fs::copy(info.join("alternates"), &target).unwrap();
+    fs::remove_file(info.join("alternates")).unwrap();
     symlink(&target, info.join("alternates")).unwrap();
+    let own_packs = fs::read_dir(borrower.join(".git").join("objects").join("pack"))
+        .map(|r| r.count())
+        .unwrap_or(0);
+    assert_eq!(own_packs, 0, "the borrower must hold no objects of its own");
+    // git follows the symlink, so the borrower still works and still needs the source.
+    git(&borrower, &["cat-file", "-e", "HEAD^{tree}"]);
 
     let mut opts = ScanOptions::new(vec![root.clone()]);
     opts.facts = FactsConfig::default().with_network_predicate(|_| true);
     let res = scan(&opts).unwrap();
-    assert!(
-        facts_of(&res, &src).no_dependents == Tri::Yes,
-        "a symlinked alternates file must not be read"
+    // The scanner does not follow the symlink, so it cannot see that the source is a provider:
+    // the source's dependents are unknown and it is never offered for removal.
+    assert_eq!(
+        facts_of(&res, &src).no_dependents,
+        Tri::Unknown,
+        "an unread alternates file must not leave the provider marked free of dependents"
     );
+    assert_eq!(action_for(&res, &src), Action::Ask);
     assert!(
         res.warnings.iter().any(|w| w.contains("alternates")),
         "{:?}",

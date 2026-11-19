@@ -60,15 +60,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Mount a tmpfs inside a scan root
+      - name: Mount two tmpfs inside a scan root (in node_modules and in a repo)
         run: |
-          mkdir -p "$RUNNER_TEMP/mnttest/mnt"
-          sudo mount -t tmpfs -o size=16m tmpfs "$RUNNER_TEMP/mnttest/mnt"
-          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/mnttest/mnt"
+          for m in proj/node_modules/mnt repo/data; do
+            mkdir -p "$RUNNER_TEMP/mnttest/$m"
+            sudo mount -t tmpfs -o size=16m tmpfs "$RUNNER_TEMP/mnttest/$m"
+            sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/mnttest/$m"
+          done
       - name: Test
         env:
-          DC_TEST_MOUNT_DIR: ${{ runner.temp }}/mnttest/mnt
+          DC_TEST_MOUNT_ROOT: ${{ runner.temp }}/mnttest
         run: cargo test -p disk-cleaner-core --locked --test mount -- --nocapture
+      - name: Create a repository owned by another user (root)
+        if: success() || failure()
+        run: |
+          f="$RUNNER_TEMP/foreign/scan/theirs"
+          sudo mkdir -p "$f"
+          sudo git -C "$f" init -q -b main
+          echo hello | sudo tee "$f/README.md" > /dev/null
+          sudo git -C "$f" add README.md
+          sudo git -C "$f" -c user.name=Test -c user.email=test@example.invalid commit -q -m init
+      - name: Test a repository owned by another user
+        if: success() || failure()
+        env:
+          DC_TEST_FOREIGN_ROOT: ${{ runner.temp }}/foreign/scan
+        run: cargo test -p disk-cleaner-core --locked --test foreign_owner -- --nocapture
 
   binaries:
     name: binary (${{ matrix.target }})
