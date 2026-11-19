@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 64" role="img" aria-labelledby="t">
+  <title id="t">disk-cleaner</title>
+  <style>
+    .a { fill: #0b5d56; }
+    .b { fill: #b45309; }
+    .c { fill: #2f5fb3; }
+    .w { fill: #1b2420; font: 600 30px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    @media (prefers-color-scheme: dark) {
+      .a { fill: #5ed6c8; }
+      .b { fill: #f0a54a; }
+      .c { fill: #7aa7f0; }
+      .w { fill: #e8eeea; }
+    }
+  </style>
+  <rect class="a" x="3" y="3" width="36" height="58" rx="7"/>
+  <rect class="b" x="43" y="3" width="18" height="27" rx="6"/>
+  <rect class="c" x="43" y="34" width="18" height="27" rx="6"/>
+  <!-- Wordmark is live text in the system monospace stack, so no font file ships. -->
+  <text class="w" x="76" y="43">disk-cleaner</text>
+</svg>
