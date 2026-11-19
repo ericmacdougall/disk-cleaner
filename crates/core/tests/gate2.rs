@@ -457,11 +457,7 @@ fn sibling_a_control_rr_cache_and_a_quiet_repo_keep_the_fact_yes() {
     let id = "0123456789abcdef0123456789abcdef01234567";
     let (state, act) = pending_case(|repo| {
         write(
-            &repo
-                .join(".git")
-                .join("rr-cache")
-                .join(id)
-                .join("preimage"),
+            &repo.join(".git").join("rr-cache").join(id).join("preimage"),
             "x",
         );
     });
