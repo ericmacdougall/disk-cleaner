@@ -275,6 +275,7 @@ fn saved_repo(path: &str) -> disk_cleaner_core::Node {
             reflog_saved: Tri::Yes,
             no_pending_state: Tri::Yes,
             plain_layout: Tri::Yes,
+            no_local_admin_content: Tri::Yes,
         },
         ..RepoInfo::default()
     });

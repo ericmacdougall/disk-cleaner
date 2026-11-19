@@ -143,10 +143,17 @@ fn f1_ordinary_repo_config_is_not_rejected() {
     git(&repo, &["config", "pull.rebase", "true"]);
     git(&repo, &["config", "branch.main.description", "x"]);
     let res = scan_with(&root, network_everywhere());
-    assert!(
-        facts_of(&res, &repo).all_yes(),
-        "{:?}",
-        facts_of(&res, &repo)
+    // Every key passed the allowlist (git ran and every fact was decided). The branch
+    // description is text that exists only in this repository, so it is reported as the
+    // repository's own content (gate d1e3f23, W1); nothing else is.
+    let mut f = facts_of(&res, &repo);
+    assert_eq!(f.no_local_admin_content, Tri::No, "{f:?}");
+    f.no_local_admin_content = Tri::Yes;
+    assert!(f.all_yes(), "{f:?}");
+    let info = node(&res, &repo).repo.as_ref().unwrap();
+    assert_eq!(
+        info.local_admin_content,
+        vec!["config: branch.<redacted>.description".to_string()]
     );
 }
 

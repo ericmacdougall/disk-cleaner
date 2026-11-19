@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **9** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **10** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -18,7 +18,10 @@ refused) and replaced the plan field `required_full_coverage` with `accepted_inc
 `repo.unsaved_pseudorefs` and `repo.unchecked_pseudorefs`: `reflog_saved` now also covers
 pseudorefs such as `ORIG_HEAD`, and an unknown entry at the top of the git directory makes
 `plain_layout` `no`; a version 8 scan could read a repository as saved while `ORIG_HEAD` alone kept
-an unpushed commit, so it is refused.
+an unpushed commit, so it is refused. Version 10 added the fact `no_local_admin_content` and
+`repo.local_admin_content` and `repo.local_admin_content_count`, made a pseudoref that names a tag
+object `unknown`, and made `repo.unchecked_pseudorefs` whole sentences; a version 9 scan could
+archive a repository whose custom hook or note existed nowhere else, so it is refused.
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 Such a node therefore gets an `ask_reason` and is never offered for removal (see "File names git
@@ -33,7 +36,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 9 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 10 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots that were walked, as spelled (a kept inner root under the spelling of the root that encloses it); overlapping roots are normalised first (see "Overlapping scan roots") |
@@ -214,7 +217,7 @@ with or without evidence.
 
 | Field | Meaning |
 |---|---|
-| `facts` | the ten safety facts, each `"yes"`, `"no"` or `"unknown"` |
+| `facts` | the eleven safety facts, each `"yes"`, `"no"` or `"unknown"` |
 | `notes` | why facts are not `yes` (git errors, ignored paths found); every note passes one redaction function (see below) |
 | `remotes` | `name`, `url` (credentials stripped), `network` |
 | `head_commit`, `last_commit_time` | HEAD id; newest commit on any ref |
@@ -225,7 +228,9 @@ with or without evidence.
 | `links_into_git_dir` | symlinks in the scan, outside every git directory and checkout, that point into this repository's git directory (a convenience link such as `hooks -> A/.git/hooks`); they make `no_dependents` `no` and the plan names each as "a link at <path>", not as a checkout |
 | `hidden_index_entries` | present when not 0: index entries marked skip-worktree or assume-unchanged whose file is present in the working tree. Git hides edits to them from `status`, `diff`, `add` and `stash`, so recovery cannot save them; `tree_clean` is `no` and the plan asks (see "Hidden index entries") |
 | `submodule_gitdirs`, `git_dir` | submodule git directories under `.git/modules`; this node's own git directory |
-| `unsaved_pseudorefs`, `unchecked_pseudorefs` | present when not empty: pseudorefs at the top of this worktree's git directory (`ORIG_HEAD` and the like) whose commit no network remote's tracking refs contain (`reflog_saved` is `no`), and those that could not be read, parsed or compared (`reflog_saved` is `unknown`) |
+| `unsaved_pseudorefs` | present when not empty: the exact names of the pseudorefs at the top of this worktree's git directory (`ORIG_HEAD` and the like) whose commit no network remote's tracking refs contain (`reflog_saved` is `no`). A name that would not be shown exactly (a control character, text the redaction rewrites) is never listed here: such a pseudoref is unchecked instead, so recovery is never told a name that is not the file's |
+| `unchecked_pseudorefs` | present when not empty: one sentence per pseudoref that could not be read, parsed or compared, naming it and what is wrong (`ORIG_HEAD at the top of the git directory names a tag object, not a commit`); `reflog_saved` is `unknown` |
+| `local_admin_content`, `local_admin_content_count` | present when not empty: up to five examples, sorted, of what the git directory holds of its own (`hooks/pre-commit`, `info/notes.txt`, `description`, `config: user.email`), and how many were found in all; `no_local_admin_content` is `no` (see "Local content in the git directory") |
 | `sizes` | `total`, `git` (the `.git` directory), `regenerable`, `output` |
 
 Facts (the safe value is always `yes`):
@@ -239,8 +244,9 @@ Facts (the safe value is always `yes`):
 | `tree_clean` | no tracked changes and no untracked files in this repo's own tree (submodules are their own nodes), no present file marked skip-worktree or assume-unchanged (those hide local edits; counted in `hidden_index_entries`, and a sparse checkout's absent files are not counted), and every submodule gitlink agrees: the index matches HEAD, and each checked-out submodule's HEAD equals the commit the index records (`status --ignore-submodules=all` hides both). A recorded submodule with a missing or empty directory is fine; a directory with files and no `.git` at a gitlink path, an unmerged gitlink or a differing commit is `no`; a submodule whose config fails the allowlist, whose HEAD cannot be read, or more than 200 submodules is `unknown`. The commits are compared with `ls-files -s`, `ls-tree -r HEAD` and `rev-parse --verify HEAD` run in the submodule through the hardened runner; no status runs inside it |
 | `no_unique_ignored` | no ignored files outside regenerable and cache directories (`.env`, local databases...) |
 | `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone, shared object directory or other reference into this repository's git directory was found (see "Inbound references"), and the repository does not declare `extensions.preciousObjects = true` (see "Declared dependents"). Places the scan could not read are not covered: see "Incomplete coverage" |
-| `reflog_saved` | every commit reachable from any reflog entry (HEAD of this worktree and every ref's reflog), and every commit a pseudoref at the top of this worktree's git directory names (`ORIG_HEAD`, `MERGE_AUTOSTASH`, `FETCH_HEAD`, `AUTO_MERGE`, any file there that names a commit: see "Plain layout", check 4a), is contained in a network remote's tracking refs. An unpushed commit after `git reset --hard`, an amended or rebased-away commit and a stash's commits are `no`, also when reflogs are disabled or expired and only `ORIG_HEAD` still names the commit (`repo.unsaved_pseudorefs` lists such pseudorefs and the plan reason names them). No network remote is `no`; an unborn HEAD, any git failure or a timeout is `unknown`, and so is a pseudoref that cannot be read, does not parse, or names something that is not a commit (a tree, as `AUTO_MERGE` does, or an object the repository does not have): `repo.unchecked_pseudorefs` lists them and the plan reason names them. `unknown` wins over `no` |
+| `reflog_saved` | every commit reachable from any reflog entry (HEAD of this worktree and every ref's reflog), and every commit a pseudoref at the top of this worktree's git directory names (`ORIG_HEAD`, `MERGE_AUTOSTASH`, `FETCH_HEAD`, `AUTO_MERGE`, any file there that names a commit: see "Plain layout", check 4a), is contained in a network remote's tracking refs. An unpushed commit after `git reset --hard`, an amended or rebased-away commit and a stash's commits are `no`, also when reflogs are disabled or expired and only `ORIG_HEAD` still names the commit (`repo.unsaved_pseudorefs` lists such pseudorefs and the plan reason names them). No network remote is `no`; an unborn HEAD, any git failure or a timeout is `unknown`, and so is a pseudoref that cannot be read, does not parse, or names something that is not a commit (a tag object, whose annotation or signature may exist nowhere else even when its commit is pushed; a tree, as `AUTO_MERGE` does; or an object the repository does not have), or whose name cannot be shown exactly: `repo.unchecked_pseudorefs` lists them and the plan reason names them. `unknown` wins over `no` |
 | `plain_layout` | the repository has the plain layout described under "Plain layout" below. `no` or `unknown` makes the plan `ask` with the reason `unusual repository layout: <first failing check>` (kept in `repo.layout_issue`); it is never `recover-then-archive` or `archive` |
+| `no_local_admin_content` | the git directory holds nothing of its own outside the object store, refs and logs: only the stock `*.sample` hooks, a comment-only `info/exclude`, the stock or an empty `description`, no unsent tag, merge or squash message, no legacy `branches/` or `remotes/` file and no config value only this repository has (see "Local content in the git directory"). `no` makes the plan `ask`, naming what was found, with nothing reclaimable; `unknown` when a bounded read or listing failed or overflowed, or when the git directory is not the node's own `.git` directory (a linked worktree or submodule checkout, whose layout already asks) |
 | `no_pending_state` | no unfinished rebase, merge, cherry-pick, revert or bisect in this worktree's git directory (`rebase-merge`, `rebase-apply`, `sequencer`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_*`) and no local-only content under `.git/lfs/objects` or `.git/annex/objects`. Found by name only. Never `no`: a finding is `unknown` (state that no ref records cannot be recovered into a ref, so a person decides) |
 
 `reflog_saved` is computed with `git rev-list -n 1 --reflog --not --remotes=<network remote>...`, which
@@ -255,9 +261,16 @@ reads `no` until they expire. Other state git keeps outside refs: `refs/original
 `refs/rewritten` are refs and are covered by `all_branches_on_remote`; a non-empty `.git/rr-cache`
 only records conflict resolutions that can be derived again and is not work.
 
-Each pseudoref's object id is read from the file itself (bounded, no git command) and checked with
-`git rev-list -n 1 <id>^{commit} --not --remotes=<network remote>...`: `^{commit}` makes an id
-that is not a commit an error (`unknown`) instead of an empty walk. A `git pull` or a reset to a
+Each pseudoref's object id is read from the file itself (bounded, no git command). Its own object
+type is read first with `git cat-file -t <id>` (no peeling): only a commit goes on to
+`git rev-list -n 1 <id> --not --remotes=<network remote>...`. A tag object (whose annotation or
+signature may exist nowhere else once its tag ref is deleted, even when the commit it points to is
+pushed), a tag of a tag, a tree, a blob, a missing object or any git failure makes the fact
+`unknown`, and the sentence in `repo.unchecked_pseudorefs` says which (`names a tag object, not a
+commit`). A `FETCH_HEAD` written by `git fetch --tags` lists annotated tags, so it asks too. A
+pseudoref whose name would be changed by display redaction is not checked at all: it is `unknown`
+with the sentence `... has a name that cannot be shown exactly`, so `repo.unsaved_pseudorefs` only
+ever holds exact names. A `git pull` or a reset to a
 pushed commit leaves `ORIG_HEAD` and `FETCH_HEAD` at commits a tracking ref contains, so they do not
 change the fact. Without a network remote nothing is subtracted (`--not` is left out): every
 pseudoref commit is unsaved, so `reflog_saved` is `no` and `repo.unsaved_pseudorefs` tells recovery
@@ -318,6 +331,8 @@ is followed):
    five such entries (`the git directory holds an entry this tool does not know (stuff), ...`).
    `FETCH_HEAD` is checked, not trusted: the commits it names were fetched, but possibly from a
    remote this tool does not count as saved (a local path).
+   What each known entry may hold and still be nothing unique is a separate rule, read by
+   `no_local_admin_content` (see "Local content in the git directory").
 5. No unfinished rebase, merge, cherry-pick, revert or bisect and no local-only LFS or annex
    content (`no_pending_state`).
 6. The config passed the allowlist (a refused config makes every fact `unknown` before this).
@@ -334,6 +349,63 @@ The structural checks (1 to 4) run first, by `lstat` alone. If an entry git itse
 `plain_layout` is `no` and the reason names the entry (`HEAD is a symlink`). A repo that is merely
 unusual but healthy (a `.git` file, alternates, worktrees, modules) is still read with the hardened,
 read-only commands and asks for its layout.
+
+**Local content in the git directory.** Recovery, as defined so far, saves commits and
+working-tree files; it does not save the git directory's own small files. So every allowlisted
+entry at the top of the git directory (check 4a) also has a rule for what it may hold and still be
+nothing unique (`Holds`, next to the allowlist in `crates/core/src/facts.rs`), read by `lstat`,
+directory listings capped at 1000 entries and reads capped at 64 KiB per file, nothing followed:
+
+| Entry | Nothing unique when | Otherwise |
+|---|---|---|
+| `hooks/` | every entry is a regular file whose name ends in `.sample` (the templates `git init` installs) | a custom hook, a hook manager's shim, a subdirectory or a symlink is local content (`hooks/pre-commit`) |
+| `info/` | `exclude` holds only blank lines and lines starting with `#` (the stock template; a trailing CR is allowed); `refs` is absent or holds only `<object id>`, tab, `refs/...` lines (the listing `git update-server-info` writes, which `git gc` and `git repack` run by default, so an empty-only rule would make every garbage-collected repository ask); `attributes` is absent or empty | any other file (`info/notes.txt`, `info/sparse-checkout`), a real exclude pattern or other text in `info/refs` is local content |
+| `description` | its text, trimmed, is empty or exactly `Unnamed repository; edit this file 'description' to name the repository.` | an edited description is local content |
+| `TAG_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG` | absent or empty | a message written and not used by a tag or commit: small, but it exists nowhere else |
+| `branches/`, `remotes/` | empty | any file: a legacy remote shorthand that no clone recreates |
+| `COMMIT_EDITMSG` | always | the last commit's message, which that commit holds; git overwrites it at every commit, so counting it would make every repository ask. Only the message of a commit that a hook or an empty message aborted is lost |
+| `HEAD`, `index`, `refs/`, `packed-refs`, `logs/`, `objects/`, `shallow` | always | covered by the ref, reflog, `tree_clean`, hidden-index and object checks; `shallow` lists boundary commits that came from the remote |
+| `MERGE_MODE`, `MERGE_RR`, `rr-cache/` | always | merge-mode text and recorded conflict resolutions, which rerere can learn again from the merge commits |
+| `gitk.cache`, `gc.log`, `gc.pid`, `fsmonitor--daemon*`, `lfs/` | always | caches, logs, a lock-holder's pid, the file-system monitor's state; LFS objects are `no_pending_state`'s |
+| `worktrees/`, `modules/` | always | not plain when not empty (check 4) |
+| `config`, `config.worktree` | every key's family is one the next table marks not local | see below |
+
+Config keys first pass the allowlist (anything that could run a program is refused before this).
+Each allowed family is then decided once:
+
+| Family | Local content? | Why |
+|---|---|---|
+| `core.*` | no | format and platform values that `init` and `clone` write again, and behaviour preferences, not work |
+| `remote.*` | no | the URL is recorded in `repo.remotes`; refspecs are set by clone |
+| `branch.<b>.description` | yes | text a person wrote, kept nowhere else |
+| other `branch.<b>.*` | no | tracking is set again by clone and `push -u` |
+| `user.*` | yes | a per-repository identity; without it later commits would carry another identity |
+| `url.<base>.*` | yes | URL rewrites may be what makes the remote reachable |
+| `submodule.*` | no | derived from `.gitmodules` again (and `modules/` is never plain) |
+| `extensions.*` | no | format extensions written by `init` and `clone` (`preciousObjects` is read as a dependency) |
+| `init`, `gc`, `pack`, `receive`, `transfer`, `fetch`, `pull`, `push`, `color`, `advice`, `gui`, `commit.gpgsign`, `tag.gpgsign` | no | preferences |
+| `include.*`, `includeIf.*` | no | an included file lives where it is named; one inside the git directory is an unknown top-level entry, so the layout is not plain |
+| any family without a row | yes | it asks rather than loses |
+
+Anything found makes `no_local_admin_content` `no`, and the plan asks ("this repository has files
+of its own in its git directory that exist nowhere else: hooks/pre-commit, info/notes.txt; copy
+them out or decide they can go") with nothing reclaimable. It asks rather than recovering then
+archiving because recovery does not save these files. A later apply phase may relax this by saving
+the git directory's small non-object files with the recovery manifest; until then such
+repositories ask. The stock templates were checked on git 2.56 on Linux, macOS and Windows: all
+three install the same fourteen `*.sample` hooks, the same comment-only `info/exclude` and the same
+`description`.
+
+Linked worktrees: their private git directory (`worktrees/<name>/` in the main repository) has no
+hooks of its own but can hold `info/sparse-checkout`, `logs/HEAD`, pseudorefs and message files.
+It is not inventoried: a linked worktree's `.git` is a file, so its layout is not plain and it asks
+(`no_local_admin_content` is `unknown` there), and the main repository asks because `worktrees/`
+is not empty. Submodule git directories under `modules/` likewise make the layout not plain.
+
+**Known limit: inside covered directories.** The directories marked "always" above are not
+listed: a file a person put inside one of them (`.git/rr-cache/notes.txt`, `.git/logs/todo`,
+`.git/lfs/tmp/x`) is not found, and such a repository can still be archived. Stray files inside
+`refs/` that are not refs and inside `objects/` that are not objects are likewise not looked for.
 
 A `shallow` file does not make a repository unplain (a shallow clone is complete for what it
 holds); the shape check ignores it. A failure is `no`; a check that cannot be made is `unknown`;
@@ -622,7 +694,7 @@ state is `unknown`.
 1. Active: `keep`.
 2. Regenerable and cache: contains output files, has an `ask_reason`, is incomplete (`unreadable`
    or `skipped_mounts`), or state unknown: `ask`; otherwise `remove-regenerable`.
-3. Repo and worktree: state unknown: `ask`; `plain_layout` not `yes`: `ask` (unusual repository layout); `no_dependents` `no`: `ask`, never a removing action, naming up to three dependents and links and the count of the rest (recovery saves this repo's own refs and cannot make the repos that use its objects safe); `hidden_index_entries` above 0: `ask` ("N files are marked skip-worktree or assume-unchanged, so git hides edits to them and they cannot be saved automatically; review them first"); any fact `unknown`: `ask`, with each unknown fact explained in words (what could not be checked and what would settle it; for local tags, that tag names cannot be checked against the remote without contacting it and will be verified when a removal is applied); any other fact `no`:
+3. Repo and worktree: state unknown: `ask`; `plain_layout` not `yes`: `ask` (unusual repository layout); `no_dependents` `no`: `ask`, never a removing action, naming up to three dependents and links and the count of the rest (recovery saves this repo's own refs and cannot make the repos that use its objects safe); `no_local_admin_content` `no`: `ask` with nothing reclaimable, naming up to five of the git directory's own files and the count of the rest (recovery does not save them); `hidden_index_entries` above 0: `ask` ("N files are marked skip-worktree or assume-unchanged, so git hides edits to them and they cannot be saved automatically; review them first"); any fact `unknown`: `ask`, with each unknown fact explained in words (what could not be checked and what would settle it; for local tags, that tag names cannot be checked against the remote without contacting it and will be verified when a removal is applied); any other fact `no`:
    `recover-then-archive`, naming in words what is not saved elsewhere; every fact `yes`: `archive` (labelled unverified, see
    `remote_facts_verified`; its reason says "no dependents were found", never that nothing depends on it). A repo whose `.git/modules` hold a submodule git directory that no scanned
    git node inside it uses, or that is incomplete (`unreadable` or `skipped_mounts`), asks.

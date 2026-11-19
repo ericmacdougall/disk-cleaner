@@ -795,7 +795,7 @@ fn effective_facts(mut facts: Facts, strict: bool) -> Facts {
 /// `unknown` means (what could not be checked and what would settle it). Every reason that
 /// rests on a fact says it in these words and then names the fact as a trailing tag,
 /// `[tree_clean]`, so the words never depend on knowing the field names.
-static FACT_WORDS: [(&str, &str, &str); 10] = [
+static FACT_WORDS: [(&str, &str, &str); 11] = [
     (
         "has_network_remote",
         "no remote that points to another machine",
@@ -852,6 +852,15 @@ static FACT_WORDS: [(&str, &str, &str); 10] = [
         "plain_layout",
         "a layout check failed",
         "the layout could not be checked",
+    ),
+    (
+        "no_local_admin_content",
+        "files of its own in its git directory (a custom hook, a note in info, an edited \
+         description, an unsent message or a setting only this repository has) that exist \
+         nowhere else",
+        "the git directory's own files (hooks, info, description, messages) could not all be \
+         listed or read, or there are too many to check; look at the git directory and run the \
+         scan again",
     ),
 ];
 
@@ -934,6 +943,28 @@ fn dependents_reason(node: &Node) -> String {
     )
 }
 
+/// Why a repository whose git directory holds files of its own asks: up to five are named.
+fn local_admin_reason(node: &Node) -> String {
+    let (mut found, total) = node
+        .repo
+        .as_ref()
+        .map(|r| (r.local_admin_content.clone(), r.local_admin_content_count))
+        .unwrap_or_default();
+    let rest = total.saturating_sub(found.len() as u64);
+    if rest > 0 {
+        found.push(format!("{rest} more"));
+    }
+    let list = if found.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", found.join(", "))
+    };
+    format!(
+        "this repository has files of its own in its git directory that exist nowhere \
+         else{list}; copy them out or decide they can go [no_local_admin_content]"
+    )
+}
+
 /// For each unknown fact: what could not be checked and what would settle it. `strict` is what
 /// the scan could not read, when incomplete coverage was not accepted.
 fn explain_unknown(node: &Node, facts: &Facts, strict: Option<&str>) -> String {
@@ -962,11 +993,12 @@ fn explain_unknown(node: &Node, facts: &Facts, strict: Option<&str>) -> String {
                  repository; make them readable and scan again, or accept incomplete coverage \
                  with --accept-incomplete-coverage [{name}]"
             ),
+            // Each entry is a whole sentence naming the pseudoref and what is wrong with it.
             (_, "reflog_saved") if !unchecked.is_empty() => format!(
-                "{} at the top of the git directory could not be read or compared with the \
-                 remote (it does not name a commit, or git failed); look at {} and run the scan \
-                 again [{name}]",
+                "{}, so what {} cannot be shown to be on a network remote; look at {} and run \
+                 the scan again [{name}]",
                 some_of(&unchecked, 3),
+                agree(unchecked.len() as u64, "it keeps", "they keep"),
                 agree(unchecked.len() as u64, "it", "them")
             ),
             (_, "all_branches_on_remote") if notes.contains("has tags") => format!(
@@ -1067,6 +1099,11 @@ fn decide(
                 // Recovery saves this repository's own refs; it cannot make the repositories
                 // that use its objects or refs safe, so it must not be removed first.
                 return (Action::Ask, dependents_reason(node), 0);
+            }
+            if facts.no_local_admin_content == Tri::No {
+                // Recovery saves commits and working-tree files, not the git directory's own
+                // files, so only a person can keep them.
+                return (Action::Ask, local_admin_reason(node), 0);
             }
             let hidden = node
                 .repo

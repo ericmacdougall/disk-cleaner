@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -106,11 +106,19 @@ pub struct Facts {
     /// content, and only refs under `refs/heads`, `refs/tags`, `refs/remotes` and `refs/stash`
     /// that point at commits. Only a plain repo may be archived or recovered then archived.
     pub plain_layout: Tri,
+    /// The git directory holds nothing of its own outside the object store, refs and logs: no
+    /// custom hook, no file in `info/` beyond the stock comment-only `exclude`, a stock or empty
+    /// `description`, no unsent tag, merge or squash message, no legacy `branches/` or
+    /// `remotes/` file, no recorded conflict resolution, and no config value that only this
+    /// repository holds (see `docs/SCAN-FORMAT.md`). `No` names what was found
+    /// ([`RepoInfo::local_admin_content`]); `Unknown` when a bounded read or listing failed.
+    #[serde(default)]
+    pub no_local_admin_content: Tri,
 }
 
 impl Facts {
     /// Every fact paired with its JSON name.
-    pub fn entries(&self) -> [(&'static str, Tri); 10] {
+    pub fn entries(&self) -> [(&'static str, Tri); 11] {
         [
             ("has_network_remote", self.has_network_remote),
             ("head_on_remote", self.head_on_remote),
@@ -122,6 +130,7 @@ impl Facts {
             ("reflog_saved", self.reflog_saved),
             ("no_pending_state", self.no_pending_state),
             ("plain_layout", self.plain_layout),
+            ("no_local_admin_content", self.no_local_admin_content),
         ]
     }
 
@@ -229,14 +238,23 @@ pub struct RepoInfo {
     pub git_dir: Option<String>,
     /// Pseudorefs at the top of this worktree's git directory (`ORIG_HEAD`, `MERGE_AUTOSTASH`,
     /// any file there that names a commit) whose commit no network remote's tracking refs
-    /// contain: `reflog_saved` is then `no`.
+    /// contain: `reflog_saved` is then `no`. Each is the file's exact name: a name that would
+    /// not be shown exactly is never listed here (it is unchecked instead).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsaved_pseudorefs: Vec<String>,
-    /// Pseudorefs that could not be read, parsed or compared with the remote (one naming a tree
-    /// or a missing object, or holding text that is not an object id): `reflog_saved` is then
-    /// `unknown`.
+    /// One sentence per pseudoref that could not be read, parsed or compared with the remote
+    /// (one naming a tag, tree or blob object or a missing object, holding text that is not an
+    /// object id, or whose name cannot be shown exactly): `reflog_saved` is then `unknown`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unchecked_pseudorefs: Vec<String>,
+    /// Up to five examples, sorted, of what the git directory holds of its own
+    /// (`hooks/pre-commit`, `info/notes.txt`, `config: user.email`): `no_local_admin_content`
+    /// is then `no`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_admin_content: Vec<String>,
+    /// How many such entries were found in all (the examples are the first five).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub local_admin_content_count: u64,
     pub sizes: RepoSizes,
 }
 

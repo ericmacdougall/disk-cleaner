@@ -121,7 +121,10 @@ fn w1_a_custom_pre_commit_hook_asks_naming_it() {
     let (_clone, inv) = fresh_clone(tmp.path(), &tmp.path().join("probe"), &remotes);
     let repo = pushed_repo(&root, &remotes, "app");
     let hook = repo.join(".git").join("hooks").join("pre-commit");
-    write(&hook, "#!/bin/sh\n# a check of this project's own\nexit 0\n");
+    write(
+        &hook,
+        "#!/bin/sh\n# a check of this project's own\nexit 0\n",
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -173,7 +176,11 @@ fn w1_a_branch_description_and_a_repository_identity_ask() {
     let described = pushed_repo(&root, &remotes, "described");
     git(
         &described,
-        &["config", "branch.main.description", "what this branch is for"],
+        &[
+            "config",
+            "branch.main.description",
+            "what this branch is for",
+        ],
     );
     let identity = pushed_repo(&root, &remotes, "identity");
     git(&identity, &["config", "user.email", "work@example.invalid"]);
@@ -204,6 +211,27 @@ fn w1_control_a_fresh_clone_is_archivable_on_this_system() {
     assert_eq!(it.action, Action::Archive, "{}\nstock: {inv}", it.reason);
 }
 
+/// `git gc` (and auto-gc) runs `update-server-info`, which writes `info/refs`, a listing of the
+/// refs: a repository that was ever garbage-collected must not ask for it. Fails against a rule
+/// that accepts only an absent or empty `info/refs`. A note written there still asks.
+#[test]
+fn w1_control_a_garbage_collected_repo_is_archivable_and_a_note_in_info_refs_asks() {
+    let (_tmp, root, remotes) = workspace();
+    let gcd = pushed_repo(&root, &remotes, "gcd");
+    git(&gcd, &["gc", "-q"]);
+    let inv = inventory(&gcd);
+    let noted = pushed_repo(&root, &remotes, "noted");
+    write(
+        &noted.join(".git").join("info").join("refs"),
+        "remember to rotate the deploy key\n",
+    );
+    let res = scan_with(&root, network_everywhere());
+    let p = plan_of(&res);
+    let it = item(&p, &gcd);
+    assert_eq!(it.action, Action::Archive, "{}\ngc: {inv}", it.reason);
+    assert_asks_naming(&res, &noted, "info/refs", &inv);
+}
+
 #[cfg(unix)]
 #[test]
 fn w1_control_a_symlinked_hook_is_already_not_plain() {
@@ -211,8 +239,7 @@ fn w1_control_a_symlinked_hook_is_already_not_plain() {
     let repo = pushed_repo(&root, &remotes, "app");
     let target = tmp.path().join("shared-hook");
     write(&target, "#!/bin/sh\nexit 0\n");
-    std::os::unix::fs::symlink(&target, repo.join(".git").join("hooks").join("pre-push"))
-        .unwrap();
+    std::os::unix::fs::symlink(&target, repo.join(".git").join("hooks").join("pre-push")).unwrap();
     let res = scan_with(&root, network_everywhere());
     let p = plan_of(&res);
     let it = item(&p, &repo);
@@ -255,7 +282,10 @@ fn w1_an_unreadable_hooks_directory_is_unknown_and_asks() {
 fn w2_orig_head_naming_an_annotated_tag_object_asks() {
     let (_tmp, root, remotes) = workspace();
     let repo = pushed_repo(&root, &remotes, "app");
-    git(&repo, &["tag", "-a", "v1", "-m", "a signed-off note kept only here"]);
+    git(
+        &repo,
+        &["tag", "-a", "v1", "-m", "a signed-off note kept only here"],
+    );
     let tag = git(&repo, &["rev-parse", "v1"]);
     assert_eq!(git(&repo, &["cat-file", "-t", &tag]), "tag");
     git(&repo, &["tag", "-d", "v1"]);
@@ -327,7 +357,10 @@ fn low_a_pseudoref_whose_name_cannot_be_shown_exactly_asks() {
     let it = item(&p, &repo);
     assert_eq!(it.action, Action::Ask, "{}", it.reason);
     let v = serde_json::to_value(node(&res, &repo).repo.as_ref().unwrap()).unwrap();
-    let unsaved = v["unsaved_pseudorefs"].as_array().cloned().unwrap_or_default();
+    let unsaved = v["unsaved_pseudorefs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
         unsaved.is_empty(),
         "a name that is not the file's exact name must not be listed for recovery: {unsaved:?}"

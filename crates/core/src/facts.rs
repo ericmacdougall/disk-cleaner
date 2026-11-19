@@ -491,22 +491,55 @@ const IN_PROGRESS: [&str; 9] = [
 /// objects and git-annex content that may never have been uploaded.
 const LOCAL_CONTENT: [&str; 2] = ["lfs/objects", "annex/objects"];
 
+/// What an allowlisted entry at the top of the git directory may hold and still be nothing
+/// unique; [`local_admin_content`] checks it. Anything else there is the repository's own
+/// content, which recovery (commits and working-tree files) does not save, so the plan asks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Holds {
+    /// Nothing more to read: another fact covers it, or it is a cache, log or lock that git
+    /// writes again.
+    Covered,
+    /// Config: each key is judged by its family ([`CONFIG_FAMILIES`]).
+    ConfigKeys,
+    /// Only regular files whose names end in `.sample`: the templates `git init` installs.
+    SampleHooks,
+    /// `exclude` with blank and comment lines only (the stock template); `refs` holding only
+    /// `<object id>\t<refname>` lines (what `git gc` writes through `update-server-info`);
+    /// `attributes` empty. Any other entry is local content.
+    Info,
+    /// [`STOCK_DESCRIPTION`] or nothing.
+    StockDescription,
+    /// Local content when it holds anything at all.
+    LocalWhenNonEmpty,
+    /// Every entry inside is local content (an empty directory is fine).
+    LocalEntries,
+}
+
 /// Entries at the top of a git directory that are known not to hold history of their own, with
-/// the kind each must be (`None`: any kind). Everything else there is either a pseudoref, whose
-/// commit is checked ([`pseudoref_check`]), or unknown, which makes the layout not plain.
+/// the kind each must be (`None`: any kind) and what each may hold ([`Holds`]). Everything else
+/// there is either a pseudoref, whose commit is checked ([`pseudoref_check`]), or unknown, which
+/// makes the layout not plain.
 ///
 /// - `HEAD`, `config`, `refs`, `objects`, `worktrees`, `modules`: checked by [`shape`] and the
 ///   ref and object checks. `packed-refs` holds refs, which `for-each-ref` and `rev-list` read;
 ///   `logs` holds the reflogs, which `reflog_saved` reads; `index` holds staged content, which
-///   `status` (`tree_clean`) reports.
-/// - `config.worktree`, `description`, `hooks`, `info`, `branches`, `remotes`: settings, scripts
-///   and exclude patterns, no objects (`info/grafts` and `info/alternates` are refused by
-///   [`shape`]).
+///   `status` (`tree_clean`) and the hidden-index count report.
+/// - `config`, `config.worktree`: settings, judged key by key ([`CONFIG_FAMILIES`]).
+/// - `hooks`, `info`, `description`: the stock templates are nothing unique; anything else is
+///   (a custom hook, a note, a real exclude pattern, a sparse-checkout pattern list, an edited
+///   description). `info/grafts` and `info/alternates` are refused by [`shape`] first.
+/// - `branches`, `remotes`: legacy remote shorthands, which no clone recreates: any file there
+///   is local content.
 /// - `shallow`: the ids of the commits where a shallow clone's history was cut, which came from
 ///   the remote.
-/// - `COMMIT_EDITMSG`, `TAG_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG`, `MERGE_MODE`, `MERGE_RR`: message
-///   and merge-mode text; a squash merge's changes are in the index and working tree, which
-///   `tree_clean` covers. `rr-cache`: recorded conflict resolutions, which can be derived again.
+/// - `TAG_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG`: a message that was written and not (yet) used by a
+///   commit or tag; small, but it exists nowhere else, so one that is not empty is local content.
+///   A squash merge's changes are in the index and working tree, which `tree_clean` covers.
+/// - `COMMIT_EDITMSG`: the message of the last commit, which that commit holds; git overwrites
+///   it at every commit, so counting it would make every repository with a commit ask. What is
+///   lost is only the message of a commit that a hook or an empty message aborted.
+/// - `MERGE_MODE`, `MERGE_RR`, `rr-cache`: merge-mode text and recorded conflict resolutions,
+///   which `rerere` can learn again from the merge commits that hold the resolved results.
 /// - `gitk.cache`, `gc.log`, `gc.pid`, `fsmonitor--daemon`, `fsmonitor--daemon.ipc`, and the
 ///   split index's `sharedindex.*` files: caches, logs, a lock-holder's pid, the file-system
 ///   monitor's socket and cookies, and part of the index. None keeps an object alive.
@@ -515,37 +548,233 @@ const LOCAL_CONTENT: [&str; 2] = ["lfs/objects", "annex/objects"];
 ///
 /// `FETCH_HEAD` is not here: the commits it names were fetched, but from a remote this tool may
 /// not count as saved (a local path), so they are checked like any pseudoref.
-const TOP_LEVEL_KNOWN: [(&str, Option<Lk>); 29] = [
-    ("HEAD", Some(Lk::File)),
-    ("config", Some(Lk::File)),
-    ("config.worktree", Some(Lk::File)),
-    ("description", Some(Lk::File)),
-    ("index", Some(Lk::File)),
-    ("packed-refs", Some(Lk::File)),
-    ("shallow", Some(Lk::File)),
-    ("COMMIT_EDITMSG", Some(Lk::File)),
-    ("TAG_EDITMSG", Some(Lk::File)),
-    ("MERGE_MSG", Some(Lk::File)),
-    ("SQUASH_MSG", Some(Lk::File)),
-    ("MERGE_MODE", Some(Lk::File)),
-    ("MERGE_RR", Some(Lk::File)),
-    ("gitk.cache", Some(Lk::File)),
-    ("gc.log", Some(Lk::File)),
-    ("gc.pid", Some(Lk::File)),
-    ("fsmonitor--daemon.ipc", None),
-    ("fsmonitor--daemon", Some(Lk::Dir)),
-    ("hooks", Some(Lk::Dir)),
-    ("info", Some(Lk::Dir)),
-    ("logs", Some(Lk::Dir)),
-    ("objects", Some(Lk::Dir)),
-    ("refs", Some(Lk::Dir)),
-    ("branches", Some(Lk::Dir)),
-    ("remotes", Some(Lk::Dir)),
-    ("rr-cache", Some(Lk::Dir)),
-    ("lfs", Some(Lk::Dir)),
-    ("worktrees", Some(Lk::Dir)),
-    ("modules", Some(Lk::Dir)),
+const TOP_LEVEL_KNOWN: [(&str, Option<Lk>, Holds); 29] = [
+    ("HEAD", Some(Lk::File), Holds::Covered),
+    ("config", Some(Lk::File), Holds::ConfigKeys),
+    ("config.worktree", Some(Lk::File), Holds::ConfigKeys),
+    ("description", Some(Lk::File), Holds::StockDescription),
+    ("index", Some(Lk::File), Holds::Covered),
+    ("packed-refs", Some(Lk::File), Holds::Covered),
+    ("shallow", Some(Lk::File), Holds::Covered),
+    ("COMMIT_EDITMSG", Some(Lk::File), Holds::Covered),
+    ("TAG_EDITMSG", Some(Lk::File), Holds::LocalWhenNonEmpty),
+    ("MERGE_MSG", Some(Lk::File), Holds::LocalWhenNonEmpty),
+    ("SQUASH_MSG", Some(Lk::File), Holds::LocalWhenNonEmpty),
+    ("MERGE_MODE", Some(Lk::File), Holds::Covered),
+    ("MERGE_RR", Some(Lk::File), Holds::Covered),
+    ("gitk.cache", Some(Lk::File), Holds::Covered),
+    ("gc.log", Some(Lk::File), Holds::Covered),
+    ("gc.pid", Some(Lk::File), Holds::Covered),
+    ("fsmonitor--daemon.ipc", None, Holds::Covered),
+    ("fsmonitor--daemon", Some(Lk::Dir), Holds::Covered),
+    ("hooks", Some(Lk::Dir), Holds::SampleHooks),
+    ("info", Some(Lk::Dir), Holds::Info),
+    ("logs", Some(Lk::Dir), Holds::Covered),
+    ("objects", Some(Lk::Dir), Holds::Covered),
+    ("refs", Some(Lk::Dir), Holds::Covered),
+    ("branches", Some(Lk::Dir), Holds::LocalEntries),
+    ("remotes", Some(Lk::Dir), Holds::LocalEntries),
+    ("rr-cache", Some(Lk::Dir), Holds::Covered),
+    ("lfs", Some(Lk::Dir), Holds::Covered),
+    ("worktrees", Some(Lk::Dir), Holds::Covered),
+    ("modules", Some(Lk::Dir), Holds::Covered),
 ];
+
+/// The text `git init` writes to `description` (trailing newline aside), on every system the
+/// tests run on (git 2.56 on Linux, macOS and Windows).
+const STOCK_DESCRIPTION: &str =
+    "Unnamed repository; edit this file 'description' to name the repository.";
+
+/// Most entries listed from one directory of the git directory; more makes
+/// `no_local_admin_content` unknown.
+const MAX_ADMIN_ENTRIES: usize = 1000;
+
+/// Config key families: `(section, variable or "" for any, local)`. `local` is true when a
+/// value there exists only in this repository and its loss is concrete; false when the value is
+/// recorded in the scan output (remote URLs), set again by cloning (format, tracking), or a
+/// preference rather than work. The first matching row wins; a key that matches no row is
+/// local, so a family added to [`config_key_is_safe`] without a row here asks rather than loses.
+const CONFIG_FAMILIES: [(&str, &str, bool); 23] = [
+    // `core.*`: format and platform values that `init` and `clone` write again, and behaviour
+    // preferences (line endings, sparse checkout on or off), not work.
+    ("core", "", false),
+    // Remote URLs are recorded in the scan output (`remotes`); fetch refspecs are set by clone.
+    ("remote", "", false),
+    // A branch description is text a person wrote, kept nowhere else.
+    ("branch", "description", true),
+    // Tracking (`remote`, `merge`, `rebase`, `pushremote`) is set again by clone and `push -u`.
+    ("branch", "", false),
+    // A per-repository identity: without it, later commits would carry another identity.
+    ("user", "", true),
+    // Submodule settings are derived from `.gitmodules` again (`modules/` is never plain).
+    ("submodule", "", false),
+    // URL rewrites may be what makes the remote reachable at all.
+    ("url", "", true),
+    // Repository format extensions are written by `init` and `clone` (`preciousObjects` is
+    // read separately, as a dependency).
+    ("extensions", "", false),
+    // Behaviour preferences without subsections.
+    ("init", "", false),
+    ("gc", "", false),
+    ("pack", "", false),
+    ("receive", "", false),
+    ("transfer", "", false),
+    ("fetch", "", false),
+    ("pull", "", false),
+    ("push", "", false),
+    ("color", "", false),
+    ("advice", "", false),
+    ("gui", "", false),
+    // An included file lives where it is named; one inside the git directory is an unknown
+    // top-level entry, which makes the layout not plain.
+    ("include", "", false),
+    ("includeif", "", false),
+    // `commit.gpgsign`, `tag.gpgsign`: a signing preference.
+    ("commit", "", false),
+    ("tag", "", false),
+];
+
+/// The decision of the first [`CONFIG_FAMILIES`] row that matches config `key`, if any.
+fn config_family(key: &str) -> Option<bool> {
+    let key = key.to_ascii_lowercase();
+    let (section, rest) = key.split_once('.').unwrap_or((key.as_str(), ""));
+    let name = rest.rsplit('.').next().unwrap_or(rest);
+    CONFIG_FAMILIES
+        .iter()
+        .find(|(s, n, _)| *s == section && (n.is_empty() || *n == name))
+        .map(|(_, _, local)| *local)
+}
+
+/// Is the value of config `key` local content? A key no family matches is.
+fn config_key_is_local(key: &str) -> bool {
+    config_family(key).unwrap_or(true)
+}
+
+/// The entries of directory `dir` (shown in messages as `label`), with their kind; a name that
+/// is not valid Unicode is spelt lossily and given the kind `Other`, so no rule accepts it.
+fn list_bounded(dir: &Path, label: &str) -> Result<Vec<(String, Lk)>, String> {
+    let list_err = |e: std::io::Error| format!("cannot list {label} ({e})");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(list_err)? {
+        let entry = entry.map_err(list_err)?;
+        if out.len() == MAX_ADMIN_ENTRIES {
+            return Err(format!("{label} holds more than {MAX_ADMIN_ENTRIES} entries"));
+        }
+        let os_name = entry.file_name();
+        let item = match os_name.to_str() {
+            Some(n) => {
+                let read_err = |e: String| format!("cannot read {label}/{n} ({e})");
+                let kind = lk(&entry.path()).map_err(read_err)?;
+                (n.to_string(), kind)
+            }
+            None => (os_name.to_string_lossy().into_owned(), Lk::Other),
+        };
+        out.push(item);
+    }
+    Ok(out)
+}
+
+/// Does `info/<name>` (of kind `kind`) hold only what `git init` puts there?
+fn info_entry_is_stock(info: &Path, name: &str, kind: Lk) -> Result<bool, String> {
+    if kind != Lk::File {
+        return Ok(false);
+    }
+    let p = info.join(name);
+    let read_err = |e: String| format!("cannot read info/{name} ({e})");
+    match name {
+        "exclude" => {
+            let bytes = read_bounded(&p).map_err(read_err)?;
+            let text = String::from_utf8_lossy(&bytes);
+            Ok(text.lines().all(|l| {
+                let l = l.strip_suffix('\r').unwrap_or(l);
+                l.trim().is_empty() || l.starts_with('#')
+            }))
+        }
+        // `git update-server-info`, which `git gc` and `git repack` run by default, writes one
+        // `<object id>\t<refname>` line per ref: a listing the ref checks already cover.
+        "refs" => {
+            let bytes = read_bounded(&p).map_err(read_err)?;
+            let lines = match std::str::from_utf8(&bytes) {
+                Ok(text) => text,
+                Err(_) => return Ok(false),
+            };
+            Ok(lines.lines().all(|l| match l.split_once('\t') {
+                Some((id, r)) => is_object_id(id) && r.starts_with("refs/"),
+                None => false,
+            }))
+        }
+        "attributes" => match std::fs::symlink_metadata(&p) {
+            Ok(m) => Ok(m.len() == 0),
+            Err(e) => Err(read_err(e.to_string())),
+        },
+        _ => Ok(false),
+    }
+}
+
+/// What the git directory `gd` holds of its own outside the object store, refs and logs, by the
+/// rules of [`TOP_LEVEL_KNOWN`] and [`CONFIG_FAMILIES`]: names such as `hooks/pre-commit`,
+/// `info/notes.txt` or `config: user.email`, sorted (lossy, for display), or why the inventory
+/// could not be made (an entry that cannot be listed or read, a file over the read bound, a
+/// directory over [`MAX_ADMIN_ENTRIES`]). Only `lstat`, directory listings and bounded reads;
+/// nothing is followed. `config_keys` are the keys the allowlist already read.
+fn local_admin_content(gd: &Path, config_keys: &[String]) -> Result<Vec<String>, String> {
+    let mut found: Vec<String> = Vec::new();
+    for (name, _, holds) in TOP_LEVEL_KNOWN {
+        let p = gd.join(name);
+        let kind = lk(&p).map_err(|e| format!("cannot read {name} ({e})"))?;
+        if kind == Lk::Missing {
+            continue;
+        }
+        let read_err = |e: String| format!("cannot read {name} ({e})");
+        match holds {
+            Holds::Covered | Holds::ConfigKeys => {}
+            Holds::LocalWhenNonEmpty => {
+                let len = match std::fs::symlink_metadata(&p) {
+                    Ok(m) => m.len(),
+                    Err(e) => return Err(read_err(e.to_string())),
+                };
+                if kind != Lk::File || len > 0 {
+                    found.push(name.to_string());
+                }
+            }
+            Holds::StockDescription => {
+                let stock = kind == Lk::File && {
+                    let bytes = read_bounded(&p).map_err(read_err)?;
+                    let text = String::from_utf8_lossy(&bytes);
+                    let t = text.trim();
+                    t.is_empty() || t == STOCK_DESCRIPTION
+                };
+                if !stock {
+                    found.push(name.to_string());
+                }
+            }
+            Holds::SampleHooks | Holds::Info | Holds::LocalEntries => {
+                if kind != Lk::Dir {
+                    found.push(name.to_string());
+                    continue;
+                }
+                for (entry, ekind) in list_bounded(&p, name)? {
+                    let stock = match holds {
+                        Holds::SampleHooks => ekind == Lk::File && entry.ends_with(".sample"),
+                        Holds::Info => info_entry_is_stock(&p, &entry, ekind)?,
+                        _ => false,
+                    };
+                    if !stock {
+                        found.push(format!("{name}/{entry}"));
+                    }
+                }
+            }
+        }
+    }
+    for key in config_keys {
+        if config_key_is_local(key) {
+            found.push(format!("config: {}", config_key_label(key)));
+        }
+    }
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
 
 /// Most bytes read from one pseudoref: git writes one line (or, for `FETCH_HEAD`, one line per
 /// fetched ref), so anything longer is not a pseudoref this tool understands.
@@ -589,7 +818,7 @@ fn pseudoref_name(name: &str) -> bool {
 /// Parse a pseudoref's bytes. `FETCH_HEAD` has one line per fetched ref, each starting with an
 /// object id and a tab; every other pseudoref is one line: an object id or `ref: refs/...`.
 fn parse_pseudoref(name: &str, bytes: &[u8]) -> Pseudo {
-    let bad = || Pseudo::Unreadable("it is not an object id or a ref: line".to_string());
+    let bad = || Pseudo::Unreadable("does not hold an object id or a ref: line".to_string());
     let text = match std::str::from_utf8(bytes) {
         Ok(t) => t,
         Err(_) => return bad(),
@@ -628,7 +857,7 @@ fn read_bounded(p: &Path) -> Result<Vec<u8>, String> {
         .read_to_end(&mut buf)
         .map_err(|e| e.to_string())?;
     if buf.len() as u64 > MAX_PSEUDOREF_BYTES {
-        return Err(format!("it is longer than {MAX_PSEUDOREF_BYTES} bytes"));
+        return Err(format!("longer than {MAX_PSEUDOREF_BYTES} bytes"));
     }
     Ok(buf)
 }
@@ -651,7 +880,7 @@ fn top_level(gd: &Path) -> Result<TopLevel, String> {
             }
         };
         let kind = lk(&entry.path()).map_err(|e| format!("cannot read {name} ({e})"))?;
-        if let Some((_, want)) = TOP_LEVEL_KNOWN.iter().find(|(n, _)| *n == name) {
+        if let Some((_, want, _)) = TOP_LEVEL_KNOWN.iter().find(|(n, _, _)| *n == name) {
             if want.is_none() || *want == Some(kind) {
                 continue;
             }
@@ -676,7 +905,10 @@ fn top_level(gd: &Path) -> Result<TopLevel, String> {
                     out.unknown.push(name);
                 }
             }
-            Err(e) if pseudoref_name(&name) => out.pseudorefs.push((name, Pseudo::Unreadable(e))),
+            Err(e) if pseudoref_name(&name) => {
+                let why = format!("could not be read ({e})");
+                out.pseudorefs.push((name, Pseudo::Unreadable(why)));
+            }
             Err(_) => out.unknown.push(name),
         }
     }
@@ -688,10 +920,28 @@ fn top_level(gd: &Path) -> Result<TopLevel, String> {
 /// Pseudorefs of one git directory compared with the network remotes.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PseudorefCheck {
-    /// Names whose commit no network remote's tracking refs contain.
+    /// Exact names whose commit no network remote's tracking refs contain.
     unsaved: Vec<String>,
-    /// Names that could not be read, parsed or compared, each with the reason.
-    unchecked: Vec<(String, String)>,
+    /// Pseudorefs that could not be read, parsed or compared: a sentence naming each (its
+    /// shown name) and why, with git's own error when there is one.
+    unchecked: Vec<(String, Option<String>)>,
+}
+
+/// The sentence for a pseudoref that cannot be checked.
+fn unchecked_sentence(shown: &str, clause: &str) -> String {
+    format!("{shown} at the top of the git directory {clause}")
+}
+
+/// The word for an object type `git cat-file -t` printed, from a fixed list (git's output is
+/// never repeated as is).
+fn object_kind(printed: &str) -> &'static str {
+    match printed.trim() {
+        "commit" => "commit",
+        "tag" => "tag",
+        "tree" => "tree",
+        "blob" => "blob",
+        _ => "unexpected",
+    }
 }
 
 impl PseudorefCheck {
@@ -708,32 +958,57 @@ impl PseudorefCheck {
 
 /// Check every pseudoref at the top of `gitdir` (this worktree's own git directory): the commit
 /// each names must be contained in a network remote's tracking refs (`names`; when it is empty,
-/// every commit is unsaved), as for
-/// the reflogs. `<id>^{commit}` makes an id that is not a commit (a tree, as `AUTO_MERGE` holds,
-/// or a missing object) an error, so it is unchecked instead of passing an empty walk.
+/// every commit is unsaved), as for the reflogs.
+///
+/// The object's own type is read first (`git cat-file -t <id>`): only a commit goes on to the
+/// containment check. A tag object (whose annotation or signature may exist nowhere else even
+/// when the commit it points to is pushed), a tree (as `AUTO_MERGE` holds), a blob, a missing
+/// object or any failure is unchecked, and the sentence says which. A pseudoref whose name would
+/// not be shown exactly (a control character, text the redaction rewrites) is unchecked too, so
+/// [`PseudorefCheck::unsaved`] only ever holds exact names.
 fn pseudoref_check(git: &Git, path: &Path, gitdir: &Path, names: &[String]) -> PseudorefCheck {
     let mut out = PseudorefCheck::default();
     let top = match top_level(gitdir) {
         Ok(t) => t,
         Err(why) => {
-            out.unchecked
-                .push(("the list of pseudorefs".to_string(), why));
+            let s = "the pseudorefs at the top of the git directory could not be listed";
+            out.unchecked.push((s.to_string(), Some(why)));
             return out;
         }
     };
     let pats: Vec<String> = names.iter().map(|n| format!("--remotes={n}")).collect();
     for (name, content) in top.pseudorefs {
+        let shown = diag(&name);
+        if shown != name {
+            let s = unchecked_sentence(&shown, "has a name that cannot be shown exactly");
+            out.unchecked.push((s, None));
+            continue;
+        }
         let ids = match content {
             Pseudo::Ids(ids) => ids,
             Pseudo::Symbolic => continue,
             Pseudo::Unreadable(why) => {
-                out.unchecked.push((name, why));
+                let s = unchecked_sentence(&name, &why);
+                out.unchecked.push((s, None));
                 continue;
             }
         };
         for id in ids {
-            let rev = format!("{id}^{{commit}}");
-            let mut args: Vec<&str> = vec!["rev-list", "-n", "1", rev.as_str()];
+            let kind = match git.run(path, &["cat-file", "-t", id.as_str()]) {
+                Ok(t) => object_kind(&t),
+                Err(e) => {
+                    let clause = "names an object git could not read (missing or damaged)";
+                    let s = unchecked_sentence(&name, clause);
+                    out.unchecked.push((s, Some(e.to_string())));
+                    break;
+                }
+            };
+            if kind != "commit" {
+                let s = unchecked_sentence(&name, &format!("names a {kind} object, not a commit"));
+                out.unchecked.push((s, None));
+                break;
+            }
+            let mut args: Vec<&str> = vec!["rev-list", "-n", "1", id.as_str()];
             if !pats.is_empty() {
                 // Without a network remote nothing is subtracted: every commit is unsaved.
                 args.push("--not");
@@ -746,7 +1021,9 @@ fn pseudoref_check(git: &Git, path: &Path, gitdir: &Path, names: &[String]) -> P
                     break;
                 }
                 Err(e) => {
-                    out.unchecked.push((name.clone(), e.to_string()));
+                    let clause = "could not be compared with the remote (git failed)";
+                    let s = unchecked_sentence(&name, clause);
+                    out.unchecked.push((s, Some(e.to_string())));
                     break;
                 }
             }
@@ -1395,24 +1672,29 @@ pub fn collect_repo_info(
             let gitdir_args = ["rev-parse", "--absolute-git-dir"];
             let pseudo = match printed_path(git, path, &gitdir_args, "git dir") {
                 Ok(gitdir) => pseudoref_check(git, path, &gitdir, names),
-                Err(why) => PseudorefCheck {
-                    unchecked: vec![("the list of pseudorefs".to_string(), why)],
-                    ..PseudorefCheck::default()
-                },
+                Err(why) => {
+                    let s = "the pseudorefs at the top of the git directory could not be listed";
+                    PseudorefCheck {
+                        unchecked: vec![(s.to_string(), Some(why))],
+                        ..PseudorefCheck::default()
+                    }
+                }
             };
             for name in &pseudo.unsaved {
                 notes.push(format!(
                     "reflog_saved: {name} names a commit that no network remote has"
                 ));
             }
-            for (name, why) in &pseudo.unchecked {
-                notes.push(format!(
-                    "reflog_saved: {name} could not be read or compared with the remote ({why})"
-                ));
+            for (sentence, detail) in &pseudo.unchecked {
+                notes.push(match detail {
+                    Some(d) => format!("reflog_saved: {sentence} ({})", diag(d)),
+                    None => format!("reflog_saved: {sentence}"),
+                });
             }
             let tri = pseudo.tri();
-            info.unsaved_pseudorefs = pseudo.unsaved.iter().map(|n| diag(n)).collect();
-            info.unchecked_pseudorefs = pseudo.unchecked.iter().map(|(n, _)| diag(n)).collect();
+            // Exact names: `pseudoref_check` refuses any name `diag` would change.
+            info.unsaved_pseudorefs = pseudo.unsaved.clone();
+            info.unchecked_pseudorefs = pseudo.unchecked.iter().map(|(s, _)| s.clone()).collect();
             // Unknown wins: something that could not be checked is never recovered on trust.
             match (reflogs, tri) {
                 (Tri::Unknown, _) | (_, Tri::Unknown) => Tri::Unknown,
@@ -1657,6 +1939,45 @@ pub fn collect_repo_info(
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok());
 
+    // Files the git directory keeps of its own outside the object store, refs and logs: a
+    // custom hook, a note in `info/`, an edited description, an unsent message, a setting only
+    // this repository has. Recovery saves commits and working-tree files, not these.
+    let own_git_dir = if class == Class::BareRepo {
+        Some(path.to_path_buf())
+    } else {
+        let g = path.join(".git");
+        matches!(lk(&g), Ok(Lk::Dir)).then_some(g)
+    };
+    facts.no_local_admin_content = match own_git_dir {
+        Some(gd) => match local_admin_content(&gd, &config_keys) {
+            Ok(found) if found.is_empty() => Tri::Yes,
+            Ok(found) => {
+                let shown: Vec<String> = found.iter().map(|n| diag(n)).collect();
+                notes.push(format!(
+                    "no_local_admin_content: the git directory holds files of its own that \
+                     exist nowhere else: {}",
+                    crate::words::some_of(&shown, 5)
+                ));
+                info.local_admin_content_count = shown.len() as u64;
+                info.local_admin_content = shown.into_iter().take(5).collect();
+                Tri::No
+            }
+            Err(why) => {
+                notes.push(format!("no_local_admin_content: {why}"));
+                Tri::Unknown
+            }
+        },
+        // A `.git` file (a linked worktree, a submodule checkout, a separate git directory):
+        // the layout is not plain, so the plan asks for that first.
+        None => {
+            notes.push(
+                "no_local_admin_content: the git directory is not this directory's own .git, \
+                 so its files were not listed",
+            );
+            Tri::Unknown
+        }
+    };
+
     let (plain, issue) = layout_check(git, path, class);
     facts.plain_layout = plain;
     info.layout_issue = issue.map(|i| {
@@ -1738,6 +2059,148 @@ mod tests {
             parse_pseudoref("ORIG_HEAD", two.as_bytes()),
             Pseudo::Unreadable(_)
         ));
+    }
+
+    #[test]
+    fn standard_pseudoref_names_are_shown_exactly() {
+        // `pseudoref_check` refuses a name `diag` would change; git's own names must pass.
+        for n in [
+            "ORIG_HEAD",
+            "FETCH_HEAD",
+            "AUTO_MERGE",
+            "MERGE_AUTOSTASH",
+            "REBASE_HEAD",
+        ] {
+            assert_eq!(diag(n), n);
+        }
+        assert_ne!(diag("ODD\u{1b}_HEAD"), "ODD\u{1b}_HEAD");
+    }
+
+    #[test]
+    fn every_config_family_the_allowlist_accepts_has_a_decision() {
+        // One key or more for each arm of `config_key_is_safe`.
+        let local = [
+            "branch.main.description",
+            "user.name",
+            "user.email",
+            "user.signingkey",
+            "url.https://example.invalid/.insteadof",
+        ];
+        let not_local = [
+            "core.repositoryformatversion",
+            "core.bare",
+            "core.sparsecheckout",
+            "remote.origin.url",
+            "remote.origin.fetch",
+            "branch.main.remote",
+            "branch.main.merge",
+            "submodule.sub.url",
+            "extensions.objectformat",
+            "init.defaultbranch",
+            "gc.auto",
+            "pack.threads",
+            "receive.fsckobjects",
+            "transfer.fsckobjects",
+            "fetch.prune",
+            "pull.rebase",
+            "push.default",
+            "color.ui",
+            "advice.detachedhead",
+            "gui.encoding",
+            "include.path",
+            "includeif.path",
+            "commit.gpgsign",
+            "tag.gpgsign",
+        ];
+        for k in local.iter().chain(not_local.iter()) {
+            assert!(config_key_is_safe(k), "{k} must pass the allowlist");
+            assert!(config_family(k).is_some(), "{k} has no CONFIG_FAMILIES row");
+        }
+        for k in local {
+            assert!(config_key_is_local(k), "{k}");
+        }
+        for k in not_local {
+            assert!(!config_key_is_local(k), "{k}");
+        }
+        // A family without a row is local: it asks rather than loses.
+        assert!(config_key_is_local("newsection.key"));
+    }
+
+    fn put(gd: &Path, rel: &str, text: &str) {
+        let p = gd.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    #[test]
+    fn a_stock_git_directory_holds_nothing_of_its_own_and_each_rule_bites() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gd = tmp.path();
+        let exclude = "# git ls-files --others --exclude-from=.git/info/exclude\n\
+                       # Lines that start with '#' are comments.\n\n";
+        put(gd, "hooks/pre-commit.sample", "#!/bin/sh\n");
+        put(gd, "hooks/update.sample", "#!/bin/sh\n");
+        put(gd, "info/exclude", exclude);
+        let listing = format!(
+            "{}\trefs/heads/main\n{}\trefs/tags/v1^{{}}\n",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        put(gd, "info/refs", &listing);
+        put(gd, "description", &format!("{STOCK_DESCRIPTION}\n"));
+        put(gd, "COMMIT_EDITMSG", "the last commit's message\n");
+        put(gd, "TAG_EDITMSG", "");
+        std::fs::create_dir_all(gd.join("branches")).unwrap();
+        let keys = [
+            "core.bare".to_string(),
+            "remote.origin.url".to_string(),
+            "branch.main.merge".to_string(),
+        ];
+        assert_eq!(local_admin_content(gd, &keys), Ok(vec![]));
+        // The same template with Windows line endings, and an empty description.
+        put(gd, "info/exclude", &exclude.replace('\n', "\r\n"));
+        put(gd, "description", "");
+        assert_eq!(local_admin_content(gd, &keys), Ok(vec![]));
+
+        put(gd, "info/exclude", "# comment\n*.log\n");
+        put(gd, "info/attributes", "* text\n");
+        put(gd, "info/refs", "a note\n");
+        put(gd, "info/notes.txt", "x");
+        put(gd, "hooks/pre-commit", "#!/bin/sh\n");
+        std::fs::create_dir_all(gd.join("hooks").join("dir.sample")).unwrap();
+        put(gd, "description", "my project\n");
+        put(gd, "TAG_EDITMSG", "release notes\n");
+        put(gd, "branches/origin", "https://example.invalid/x\n");
+        let found = local_admin_content(gd, &["user.email".to_string()]).unwrap();
+        assert_eq!(
+            found,
+            vec![
+                "TAG_EDITMSG",
+                "branches/origin",
+                "config: user.email",
+                "description",
+                "hooks/dir.sample",
+                "hooks/pre-commit",
+                "info/attributes",
+                "info/exclude",
+                "info/notes.txt",
+                "info/refs",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_oversized_listing_or_file_is_unknown_not_stock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let many = tmp.path().join("many");
+        for i in 0..=MAX_ADMIN_ENTRIES {
+            put(&many, &format!("hooks/h{i}.sample"), "");
+        }
+        assert!(local_admin_content(&many, &[]).is_err());
+        let big = tmp.path().join("big");
+        let text = "#".repeat(MAX_PSEUDOREF_BYTES as usize + 1);
+        put(&big, "description", &text);
+        assert!(local_admin_content(&big, &[]).is_err());
     }
 
     #[test]

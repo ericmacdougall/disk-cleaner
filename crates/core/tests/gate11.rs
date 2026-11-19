@@ -91,7 +91,7 @@ fn s1_a_hidden_edit_still_asks_when_there_is_also_an_untracked_file() {
 }
 
 #[test]
-fn s1_a_cone_sparse_checkout_with_everything_pushed_is_still_archivable() {
+fn s1_a_cone_sparse_checkout_with_everything_pushed_asks_only_for_its_pattern_file() {
     let (_tmp, root, remotes) = workspace();
     let a = root.join("a");
     init_repo(&a);
@@ -111,9 +111,17 @@ fn s1_a_cone_sparse_checkout_with_everything_pushed_is_still_archivable() {
     let res = scan_with(&root, network_everywhere());
     assert_eq!(hidden_entries(&res, &a), 0);
     assert_eq!(facts_of(&res, &a).tree_clean, Tri::Yes);
+    // The pattern list in `info/sparse-checkout` exists only here: since gate d1e3f23 (W1)
+    // every file in `info/` other than the stock `exclude` is the repository's own content, so
+    // the plan asks for that file, and for nothing else.
+    let mut f = facts_of(&res, &a);
+    assert_eq!(f.no_local_admin_content, Tri::No, "{f:?}");
+    f.no_local_admin_content = Tri::Yes;
+    assert!(f.all_yes(), "{f:?}");
     let p = plan_of(&res);
     let it = item(&p, &a);
-    assert_eq!(it.action, Action::Archive, "{}", it.reason);
+    assert_eq!(it.action, Action::Ask, "{}", it.reason);
+    assert!(it.reason.contains("info/sparse-checkout"), "{}", it.reason);
 }
 
 #[test]
@@ -262,6 +270,7 @@ fn all_yes() -> Facts {
         reflog_saved: Tri::Yes,
         no_pending_state: Tri::Yes,
         plain_layout: Tri::Yes,
+        no_local_admin_content: Tri::Yes,
     }
 }
 
@@ -382,7 +391,7 @@ fn s2f_a_nested_veto_leads_the_reason_with_or_without_the_process_check() {
     }
 }
 
-const FACTS: [&str; 10] = [
+const FACTS: [&str; 11] = [
     "has_network_remote",
     "head_on_remote",
     "all_branches_on_remote",
@@ -393,6 +402,7 @@ const FACTS: [&str; 10] = [
     "reflog_saved",
     "no_pending_state",
     "plain_layout",
+    "no_local_admin_content",
 ];
 
 fn with_fact(name: &str, v: Tri) -> Facts {
@@ -407,7 +417,8 @@ fn with_fact(name: &str, v: Tri) -> Facts {
         "no_dependents" => f.no_dependents = v,
         "reflog_saved" => f.reflog_saved = v,
         "no_pending_state" => f.no_pending_state = v,
-        _ => f.plain_layout = v,
+        "plain_layout" => f.plain_layout = v,
+        _ => f.no_local_admin_content = v,
     }
     f
 }

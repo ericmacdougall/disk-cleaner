@@ -60,6 +60,7 @@ fn all_yes() -> Facts {
         reflog_saved: Tri::Yes,
         no_pending_state: Tri::Yes,
         plain_layout: Tri::Yes,
+        no_local_admin_content: Tri::Yes,
     }
 }
 
@@ -75,7 +76,8 @@ fn with_fact(index: usize, v: Tri) -> Facts {
         6 => f.no_dependents = v,
         7 => f.reflog_saved = v,
         8 => f.no_pending_state = v,
-        _ => f.plain_layout = v,
+        9 => f.plain_layout = v,
+        _ => f.no_local_admin_content = v,
     }
     f
 }
@@ -104,7 +106,7 @@ fn a_repo_with_any_fact_not_yes_never_gets_a_removing_action() {
         );
     }
     for class in [Class::Repo, Class::Worktree] {
-        for index in 0..10 {
+        for index in 0..11 {
             for (v, expected) in [
                 (Tri::No, Action::RecoverThenArchive),
                 (Tri::Unknown, Action::Ask),
@@ -112,9 +114,10 @@ fn a_repo_with_any_fact_not_yes_never_gets_a_removing_action() {
                 let s = synthetic(vec![repo_node("/r", class, with_fact(index, v))]);
                 let p = plan(&s, &opts(vec![], 30, now));
                 let a = p.items[0].action;
-                // An unusual layout (fact 9) and other repos depending on this one (fact 6) are
-                // never recovered then archived: they ask, because recovery cannot fix them.
-                let expected = if index == 9 || (index == 6 && v == Tri::No) {
+                // An unusual layout (fact 9), other repos depending on this one (fact 6) and
+                // files of the git directory's own (fact 10) are never recovered then archived:
+                // they ask, because recovery cannot save or fix them.
+                let expected = if index >= 9 || (index == 6 && v == Tri::No) {
                     Action::Ask
                 } else {
                     expected
