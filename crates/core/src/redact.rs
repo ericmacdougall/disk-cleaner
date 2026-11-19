@@ -78,12 +78,22 @@ pub fn config_key_label(key: &str) -> String {
     let clean = |s: &str| -> String {
         s.chars()
             .take(40)
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '?' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '?'
+                }
+            })
             .collect()
     };
     match (key.find('.'), key.rfind('.')) {
         (Some(first), Some(last)) if first < last => {
-            format!("{}.<redacted>.{}", clean(&key[..first]), clean(&key[last + 1..]))
+            format!(
+                "{}.<redacted>.{}",
+                clean(&key[..first]),
+                clean(&key[last + 1..])
+            )
         }
         (Some(first), _) => format!("{}.{}", clean(&key[..first]), clean(&key[first + 1..])),
         (None, _) => "<unparsed key>".to_string(),
@@ -100,7 +110,10 @@ mod tests {
             config_key_label("credential.https://user:SYNTHETIC_TOKEN@example.invalid.helper"),
             "credential.<redacted>.helper"
         );
-        assert_eq!(config_key_label("filter.lfs.clean"), "filter.<redacted>.clean");
+        assert_eq!(
+            config_key_label("filter.lfs.clean"),
+            "filter.<redacted>.clean"
+        );
         assert_eq!(config_key_label("core.fsmonitor"), "core.fsmonitor");
         assert_eq!(config_key_label("nodots"), "<unparsed key>");
         assert!(!config_key_label("a.b.c.d.name\u{1b}[0m").contains('\u{1b}'));

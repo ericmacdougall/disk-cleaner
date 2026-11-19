@@ -623,7 +623,7 @@ pub fn collect_repo_info(
 
     // Working tree facts need a working tree.
     if class == Class::BareRepo {
-        notes.push("tree_clean and no_unique_ignored: a bare repo has no working tree".into());
+        notes.push("tree_clean and no_unique_ignored: a bare repo has no working tree");
     } else {
         let status_args = [
             "status",
