@@ -69,7 +69,10 @@ pub enum WalkError {
     Cancelled,
     NoRoots,
     /// A root is not an absolute path to an existing folder.
-    Root { path: String, message: String },
+    Root {
+        path: String,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for WalkError {
@@ -360,7 +363,12 @@ pub fn walk(
                 (meta.alloc, meta.logical)
             };
             if kind == EntryKind::Dir {
-                if entry.read_children.as_ref().and_then(|rc| rc.error()).is_some() {
+                if entry
+                    .read_children
+                    .as_ref()
+                    .and_then(|rc| rc.error())
+                    .is_some()
+                {
                     bits |= flags::UNREADABLE;
                     acc.stats.unreadable += 1;
                 }

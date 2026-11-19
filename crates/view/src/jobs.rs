@@ -210,7 +210,10 @@ mod tests {
         assert!(jobs.cancel(t1.id));
         assert!(t1.cancel.load(Ordering::Relaxed));
         assert!(!jobs.is_current(t1.id));
-        assert!(!jobs.advance(t1.id, JobState::Done), "a cancelled job cannot finish");
+        assert!(
+            !jobs.advance(t1.id, JobState::Done),
+            "a cancelled job cannot finish"
+        );
         assert!(!jobs.cancel(t1.id), "cancelling twice is a no-op");
         assert_eq!(jobs.current(), (Some(t1.id), JobState::Cancelled));
     }

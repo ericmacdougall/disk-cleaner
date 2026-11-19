@@ -45,7 +45,12 @@ fn core_scan(root: &Path) -> disk_cleaner_core::ScanResult {
 
 fn view_walk(root: &Path) -> disk_cleaner_view::Tree {
     let cancel = AtomicBool::new(false);
-    walk(&WalkOptions::new(vec![root.to_path_buf()]), &cancel, &mut |_| {}).unwrap()
+    walk(
+        &WalkOptions::new(vec![root.to_path_buf()]),
+        &cancel,
+        &mut |_| {},
+    )
+    .unwrap()
 }
 
 #[test]
@@ -58,7 +63,10 @@ fn the_walk_agrees_with_core_totals() {
     // logical sizes, and so does the walk.
     assert_eq!(tree.alloc(r), core.totals.allocated_bytes, "allocated");
     assert_eq!(tree.stats.allocated_bytes, core.totals.allocated_bytes);
-    assert_eq!(tree.stats.logical_bytes, core.totals.logical_bytes, "logical");
+    assert_eq!(
+        tree.stats.logical_bytes, core.totals.logical_bytes,
+        "logical"
+    );
     assert_eq!(tree.stats.files, core.totals.files, "files");
     assert_eq!(tree.stats.dirs, core.totals.dirs, "dirs");
     assert_eq!(tree.stats.symlinks, core.totals.symlinks, "symlinks");
@@ -70,11 +78,11 @@ fn the_walk_agrees_with_core_totals() {
     {
         assert_eq!(tree.stats.hardlink_duplicates_skipped, 1);
         let link = tree.find_path(&root.join("link-to-a")).unwrap();
-        assert_eq!(
-            tree.kind(link),
-            disk_cleaner_view::tree::EntryKind::Symlink
+        assert_eq!(tree.kind(link), disk_cleaner_view::tree::EntryKind::Symlink);
+        assert!(
+            tree.children(link).is_empty(),
+            "a symlink is never followed"
         );
-        assert!(tree.children(link).is_empty(), "a symlink is never followed");
     }
     // The root's file count is every non-folder entry.
     assert_eq!(tree.files(r), core.totals.files);

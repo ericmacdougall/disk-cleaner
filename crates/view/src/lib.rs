@@ -14,6 +14,7 @@ pub mod settings;
 pub mod synth;
 pub mod table;
 pub mod tree;
+pub mod units;
 pub mod walk;
 
 pub use dev::DevView;

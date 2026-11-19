@@ -304,7 +304,9 @@ impl TreeBuilder {
     /// Add an entry. Returns `None` when the tree is full (4 billion entries) or the parent was
     /// not pushed yet.
     pub fn push(&mut self, e: NewEntry<'_>) -> Option<NodeId> {
-        let id = u32::try_from(self.entries.len()).ok().filter(|&i| i < NO_PARENT)?;
+        let id = u32::try_from(self.entries.len())
+            .ok()
+            .filter(|&i| i < NO_PARENT)?;
         let parent = match e.parent {
             Some(p) if p < id => p,
             Some(_) => return None,
@@ -457,16 +459,23 @@ mod tests {
         assert_eq!(t.roots(), &[root]);
         assert_eq!(t.depth(4), 1);
         assert_eq!(t.path(2), PathBuf::from("/r").join("a").join("f1"));
-        assert_eq!(t.find_path(&PathBuf::from("/r").join("a").join("f2")), Some(3));
+        assert_eq!(
+            t.find_path(&PathBuf::from("/r").join("a").join("f2")),
+            Some(3)
+        );
         assert_eq!(t.find_path(&PathBuf::from("/r").join("nope")), None);
     }
 
     #[test]
     fn a_child_before_its_parent_is_refused() {
         let mut b = TreeBuilder::new(true);
-        assert!(b.push(entry(Some(0), "orphan", EntryKind::File, 1)).is_none());
+        assert!(b
+            .push(entry(Some(0), "orphan", EntryKind::File, 1))
+            .is_none());
         let r = b.push(entry(None, "/r", EntryKind::Dir, 0)).unwrap();
-        assert!(b.push(entry(Some(r + 5), "x", EntryKind::File, 1)).is_none());
+        assert!(b
+            .push(entry(Some(r + 5), "x", EntryKind::File, 1))
+            .is_none());
     }
 
     #[test]

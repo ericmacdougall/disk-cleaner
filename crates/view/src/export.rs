@@ -127,7 +127,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = plan();
         let first = export_to_dir(dir.path(), &p, EPOCH).unwrap();
-        let taken = dir.path().join(format!("prunedisk-plan-{}-2.json", stamp(EPOCH)));
+        let taken = dir
+            .path()
+            .join(format!("prunedisk-plan-{}-2.json", stamp(EPOCH)));
         std::fs::write(&taken, b"user data").unwrap();
         let second = export_to_dir(dir.path(), &p, EPOCH).unwrap();
         assert_ne!(first, second);

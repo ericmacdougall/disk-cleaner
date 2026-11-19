@@ -269,8 +269,7 @@ impl TreeView {
 
     /// Open a folder's row. Returns false when it is not visible or not a folder.
     pub fn expand(&mut self, id: NodeId) -> bool {
-        if !self.valid(id) || self.tree.kind(id) != EntryKind::Dir || self.expanded[id as usize]
-        {
+        if !self.valid(id) || self.tree.kind(id) != EntryKind::Dir || self.expanded[id as usize] {
             return false;
         }
         let Some(pos) = self.row_of(id) else {

@@ -4,7 +4,8 @@
 
 use crate::sanitize::display_name;
 use crate::table::MAX_PAGE;
-use disk_cleaner_core::{Class, Config, Plan, PlanOptions, PlanTotals, ProcessCheck, ScanResult};
+use disk_cleaner_core::plan::PlanTotals;
+use disk_cleaner_core::{Class, Config, Plan, PlanOptions, ProcessCheck, ScanResult};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -98,12 +99,7 @@ pub struct PlanInputs {
 }
 
 /// Build the plan for a scan with the given settings, at time `now`.
-pub fn make_plan(
-    scan: &ScanResult,
-    inputs: &PlanInputs,
-    now: i64,
-    process: ProcessCheck,
-) -> Plan {
+pub fn make_plan(scan: &ScanResult, inputs: &PlanInputs, now: i64, process: ProcessCheck) -> Plan {
     let mut opts = PlanOptions::new(inputs.config.active_window_days, now);
     opts.window_source = inputs.window_source.clone();
     opts.process = process;
@@ -114,7 +110,10 @@ pub fn make_plan(
 }
 
 fn group_index(class: Class) -> usize {
-    GROUPS.iter().position(|(c, _)| *c == class).unwrap_or(GROUPS.len() - 1)
+    GROUPS
+        .iter()
+        .position(|(c, _)| *c == class)
+        .unwrap_or(GROUPS.len() - 1)
 }
 
 impl DevView {
@@ -175,13 +174,14 @@ impl DevView {
         let age_secs = now.saturating_sub(scan.generated_at).max(0);
         let scan_age_days = age_secs / DAY;
         let window = plan.active_window_days;
-        let stale_warning = (imported && age_secs > (window as i64).saturating_mul(DAY)).then(|| {
-            format!(
-                "This scan is {scan_age_days} days old, older than the {window}-day active \
+        let stale_warning =
+            (imported && age_secs > (window as i64).saturating_mul(DAY)).then(|| {
+                format!(
+                    "This scan is {scan_age_days} days old, older than the {window}-day active \
                  window, so projects can look idle when they are not. Scan again for a current \
                  plan."
-            )
-        });
+                )
+            });
         let imported_note = imported.then(|| {
             "This scan was read from a file. The running-process check describes this \
              computer, not the one that made the scan."
@@ -228,6 +228,11 @@ impl DevView {
     /// Every item, in group order (for the TUI and exports).
     pub fn all(&self) -> impl Iterator<Item = &DevItem> {
         self.items.iter().flatten()
+    }
+
+    /// The items of group `g` (an index into [`GROUPS`]); empty when out of range.
+    pub fn items(&self, g: usize) -> &[DevItem] {
+        self.items.get(g).map(|v| v.as_slice()).unwrap_or(&[])
     }
 }
 
@@ -276,7 +281,12 @@ mod tests {
         let plan = make_plan(&scan, &inputs(7), now, ProcessCheck::none_running());
         let v = DevView::new(&scan, &plan, true, now);
         assert_eq!(v.summary.scan_age_days, 30);
-        assert!(v.summary.stale_warning.as_deref().unwrap().contains("30 days old"));
+        assert!(v
+            .summary
+            .stale_warning
+            .as_deref()
+            .unwrap()
+            .contains("30 days old"));
         assert!(v.summary.imported_note.is_some());
         let fresh = DevView::new(&scan, &plan, false, now);
         assert!(fresh.summary.stale_warning.is_none());

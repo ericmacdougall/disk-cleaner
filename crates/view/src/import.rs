@@ -410,7 +410,10 @@ mod tests {
     fn a_fifo_with_no_writer_returns_at_once() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("fifo");
-        let status = std::process::Command::new("mkfifo").arg(&p).status().unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&p)
+            .status()
+            .unwrap();
         assert!(status.success());
         let start = std::time::Instant::now();
         match import(&p, Limits::default()) {

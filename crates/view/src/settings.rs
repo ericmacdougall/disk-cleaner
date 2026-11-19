@@ -108,10 +108,10 @@ impl Loaded {
         }
     }
 
-    /// Where the plan's active window came from.
+    /// Where the plan's active window came from, worded as the CLI words it.
     pub fn window_source(&self) -> String {
         if self.text.is_some() {
-            self.path.to_string_lossy().into_owned()
+            format!("config {}", self.path.display())
         } else {
             "default".to_string()
         }
@@ -159,9 +159,8 @@ pub fn load_core(path: &Path) -> Result<Loaded, SettingsError> {
 
 /// Core's default config path, the one the CLI reads without `--config`.
 pub fn default_core_path() -> Result<PathBuf, SettingsError> {
-    disk_cleaner_core::config::default_config_path().ok_or_else(|| {
-        SettingsError::Io("cannot find this system's settings folder".to_string())
-    })
+    disk_cleaner_core::config::default_config_path()
+        .ok_or_else(|| SettingsError::Io("cannot find this system's settings folder".to_string()))
 }
 
 /// The values the user changed (unchanged keys are `None` and are not written).
@@ -214,9 +213,10 @@ impl CoreChanges {
 
 /// The text with only the changed keys set; everything else (comments, other keys) kept.
 pub fn edit_text(old: Option<&str>, changes: &CoreChanges) -> Result<String, SettingsError> {
-    let mut doc: toml_edit::DocumentMut = old.unwrap_or("").parse().map_err(|e| {
-        SettingsError::Refused(format!("the config file is not valid TOML: {e}"))
-    })?;
+    let mut doc: toml_edit::DocumentMut = old
+        .unwrap_or("")
+        .parse()
+        .map_err(|e| SettingsError::Refused(format!("the config file is not valid TOML: {e}")))?;
     let to_i64 = |v: u64| {
         i64::try_from(v).map_err(|_| SettingsError::Invalid("value too large".to_string()))
     };
@@ -252,7 +252,9 @@ pub enum SaveOutcome {
 impl SaveOutcome {
     pub fn loaded(&self) -> &Loaded {
         match self {
-            SaveOutcome::Saved(l) | SaveOutcome::Unchanged(l) | SaveOutcome::SavedUnconfirmed(l, _) => l,
+            SaveOutcome::Saved(l)
+            | SaveOutcome::Unchanged(l)
+            | SaveOutcome::SavedUnconfirmed(l, _) => l,
         }
     }
 }
@@ -309,7 +311,9 @@ pub fn lock_config(path: &Path) -> Result<File, SettingsError> {
         .create(true)
         .truncate(false)
         .open(&lock)
-        .map_err(|e| SettingsError::Io(format!("not saved: cannot create {}: {e}", shown(&lock))))?;
+        .map_err(|e| {
+            SettingsError::Io(format!("not saved: cannot create {}: {e}", shown(&lock)))
+        })?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(std::fs::TryLockError::WouldBlock) => Err(SettingsError::Refused(
@@ -327,10 +331,7 @@ pub fn lock_config(path: &Path) -> Result<File, SettingsError> {
 fn write_temp(target: &Path, text: &str, perms_from: Option<&Path>) -> std::io::Result<PathBuf> {
     let mut last_err = None;
     for attempt in 0..16u32 {
-        let tmp = sibling(
-            target,
-            &format!(".{}.{attempt}.tmp", std::process::id()),
-        );
+        let tmp = sibling(target, &format!(".{}.{attempt}.tmp", std::process::id()));
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -386,9 +387,8 @@ pub fn save_core_config(
     let dir = path
         .parent()
         .ok_or_else(|| SettingsError::Io("not saved: the config path has no folder".into()))?;
-    std::fs::create_dir_all(dir).map_err(|e| {
-        SettingsError::Io(format!("not saved: cannot create {}: {e}", shown(dir)))
-    })?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| SettingsError::Io(format!("not saved: cannot create {}: {e}", shown(dir))))?;
     // 1
     let _lock = lock_config(path)?;
     // 2
@@ -420,7 +420,9 @@ pub fn save_core_config(
     }
     let new_text = edit_text(current.as_deref(), changes)?;
     let new_config = parse_core(&new_text, path).map_err(|e| {
-        SettingsError::Refused(display_name(&format!("not saved: the new text is invalid: {e}")))
+        SettingsError::Refused(display_name(&format!(
+            "not saved: the new text is invalid: {e}"
+        )))
     })?;
     if !changes.held_by(&new_config) {
         return Err(SettingsError::Refused(
@@ -440,7 +442,10 @@ pub fn save_core_config(
             .map_err(|e| fail(format!("not saved: cannot write the backup copy: {e}")))?;
         if let Err(e) = std::fs::rename(&bak_tmp, &bak) {
             let _ = std::fs::remove_file(&bak_tmp);
-            return Err(fail(format!("not saved: cannot write {}: {e}", shown(&bak))));
+            return Err(fail(format!(
+                "not saved: cannot write {}: {e}",
+                shown(&bak)
+            )));
         }
     }
     // 6
@@ -462,7 +467,10 @@ pub fn save_core_config(
     }
     .and_then(|_| std::fs::rename(&tmp, path));
     if let Err(e) = commit {
-        return Err(fail(format!("not saved: cannot replace {}: {e}", shown(path))));
+        return Err(fail(format!(
+            "not saved: cannot replace {}: {e}",
+            shown(path)
+        )));
     }
     let saved = Loaded {
         path: path.clone(),
@@ -610,7 +618,8 @@ mod tests {
 
     #[test]
     fn round_trip_keeps_comments_and_other_keys() {
-        let original = "# my settings\nactive_window_days = 7 # a week\ntrust_partial_process_check = true\n";
+        let original =
+            "# my settings\nactive_window_days = 7 # a week\ntrust_partial_process_check = true\n";
         let (_d, p) = setup(Some(original));
         let loaded = load_core(&p).unwrap();
         let out = save_core_config(&loaded, &days(30), false, &SaveHooks::default()).unwrap();
@@ -618,11 +627,17 @@ mod tests {
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("# my settings"), "{text}");
         assert!(text.contains("active_window_days = 30 # a week"), "{text}");
-        assert!(text.contains("trust_partial_process_check = true"), "{text}");
+        assert!(
+            text.contains("trust_partial_process_check = true"),
+            "{text}"
+        );
         let again = load_core(&p).unwrap();
         assert_eq!(again.config.active_window_days, 30);
         assert!(again.config.trust_partial_process_check);
-        assert_eq!(std::fs::read_to_string(sibling(&p, ".bak")).unwrap(), original);
+        assert_eq!(
+            std::fs::read_to_string(sibling(&p, ".bak")).unwrap(),
+            original
+        );
         assert!(temps_left(&p).is_empty());
     }
 
@@ -633,7 +648,10 @@ mod tests {
         assert_eq!(loaded.text, None);
         save_core_config(&loaded, &days(14), false, &SaveHooks::default()).unwrap();
         assert_eq!(load_core(&p).unwrap().config.active_window_days, 14);
-        assert!(!sibling(&p, ".bak").exists(), "no backup of a file that did not exist");
+        assert!(
+            !sibling(&p, ".bak").exists(),
+            "no backup of a file that did not exist"
+        );
     }
 
     #[test]
@@ -659,14 +677,19 @@ mod tests {
             save_core_config(&loaded, &days(7), false, &h).unwrap_err(),
             SettingsError::NeedsConfirmation { old: 30, new: 7 }
         );
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "active_window_days = 30\n");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "active_window_days = 30\n"
+        );
         save_core_config(&loaded, &days(7), true, &h).unwrap();
         assert_eq!(load_core(&p).unwrap().config.active_window_days, 7);
     }
 
     #[test]
     fn an_out_of_range_value_already_in_the_file_is_kept() {
-        let (_d, p) = setup(Some("active_window_days = 9000\nmax_git_admin_bytes = 10\n"));
+        let (_d, p) = setup(Some(
+            "active_window_days = 9000\nmax_git_admin_bytes = 10\n",
+        ));
         let loaded = load_core(&p).unwrap();
         let v = loaded.view();
         assert!(!v.active_window_in_range);
@@ -739,7 +762,10 @@ mod tests {
             save_core_config(&loaded, &days(30), false, &hooks),
             Err(SettingsError::Refused(_))
         ));
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "active_window_days = 9\n");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "active_window_days = 9\n"
+        );
         assert!(temps_left(&p).is_empty());
     }
 
@@ -778,7 +804,10 @@ mod tests {
             Err(SettingsError::Io(m)) => assert!(m.starts_with("not saved"), "{m}"),
             other => panic!("{other:?}"),
         }
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "active_window_days = 7\n");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "active_window_days = 7\n"
+        );
         assert!(temps_left(&p).is_empty());
     }
 
@@ -860,10 +889,7 @@ mod tests {
         };
         save_app_settings(&ap, &s).unwrap();
         assert_eq!(load_app_settings(&ap).0, s);
-        let bad = AppSettings {
-            top_files: 5,
-            ..s
-        };
+        let bad = AppSettings { top_files: 5, ..s };
         assert!(save_app_settings(&ap, &bad).is_err());
         std::fs::write(&ap, "{\"top_files\": 50}").unwrap();
         let (got, note) = load_app_settings(&ap);
