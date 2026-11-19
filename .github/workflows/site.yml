@@ -26,6 +26,23 @@ jobs:
       - name: Site tests
         run: python3 -m unittest discover -s site/tests -v
 
+  # Runs the gate that pages.yml uses before it deploys, read-only, so every change shows what the deploy
+  # would decide today. With Pages not enabled this prints a notice and enabled=false and passes.
+  pages-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Would the Pages deploy run?
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I site/tools/pages_gate.py
+
   # Rehearses the Pages deploy without deploying: same preparation as pages.yml, then served under
   # the /disk-cleaner/ subpath that a project Pages site uses.
   pages-rehearsal:

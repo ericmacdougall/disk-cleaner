@@ -2,6 +2,7 @@ name: Pages
 
 # Publishes the static site in site/ to GitHub Pages. Pages must be enabled in the
 # repository settings (Source: GitHub Actions) by a maintainer; this file does not do that.
+# Until then the gate job finds Pages off and the deploy job is skipped, so the run stays green.
 on:
   push:
     branches: [main]
@@ -20,7 +21,30 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Read-only: asks the API whether Pages is enabled with GitHub Actions as its source. Not enabled
+  # means skip; an API or token failure fails this job instead of being read as "not enabled".
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: gate
+        name: Is Pages enabled?
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I site/tools/pages_gate.py
+
+  # Skipped at job level when the gate says no, so the github-pages environment is not touched.
   deploy:
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

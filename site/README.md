@@ -33,13 +33,20 @@ Pages deploy runs them first.
 
 - **One-time setup:** a maintainer sets the Pages source to "GitHub Actions" in the repository
   settings. The workflows do not change settings.
-- **Deploy:** `.github/workflows/pages.yml` runs the tests, builds the publishable copy with
-  `python3 site/tools/prepare.py _site` (no README, BRAND.md, tests or tools) and deploys it on every push
-  to `main` that touches `site/**`.
+- **Deploy:** `.github/workflows/pages.yml` runs on every push to `main` that touches `site/**` (or by hand
+  from the Actions tab). Its `gate` job asks the GitHub API, read-only, whether Pages is enabled with
+  GitHub Actions as its source (`python3 -I site/tools/pages_gate.py`). If it is, the `deploy` job runs the
+  tests, builds the publishable copy with `python3 site/tools/prepare.py _site` (no README, BRAND.md, tests
+  or tools) and deploys it. If Pages is not enabled, `deploy` is skipped with a notice and the run stays
+  green; if Pages publishes from a branch instead, it is skipped with a warning. Any other answer (a token
+  or permission error, an outage) fails the run rather than being read as "not enabled".
+- **After enabling Pages:** nothing deploys until the next push that touches `site/**`; to publish at once,
+  run the "Pages" workflow from the Actions tab.
 - **Rehearsal:** on every pull request, the `pages-rehearsal` job in `.github/workflows/site.yml` runs the
   same preparation script, packages the artifact without deploying, serves it under `/disk-cleaner/` (how a
   project Pages site is served) and smoke-tests it with curl. Both workflows call the same script, and a
-  test checks that.
+  test checks that. The `pages-gate` job runs the same gate, so every change shows what the deploy would
+  decide today.
 - **Roll back:** re-run the previous successful "Pages" workflow run from the Actions tab, or revert the
   commit and push.
 - **Take the site down:** disable Pages in the repository settings.
