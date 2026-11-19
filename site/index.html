@@ -3,15 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>disk-cleaner: know what is safe to remove</title>
+<title>PruneDisk: know what is safe to remove</title>
 <meta name="description" content="A free, MIT-licensed disk analyzer and cleaner that understands developer machines: git repos, worktrees, rebuildable folders and agent logs. Early: a read-only command-line scanner only.">
 <meta name="color-scheme" content="light dark">
 <meta property="og:type" content="website">
-<meta property="og:title" content="disk-cleaner: know what is safe to remove">
+<meta property="og:title" content="PruneDisk: know what is safe to remove">
 <meta property="og:description" content="A free, open-source disk cleaner for developer machines. Early: read-only scanning and planning only; it deletes nothing yet.">
 <meta name="twitter:card" content="summary">
 <link rel="icon" href="brand/favicon.svg" type="image/svg+xml">
-<style>/* disk-cleaner site. No external requests: system fonts only, no build step. */
+<style>/* PruneDisk site. No external requests: system fonts only, no build step. */
 
 :root {
   color-scheme: light dark;
@@ -97,7 +97,7 @@ a:hover { text-decoration-thickness: 2px; }
 /* Header */
 .site-header { border-bottom: 1px solid var(--rule); }
 .site-header .wrap { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem 1.5rem; padding-top: 0.9rem; padding-bottom: 0.9rem; }
-.brand { display: inline-flex; align-items: center; gap: 0.6rem; color: var(--text); text-decoration: none; font: 600 1.15rem/1 var(--mono); }
+.brand { display: inline-flex; align-items: center; gap: 0.6rem; color: var(--text); text-decoration: none; font: 700 1.2rem/1 var(--sans); letter-spacing: -0.01em; }
 .brand svg { width: 28px; height: 28px; flex: none; }
 .nav { display: flex; flex-wrap: wrap; gap: 0.25rem 1.1rem; margin: 0; padding: 0; list-style: none; }
 .nav a { color: var(--text); text-decoration: none; display: inline-block; padding: 0.35rem 0; }
@@ -224,13 +224,13 @@ pre code { background: none; padding: 0; font: inherit; }
 
 <header class="site-header">
   <div class="wrap">
-    <a class="brand" href="#top" aria-label="disk-cleaner, top of page">
+    <a class="brand" href="#top" aria-label="PruneDisk, top of page">
       <svg viewBox="0 0 64 64" aria-hidden="true" focusable="false">
         <rect x="3" y="3" width="36" height="58" rx="7" fill="var(--accent)"/>
         <rect x="43" y="3" width="18" height="27" rx="6" fill="var(--c-regen)"/>
         <rect x="43" y="34" width="18" height="27" rx="6" fill="var(--c-repo)"/>
       </svg>
-      disk-cleaner
+      PruneDisk
     </a>
     <nav aria-label="Page sections">
       <ul class="nav">
@@ -249,7 +249,7 @@ pre code { background: none; padding: 0; font: inherit; }
     <div class="wrap">
       <p class="status-note"><strong>Early.</strong> Only a read-only command-line scanner and planner exists, and it is still in review. It deletes nothing. There is no desktop app, installer or store listing yet.</p>
       <h1 id="h-hero">Know what is safe to remove.</h1>
-      <p class="lede">disk-cleaner is a free, open-source disk analyzer and cleaner for Windows, macOS and Linux that works out what each folder on a developer machine actually is, and therefore what can be removed, what must be backed up first, and what must be left alone.</p>
+      <p class="lede">PruneDisk is a free, open-source disk analyzer and cleaner for Windows, macOS and Linux that works out what each folder on a developer machine actually is, and therefore what can be removed, what must be backed up first, and what must be left alone.</p>
       <div class="cta-row">
         <a class="btn" href="https://github.com/ericmacdougall/disk-cleaner">Follow the project on GitHub</a>
         <a class="btn secondary" href="#status">See what exists today</a>
@@ -302,7 +302,7 @@ pre code { background: none; padding: 0; font: inherit; }
     <div class="wrap">
       <h2 id="h-problem">The problem</h2>
       <p>A developer disk fills up in a particular way. Hundreds of clones. Forty linked worktrees an agent created and never tidied. A <code>node_modules</code> or <code>target</code> folder in every project you have ever touched. Package caches. Gigabytes of coding-agent transcripts and logs. Rendered videos and model files that were never meant to go into git.</p>
-      <p>A general disk tool shows you one big folder and leaves the judgement to you. The risky part is that the folder next to it may hold the only copy of an unpushed branch, a stash, or a <code>.env</code> file. disk-cleaner is being built to tell those cases apart before anything is touched.</p>
+      <p>A general disk tool shows you one big folder and leaves the judgement to you. The risky part is that the folder next to it may hold the only copy of an unpushed branch, a stash, or a <code>.env</code> file. PruneDisk is being built to tell those cases apart before anything is touched.</p>
     </div>
   </section>
 
@@ -410,14 +410,14 @@ Items:
   remove-regenerable      1.9 GiB  [regenerable] ~/projects/example-app/node_modules
   recover-then-archive    0 B     [repo] ~/projects/example-notes
       (reasons abridged)</code></pre>
-      <p class="muted">The plan only describes what would happen. In the current version no command removes, moves or changes anything. The scanner writes a file only where you give <code>--out</code>.</p>
+      <p class="muted">The command is still called <code>disk-cleaner</code> today; it will be renamed <code>prunedisk</code>. The plan only describes what would happen. In the current version no command removes, moves or changes anything. The scanner writes a file only where you give <code>--out</code>.</p>
     </div>
   </section>
 
   <section id="follow" aria-labelledby="h-follow">
     <div class="wrap">
       <h2 id="h-follow">Follow along</h2>
-      <p>The project is developed in the open. The best way to follow it is the repository: the design document, the open pull request for the scanner, and the issue tracker. There is no mailing list, no account to create and nothing to install yet.</p>
+      <p>The project is developed in the open. The best way to follow it is the repository: the design document, the open pull request for the scanner, and the issue tracker. The repository is still named disk-cleaner; renaming the repository and the command to prunedisk is planned, not done. There is no mailing list, no account to create and nothing to install yet.</p>
       <p><a class="btn" href="https://github.com/ericmacdougall/disk-cleaner">github.com/ericmacdougall/disk-cleaner</a></p>
       <h3>Licence</h3>
       <p>MIT. Free to use, change and share. See the <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/LICENSE">licence file</a>.</p>
@@ -427,7 +427,7 @@ Items:
 
 <footer class="site-footer">
   <div class="wrap">
-    <p>disk-cleaner is an early open-source project under the MIT licence. This page loads no scripts, fonts, analytics or third-party resources.</p>
+    <p>PruneDisk is an early open-source project under the MIT licence. This page loads no scripts, fonts, analytics or third-party resources.</p>
   </div>
 </footer>
 </body>

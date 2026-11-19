@@ -1,6 +1,6 @@
-# disk-cleaner site
+# PruneDisk site
 
-A static page. No build step, no dependencies, no external requests.
+A static page for PruneDisk (the repository and command are still named disk-cleaner until the planned rename). No build step, no dependencies, no external requests.
 
 ```
 site/

@@ -1,20 +1,22 @@
-# disk-cleaner brand
+# PruneDisk brand
 
-Status: proposal for the project owner. Nothing here renames the project.
+Status: the project owner chose the name PruneDisk. The rename of the repository and the command is planned, not done (see section 1).
 
 ## 1. Name
 
-- **Repository, crate and command: `disk-cleaner`.** Fixed. Always lower case, always with the hyphen,
-  always in code font or the wordmark when it names the tool or the command.
-- **Display name (recommendation):** keep `disk-cleaner` as the display name too, set in the wordmark
-  below. In running prose write "disk-cleaner" (lower case, even at the start of a sentence, the way
-  `git` and `curl` are written). This avoids inventing a second name before the name question in
-  section 7 is decided.
-- **Wordmark:** the three-block mark followed by `disk-cleaner` in the system monospace stack, weight 600.
-  Minimum clear space: the height of one small block on every side. Minimum size: 16 px for the mark alone
+- **Display name: PruneDisk.** One word, capital P and capital D, in prose and headings, including at
+  the start of a sentence. Never "Prune Disk", "Prunedisk", "prune-disk" or "PRUNEDISK".
+- **Command, package and domain forms: `prunedisk`**, lower case, in code font. This is the planned
+  name of the command-line binary, crate, package and any domain.
+- **Today (not yet renamed):** the repository is `github.com/ericmacdougall/disk-cleaner` and the
+  command-line binary is still `disk-cleaner`. Renaming the repository and the binary to `prunedisk`
+  is planned. Until it happens, anything a reader can copy (links, commands, examples) must use the
+  current `disk-cleaner` names, with one short line saying the command will be renamed. Do not print
+  `prunedisk.com` or `prunedisk.app` as live addresses or links: they are not registered.
+- **Wordmark:** the three-block mark followed by "PruneDisk" drawn as strokes (section 6). Minimum
+  clear space: the height of one small block on every side. Minimum size: 16 px for the mark alone
   (`favicon.svg`), 120 px wide for the full logo.
-- **Do not** write "Disk Cleaner" in title case, "DiskCleaner", or use the name next to the logo of
-  another product.
+- **Do not** put the name next to the logo of another product or imitate another product's look.
 
 ## 2. Tagline
 
@@ -87,8 +89,8 @@ The three logo colours are `--accent`, the regenerable colour and the repo colou
 
 System font stacks only. Nothing is downloaded, embedded or licensed.
 
-- Text: `system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif`
-- Code and wordmark: `ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace`
+- Text and the site header name: `system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif`
+- Code and command names: `ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace`
 
 These are the operating system's own fonts, used by name. No font file is distributed with the
 project, so there is no font licence to carry. If the project later bundles a typeface it must be
@@ -103,45 +105,23 @@ Scale: base 16 px, line height 1.6; headings clamp from 1.4 rem to 3 rem. Code n
   stays. Three flat tiles with generous gaps stay distinguishable at 16 px; `favicon.svg` is the same
   mark redrawn on a 32-unit grid with wider relative gaps. Colour is carried by the three tiles, so it
   works on light and dark: each SVG switches its fills with `prefers-color-scheme` internally.
-- **Logo** (`logo.svg`): the mark plus the wordmark. The wordmark is live text in the system monospace
-  stack, so its exact glyphs depend on the viewer's system. A version with outlined letters is not
-  included, because no open font was chosen; make one only when a typeface is.
+- **Logo** (`logo.svg`): the mark plus the wordmark. The letters of "PruneDisk" are hand-drawn as
+  rounded strokes (nine paths, no font), so the logo renders identically on every system and carries no
+  font licence. They are geometric and plain by design; they are not an outlined copy of any typeface.
+  The website header sets the name in the system sans-serif at weight 700 instead of using the logo image.
 - Drawn by hand as plain rectangles. No stock icon, no generated image, no shape borrowed from another
   product. Do not rotate, outline, add shadows or recolour outside the tokens above.
 
-## 7. Name availability (decision for the project owner)
+## 7. Name decision and availability
 
-Checked 18 and 19 November 2026 with each service's public search interface or API; counts change daily.
-The Microsoft Store has no public search API, so that row is a web search and is not exhaustive.
+**Decision (project owner): the product is called PruneDisk.** The earlier generic name `disk-cleaner`
+was crowded: the crates.io name was already taken, and a Snap and a Mac App Store product used it.
 
-Existing products named "Disk Cleaner" or `disk-cleaner`:
+Availability note, dated **2026-11-18**: when checked on that date, the names `prunedisk.com` and
+`prunedisk.app` and the names `prunedisk` / PruneDisk on crates.io, npm, GitHub, the Snap Store and the
+Mac App Store were unclaimed. Not checked: the Microsoft Store and Flathub. This is **not a trademark
+search**; a trademark search in the target jurisdictions is still needed before the name is relied on
+publicly. The domains are not registered, so nothing on the site links to them.
 
-| Where | Finding |
-|---|---|
-| GitHub | 481 repositories with "disk-cleaner" in the name, none dominant. Most starred: [vudsen/ai-disk-cleaner](https://github.com/vudsen/ai-disk-cleaner), [gouthamkb06-ux/advanced-disk-cleaner](https://github.com/gouthamkb06-ux/advanced-disk-cleaner), [cyb3rl00m/safe-disk-cleaner](https://github.com/cyb3rl00m/safe-disk-cleaner), [ozankasikci/rust-disk-cleaner](https://github.com/ozankasikci/rust-disk-cleaner). Search: <https://github.com/search?q=disk-cleaner+in%3Aname&type=repositories> |
-| crates.io | The crate name `disk-cleaner` is **taken** ("A disk usage cli similar to windirstat"): <https://crates.io/crates/disk-cleaner> |
-| npm | `disk-cleaner` itself is free. Many near names exist, for example [dsh-disk-cleaner](https://www.npmjs.com/package/dsh-disk-cleaner). |
-| Snap Store | A snap named `disk-cleaner` exists, plus [easy-disk-cleaner](https://snapcraft.io/easy-disk-cleaner): <https://snapcraft.io/disk-cleaner> |
-| Flathub | No app with that exact name. Similar tools exist (Czkawka, Disk Usage Analyzer, Prunr): <https://flathub.org/apps/search?q=disk-cleaner> |
-| Microsoft Store | No exact "Disk Cleaner" found by web search; several similarly named cleaners (Disk Clean, PowerDisk, Disko). Not verified in the Store's own search. |
-| Mac App Store | [Disk Cleaner - Free HD Space](https://apps.apple.com/us/app/disk-cleaner-free-hd-space/id970246631) already exists, as do many similar cleaners. |
-
-Reading: the generic name is crowded. The repository name is fine for a GitHub project, but the crate
-name is already used by another project (the binary can still be called `disk-cleaner`; publishing the
-crate would need a different crate name), and an app-store listing called "Disk Cleaner" would sit
-beside an existing product with that exact title. **This is the owner's decision; nothing has been renamed.**
-
-Three distinctive alternative display names, same checks (crates.io and npm exact name, GitHub name search, Snap, Flathub, Mac App Store search via their APIs on the same dates; Microsoft Store not checked for these):
-
-| Name | Result |
-|---|---|
-| **Shedwise** | crates.io and npm exact names free. GitHub: 10 repositories with the word, none a disk tool (an unrelated GitHub organisation named `shedwise` exists). No Snap, Flathub or Mac App Store hit. Cleanest result. |
-| **Slackspace** | crates.io and npm exact names free. GitHub: 24 repositories, top ones are unrelated demos ([example](https://github.com/cternes/slackspace-angular-spring-keycloak)). No Snap, Flathub or Mac App Store hit. "Slack space" is a real filesystem term, which is meaningful but may confuse a search for the messaging product. |
-| **Tidyroot** | crates.io and npm exact names free. GitHub: no repositories. No Snap or Flathub hit; Mac App Store shows only unrelated "Clean" apps. Clear, but the most invented of the three. |
-
-Rejected for being taken: Ballast (crates.io and npm taken, 731 GitHub repositories), Spillway, Skerry
-and Tidemark (all taken on crates.io and npm), Diskwise (npm taken, a Mac App Store app "DiskWise: Storage
-Cleaner" exists).
-
-None of this is a trademark search. Before adopting a new name publicly, a trademark search in the
-target jurisdictions is needed; this document does not provide one.
+Planned follow-up (not done): register the domains and reserve the package names; rename the repository
+and the binary to `prunedisk`; update the site's links and example commands at the same time.
