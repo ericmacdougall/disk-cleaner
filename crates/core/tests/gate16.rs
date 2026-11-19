@@ -117,7 +117,8 @@ fn assert_preserves(it: &PlanItem, repo: &Path, files: &[String]) {
     assert_eq!(pre.git_admin.files, files.len() as u64, "{files:?}");
     assert!(pre.git_admin.files > 0 && pre.git_admin.bytes > 0);
     assert!(
-        it.reason.contains("saved with the manifest first, then it is removed"),
+        it.reason
+            .contains("saved with the manifest first, then it is removed"),
         "{}",
         it.reason
     );
@@ -181,7 +182,9 @@ fn y1_a_clean_pushed_clone_is_backed_up_then_removed() {
         assert!(files.iter().any(|f| f == must), "{must} missing: {files:?}");
     }
     assert!(
-        !files.iter().any(|f| f.starts_with("objects/") && f.len() == 49),
+        !files
+            .iter()
+            .any(|f| f.starts_with("objects/") && f.len() == 49),
         "loose objects are not the git directory's own files: {files:?}"
     );
     let p = plan_of(&res);
@@ -231,7 +234,7 @@ fn y1_a_git_directory_over_the_cap_asks_naming_its_largest_file() {
 fn y1_a_repo_removed_with_its_parent_has_its_git_directory_in_the_parents_obligation() {
     let (tmp, root, remotes) = workspace();
     let outer = clone_of(tmp.path(), &root, &remotes, "outer");
-    pushed_repo(&tmp.join("src"), &remotes, "inner");
+    pushed_repo(&tmp.path().join("src"), &remotes, "inner");
     let inner = outer.join("inner");
     let url = remotes.join("inner.git");
     git(
@@ -283,7 +286,10 @@ fn y2_a_rerere_resolution_recorded_before_an_aborted_merge_is_backed_up() {
     git(&repo, &["push", "-q", "origin", "main"]);
     let merged = git_ok(&repo, &["-c", "rerere.enabled=true", "merge", "-q", "side"]);
     assert!(!merged, "the merge must conflict");
-    write(&repo.join("README.md"), "the only copy of this resolution\n");
+    write(
+        &repo.join("README.md"),
+        "the only copy of this resolution\n",
+    );
     git(&repo, &["-c", "rerere.enabled=true", "rerere"]);
     git(&repo, &["merge", "--abort"]);
     assert_eq!(git(&repo, &["status", "--porcelain"]), "");
