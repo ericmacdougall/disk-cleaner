@@ -44,11 +44,16 @@ fn assert_inspected(res: &ScanResult, repo: &Path) {
 }
 
 /// The repo was refused before git ran: every fact is unknown, and the reason contains `want`.
+/// `plain_layout` may be `no` instead: the scan's own walk sets it for a symlink in the git
+/// directory whatever the config check found, and a `no` never offers anything.
 fn assert_refused(res: &ScanResult, repo: &Path, want: &str) {
     let f = facts_of(res, repo);
     let why = issues(res, repo);
+    let unknown = |(name, t): &(&str, Tri)| {
+        *t == Tri::Unknown || (*name == "plain_layout" && *t == Tri::No)
+    };
     assert!(
-        f.entries().iter().all(|(_, t)| *t == Tri::Unknown),
+        f.entries().iter().all(unknown),
         "{}: every fact must be unknown: {f:?} ({why})",
         repo.display()
     );
