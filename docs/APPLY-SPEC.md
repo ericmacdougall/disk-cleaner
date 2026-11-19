@@ -125,7 +125,7 @@ and restore detect it, they cannot undo it); memory corruption.
   recorded by name, not archived, and not recreated by restore.
 - **Index**: the item's fingerprint F0 plus the SHA-256 of every regular file (9.3). For a
   `remove-regenerable` item removed without a backup, the index is F0 alone, written to
-  `<state>/index/` at step 2.
+  `<state>/index/` before its quarantine (never in a dry run, which writes nothing).
 - **Quarantine**: renaming an item, with no-replace semantics, to `.disk-cleaner-removing-<item_id>`
   in the same parent directory before deleting it.
 - **Secret-like file**: defined in 9.2.
@@ -332,16 +332,20 @@ All of them are local and read-only, and all go through core's hardened runner (
 variables). `protocol.allow=never` also stops a lazy fetch in a partial clone. Apply reaches git
 only through:
 
-- core's `rescan_item` and `project_activity` (C-3) and `git_admin_files` and `object_store_files`,
-  which run the read-only commands core's scan already runs, unchanged;
+- core's `rescan_item` and `project_activity` (C-3), which run the read-only commands core's scan
+  runs, unchanged. At core commit 28705e2 these are exactly: `--version`, `rev-parse`, `config`
+  (`--get` and `--list` forms only), `status`, `ls-files`, `ls-tree`, `rev-list`, `for-each-ref`,
+  `log`, `cat-file`, `remote -v`, `stash list` and `worktree list`. (`git_admin_files` and
+  `object_store_files` classify by name and run no git.);
 - `git config --file FILE --includes --get core.excludesFile`, once per run for each of the user's
   global config files (9.2), run from the file-system root;
-- `git ls-files -z --others --ignored --exclude-from=FILE` in each working tree inside the item
+- `git ls-files -z --others --exclude-standard` and
+  `git ls-files -z --others --ignored --exclude-from=FILE` in each working tree inside the item
   (9.2).
 
-Restore and removal never run git. A test (AC-9) records every git invocation through a logging
-shim and fails on any subcommand outside the set core and apply use today; a change to that set is
-a deliberate change to the test.
+That list is the **allowed set**. Restore and removal never run git. A test (AC-9) records every git
+invocation through a logging shim and fails on any subcommand outside the allowed set; when core
+changes its command set, this list and the test change together, deliberately.
 
 ## 8. Deferred: live remote check and recovery push
 
@@ -421,10 +425,14 @@ always to the user's own storage):
     database; a leading `~/` in the value is expanded the same way; with no value, the default is
     `<config home>/git/ignore`;
   - `includeIf` blocks are not evaluated (they depend on the repository; section 17);
-  - in each working tree inside the item, `git ls-files -z --others --ignored
-    --exclude-from=FILE` lists the untracked files that file matches. Every such file is
-    secret-like, including one the repository's own rules also ignore (a superset, which can only
-    keep more items);
+  - in each working tree inside the item, a file is secret-like when it is listed both by
+    `git ls-files -z --others --exclude-standard` (untracked and not ignored by the repository's
+    own rules, which is how core's scan sees it) and by
+    `git ls-files -z --others --ignored --exclude-from=FILE` (matched by the global file). A file
+    the repository's own rules ignore is not caught by this rule (other rules still apply);
+  - operating-system metadata files are exempt from this rule only: `.DS_Store`, `Thumbs.db`,
+    `desktop.ini` and the macOS `Icon` file with a trailing carriage return. Without the exemption
+    a global `.DS_Store` rule, which is common on macOS, would keep almost every repository;
 - it is untracked or ignored, smaller than 1 MiB, and its first 64 KiB contain the header line of a
   PEM private key block, a URL that carries a password or token before the host, or a token in one
   of the documented formats of the common providers (AWS access keys, GitHub and GitLab tokens,
@@ -549,14 +557,14 @@ compared by path and kind only, because deleting its children changes its times 
 
 | Last state | O | Q | On resume |
 |---|---|---|---|
-| before `segment-synced` (archived item) or before `quarantine-intent` (unarchived regenerable item) | any | absent | Start the item again from step 2 with the next attempt. Earlier objects are orphans. O absent: skipped `gone`. |
-| `segment-synced` or `checked-again` | present | absent | Step 2 again (F0 must equal the index), then steps 7 to 11. |
-| `segment-synced` or `checked-again` | absent | absent | Skipped `gone`; the `backed-up` record stays valid for restore. |
+| Archived item: before `segment-synced`. Unarchived regenerable item: any state before `quarantine-intent` | any | absent | Start the item again from step 2 with the next attempt. Earlier objects are orphans. O absent: skipped `gone`. |
+| Archived item: `segment-synced` or `checked-again` | present | absent | Step 2 again (F0 must equal the index), then steps 7 to 11. |
+| Archived item: `segment-synced` or `checked-again` | absent | absent | Skipped `gone`; the `backed-up` record stays valid for restore. |
 | `quarantine-intent` | present | absent | The rename never happened: as `segment-synced`. |
 | `quarantine-intent` or `quarantined` | absent | present | Fingerprint Q: equal, continue at step 10; otherwise rename it back to O and record `kept` with the difference. |
 | `quarantine-intent` or `quarantined` | present | present | Touch neither; `failed`; report both paths. |
 | `quarantined` | present | absent | Touch nothing; `failed` ("quarantine missing, a directory is at the original path"). |
-| `quarantine-intent` or `quarantined` | absent | absent | Something outside the tool removed the item after it was backed up. Write a `vanished` record (the archive is the copy; restore works); `failed` in the summary. Never `removed`, never `kept`. |
+| `quarantine-intent` or `quarantined` | absent | absent | Something outside the tool removed the item. Archived item: write a `vanished` record (the archive is the copy; restore works); `failed` in the summary. Unarchived regenerable item: skipped `gone`, no record. Never `removed`, never `kept`. |
 | `delete-started` | any | present | Fingerprint Q: subset, continue deleting Q; otherwise stop, leave Q as it is, `failed`, and report Q (entries not in the index are not in the archive). A directory at O is never touched. |
 | `delete-started` | any | absent | Deletion finished before `deleted` was written: write `deleted`, then the `removed` record. A directory at O is new and is not touched; the summary names it. |
 | `deleted` | any | absent | Write and sync the `removed` record if no synced segment has it. |
@@ -776,7 +784,11 @@ TARGET_MISMATCH) and is reported to the user as such.
   writes after the final comparison and before deletion are lost. Only working directories are
   checked, not open files.
 - Dependents outside the item are as fresh as the scan (bounded by the plan age); references from
-  outside the scanned roots were never seen (SCAN-FORMAT.md, known limits).
+  outside the scanned roots were never seen (SCAN-FORMAT.md, known limits). Two known core gaps,
+  open as core follow-ups, are not relied on to be fixed: reference entry names are matched exactly,
+  so a case-variant spelling on a case-insensitive file system is not seen as a dependency; and
+  core's dependency tests do not run on Windows. Apply adds no dependency check of its own; on
+  Windows this matters less because Windows is backup-only (D-13).
 - Secret detection is best effort (9.2). Anything it misses is uploaded to the user's own storage,
   unencrypted unless the remote is `crypt`. A `core.excludesFile` set inside an `includeIf` block is
   not seen.
@@ -801,8 +813,8 @@ TARGET_MISMATCH) and is reported to the user as such.
   `min(--part-size, (free on the temporary volume - min-free) / 2)`, rounded down to a MiB, with
   `--part-size` defaulting to 1 GiB. Below 64 MiB the item is not started ("not enough free space
   on VOLUME"). The part size is journaled with the attempt (9.4); a later attempt may choose a
-  different one. Worked examples, with the default 1 GiB floor: a volume 97% full with 13 GiB free
-  uses 1 GiB parts; 1.6 GiB free uses 307 MiB parts; 1.1 GiB free stops before the item.
+  different one. Worked examples, with the default 1 GiB floor: a 500 GiB volume 97% full (15 GiB
+  free) uses 1 GiB parts; 1.6 GiB free uses 307 MiB parts; 1.1 GiB free stops before the item.
 - A part during which the temporary volume falls below the floor fails the attempt (fail closed);
   the next attempt sizes its parts again.
 - Memory is bounded by fixed buffers (1 MiB per stream); nothing holds a whole file in memory.
@@ -920,7 +932,7 @@ two steps; it exists only in test builds (AC-35).
 - **AC-24** Free space and budgets follow section 18 and 9.5: the floor is checked on the state and
   temporary volumes before each item and part, the part size is derived from free space and
   journaled per attempt, the upload budget uses logical size, and three consecutive storage failures
-  stop the backup stage. A 97%-full volume with 13 GiB free runs with 1 GiB parts. rclone's `local`
+  stop the backup stage. A 500 GiB volume 97% full runs with 1 GiB parts. rclone's `local`
   backend does not spool. Verify by: `limits.rs` with an injected free-space reader and `FaultStore`
   (the worked examples of section 18 as cases); and `rclone_spool.rs` in the Linux job, which runs
   the real rclone `rcat --size` of a 256 MiB part to a `local` remote with `TMPDIR` on a 64 MiB tmpfs
@@ -1000,7 +1012,8 @@ two steps; it exists only in test builds (AC-35).
   before the host in `.git/config`, `FETCH_HEAD` and `logs/HEAD`: the item is kept by default and
   none of the values appears in any stored object, segment, journal line or output; with
   `--upload-secrets` they are archived; with `--require-encrypted-remote` and a plain remote, exit 1
-  before any upload.
+  before any upload. A `.DS_Store` matched only by the global excludes file does not keep the item;
+  a `node_modules` ignored by the repository's own rules and also by the global file is not flagged.
 - **NEG-13 (AC-13)** An xattr over 64 KiB, or a Windows ADS other than `Zone.Identifier`: item
   unsupported, skipped.
 - **NEG-14 (AC-14)** The store fails mid-part; one byte differs on read-back; the read-back is short;
@@ -1045,8 +1058,9 @@ two steps; it exists only in test builds (AC-35).
 - **NEG-27 (AC-29)** A repository whose nested `node_modules` is answered `n` or is outside
   `--class`, with `--remove`: the repository is skipped. The same with `--backup-only`: the
   repository is archived with the `node_modules` inside.
-- **NEG-28 (AC-33)** An encrypted rclone configuration with no password available: exit 1 before
-  any upload, no prompt, and no rclone process reads stdin outside `rcat`. rclone older than 1.64:
+- **NEG-28 (AC-33)** An encrypted rclone configuration, with or without a password in the
+  environment: exit 1 before any upload, no prompt, and no rclone process reads stdin outside
+  `rcat`. rclone older than 1.64:
   exit 1. rclone stderr carrying a fake token: absent from every output.
 - **NEG-29 (AC-34)** A crash after `attempt-started` and before the first part, then a resume: the
   next attempt number is used and no name is written twice. A crash after `segment-reserved`: the
@@ -1090,7 +1104,7 @@ two steps; it exists only in test builds (AC-35).
 | M5 sync folders and placeholders | Such items are kept (7.4) | AC-7; NEG-7 |
 | M6 "reproducible" files trusted on git's stat check; restore fidelity | Whole-item archive; restore compared with the original snapshot (9.1, 13.3, D-12) | AC-11, AC-27; NEG-8 |
 | M7 same-disk vault as the only copy | No vault; secret-like files keep the item unless uploaded (9.2, D-4) | AC-12; NEG-12 |
-| M8 globally ignored files | Read from the global excludes file and treated as secret-like (9.2) | AC-12; NEG-12 |
+| M8 globally ignored files | Untracked files matched by the global excludes file are secret-like, OS metadata names exempt (9.2) | AC-12; NEG-12 |
 | M9 detection by name only, unencrypted upload | More names, bounded content check, encryption warning, `--require-encrypted-remote` (9.2) | AC-12; NEG-12 |
 | M10 regenerable items cannot be re-scanned alone | Core item re-scan and project activity (C-3, 7.2) | AC-5, AC-20 |
 | M11 production network path untested | No network path in this release | AC-9 |
@@ -1134,7 +1148,9 @@ runs the real binary before the work is called ready.
   unpushed commit, a stash, uncommitted, untracked and ignored files
   (`recover-backup-then-remove`); a project with a `node_modules` (`remove-regenerable`); one
   repository with a fake `.env` (kept by default); a nested case; a file with an extended
-  attribute; a long path on Windows. The tester runs `scan` and `plan` on DIR.
+  attribute; a long path on Windows. The script sets every modification time and every commit
+  date 60 days in the past, beyond the default 7-day active window, so the plan gives the actions
+  named. The tester runs `scan` and `plan` on DIR.
 - **Storage.** (a) A local-directory rclone remote in a temporary rclone config. (b) One real
   non-local remote in a disposable bucket or folder that the coordinator provides at test time. The
   tester configures it in their own rclone config; no credential appears in the repository, the

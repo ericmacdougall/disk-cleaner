@@ -127,7 +127,10 @@ sections 5 to 7 and 9 where they differ. In short: every removed repository is a
 the user's storage and read back first; the first apply release runs no network git command, so it
 pushes no recovery refs and makes no live remote check (both are deferred, with entry conditions,
 to a later release); nothing is ever written into the user's repository; there is no bundle (the
-archive holds everything). The text below is the original intent, kept for the later release.
+archive holds everything). The text below is the original intent. The later release is bound by
+the entry conditions in APPLY-SPEC.md section 8: where the text below conflicts with them (pushing
+stashes or snapshot commits of uncommitted work, bundles, `recovery/<host>` ref names), section 8
+wins.
 
 Modes: `ask` (per item), `auto` (apply the default action), `report` (list only).
 
