@@ -295,10 +295,8 @@ fn build_ctx(scan: &ScanResult, opts: &PlanOptions) -> Ctx {
             path.push(c);
             cur = parent[c];
         }
-        let mut d = base;
-        for &c in path.iter().rev() {
-            depth[c] = d;
-            d += 1;
+        for (off, &c) in path.iter().rev().enumerate() {
+            depth[c] = base + off;
             on_path[c] = false;
         }
     }
