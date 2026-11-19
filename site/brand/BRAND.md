@@ -34,7 +34,7 @@ been measured and published with its method.
 
 ## 3. Voice
 
-Plain, specific, calm. Say what a thing is, then what it does. Prefer the concrete noun
+Write in American English (analyzer, color, license, judgment). Plain, specific, calm. Say what a thing is, then what it does. Prefer the concrete noun
 (`node_modules`, "an unpushed branch") to the abstract one ("junk", "bloat"). Say "early" and "planned"
 where they are true; never write a future feature in the present tense. State limits next to claims.
 No exclamation marks, no emoji, no fear ("your disk is dying"), no superlatives. Examples invented for
@@ -46,7 +46,7 @@ the site use obviously synthetic paths such as `~/projects/example-app`.
 | Cleans your disk in one click | Plans removals you can read first. In the current version nothing is removed. |
 | Safe and secure | Unknown means keep. A check that fails counts as "keep". |
 
-## 4. Colour tokens
+## 4. Color tokens
 
 Text pairs are WCAG 2.2 AA at normal size (4.5:1) or better. Non-text parts (borders that mark a
 control, chart tiles) are 3:1 or better. Ratios were computed with the WCAG relative-luminance formula
@@ -68,7 +68,7 @@ surface 3.4.
 Contrast, dark: text on bg 15.7, text on surface 14.1, muted on bg 8.8, muted on surface 7.9, accent
 on bg 10.5, accent on surface 9.4, bg on accent (button) 10.5, border on bg 4.4, border on surface 3.9.
 
-Class colours (one per file class; always paired with a text label, never the only signal):
+Class colors (one per file class; always paired with a text label, never the only signal):
 
 | Class | Light | Dark | Label text on tile, light / dark |
 |---|---|---|---|
@@ -79,11 +79,11 @@ Class colours (one per file class; always paired with a text label, never the on
 | output | `#1f7a4d` | `#5fcf93` | 5.3 / 9.5 |
 | loose-code | `#5f6b66` | `#9aa7a1` | 5.6 / 7.4 |
 
-Label text is white on the light tiles and `#0f1513` on the dark tiles. Each class colour also
+Label text is white on the light tiles and `#0f1513` on the dark tiles. Each class color also
 clears 4.3:1 or more against both page backgrounds in its own scheme, so it is usable as a swatch or
 a thin line.
 
-The three logo colours are `--accent`, the regenerable colour and the repo colour of the active scheme.
+The three logo colors are `--accent`, the regenerable color and the repo color of the active scheme.
 
 ## 5. Type
 
@@ -93,8 +93,8 @@ System font stacks only. Nothing is downloaded, embedded or licensed.
 - Code and command names: `ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace`
 
 These are the operating system's own fonts, used by name. No font file is distributed with the
-project, so there is no font licence to carry. If the project later bundles a typeface it must be
-open-licensed (SIL OFL or Apache-2.0), self-hosted, and its licence added to the repository.
+project, so there is no font license to carry. If the project later bundles a typeface it must be
+open-licensed (SIL OFL or Apache-2.0), self-hosted, and its license added to the repository.
 
 Scale: base 16 px, line height 1.6; headings clamp from 1.4 rem to 3 rem. Code never goes below 13 px.
 
@@ -103,14 +103,19 @@ Scale: base 16 px, line height 1.6; headings clamp from 1.4 rem to 3 rem. Code n
 - **Mark** (`logo-mark.svg`): a square cut into one large block and two small ones, a treemap in three
   tiles. It says what the tool shows (where space went, by kind) and the large block is the part that
   stays. Three flat tiles with generous gaps stay distinguishable at 16 px; `favicon.svg` is the same
-  mark redrawn on a 32-unit grid with wider relative gaps. Colour is carried by the three tiles, so it
-  works on light and dark: each SVG switches its fills with `prefers-color-scheme` internally.
+  mark redrawn on a 32-unit grid with wider relative gaps.
+- **Light and dark files.** The standalone files do not switch by themselves: `logo.svg` and
+  `logo-mark.svg` are for light backgrounds, `logo-dark.svg` and `logo-mark-dark.svg` for dark ones. The
+  caller picks, for example with
+  `<picture><source srcset="logo-dark.svg" media="(prefers-color-scheme: dark)"><img src="logo.svg" alt="PruneDisk"></picture>`.
+  The one exception is `favicon.svg`, which follows the browser's color scheme with `prefers-color-scheme`
+  because a tab strip can be light or dark independently of the page.
 - **Logo** (`logo.svg`): the mark plus the wordmark. The letters of "PruneDisk" are hand-drawn as
   rounded strokes (nine paths, no font), so the logo renders identically on every system and carries no
-  font licence. They are geometric and plain by design; they are not an outlined copy of any typeface.
+  font license. They are geometric and plain by design; they are not an outlined copy of any typeface.
   The website header sets the name in the system sans-serif at weight 700 instead of using the logo image.
 - Drawn by hand as plain rectangles. No stock icon, no generated image, no shape borrowed from another
-  product. Do not rotate, outline, add shadows or recolour outside the tokens above.
+  product. Do not rotate, outline, add shadows or recolor outside the tokens above.
 
 ## 7. Name decision and availability
 

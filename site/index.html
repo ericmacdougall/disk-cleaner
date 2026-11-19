@@ -4,11 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PruneDisk: know what is safe to remove</title>
-<meta name="description" content="A free, MIT-licensed disk analyzer and cleaner that understands developer machines: git repos, worktrees, rebuildable folders and agent logs. Early: a read-only command-line scanner only.">
+<meta name="description" content="Early, read-only: PruneDisk scans a developer machine and plans what is safe to remove. It deletes nothing yet.">
 <meta name="color-scheme" content="light dark">
 <meta property="og:type" content="website">
 <meta property="og:title" content="PruneDisk: know what is safe to remove">
-<meta property="og:description" content="A free, open-source disk cleaner for developer machines. Early: read-only scanning and planning only; it deletes nothing yet.">
+<meta property="og:site_name" content="PruneDisk">
+<meta property="og:description" content="Early, read-only: PruneDisk scans a developer machine and plans what is safe to remove. It deletes nothing yet.">
 <meta name="twitter:card" content="summary">
 <link rel="icon" href="brand/favicon.svg" type="image/svg+xml">
 <style>/* PruneDisk site. No external requests: system fonts only, no build step. */
@@ -160,7 +161,7 @@ figcaption { color: var(--muted); font-size: 0.9rem; margin-top: 0.5rem; max-wid
 /* Small screens: tile text would shrink below legibility, so a legend replaces it. */
 .legend { display: none; list-style: none; margin: 0.75rem 0 0; padding: 0; font-size: 0.9rem; }
 .legend li { margin-bottom: 0.3rem; }
-@media (max-width: 40rem) {
+@media (max-width: 44rem) {
   .legend { display: block; }
   .tile-label, .tile-sub { display: none; }
 }
@@ -249,7 +250,7 @@ pre code { background: none; padding: 0; font: inherit; }
     <div class="wrap">
       <p class="status-note"><strong>Early.</strong> Only a read-only command-line scanner and planner exists, and it is still in review. It deletes nothing. There is no desktop app, installer or store listing yet.</p>
       <h1 id="h-hero">Know what is safe to remove.</h1>
-      <p class="lede">PruneDisk is a free, open-source disk analyzer and cleaner for Windows, macOS and Linux that works out what each folder on a developer machine actually is, and therefore what can be removed, what must be backed up first, and what must be left alone.</p>
+      <p class="lede">PruneDisk is a free, open-source disk analyzer for developer machines. Today a read-only command-line tool scans a disk, works out what each folder is (a git repo, a worktree, a rebuildable folder, a cache) and plans what could be removed, backed up first, or left alone. It deletes nothing. It is being built into a cleaner for Windows, macOS and Linux, which are the target platforms: the build on the review branch covers all three, and only macOS has been tested by hand so far.</p>
       <div class="cta-row">
         <a class="btn" href="https://github.com/ericmacdougall/disk-cleaner">Follow the project on GitHub</a>
         <a class="btn secondary" href="#status">See what exists today</a>
@@ -257,7 +258,7 @@ pre code { background: none; padding: 0; font: inherit; }
 
       <figure>
         <svg viewBox="0 0 640 340" role="img" aria-labelledby="fig-t fig-d">
-          <title id="fig-t">Illustration of a disk drawn as a treemap, coloured by class</title>
+          <title id="fig-t">Illustration of a disk drawn as a treemap, colored by class</title>
           <desc id="fig-d">A rectangle split into seven blocks. The largest is regenerable folders such as node_modules and target. Others are a git repo, linked worktrees, caches, agent session logs, output files and loose code. The sizes are invented.</desc>
           <rect class="tile-regen" x="0" y="0" width="300" height="200" rx="6"/>
           <text class="tile-label" x="14" y="30">regenerable</text>
@@ -293,7 +294,7 @@ pre code { background: none; padding: 0; font: inherit; }
           <li><span class="dot" style="background:var(--c-output)"></span>output: video, models</li>
           <li><span class="dot" style="background:var(--c-loose)"></span>loose-code: source outside any repo</li>
         </ul>
-        <figcaption>A drawing of the idea, not a screenshot: colour says what a folder is, and area says how much space it takes. The sizes are invented. The desktop views are planned and do not exist yet.</figcaption>
+        <figcaption>A drawing of the idea, not a screenshot: color says what a folder is, and area says how much space it takes. The sizes are invented. The desktop views are planned and do not exist yet.</figcaption>
       </figure>
     </div>
   </section>
@@ -301,8 +302,8 @@ pre code { background: none; padding: 0; font: inherit; }
   <section id="problem" aria-labelledby="h-problem">
     <div class="wrap">
       <h2 id="h-problem">The problem</h2>
-      <p>A developer disk fills up in a particular way. Hundreds of clones. Forty linked worktrees an agent created and never tidied. A <code>node_modules</code> or <code>target</code> folder in every project you have ever touched. Package caches. Gigabytes of coding-agent transcripts and logs. Rendered videos and model files that were never meant to go into git.</p>
-      <p>A general disk tool shows you one big folder and leaves the judgement to you. The risky part is that the folder next to it may hold the only copy of an unpushed branch, a stash, or a <code>.env</code> file. PruneDisk is being built to tell those cases apart before anything is touched.</p>
+      <p>A developer disk fills up in a particular way. Hundreds of clones. Linked worktrees an agent created and never tidied. A <code>node_modules</code> or <code>target</code> folder in every project you have ever touched. Package caches. Gigabytes of coding-agent transcripts and logs. Rendered videos and model files that were never meant to go into git.</p>
+      <p>A general disk tool shows you one big folder and leaves the judgment to you. The risky part is that the folder next to it may hold the only copy of an unpushed branch, a stash, or a <code>.env</code> file. PruneDisk is being built to tell those cases apart before anything is touched.</p>
     </div>
   </section>
 
@@ -312,19 +313,19 @@ pre code { background: none; padding: 0; font: inherit; }
       <p>Every directory gets one class. Each class has a default disposition. These are the rules in the project's <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/docs/DESIGN.md">design document</a>; the read-only scanner in review assigns repo, worktree, bare-repo, regenerable, cache and loose-code, and lists output files individually. Agent-session handling is designed but not built.</p>
 
       <div class="table-wrap">
-        <table class="stack">
-          <caption>Classes and what happens to them by default</caption>
-          <thead><tr><th scope="col">Class</th><th scope="col">What it is</th><th scope="col">Default</th></tr></thead>
-          <tbody>
-            <tr><th scope="row"><span class="dot" style="background:var(--c-repo)"></span>repo</th><td data-label="What it is">A directory with a <code>.git</code> directory.</td><td data-label="Default">Keep. Can be archived when idle and fully on a remote.</td></tr>
-            <tr><th scope="row"><span class="dot" style="background:var(--c-worktree)"></span>worktree</th><td data-label="What it is">A linked git worktree.</td><td data-label="Default">Like a repo, checked against its own HEAD.</td></tr>
-            <tr><th scope="row"><span class="dot" style="background:var(--text)"></span>bare-repo</th><td data-label="What it is">A bare git repository.</td><td data-label="Default">Never removed while a worktree or clone depends on it.</td></tr>
-            <tr><th scope="row"><span class="dot" style="background:var(--c-regen)"></span>regenerable</th><td data-label="What it is"><code>node_modules</code>, <code>target</code>, <code>.venv</code>, <code>.next</code>, <code>DerivedData</code>.</td><td data-label="Default">Remove when the owning project is not active.</td></tr>
-            <tr><th scope="row"><span class="dot" style="background:var(--c-cache)"></span>cache</th><td data-label="What it is">Package manager and tool caches.</td><td data-label="Default">Remove by age or size policy.</td></tr>
-            <tr><th scope="row"><span class="dot" style="background:var(--c-agent)"></span>agent-session</th><td data-label="What it is">Coding-agent transcripts, logs and work directories.</td><td data-label="Default">Back up first, remove only after a verified backup and an age threshold.</td></tr>
-            <tr><th scope="row"><span class="dot" style="background:var(--c-output)"></span>output</th><td data-label="What it is">Video, audio, images, archives, model weights, datasets.</td><td data-label="Default">Never to git. Back up, then remove by policy.</td></tr>
-            <tr><th scope="row"><span class="dot" style="background:var(--c-loose)"></span>loose-code</th><td data-label="What it is">Source files or a project manifest outside any repo.</td><td data-label="Default">Ask: connect a remote, back up, remove, or leave.</td></tr>
-            <tr><th scope="row"><span class="dot" style="background:var(--muted)"></span>system, user-data</th><td data-label="What it is">Operating system files, documents, photos.</td><td data-label="Default">Analyze only.</td></tr>
+        <table class="stack" role="table">
+          <caption role="caption">Classes and what happens to them by default</caption>
+          <thead role="rowgroup"><tr role="row"><th scope="col" role="columnheader">Class</th><th scope="col" role="columnheader">What it is</th><th scope="col" role="columnheader">Default</th></tr></thead>
+          <tbody role="rowgroup">
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-repo)"></span>repo</th><td role="cell" data-label="What it is">A directory with a <code>.git</code> directory.</td><td role="cell" data-label="Default">Keep. Can be archived when idle and fully on a remote.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-worktree)"></span>worktree</th><td role="cell" data-label="What it is">A linked git worktree.</td><td role="cell" data-label="Default">Like a repo, checked against its own HEAD.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--text)"></span>bare-repo</th><td role="cell" data-label="What it is">A bare git repository.</td><td role="cell" data-label="Default">Never removed while a worktree or clone depends on it.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-regen)"></span>regenerable</th><td role="cell" data-label="What it is"><code>node_modules</code>, <code>target</code>, <code>.venv</code>, <code>.next</code>, <code>DerivedData</code>.</td><td role="cell" data-label="Default">Remove when the owning project is not active.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-cache)"></span>cache</th><td role="cell" data-label="What it is">Package manager and tool caches.</td><td role="cell" data-label="Default">Remove by age or size policy.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-agent)"></span>agent-session</th><td role="cell" data-label="What it is">Coding-agent transcripts, logs and work directories.</td><td role="cell" data-label="Default">Back up first, remove only after a verified backup and an age threshold.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-output)"></span>output</th><td role="cell" data-label="What it is">Video, audio, images, archives, model weights, datasets.</td><td role="cell" data-label="Default">Never to git. Back up, then remove by policy.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-loose)"></span>loose-code</th><td role="cell" data-label="What it is">Source files or a project manifest outside any repo.</td><td role="cell" data-label="Default">Ask: connect a remote, back up, remove, or leave.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--muted)"></span>system, user-data</th><td role="cell" data-label="What it is">Operating system files, documents, photos.</td><td role="cell" data-label="Default">Analyze only.</td></tr>
           </tbody>
         </table>
       </div>
@@ -354,15 +355,15 @@ pre code { background: none; padding: 0; font: inherit; }
       <h2 id="h-status">What exists today and what is planned</h2>
       <p>Last checked against the project repository on 18 November 2026. The repository is the source of truth; this table can lag it.</p>
       <div class="table-wrap">
-        <table class="stack">
-          <caption>Status of each part of the project</caption>
-          <thead><tr><th scope="col">Part</th><th scope="col">Status</th><th scope="col">Notes</th></tr></thead>
-          <tbody>
-            <tr><th scope="row">Design</th><td data-label="Status"><span class="badge">Written</span></td><td data-label="Notes">Draft design document in the repository.</td></tr>
-            <tr><th scope="row">CLI: scan and plan</th><td data-label="Status"><span class="badge">In review</span></td><td data-label="Notes">Read-only. On an open draft pull request, not merged. Produces JSON and a readable summary. Deletes nothing.</td></tr>
-            <tr><th scope="row">Recovery, backup, apply, restore</th><td data-label="Status"><span class="badge">Planned</span></td><td data-label="Notes">Recovery branches, rclone backup connectors, removal with a manifest, restore. Not started.</td></tr>
-            <tr><th scope="row">Desktop app</th><td data-label="Status"><span class="badge">Planned</span></td><td data-label="Notes">Sunburst, treemap and outline views. Not started.</td></tr>
-            <tr><th scope="row">App stores and installers</th><td data-label="Status"><span class="badge">Planned</span></td><td data-label="Notes">Nothing to download yet.</td></tr>
+        <table class="stack" role="table">
+          <caption role="caption">Status of each part of the project</caption>
+          <thead role="rowgroup"><tr role="row"><th scope="col" role="columnheader">Part</th><th scope="col" role="columnheader">Status</th><th scope="col" role="columnheader">Notes</th></tr></thead>
+          <tbody role="rowgroup">
+            <tr role="row"><th scope="row" role="rowheader">Design</th><td role="cell" data-label="Status"><span class="badge">Written</span></td><td role="cell" data-label="Notes">Draft design document in the repository.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">CLI: scan and plan</th><td role="cell" data-label="Status"><span class="badge">In review</span></td><td role="cell" data-label="Notes">Read-only. On an open draft pull request, not merged. Produces JSON and a readable summary. Deletes nothing.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">Recovery, backup, apply, restore</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Recovery branches, rclone backup connectors, removal with a manifest, restore. Not started.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">Desktop app</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Sunburst, treemap and outline views. Not started.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">App stores and installers</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Nothing to download yet.</td></tr>
           </tbody>
         </table>
       </div>
@@ -373,7 +374,7 @@ pre code { background: none; padding: 0; font: inherit; }
     <div class="wrap">
       <h2 id="h-example">What the scanner prints</h2>
       <p>The shape below follows the summary the command-line scanner prints and the format in the project's scan documentation. The paths and sizes are invented for this page, and long lines are shortened. It is not output from a real machine.</p>
-<pre tabindex="0" aria-label="Example scanner output"><code>$ disk-cleaner scan ~/projects
+<pre tabindex="0" role="region" aria-label="Example scanner output"><code>$ disk-cleaner scan ~/projects
 Scanned ~/projects
 18402 files, 1311 directories, 9.4 GiB allocated (9.1 GiB logical)
 
@@ -419,15 +420,15 @@ Items:
       <h2 id="h-follow">Follow along</h2>
       <p>The project is developed in the open. The best way to follow it is the repository: the design document, the open pull request for the scanner, and the issue tracker. The repository is still named disk-cleaner; renaming the repository and the command to prunedisk is planned, not done. There is no mailing list, no account to create and nothing to install yet.</p>
       <p><a class="btn" href="https://github.com/ericmacdougall/disk-cleaner">github.com/ericmacdougall/disk-cleaner</a></p>
-      <h3>Licence</h3>
-      <p>MIT. Free to use, change and share. See the <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/LICENSE">licence file</a>.</p>
+      <h3>License</h3>
+      <p>MIT. Free to use, change and share. See the <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/LICENSE">license file</a>.</p>
     </div>
   </section>
 </main>
 
 <footer class="site-footer">
   <div class="wrap">
-    <p>PruneDisk is an early open-source project under the MIT licence. This page loads no scripts, fonts, analytics or third-party resources.</p>
+    <p>PruneDisk is an early open-source project under the MIT license. This page loads no scripts, fonts, analytics or third-party resources.</p>
   </div>
 </footer>
 </body>

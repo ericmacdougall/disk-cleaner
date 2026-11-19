@@ -5,7 +5,7 @@ A static page for PruneDisk (the repository and command are still named disk-cle
 ```
 site/
   index.html   the page, with its CSS inline (light and dark via prefers-color-scheme)
-  brand/       BRAND.md, logo.svg, logo-mark.svg, favicon.svg
+  brand/       BRAND.md, logo.svg and logo-dark.svg, logo-mark.svg and logo-mark-dark.svg, favicon.svg
 ```
 
 ## Preview locally
