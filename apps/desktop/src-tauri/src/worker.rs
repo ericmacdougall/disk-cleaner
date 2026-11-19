@@ -265,7 +265,15 @@ pub fn sweep_session(sid: u32, leader_start: Option<u64>, include_leader: bool) 
         let mut found = 0;
         let mut leader = None;
         for (pid, p) in sys.processes() {
-            if p.session_id() != Some(session) || p.status() == ProcessStatus::Zombie {
+            // On Linux sysinfo also lists every thread as a "process". A thread's id is not a
+            // process: kill(tid, SIGKILL) ends the whole process the thread belongs to, so
+            // the worker's own watchdog sweep killed the worker through one of its threads
+            // before it reached the git (CI run 44637137532: 11 of 11 Linux runs left the
+            // fake git running). Threads are skipped; their process is matched by its pid.
+            if p.thread_kind().is_some()
+                || p.session_id() != Some(session)
+                || p.status() == ProcessStatus::Zombie
+            {
                 continue;
             }
             if *pid == session {
