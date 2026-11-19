@@ -79,8 +79,10 @@ For each repo and each worktree the scanner records, each as yes / no / unknown:
   places hold opts in with `accept_incomplete_coverage` (`--accept-incomplete-coverage`), and each
   removal decision then says what was not read.
 
-At apply time the remote facts are confirmed against the live remote (`git ls-remote`), because
-remote-tracking refs can be stale.
+Remote-tracking refs can be stale, so the remote facts are unverified. The first apply release
+does not contact remotes at all: it removes a repository only after a verified archive of the whole
+repository is in storage, and treats remote facts as informational (APPLY-SPEC.md, section 8). A
+live check with `git ls-remote` is deferred to the release that adds recovery pushes.
 
 A repo is **safe to remove** only when every fact is the safe value. Anything else is **ambiguous**
 and goes through recovery.
@@ -121,10 +123,11 @@ including their regenerable directories.
 ## 4. Recovery for ambiguous repos
 
 The apply phase is specified in [APPLY-SPEC.md](APPLY-SPEC.md), which supersedes this section and
-sections 5 and 6 where they differ. In short: every removed repository is archived whole to the
-user's storage and read back first; pushing recovery refs is an opt-in that stays disabled until
-its hosting assumptions are verified; nothing is ever written into the user's repository; there is
-no bundle fallback (the archive holds everything). The text below is the original intent.
+sections 5 to 7 and 9 where they differ. In short: every removed repository is archived whole to
+the user's storage and read back first; the first apply release runs no network git command, so it
+pushes no recovery refs and makes no live remote check (both are deferred, with entry conditions,
+to a later release); nothing is ever written into the user's repository; there is no bundle (the
+archive holds everything). The text below is the original intent, kept for the later release.
 
 Modes: `ask` (per item), `auto` (apply the default action), `report` (list only).
 
@@ -151,7 +154,9 @@ That gives Dropbox, S3 and Glacier classes, Backblaze B2, Google Drive, OneDrive
 external disk and many more without writing a client for each. The app helps the user create and
 test a remote; rclone owns the credentials.
 
-- **Cold storage** for outputs, raw loose code, bundles and old agent sessions.
+- **Archives** of removed items (whole repositories and, on request, regenerable directories) as
+  pax tar parts with an index (APPLY-SPEC.md, 9.3).
+- **Cold storage** for outputs, raw loose code and old agent sessions (a later release).
 - **Verification**: an upload counts only after the whole object is read back and its SHA-256
   compared with what was sent (APPLY-SPEC.md, 9.4). Rate-limit responses pause and resume; a
   partial run is never recorded as a backup.
@@ -165,7 +170,7 @@ A policy is a rule set the user enables, for example:
 - regenerable directories in projects idle for N days: remove;
 - package caches not accessed for N days, or above N GB: remove;
 - repos idle for N days: archive the whole repository to storage, verify, then remove (recovery
-  refs only on request);
+  refs in a later release);
 - agent sessions older than N days and not tied to an active project: back up, verify, remove;
 - outputs older than N days: back up, verify, remove.
 
@@ -174,12 +179,12 @@ the rest for review. No default policy is automatic.
 
 ## 7. Manifest
 
-An append-only JSON Lines file per machine, mirrored to backup storage. One record per removed or
-backed-up item: path, class, size, hashes or git object ids, the safety facts and when they were
-verified, backup location (for a git node, where its git directory's own files were saved), and
-the exact restore command. `disk-cleaner find <text>` searches it;
-`disk-cleaner restore <id>` puts an item back (re-clone at the recorded commit, fetch a bundle,
-download an archive, or note that it is regenerable and how).
+Append-only JSON Lines segments per machine, each mirrored to backup storage and read back
+(APPLY-SPEC.md, section 12). One record per removed or backed-up item: path, class, the plan's
+action, size, archive parts and digests, the scan facts used (remote facts marked unverified), and
+the exact restore command. `disk-cleaner manifest list|find|verify|orphans` reads it, from local
+state or from storage alone; `disk-cleaner restore <id>` puts an item back from its archive, or
+notes that it was regenerable and how it is rebuilt. Restore never runs git.
 
 ## 8. Interface
 
@@ -207,10 +212,10 @@ Informed by a walk through of Disk Space Analyzer and TreeSize.
 |---|---|---|---|
 | App shell | Tauri 2 | MIT or Apache-2.0 | small binaries, Rust core shared with the CLI |
 | Parallel walk | `jwalk` | MIT | used by dua-cli; `ignore` for gitignore-aware passes |
-| Git | `git` CLI first, `gix` where it pays | MIT or Apache-2.0 | the CLI is the reference for worktrees and pushes |
-| Storage | rclone (rc API) | MIT | bundled or discovered on PATH |
+| Git | `git` CLI first, `gix` where it pays | MIT or Apache-2.0 | local and read-only through the hardened runner; no network git in the first apply release |
+| Storage | rclone command line (`rcat --size`, `cat`, `lsjson`), 1.64 or later | MIT | discovered on PATH or `--rclone`; the rc API may replace it later |
 | Artifact rules | modelled on kondo, npkill, cargo-sweep | MIT | rules kept as data |
-| Recycle bin | `trash` crate | MIT | reversible removal where the user wants it |
+| Removal | handle-relative `openat`/`unlinkat` after a no-replace quarantine rename | n/a | no recycle bin: every removed item is archived first (APPLY-SPEC.md, 13.2) |
 | Charts | d3-hierarchy | ISC | sunburst and treemap layout |
 | Volumes, processes | `sysinfo` | MIT | free space, process working directories |
 
