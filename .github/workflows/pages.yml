@@ -5,7 +5,7 @@ name: Pages
 # Until then the gate job finds Pages off and the deploy job is skipped, so the run stays green.
 on:
   push:
-    branches: [main]
+    branches: [main, ci/pages-skip-rehearsal-68765ae]
     paths:
       - "site/**"
       - ".github/workflows/pages.yml"
