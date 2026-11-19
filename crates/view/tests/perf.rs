@@ -137,14 +137,19 @@ fn real_walk_over_a_million_empty_files() {
             std::fs::File::create(sub.join(format!("f{f:04}"))).unwrap();
         }
     }
-    println!("PERF real_walk_fixture_create_ms={:.0}", ms(start.elapsed()));
+    println!(
+        "PERF real_walk_fixture_create_ms={:.0}",
+        ms(start.elapsed())
+    );
     let mut runs = Vec::new();
     for _ in 0..2 {
         let cancel = AtomicBool::new(false);
         let mut events = 0u64;
         let start = Instant::now();
-        let tree = walk(&WalkOptions::new(vec![root.clone()]), &cancel, &mut |_| events += 1)
-            .unwrap();
+        let tree = walk(&WalkOptions::new(vec![root.clone()]), &cancel, &mut |_| {
+            events += 1
+        })
+        .unwrap();
         let t = ms(start.elapsed());
         assert_eq!(tree.stats.files, 1_000_000);
         let per_s = events as f64 / (t / 1000.0).max(0.001);

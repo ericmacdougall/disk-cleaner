@@ -80,10 +80,14 @@ OS_SYMBOLS = (
 OS_CALL = re.compile(OS_PREFIX + r"[\w:]*?\b" + OS_SYMBOLS + r"\b")
 OS_USE = re.compile(r"\buse\s+" + OS_PREFIX + r".*\b" + OS_SYMBOLS + r"\b")
 
-ALLOW_ATTR = re.compile(r"#\s*\[\s*(?:cfg_attr\s*\(.*,\s*)?allow\s*\((?P<lints>[^\]]*)\)")
-INNER_ALLOW = re.compile(r"#\s*!\s*\[\s*(?:cfg_attr\s*\(.*,\s*)?(?:allow|expect)\s*\((?P<lints>[^\]]*)\)")
-EXPECT_ATTR = re.compile(r"#\s*!?\s*\[\s*(?:cfg_attr\s*\(.*,\s*)?expect\s*\((?P<lints>[^\]]*)\)")
-GUARD_LINTS = re.compile(r"clippy\s*::\s*(?:disallowed_methods|disallowed_method|style|all)\b")
+# A whole attribute, possibly spread over several lines: `#[...]` or `#![...]`.
+ATTRIBUTE = re.compile(r"#\s*(?P<inner>!)?\s*\[(?P<body>(?:[^\[\]]|\[[^\[\]]*\])*)\]", re.S)
+LINT_ATTR = re.compile(r"\b(?P<kind>allow|expect|warn)\s*\((?P<lints>[^()]*)\)", re.S)
+# Lints, and lint groups, that hold disallowed_methods; `warnings` silences it too.
+GUARD_LINTS = re.compile(
+    r"(?:clippy\s*::\s*(?:disallowed_methods|disallowed_method|style|all)|\bwarnings)\b"
+)
+UNSAFE_OR_PRE_EXEC = re.compile(r"\bunsafe\b|\bpre_exec\b")
 FN_LINE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+|async\s+|unsafe\s+)*fn\s+(\w+)")
 TEST_MOD = re.compile(r"^\s*mod\s+tests\b")
 
@@ -193,40 +197,52 @@ def check_rust_sources(root: Path, allowed: set[tuple[str, str]], findings: list
             in_tests_dir = "/tests/" in rel or "/benches/" in rel or "/examples/" in rel
             text = p.read_text(errors="replace")
             lines = text.splitlines()
-            # Inner (crate or module level) allow/expect of the guard lints.
-            for n, line in enumerate(lines, 1):
-                code = strip_comment(line)
-                m = INNER_ALLOW.search(code)
-                if m and GUARD_LINTS.search(m.group("lints")) and not in_tests_dir:
-                    findings.append(f"{rel}:{n}: crate- or module-level allow of the read-only lint")
-                m = EXPECT_ATTR.search(code)
-                if m and GUARD_LINTS.search(m.group("lints")):
-                    findings.append(f"{rel}:{n}: expect(...) of the read-only lint is not allowed")
+            code_text = "\n".join(strip_comment(l) for l in lines)
+            for m in ATTRIBUTE.finditer(code_text):
+                n = code_text.count("\n", 0, m.start()) + 1
+                end_line = code_text.count("\n", 0, m.end()) + 1
+                for lm in LINT_ATTR.finditer(m.group("body")):
+                    if lm.group("kind") == "warn" or not GUARD_LINTS.search(lm.group("lints")):
+                        continue
+                    if lm.group("kind") == "expect":
+                        findings.append(f"{rel}:{n}: expect(...) of the read-only lint is not allowed")
+                        continue
+                    if m.group("inner"):
+                        if not in_tests_dir:
+                            findings.append(
+                                f"{rel}:{n}: crate- or module-level allow of the read-only lint"
+                            )
+                        continue
+                    if in_tests_dir:
+                        continue
+                    # Outer allow: only on listed functions or on the test module.
+                    j = end_line  # 0-based index of the line after the attribute
+                    target = None
+                    while j < len(lines):
+                        nxt = strip_comment(lines[j]).strip()
+                        if not nxt or nxt.startswith("#[") or nxt.startswith("///"):
+                            j += 1
+                            continue
+                        target = nxt
+                        break
+                    if target and TEST_MOD.match(target) and _is_cfg_test(lines, n - 1):
+                        continue
+                    fm = FN_LINE.match(target or "")
+                    if not fm or (rel, fm.group(1)) not in allowed:
+                        name = fm.group(1) if fm else (target or "?")
+                        findings.append(
+                            f"{rel}:{n}: allow of the read-only lint on '{name}', which is not in "
+                            "scripts/readonly-allow.txt"
+                        )
             if in_tests_dir:
                 continue
-            # Outer allow attributes: only on listed functions or on the test module.
+            spawn_span = _fn_span(lines, "spawn_worker") if rel == SPAWN_FILE else None
             for n, line in enumerate(lines, 1):
-                code = strip_comment(line)
-                m = ALLOW_ATTR.search(code)
-                if not m or code.lstrip().startswith("#!") or not GUARD_LINTS.search(m.group("lints")):
-                    continue
-                j = n  # index of the next line (0-based == n)
-                target = None
-                while j < len(lines):
-                    nxt = strip_comment(lines[j]).strip()
-                    if not nxt or nxt.startswith("#[") or nxt.startswith("///"):
-                        j += 1
-                        continue
-                    target = nxt
-                    break
-                if target and TEST_MOD.match(target) and _is_cfg_test(lines, n - 1):
-                    continue
-                fm = FN_LINE.match(target or "")
-                if not fm or (rel, fm.group(1)) not in allowed:
-                    name = fm.group(1) if fm else (target or "?")
+                if UNSAFE_OR_PRE_EXEC.search(strip_comment(line)) and not (
+                    spawn_span and spawn_span[0] <= n <= spawn_span[1]
+                ):
                     findings.append(
-                        f"{rel}:{n}: allow of the read-only lint on '{name}', which is not in "
-                        "scripts/readonly-allow.txt"
+                        f"{rel}:{n}: unsafe or pre_exec outside worker::spawn_worker"
                     )
             body = non_test_lines(text)
             for n, line in body:
@@ -237,6 +253,19 @@ def check_rust_sources(root: Path, allowed: set[tuple[str, str]], findings: list
                     findings.append(f"{rel}:{n}: process spawn outside the analysis worker")
                 if SPAWN.search(code) and rel == SPAWN_FILE and "current_exe" not in text:
                     findings.append(f"{rel}:{n}: the worker must re-run the app's own executable")
+
+
+def _fn_span(lines: list[str], name: str) -> tuple[int, int] | None:
+    """1-based first and last line of a top-level `fn name`, ending at the first line that is
+    exactly `}` (rustfmt layout)."""
+    for i, line in enumerate(lines):
+        m = FN_LINE.match(line)
+        if m and m.group(1) == name and not line.startswith((" ", "\t")):
+            for j in range(i + 1, len(lines)):
+                if lines[j] == "}":
+                    return (i + 1, j + 1)
+            return (i + 1, len(lines))
+    return None
 
 
 def _is_cfg_test(lines: list[str], attr_index: int) -> bool:

@@ -81,6 +81,47 @@ SCRIPT_CONTROLS = [
         ),
     ),
     (
+        "allow(warnings) on an unlisted function",
+        "not in scripts/readonly-allow.txt",
+        lambda r: append(
+            r / "crates/view/src/table.rs",
+            "\n#[allow(warnings)]\nfn planted() {}\n",
+        ),
+    ),
+    (
+        "multi-line allow attribute on an unlisted function",
+        "not in scripts/readonly-allow.txt",
+        lambda r: append(
+            r / "crates/tui/src/app.rs",
+            "\n#[allow(\n    dead_code,\n    clippy::disallowed_methods\n)]\nfn planted() {}\n",
+        ),
+    ),
+    (
+        "crate-level allow(warnings)",
+        "crate- or module-level allow",
+        lambda r: replace(
+            r / "crates/view/src/lib.rs",
+            "#![forbid(unsafe_code)]",
+            "#![forbid(unsafe_code)]\n#![allow(warnings)]",
+        ),
+    ),
+    (
+        "unsafe block outside the worker spawn",
+        "unsafe or pre_exec outside worker::spawn_worker",
+        lambda r: append(
+            r / "crates/tui/src/worker.rs",
+            "\npub fn planted() -> i32 { unsafe { libc::getpid() } }\n",
+        ),
+    ),
+    (
+        "pre_exec in the desktop crate outside spawn_worker",
+        "unsafe or pre_exec outside worker::spawn_worker",
+        lambda r: append(
+            r / "apps/desktop/src-tauri/src/lib.rs",
+            "\npub fn planted(c: &mut std::process::Command) { c.pre_exec(|| Ok(())); }\n",
+        ),
+    ),
+    (
         "expect attribute",
         "expect(...)",
         lambda r: append(
@@ -252,13 +293,24 @@ def clippy_controls(root: Path) -> int:
         env = dict(os.environ)
         env.setdefault("CARGO_TARGET_DIR", str(root / "target" / "readonly-controls"))
         p = subprocess.run(
-            ["cargo", "clippy", "-p", "disk-cleaner-view", "--message-format=short", "--", "-D", "warnings"],
+            [
+                "cargo",
+                "clippy",
+                "--color",
+                "never",
+                "-p",
+                "disk-cleaner-view",
+                "--message-format=short",
+                "--",
+                "-D",
+                "warnings",
+            ],
             cwd=repo,
             capture_output=True,
             text=True,
             env=env,
         )
-        out = p.stdout + p.stderr
+        out = re.sub(r"\x1b\[[0-9;]*m", "", p.stdout + p.stderr)
         reported = set()
         for m in re.finditer(r"planted\.rs:(\d+):\d+: (?:error|warning): use of a disallowed method", out):
             reported.add(int(m.group(1)))
