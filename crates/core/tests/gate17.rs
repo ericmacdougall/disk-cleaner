@@ -357,6 +357,54 @@ fn z1_controls_are_unverified_by_default_and_verified_by_git() {
     }
 }
 
+const SPLIT_ID: &str = "4444444444444444444444444444444444444444";
+
+/// `git commit-graph verify` reads `objects/info/commit-graph` when it exists and opens the
+/// split chain only when it does not (builtin/commit-graph.c), so a split graph file beside a
+/// single commit-graph is never read by git, even when the chain file names it.
+#[test]
+fn z1_a_split_graph_file_beside_a_single_commit_graph_asks() {
+    let (tmp, root, remotes) = workspace();
+    let repo = clone_of(tmp.path(), &root, &remotes, "app");
+    git(&repo, &["commit-graph", "write", "--reachable"]);
+    let info = repo.join(".git").join("objects").join("info");
+    assert!(info.join("commit-graph").is_file());
+    let graphs = info.join("commit-graphs");
+    fs::create_dir_all(&graphs).unwrap();
+    let name = format!("graph-{SPLIT_ID}.graph");
+    write(&graphs.join(&name), "CGPH and then my notes\n");
+    let chain = graphs.join("commit-graph-chain");
+    write(&chain, &format!("{SPLIT_ID}\n"));
+    let rel = format!("objects/info/commit-graphs/{name}");
+
+    let res = scan_default(&root);
+    assert_obligated_or_asks(&res, &repo, &[rel.as_str()]);
+
+    let res = scan_verified(&root);
+    let reason = assert_asks(&res, &repo);
+    assert!(reason.contains(&name), "{reason}");
+}
+
+/// An object that nothing reaches may exist nowhere else: the store is not verified, but the
+/// file is still under the object-store obligation, so the repository is not made to ask.
+#[test]
+fn z1_an_unreachable_object_leaves_the_store_unverified() {
+    let (tmp, root, remotes) = workspace();
+    let repo = clone_of(tmp.path(), &root, &remotes, "app");
+    let (rel, _) = loose_blob(&repo, &some_text());
+
+    let res = scan_verified(&root);
+    assert!(store(&res, &repo).contains(&rel));
+    let n = node(&res, &repo).repo.as_ref().unwrap();
+    assert!(
+        n.notes.iter().any(|x| x.contains("not reachable")),
+        "{:?}",
+        n.notes
+    );
+    let p = plan_of(&res);
+    assert_obligations(&res, item(&p, &repo), &repo, false);
+}
+
 #[test]
 fn z1_a_store_whose_files_were_not_counted_asks() {
     let (tmp, root, remotes) = workspace();
@@ -371,23 +419,28 @@ fn z1_a_store_whose_files_were_not_counted_asks() {
     assert!(it.reason.contains("object store"), "{}", it.reason);
 }
 
+/// A check that cannot run (here git cannot be started; a timeout ends the same way) proves
+/// nothing either way: the store is not verified, and nothing is reported damaged or
+/// unaccounted. Deterministic, unlike a short timeout, which a fast machine can beat.
 #[test]
-fn z1_a_verification_that_cannot_finish_is_not_verified() {
-    let (tmp, root, remotes) = workspace();
-    let repo = clone_of(tmp.path(), &root, &remotes, "app");
-    let git_bin = disk_cleaner_core::Git::new("git", std::time::Duration::from_millis(1));
-    let res = scan_with(
-        &root,
-        network_everywhere()
-            .with_git(git_bin)
-            .with_verify_objects(true),
+fn z1_a_verification_that_cannot_run_is_not_verified_and_not_damaged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gd = tmp.path().join(".git");
+    let git_bin = disk_cleaner_core::Git::new(
+        tmp.path().join("no-such-git"),
+        std::time::Duration::from_secs(5),
     );
-    let n = node(&res, &repo).repo.as_ref().unwrap();
-    assert!(
-        !n.object_store.as_ref().map(|s| s.verified).unwrap_or(false),
-        "{:?}",
-        n.notes
-    );
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let store = vec![
+        (format!("objects/ab/{}", &id[2..]), 4096),
+        (format!("objects/pack/pack-{id}.pack"), 4096),
+        (format!("objects/pack/pack-{id}.idx"), 4096),
+    ];
+    let v = disk_cleaner_core::preserve::verify(&git_bin, tmp.path(), &gd, &store);
+    assert!(!v.verified, "{v:?}");
+    assert_eq!(v.damaged, None, "{v:?}");
+    assert!(v.unaccounted.is_empty(), "{v:?}");
+    assert!(!v.unverified.is_empty(), "{v:?}");
 }
 
 // ---------------------------------------------------------------- click-test remark

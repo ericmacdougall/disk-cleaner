@@ -202,10 +202,8 @@ fn y1_a_clean_pushed_clone_is_backed_up_then_removed() {
     );
     let store = store_files(&res, &repo);
     assert!(
-        store
-            .iter()
-            .any(|f| f.starts_with("objects/pack/pack-") && f.ends_with(".pack")),
-        "a clone's pack is in its object store: {store:?}"
+        !store.is_empty() && store.iter().all(|f| f.starts_with("objects/")),
+        "the repository's objects are its object store: {store:?}"
     );
     let p = plan_of(&res);
     let it = item(&p, &repo);
