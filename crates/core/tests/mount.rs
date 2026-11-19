@@ -109,4 +109,45 @@ fn one_file_system_does_not_cross_a_mount_point() {
             target.display()
         );
     }
+
+    // Q3: a child root on another device than its ancestor is not covered by the ancestor under
+    // --one-file-system, so it is walked on its own: counted once, and not a skipped mount.
+    // (In this function, not a test of its own: tests share the mount root and run in parallel.)
+    let totals_of = |roots: Vec<PathBuf>| {
+        let mut o = ScanOptions::new(roots);
+        o.collect_facts = false;
+        o.one_file_system = true;
+        scan(&o).unwrap()
+    };
+    let parent_only = totals_of(vec![root.clone()]);
+    let child_only = totals_of(vec![repo_mount.clone()]);
+    let both = totals_of(vec![root.clone(), repo_mount.clone()]);
+    assert_eq!(both.totals.mount_points_skipped, 1);
+    // The mount point directory itself is seen by both single scans and counted once here.
+    #[cfg(unix)]
+    let mount_dir = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(&repo_mount).unwrap().blocks() * 512
+    };
+    #[cfg(not(unix))]
+    let mount_dir = 0;
+    assert_eq!(
+        both.totals.allocated_bytes,
+        parent_only.totals.allocated_bytes + child_only.totals.allocated_bytes - mount_dir
+    );
+    assert_eq!(
+        both.totals.files,
+        parent_only.totals.files + child_only.totals.files
+    );
+    assert_eq!(
+        both.totals.dirs,
+        parent_only.totals.dirs + child_only.totals.dirs - 1
+    );
+    // The repo was looked at in full, so it is no longer incomplete: like the full scan above.
+    let mut with_facts = ScanOptions::new(vec![root.clone(), repo_mount.clone()]);
+    with_facts.facts = FactsConfig::default().with_network_predicate(|_| true);
+    with_facts.one_file_system = true;
+    let with_facts = scan(&with_facts).unwrap();
+    let (a, why) = plan_item(&with_facts, &repo);
+    assert_eq!(a, Action::RecoverThenArchive, "{why}");
 }
