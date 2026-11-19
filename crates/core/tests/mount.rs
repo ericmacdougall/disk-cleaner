@@ -149,17 +149,13 @@ fn one_file_system_does_not_cross_a_mount_point() {
     with_facts.one_file_system = true;
     let with_facts = scan(&with_facts).unwrap();
     let (a, why) = plan_item(&with_facts, &repo);
-    assert_eq!(a, Action::RecoverThenArchive, "{why}");
 
-    // R1: the mount point under node_modules was not entered, so the scan's coverage is
-    // incomplete and the repository's removing reason says so.
-    assert!(
-        why.contains(
-            "1 mount point in this scan was not entered (--one-file-system); dependents inside \
-             it were not checked"
-        ),
-        "{why}"
-    );
+    // R1 and gate 98f8764 T2: the mount point under node_modules was not entered, so the scan's
+    // coverage is incomplete. By default the repository's dependents are then unknown and it
+    // asks, naming what was not entered and the opt-in.
+    assert_eq!(a, Action::Ask, "{why}");
+    assert!(why.contains("1 mount point was not entered"), "{why}");
+    assert!(why.contains("--accept-incomplete-coverage"), "{why}");
     let v = serde_json::to_value(&with_facts).unwrap();
     let cov = &v["coverage"];
     assert_eq!(cov["complete"], false, "{cov}");

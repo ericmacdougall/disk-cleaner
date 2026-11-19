@@ -307,32 +307,34 @@ fn s2c_one_dependent_is_counted_in_the_singular() {
 
 #[test]
 fn s2d_an_archive_reason_says_no_dependents_were_found() {
-    for coverage in [
-        complete(),
-        Coverage {
-            complete: false,
-            unreadable_dirs: 1,
-            unreadable_dir_examples: vec!["/w/locked".to_string()],
-            ..Coverage::default()
-        },
-    ] {
-        let p = plan(
-            &synthetic(vec![repo_node("/w/a", all_yes())], coverage),
-            &opts(),
-        );
-        let it = &p.items[0];
-        assert_eq!(it.action, Action::Archive, "{}", it.reason);
-        assert!(
-            it.reason.contains("no dependents were found"),
-            "{}",
-            it.reason
-        );
-        assert!(
-            !it.reason.contains("nothing depends on it"),
-            "{}",
-            it.reason
-        );
-    }
+    // Incomplete coverage asks by default (gate 98f8764, T2); the opt-in restores the archive.
+    let incomplete = Coverage {
+        complete: false,
+        unreadable_dirs: 1,
+        unreadable_dir_examples: vec!["/w/locked".to_string()],
+        ..Coverage::default()
+    };
+    let p = plan(
+        &synthetic(vec![repo_node("/w/a", all_yes())], incomplete),
+        &opts(),
+    );
+    assert_eq!(p.items[0].action, Action::Ask, "{}", p.items[0].reason);
+    let p = plan(
+        &synthetic(vec![repo_node("/w/a", all_yes())], complete()),
+        &opts(),
+    );
+    let it = &p.items[0];
+    assert_eq!(it.action, Action::Archive, "{}", it.reason);
+    assert!(
+        it.reason.contains("no dependents were found"),
+        "{}",
+        it.reason
+    );
+    assert!(
+        !it.reason.contains("nothing depends on it"),
+        "{}",
+        it.reason
+    );
 }
 
 #[test]

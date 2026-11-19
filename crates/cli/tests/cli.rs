@@ -109,7 +109,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
     let json = fs::read_to_string(&out_file).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["schema_version"], 7);
+    assert_eq!(v["schema_version"], 8);
 
     let o = run(bin()
         .args([
@@ -1193,7 +1193,7 @@ fn assert_process_check_usable(plan: &serde_json::Value) {
 
 #[cfg(unix)]
 #[test]
-fn r1_unreadable_folder_clone_is_disclosed_and_strict_coverage_asks() {
+fn r1_t2_unreadable_folder_clone_asks_by_default_and_archives_when_accepted() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("scan");
@@ -1234,21 +1234,20 @@ fn r1_unreadable_folder_clone_is_disclosed_and_strict_coverage_asks() {
     fs::create_dir_all(&home).unwrap();
     let now = far_future();
 
-    // Default: the clone was not seen (it cannot be), so A is still offered, but every reason
-    // that could be affected says what was not read.
+    // Gate 98f8764 T2, default: the clone was not seen (it cannot be), so A's dependents are
+    // unknown and it asks, naming what was not read and the opt-in.
     let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
     assert_process_check_usable(&pv);
     let it = item_of(&pv, &a);
     let reason = it["reason"].as_str().unwrap();
-    assert_eq!(it["action"], "archive", "{reason}");
-    assert!(
-        reason.contains(
-            "1 folder in this scan could not be read; dependents inside it were not checked"
-        ),
-        "the archive reason must carry the coverage sentence: {reason}"
-    );
+    assert_eq!(it["action"], "ask", "{reason}");
+    assert_eq!(it["reclaimable_bytes"], 0);
+    assert_eq!(it["facts"]["no_dependents"], "unknown");
+    assert!(reason.contains("1 folder could not be read"), "{reason}");
+    assert!(reason.contains("--accept-incomplete-coverage"), "{reason}");
     assert_eq!(pv["coverage_complete"], false);
-    assert_eq!(pv["required_full_coverage"], false);
+    assert_eq!(pv["accepted_incomplete_coverage"], false);
+    assert!(pv.get("required_full_coverage").is_none(), "{pv}");
     let note = pv["coverage_note"].as_str().unwrap_or_default();
     assert!(
         note.contains("1 folder could not be read") && note.contains("links or clones inside"),
@@ -1274,47 +1273,54 @@ fn r1_unreadable_folder_clone_is_disclosed_and_strict_coverage_asks() {
     isolate(&mut c, &home);
     let text = stdout(&run(&mut c));
     assert!(text.contains("1 folder could not be read"), "{text}");
+    assert!(text.contains("--accept-incomplete-coverage"), "{text}");
 
-    // Strict, by flag: incomplete coverage makes A's dependents unknown, so it asks.
-    let pv = plan_value(&plan_json(
-        &scan_file,
-        &home,
-        &["--now", &now, "--require-full-coverage"],
-    ));
-    let it = item_of(&pv, &a);
-    let reason = it["reason"].as_str().unwrap();
-    assert_eq!(it["action"], "ask", "{reason}");
-    assert_eq!(it["reclaimable_bytes"], 0);
-    assert_eq!(it["facts"]["no_dependents"], "unknown");
-    assert!(reason.contains("full coverage"), "{reason}");
-    assert_eq!(pv["required_full_coverage"], true);
+    // Opt-in, by flag: the disclosure behaviour. A is archived, its reason carries the coverage
+    // sentence, and the plan records that the user accepted incomplete coverage.
+    let accepted = |pv: &serde_json::Value| {
+        let it = item_of(pv, &a);
+        let reason = it["reason"].as_str().unwrap();
+        assert_eq!(it["action"], "archive", "{reason}");
+        assert!(
+            reason.contains(
+                "1 folder in this scan could not be read; dependents inside it were not checked"
+            ),
+            "the archive reason must carry the coverage sentence: {reason}"
+        );
+        assert_eq!(pv["accepted_incomplete_coverage"], true);
+    };
+    let flag = ["--now", &now, "--accept-incomplete-coverage"];
+    accepted(&plan_value(&plan_json(&scan_file, &home, &flag)));
 
-    // Strict, by config.
-    let cfg = tmp.path().join("strict.toml");
-    fs::write(&cfg, "require_full_coverage = true\n").unwrap();
-    let pv = plan_value(&plan_json(
-        &scan_file,
-        &home,
-        &["--now", &now, "--config", cfg.to_str().unwrap()],
-    ));
-    assert_eq!(item_of(&pv, &a)["action"], "ask");
-    assert_eq!(pv["required_full_coverage"], true);
+    // Opt-in, by config.
+    let cfg = tmp.path().join("accept.toml");
+    fs::write(&cfg, "accept_incomplete_coverage = true\n").unwrap();
+    let by_config = ["--now", &now, "--config", cfg.to_str().unwrap()];
+    accepted(&plan_value(&plan_json(&scan_file, &home, &by_config)));
 
     let mut c = bin();
-    c.args([
-        "plan",
-        "--scan",
-        scan_file.to_str().unwrap(),
-        "--now",
-        &now,
-        "--require-full-coverage",
-    ]);
+    c.args(["plan", "--scan", scan_file.to_str().unwrap()])
+        .args(flag);
     isolate(&mut c, &home);
     let text = stdout(&run(&mut c));
     assert!(
-        text.contains("Full coverage was required"),
-        "the header must say the user asked for it: {text}"
+        text.contains("Incomplete coverage was accepted"),
+        "the header must say the user accepted it: {text}"
     );
+
+    // The old strict setting is refused, by flag and by config, naming the new ones.
+    let old_flag = ["--now", &now, "--require-full-coverage"];
+    let o = plan_json(&scan_file, &home, &old_flag);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains("--accept-incomplete-coverage"), "{err}");
+    let old = tmp.path().join("old.toml");
+    fs::write(&old, "require_full_coverage = true\n").unwrap();
+    let old_config = ["--now", &now, "--config", old.to_str().unwrap()];
+    let o = plan_json(&scan_file, &home, &old_config);
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success(), "{err}");
+    assert!(err.contains("accept_incomplete_coverage"), "{err}");
 }
 
 #[test]
@@ -1344,12 +1350,9 @@ fn r1_a_fully_readable_scan_is_complete_and_adds_no_coverage_sentence() {
     assert_eq!(cov["complete"], true, "{cov}");
     assert_eq!(cov["unreadable_dirs"], 0, "{cov}");
 
-    // Strict mode changes nothing when coverage is complete.
-    let pv = plan_value(&plan_json(
-        &scan_file,
-        &home,
-        &["--now", &now, "--require-full-coverage"],
-    ));
+    // The opt-in changes nothing when coverage is complete.
+    let flag = ["--now", &now, "--accept-incomplete-coverage"];
+    let pv = plan_value(&plan_json(&scan_file, &home, &flag));
     assert_eq!(item_of(&pv, &a)["action"], "archive");
-    assert_eq!(pv["required_full_coverage"], true);
+    assert_eq!(pv["accepted_incomplete_coverage"], true);
 }
