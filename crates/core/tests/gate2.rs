@@ -352,6 +352,7 @@ fn h3_control_ordinary_node_modules_with_package_fixtures_stays_removable() {
     let proj = root.join("proj");
     write(&proj.join("package.json"), "{}");
     let nm = proj.join("node_modules");
+    write(&nm.join("pkg").join("package.json"), "{}");
     write(&nm.join("pkg").join("index.js"), "module.exports = 1;\n");
     write(
         &nm.join("pkg")

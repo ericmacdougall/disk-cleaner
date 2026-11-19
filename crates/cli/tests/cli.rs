@@ -1016,3 +1016,40 @@ fn h1_credential_in_a_config_subsection_never_reaches_any_output() {
         .unwrap();
     assert_eq!(item["action"], "ask");
 }
+
+// ---------------------------------------------------------------- J4 (third merge gate)
+
+#[test]
+fn j4_trust_partial_process_check_flag_and_config_are_accepted_and_recorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (scan_file, _nm) = scan_with_project_touched(tmp.path(), 30);
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let o = plan_json(&scan_file, &home, &["--trust-partial-process-check"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["trusted_partial_process_check"], true);
+
+    let o = plan_json(&scan_file, &home, &[]);
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["trusted_partial_process_check"], false);
+
+    let cfg = tmp.path().join("trust.toml");
+    fs::write(&cfg, "trust_partial_process_check = true\n").unwrap();
+    let o = plan_json(&scan_file, &home, &["--config", cfg.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["trusted_partial_process_check"], true);
+
+    let mut c = bin();
+    c.args([
+        "plan",
+        "--scan",
+        scan_file.to_str().unwrap(),
+        "--trust-partial-process-check",
+    ]);
+    isolate(&mut c, &home);
+    let text = stdout(&run(&mut c));
+    assert!(text.contains("accepted"), "the header must say so: {text}");
+}
