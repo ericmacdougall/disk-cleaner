@@ -583,8 +583,9 @@ fn decide(scan: &ScanResult, idx: usize, state: ProjectState, why: &str) -> (Act
                 (
                     Action::Archive,
                     format!(
-                        "idle ({why}); local remote-tracking refs say every commit is on a \
-                         network remote, nothing is unsaved and nothing depends on it \
+                        "idle ({why}); local remote-tracking refs say every commit (reflog \
+                         entries included) is on a network remote, nothing is unsaved, no \
+                         operation is half done and nothing depends on it \
                          (unverified until apply re-checks the remote with git ls-remote)"
                     ),
                     node.bytes_total,

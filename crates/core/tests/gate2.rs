@@ -61,7 +61,10 @@ fn h2_unpushed_commit_then_reset_to_the_pushed_parent_is_not_fully_saved() {
     // Every other fact reads as saved: HEAD, the branch and the tree match the pushed commit.
     let f = facts_of(&res, &repo);
     assert!(f.head_on_remote == disk_cleaner_core::Tri::Yes, "{f:?}");
-    assert!(f.all_branches_on_remote == disk_cleaner_core::Tri::Yes, "{f:?}");
+    assert!(
+        f.all_branches_on_remote == disk_cleaner_core::Tri::Yes,
+        "{f:?}"
+    );
     assert!(f.tree_clean == disk_cleaner_core::Tri::Yes, "{f:?}");
     assert_eq!(fact(&res, &repo, "reflog_saved"), "no");
     assert_eq!(
@@ -82,7 +85,10 @@ fn h2_commit_amended_away_is_not_fully_saved() {
 
     let res = scan_with(&root, network_everywhere());
     let f = facts_of(&res, &repo);
-    assert!(f.all_branches_on_remote == disk_cleaner_core::Tri::Yes, "{f:?}");
+    assert!(
+        f.all_branches_on_remote == disk_cleaner_core::Tri::Yes,
+        "{f:?}"
+    );
     assert_eq!(fact(&res, &repo, "reflog_saved"), "no");
     assert_ne!(action(&res, &repo), Action::Archive);
 }
@@ -104,7 +110,11 @@ fn h2_control_fresh_clone_has_reflog_saved_and_is_archivable() {
     assert!(origin.exists());
     let res = scan_with(&root, network_everywhere());
     assert_eq!(fact(&res, &clone, "reflog_saved"), "yes");
-    assert!(facts_of(&res, &clone).all_yes(), "{:?}", facts_of(&res, &clone));
+    assert!(
+        facts_of(&res, &clone).all_yes(),
+        "{:?}",
+        facts_of(&res, &clone)
+    );
     assert_eq!(action(&res, &clone), Action::Archive);
 }
 
@@ -208,7 +218,11 @@ fn h3_terraform_state_inside_an_ignored_build_directory_asks_for_build_and_repo(
     );
     let res = scan_with(&root, network_everywhere());
     let build = repo.join("build");
-    assert!(not_removing(action(&res, &build)), "{:?}", action(&res, &build));
+    assert!(
+        not_removing(action(&res, &build)),
+        "{:?}",
+        action(&res, &build)
+    );
     assert!(
         !action(&res, &repo).removes(),
         "the enclosing repo would take the state file with it: {:?}",
@@ -216,13 +230,20 @@ fn h3_terraform_state_inside_an_ignored_build_directory_asks_for_build_and_repo(
     );
     let reason = node(&res, &build).ask_reason.clone().unwrap_or_default();
     assert!(reason.to_lowercase().contains("terraform"), "{reason}");
-    assert!(!reason.contains("SYNTH_STATE_MARK"), "contents are never read or quoted");
+    assert!(
+        !reason.contains("SYNTH_STATE_MARK"),
+        "contents are never read or quoted"
+    );
 }
 
 #[test]
 fn h3_a_state_file_name_alone_is_enough_without_a_terraform_directory() {
     let (_tmp, root, remotes) = workspace();
-    let repo = repo_with_ignored_build(&root, &remotes, &[("env/prod/terraform.tfstate.backup", "{}")]);
+    let repo = repo_with_ignored_build(
+        &root,
+        &remotes,
+        &[("env/prod/terraform.tfstate.backup", "{}")],
+    );
     let res = scan_with(&root, network_everywhere());
     assert!(not_removing(action(&res, &repo.join("build"))));
     assert!(!action(&res, &repo).removes());
@@ -239,7 +260,11 @@ fn h3_dotenv_inside_a_build_directory_asks_but_a_template_does_not() {
     let repo2 = repo_with_ignored_build(
         &root2,
         &remotes2,
-        &[(".env.example", "A=\n"), (".env.template", "A=\n"), ("CMakeCache.txt", "x\n")],
+        &[
+            (".env.example", "A=\n"),
+            (".env.template", "A=\n"),
+            ("CMakeCache.txt", "x\n"),
+        ],
     );
     let res2 = scan_with(&root2, network_everywhere());
     assert_eq!(
@@ -297,7 +322,10 @@ fn h3_sqlite_database_inside_target_asks() {
     let remote = remotes.join("app.git");
     init_bare(&remote);
     push_to_remote(&repo, &remote);
-    write(&repo.join("target").join("debug").join("app.sqlite"), "rows");
+    write(
+        &repo.join("target").join("debug").join("app.sqlite"),
+        "rows",
+    );
     let res = scan_with(&root, network_everywhere());
     assert!(not_removing(action(&res, &repo.join("target"))));
     assert!(!action(&res, &repo).removes());
@@ -308,7 +336,10 @@ fn h3_dotenv_and_state_inside_node_modules_ask() {
     let (_tmp, root, _remotes) = workspace();
     let proj = root.join("proj");
     write(&proj.join("package.json"), "{}");
-    write(&proj.join("node_modules").join("pkg").join(".env"), "TOKEN=1\n");
+    write(
+        &proj.join("node_modules").join("pkg").join(".env"),
+        "TOKEN=1\n",
+    );
     let res = scan_plain(&root);
     assert!(not_removing(action(&res, &proj.join("node_modules"))));
 }
@@ -322,9 +353,27 @@ fn h3_control_ordinary_node_modules_with_package_fixtures_stays_removable() {
     write(&proj.join("package.json"), "{}");
     let nm = proj.join("node_modules");
     write(&nm.join("pkg").join("index.js"), "module.exports = 1;\n");
-    write(&nm.join("pkg").join("test").join("fixtures").join("cert.pem"), "x");
-    write(&nm.join("pkg").join("test").join("fixtures").join("server.key"), "x");
-    write(&nm.join("pkg").join("test").join("support").join("prepare.db"), "x");
+    write(
+        &nm.join("pkg")
+            .join("test")
+            .join("fixtures")
+            .join("cert.pem"),
+        "x",
+    );
+    write(
+        &nm.join("pkg")
+            .join("test")
+            .join("fixtures")
+            .join("server.key"),
+        "x",
+    );
+    write(
+        &nm.join("pkg")
+            .join("test")
+            .join("support")
+            .join("prepare.db"),
+        "x",
+    );
     write(&nm.join("pkg").join(".env.example"), "A=\n");
     let res = scan_plain(&root);
     assert_eq!(action(&res, &nm), Action::RemoveRegenerable);
@@ -368,7 +417,12 @@ fn sibling_a_paused_rebase_is_not_removable() {
 
 #[test]
 fn sibling_a_merge_cherry_pick_revert_and_bisect_state_are_not_removable() {
-    for marker in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG"] {
+    for marker in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+    ] {
         let (state, act) = pending_case(|repo| {
             let head = git(repo, &["rev-parse", "HEAD"]);
             write(&repo.join(".git").join(marker), &format!("{head}\n"));
@@ -380,9 +434,15 @@ fn sibling_a_merge_cherry_pick_revert_and_bisect_state_are_not_removable() {
 
 #[test]
 fn sibling_a_local_lfs_objects_and_annex_content_are_not_removable() {
-    for rel in ["lfs/objects/ab/cd/abcdef0123", "annex/objects/xx/yy/KEY/KEY"] {
+    for rel in [
+        "lfs/objects/ab/cd/abcdef0123",
+        "annex/objects/xx/yy/KEY/KEY",
+    ] {
         let (state, act) = pending_case(|repo| {
-            write(&repo.join(".git").join(rel), "content that may not be on the remote");
+            write(
+                &repo.join(".git").join(rel),
+                "content that may not be on the remote",
+            );
         });
         assert_eq!(state, "unknown", "{rel}");
         assert_eq!(act, Action::Ask, "{rel}");
@@ -393,7 +453,14 @@ fn sibling_a_local_lfs_objects_and_annex_content_are_not_removable() {
 fn sibling_a_control_rr_cache_and_a_quiet_repo_keep_the_fact_yes() {
     // rr-cache only records conflict resolutions that can be re-derived: not unique work.
     let (state, act) = pending_case(|repo| {
-        write(&repo.join(".git").join("rr-cache").join("abc").join("preimage"), "x");
+        write(
+            &repo
+                .join(".git")
+                .join("rr-cache")
+                .join("abc")
+                .join("preimage"),
+            "x",
+        );
     });
     assert_eq!(state, "yes");
     assert_eq!(act, Action::Archive);

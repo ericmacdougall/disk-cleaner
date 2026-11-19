@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -93,11 +93,18 @@ pub struct Facts {
     pub no_unique_ignored: Tri,
     /// No linked worktree or alternates clone depends on this object store.
     pub no_dependents: Tri,
+    /// Every commit reachable from any reflog entry (an unpushed commit after `reset --hard`, an
+    /// amended or rebased-away commit) is contained in a network remote's tracking refs.
+    pub reflog_saved: Tri,
+    /// No unfinished rebase, merge, cherry-pick, revert or bisect, and no local-only Git LFS or
+    /// git-annex content: state that no ref records. Never `No`: when something is found the
+    /// fact is `Unknown`, because this tool cannot show it is saved.
+    pub no_pending_state: Tri,
 }
 
 impl Facts {
     /// Every fact paired with its JSON name.
-    pub fn entries(&self) -> [(&'static str, Tri); 7] {
+    pub fn entries(&self) -> [(&'static str, Tri); 9] {
         [
             ("has_network_remote", self.has_network_remote),
             ("head_on_remote", self.head_on_remote),
@@ -106,6 +113,8 @@ impl Facts {
             ("tree_clean", self.tree_clean),
             ("no_unique_ignored", self.no_unique_ignored),
             ("no_dependents", self.no_dependents),
+            ("reflog_saved", self.reflog_saved),
+            ("no_pending_state", self.no_pending_state),
         ]
     }
 

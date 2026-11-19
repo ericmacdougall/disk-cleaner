@@ -50,11 +50,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: git version
-        shell: bash
-        run: |
-          git --version
-          # Inherited line-ending settings the scanner no longer reads (Git for Windows sets one).
-          git config --show-origin --show-scope --get-all core.autocrlf || true
+        run: git --version
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
 
@@ -84,8 +80,6 @@ jobs:
           echo hello | sudo tee "$f/README.md" > /dev/null
           sudo git -C "$f" add README.md
           sudo git -C "$f" -c user.name=Test -c user.email=test@example.invalid commit -q -m init
-          # Where the runner's inherited config trusts other users' directories, if it does.
-          git config --show-origin --show-scope --get-all safe.directory || true
       - name: Test a repository owned by another user
         if: success() || failure()
         env:

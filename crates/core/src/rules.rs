@@ -34,6 +34,49 @@ pub struct Rule {
     /// directory is then never offered for removal.
     #[serde(default)]
     pub ask_if_contains: Vec<String>,
+    /// The directory holds third-party package contents (dependencies, registries), which
+    /// routinely include key, certificate and database files as test fixtures. File names that
+    /// are `fixture_prone` in `[[state_file]]` do not make such a directory ask.
+    #[serde(default)]
+    pub dependency_store: bool,
+}
+
+/// A file-name pattern for unique state: a file that, found anywhere under a regenerable or
+/// cache directory, means the directory is not only generated files. Matched on the name, never
+/// on the contents.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StateFile {
+    /// `name`, `*suffix` or `prefix*`, compared without regard to case.
+    pub pattern: String,
+    /// What it is, in words for the reason shown to the user.
+    pub kind: String,
+    /// Names that match `pattern` but are not state (`.env.example`).
+    #[serde(default)]
+    pub except: Vec<String>,
+    /// Package fixtures routinely use this name: it does not count under a `dependency_store`.
+    #[serde(default)]
+    pub fixture_prone: bool,
+}
+
+impl StateFile {
+    /// Does `name` match this pattern (and none of its exceptions)?
+    pub fn matches(&self, name: &str) -> bool {
+        name_matches(&self.pattern, name)
+            && !self.except.iter().any(|e| e.eq_ignore_ascii_case(name))
+    }
+}
+
+/// `name`, `*suffix` or `prefix*`, ignoring ASCII case.
+fn name_matches(spec: &str, name: &str) -> bool {
+    let (s, n) = (spec.as_bytes(), name.as_bytes());
+    if let Some(suffix) = spec.strip_prefix('*') {
+        n.len() >= suffix.len()
+            && n[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    } else if let Some(prefix) = spec.strip_suffix('*') {
+        n.len() >= prefix.len() && n[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    } else {
+        s.eq_ignore_ascii_case(n)
+    }
 }
 
 impl Rule {
@@ -72,6 +115,8 @@ struct RawRules {
     outputs: OutputsCfg,
     #[serde(default)]
     loose_code: LooseCfg,
+    #[serde(default)]
+    state_file: Vec<StateFile>,
 }
 
 /// A compiled rule set with the lookup tables the scanner needs.
@@ -84,6 +129,7 @@ pub struct RuleSet {
     manifest_specs: Vec<String>,
     marker_specs: Vec<String>,
     scan_dir_names: HashSet<String>,
+    state_files: Vec<StateFile>,
 }
 
 /// Does a marker spec (`name` or `*.suffix`) match an entry name?
@@ -118,6 +164,21 @@ impl RuleSet {
                 return Err(Error::Rules(format!(
                     "rule {:?}: ask must give a reason",
                     r.name
+                )));
+            }
+        }
+        for sf in &raw.state_file {
+            let stars = sf.pattern.matches('*').count();
+            let edge = sf.pattern.starts_with('*') || sf.pattern.ends_with('*');
+            if sf.pattern.is_empty()
+                || sf.pattern.contains('/')
+                || stars > 1
+                || (stars == 1 && !edge)
+                || sf.kind.trim().is_empty()
+            {
+                return Err(Error::Rules(format!(
+                    "state_file {:?}: needs a name, `*suffix` or `prefix*` pattern and a kind",
+                    sf.pattern
                 )));
             }
         }
@@ -156,6 +217,7 @@ impl RuleSet {
             manifest_specs: raw.loose_code.manifests,
             marker_specs,
             scan_dir_names,
+            state_files: raw.state_file,
         })
     }
 
@@ -183,6 +245,17 @@ impl RuleSet {
     /// Is `name` an entry that some rule uses as a marker?
     pub fn is_marker(&self, name: &str) -> bool {
         self.marker_specs.iter().any(|s| marker_matches(s, name))
+    }
+
+    /// The state-file pattern (index into [`RuleSet::state_files`]) that `name` matches, if any.
+    /// The first match in the order of the rules file wins.
+    pub fn state_file(&self, name: &str) -> Option<usize> {
+        self.state_files.iter().position(|sf| sf.matches(name))
+    }
+
+    /// All state-file patterns.
+    pub fn state_files(&self) -> &[StateFile] {
+        &self.state_files
     }
 
     /// Is `name` a project manifest (loose-code evidence)?
@@ -276,6 +349,61 @@ mod tests {
         assert!(rs.is_marker("gradle.properties"));
         let bad = "[[rule]]\nname = \"x\"\nclass = \"cache\"\nask = \" \"\n";
         assert!(RuleSet::from_toml(bad).is_err());
+    }
+
+    #[test]
+    fn state_file_names_are_matched_by_name_only() {
+        let rs = RuleSet::builtin();
+        let kind = |n: &str| rs.state_file(n).map(|i| rs.state_files()[i].kind.clone());
+        for hit in [
+            "terraform.tfstate",
+            "Terraform.TFSTATE.backup",
+            "prod.tfvars",
+            ".env",
+            ".env.local",
+            "app.sqlite",
+            "app.sqlite3",
+            "data.DB",
+            "server.pem",
+            "id.key",
+            "a.keystore",
+            "a.jks",
+            "a.p12",
+        ] {
+            assert!(kind(hit).is_some(), "{hit} should be state");
+        }
+        for miss in [
+            ".env.example",
+            ".env.sample",
+            ".env.template",
+            "env",
+            "main.tf",
+            "db",
+        ] {
+            assert!(kind(miss).is_none(), "{miss} should not be state");
+        }
+        let fixture = |n: &str| rs.state_file(n).map(|i| rs.state_files()[i].fixture_prone);
+        assert_eq!(fixture("cert.pem"), Some(true));
+        assert_eq!(fixture("terraform.tfstate"), Some(false));
+        assert_eq!(fixture(".env"), Some(false));
+        let bad = "[[state_file]]\npattern = \"a*b\"\nkind = \"x\"\n";
+        assert!(RuleSet::from_toml(bad).is_err());
+    }
+
+    #[test]
+    fn dependency_stores_are_flagged_and_build_directories_are_not() {
+        let rs = RuleSet::builtin();
+        for name in ["node_modules", ".venv", "venv", "Pods", ".cargo/registry"] {
+            let r = rs.rules().iter().find(|r| r.name == name).unwrap();
+            assert!(r.dependency_store, "{name}");
+        }
+        for name in ["build", "target", "dist", "obj"] {
+            assert!(rs
+                .rules()
+                .iter()
+                .filter(|r| r.name == name)
+                .all(|r| !r.dependency_store));
+        }
     }
 
     #[test]

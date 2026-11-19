@@ -6,7 +6,7 @@
 
 use crate::git::{Git, GitError};
 use crate::model::{Class, Facts, Remote, RepoInfo, Tri};
-use crate::redact::{redact_text, strip_url_credentials};
+use crate::redact::{config_key_label, diag, strip_url_credentials};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -86,7 +86,18 @@ fn canon(p: &Path) -> PathBuf {
 }
 
 fn note(what: &str, e: &GitError) -> String {
-    redact_text(&format!("{what}: {e}"))
+    diag(&format!("{what}: {e}"))
+}
+
+/// Diagnostic lines of one repo. Every line passes through [`diag`] on the way in, so nothing a
+/// repository controls (a file name, a git error) reaches a stored note unredacted.
+#[derive(Default)]
+struct Notes(Vec<String>);
+
+impl Notes {
+    fn push(&mut self, text: impl AsRef<str>) {
+        self.0.push(diag(text.as_ref()));
+    }
 }
 
 fn parse_remotes(out: &str, cfg: &FactsConfig) -> Vec<Remote> {
@@ -102,7 +113,7 @@ fn parse_remotes(out: &str, cfg: &FactsConfig) -> Vec<Remote> {
         };
         let network = (cfg.is_network)(&url);
         remotes.push(Remote {
-            name: name.to_string(),
+            name: diag(name),
             url,
             network,
         });
@@ -117,6 +128,68 @@ fn rel_slash(path: &Path, base: &Path) -> Option<String> {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
     Some(parts.join("/"))
+}
+
+/// Names that, present in a worktree's own git directory, show an operation that is not finished.
+/// Its state (a rebase todo list, conflict resolutions, the commits a sequence still has to apply)
+/// lives in these files and not in any ref, and is deleted with the repo.
+const IN_PROGRESS: [&str; 9] = [
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "BISECT_START",
+    "BISECT_TERMS",
+];
+
+/// Directories of the shared git directory that hold content not recorded in any ref: Git LFS
+/// objects and git-annex content that may never have been uploaded.
+const LOCAL_CONTENT: [&str; 2] = ["lfs/objects", "annex/objects"];
+
+/// Does `dir` exist and hold at least one entry? `Err` for anything but a plain directory or a
+/// missing one: a symlink or an unreadable path is not looked through.
+fn non_empty_dir(dir: &Path) -> Result<bool, String> {
+    use std::io::ErrorKind::NotFound;
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => std::fs::read_dir(dir)
+            .map(|mut rd| rd.next().is_some())
+            .map_err(|e| format!("cannot read {}: {e}", dir.display())),
+        Ok(_) => Err(format!("{} is not a plain directory", dir.display())),
+        Err(e) if e.kind() == NotFound => Ok(false),
+        Err(e) => Err(format!("cannot read {}: {e}", dir.display())),
+    }
+}
+
+/// Unfinished operations of this worktree and local-only LFS or annex content, found by name
+/// only (no file is read). `rr-cache` is not listed: it records conflict resolutions that can be
+/// derived again, not work.
+fn pending_state(git: &Git, path: &Path) -> Result<Vec<String>, String> {
+    let absolute = |args: &[&str], what: &str| -> Result<PathBuf, String> {
+        let out = git.run(path, args).map_err(|e| note(what, &e))?;
+        let p = PathBuf::from(out.trim());
+        Ok(if p.is_absolute() { p } else { path.join(p) })
+    };
+    let gitdir = absolute(&["rev-parse", "--absolute-git-dir"], "git dir")?;
+    let common = absolute(&["rev-parse", "--git-common-dir"], "git dir")?;
+    let mut found: Vec<String> = Vec::new();
+    for name in IN_PROGRESS {
+        // `symlink_metadata` succeeds for any kind of entry, including a symlink or a FIFO.
+        match std::fs::symlink_metadata(gitdir.join(name)) {
+            Ok(_) => found.push(name.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot check for {name}: {e}")),
+        }
+    }
+    for rel in LOCAL_CONTENT {
+        let dir = rel.split('/').fold(common.clone(), |p, part| p.join(part));
+        if non_empty_dir(&dir)? {
+            found.push(rel.to_string());
+        }
+    }
+    Ok(found)
 }
 
 /// Is a local config key one that cannot make git run a program of the repo's choosing?
@@ -218,7 +291,8 @@ fn local_config_keys(git: &crate::git::Git, path: &Path) -> Result<Vec<String>, 
 fn unsafe_key(keys: &[String], whose: &str) -> Result<(), String> {
     match keys.iter().find(|k| !config_key_is_safe(k)) {
         Some(bad) => {
-            let shown: String = bad.chars().take(80).collect();
+            // Only the section and variable name: the subsection can be a URL carrying a token.
+            let shown = config_key_label(bad);
             Err(format!(
                 "{whose} can run programs or is not understood ({shown}); \
                  no git command was run in this repo"
@@ -346,6 +420,7 @@ pub struct RepoCheck {
 }
 
 fn all_unknown(reason: String, unverified: &[PathBuf]) -> RepoCheck {
+    let reason = diag(&reason);
     let why = reason.clone();
     RepoCheck {
         info: RepoInfo {
@@ -379,7 +454,7 @@ pub fn collect_repo_info(
     let mut unverified: Vec<(PathBuf, String)> = Vec::new();
     let mut info = RepoInfo::default();
     let mut facts = Facts::default();
-    let mut notes: Vec<String> = Vec::new();
+    let mut notes = Notes::default();
 
     // Remotes and the network predicate.
     let remotes: Option<Vec<Remote>> = match git.run(path, &["remote", "-v"]) {
@@ -489,6 +564,52 @@ pub fn collect_repo_info(
             }
         }
         None => Tri::Unknown,
+    };
+
+    // Commits that only a reflog still reaches (an unpushed commit after `reset --hard`, an amended
+    // or rebased-away commit). No ref names them, so every check above can read as saved while
+    // the work is recoverable only from the reflog, which goes with the repo.
+    facts.reflog_saved = match &network_names {
+        // No network remote can hold anything.
+        Some(names) if names.is_empty() => Tri::No,
+        // An unborn HEAD (no commit yet) is not shown to be saved: HEAD is only unknown when
+        // `rev-parse` failed, and an empty reflog would otherwise read as vacuously saved.
+        Some(names) if info.head_commit.is_some() => {
+            // `rev-list` only reads refs, reflogs and objects (git-rev-list(1)): it takes no lock
+            // and writes nothing. `--reflog` adds every reflog entry (HEAD of this worktree and
+            // all refs of the shared repo) to the revisions; `--not --remotes=<n>` removes
+            // whatever a network remote's tracking refs contain; `-n 1` stops at the first
+            // survivor, and the command timeout bounds the walk (a timeout is `Unknown`).
+            let pats: Vec<String> = names.iter().map(|n| format!("--remotes={n}")).collect();
+            let mut args: Vec<&str> = vec!["rev-list", "-n", "1", "--reflog", "--not"];
+            args.extend(pats.iter().map(|s| s.as_str()));
+            match git.run(path, &args) {
+                Ok(out) => Tri::from_bool(out.trim().is_empty()),
+                Err(e) => {
+                    notes.push(note("reflog_saved", &e));
+                    Tri::Unknown
+                }
+            }
+        }
+        _ => Tri::Unknown,
+    };
+
+    // Unfinished operations and local-only content that no ref records.
+    facts.no_pending_state = match pending_state(git, path) {
+        Ok(found) if found.is_empty() => Tri::Yes,
+        Ok(found) => {
+            notes.push(format!(
+                "no_pending_state: found {} in the git directory (an unfinished rebase, \
+                 cherry-pick, revert or bisect, or Git LFS or git-annex content); it holds work \
+                 that no ref records and cannot be shown to be saved",
+                found.join(", ")
+            ));
+            Tri::Unknown
+        }
+        Err(why) => {
+            notes.push(format!("no_pending_state: {why}"));
+            Tri::Unknown
+        }
     };
 
     // Stash.
@@ -638,11 +759,11 @@ pub fn collect_repo_info(
             if class == Class::Worktree && !main_is_me {
                 // A linked worktree: it belongs to the first listed worktree, and nothing
                 // can depend on it.
-                info.parent_repo = entries.first().cloned();
+                info.parent_repo = entries.first().map(|e| diag(e));
                 Tri::Yes
             } else {
                 let has_none = others.is_empty();
-                info.worktrees = others;
+                info.worktrees = others.iter().map(|o| diag(o)).collect();
                 Tri::from_bool(has_none)
             }
         }
@@ -659,7 +780,7 @@ pub fn collect_repo_info(
         .and_then(|s| s.trim().parse::<i64>().ok());
 
     info.facts = facts;
-    info.notes = notes;
+    info.notes = notes.0;
     info.remotes = remotes.unwrap_or_default();
     RepoCheck {
         info,

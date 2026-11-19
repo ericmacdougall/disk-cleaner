@@ -109,7 +109,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
     let json = fs::read_to_string(&out_file).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["schema_version"], 1);
+    assert_eq!(v["schema_version"], 2);
 
     let o = run(bin()
         .args([
@@ -953,7 +953,9 @@ fn h1_credential_in_a_config_subsection_never_reaches_any_output() {
     git(&repo, &["commit", "-q", "-m", "init"]);
     let config = repo.join(".git").join("config");
     let mut text = fs::read_to_string(&config).unwrap();
-    text.push_str("[credential \"https://user:SYNTHETIC_TOKEN@example.invalid\"]\n\thelper = store\n");
+    text.push_str(
+        "[credential \"https://user:SYNTHETIC_TOKEN@example.invalid\"]\n\thelper = store\n",
+    );
     fs::write(&config, text).unwrap();
     let out_file = tmp.path().join("scan.json");
 
@@ -988,7 +990,10 @@ fn h1_credential_in_a_config_subsection_never_reaches_any_output() {
         ("plan --json", &plan_json),
     ] {
         assert!(!text.contains("SYNTHETIC_TOKEN"), "token leaked in {what}");
-        assert!(!text.contains("user:"), "userinfo leaked in {what}");
+        assert!(
+            !text.contains("example.invalid"),
+            "the subsection was printed in {what}"
+        );
     }
     // The refusal itself is still reported, naming the section and variable only.
     let v: serde_json::Value = serde_json::from_str(&scan_file).unwrap();

@@ -8,6 +8,7 @@
 use crate::error::{Error, Result};
 use crate::facts::{collect_repo_info, FactsConfig, RepoCheck};
 use crate::model::*;
+use crate::redact::diag;
 use crate::rules::{marker_matches, Rule, RuleSet};
 use jwalk::WalkDirGeneric;
 use rayon::prelude::*;
@@ -130,6 +131,10 @@ struct DirAgg {
     has_manifest: bool,
     owner: Option<usize>,
     in_git: bool,
+    /// First direct file whose name is a unique-state pattern (name, index into the rules'
+    /// state files), split by whether package fixtures routinely use the name. Names only.
+    state_hard: Option<(String, usize)>,
+    state_soft: Option<(String, usize)>,
 }
 
 struct Walk {
@@ -288,6 +293,18 @@ impl DirAgg {
         if !is_dir && rules.is_source_file(name) {
             self.has_source = true;
         }
+        if !is_dir {
+            if let Some(i) = rules.state_file(name) {
+                let slot = if rules.state_files()[i].fixture_prone {
+                    &mut self.state_soft
+                } else {
+                    &mut self.state_hard
+                };
+                if slot.is_none() {
+                    *slot = Some((name.to_string(), i));
+                }
+            }
+        }
     }
 }
 
@@ -296,8 +313,75 @@ struct Build {
     node: Node,
     path: PathBuf,
     scan_outputs: bool,
+    /// The rule says this directory holds third-party package contents.
+    dependency_store: bool,
     git_bytes: u64,
     regen_bytes: u64,
+}
+
+/// `path` below `base` with `/` separators (`base` itself is the empty string).
+fn rel_slash(path: &Path, base: &Path) -> String {
+    path.strip_prefix(base)
+        .map(|rel| {
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default()
+}
+
+/// A directory inside (or being) a regenerable or cache directory is looked at for things that
+/// say it is not only generated files, which a rule match on the outer directory would hide:
+/// a nested directory that its own rule says can hold unique content (`ask`, `ask_if_contains`),
+/// and file names from the unique-state list. Names only; nothing is opened or read. The first
+/// finding becomes the owner's `ask_reason`; it names the kind of thing, never its contents.
+fn note_nested_state(build: &mut Build, dirs: &[(PathBuf, DirAgg)], i: usize, rules: &RuleSet) {
+    let (path, agg) = (&dirs[i].0, &dirs[i].1);
+    let rel = rel_slash(path, &build.path);
+    if !rel.is_empty() {
+        if let Some(rule) = match_rule(dirs, i, rules) {
+            if let Some(why) = rule.ask.as_deref() {
+                build.node.ask_reason.get_or_insert_with(|| {
+                    diag(&format!(
+                        "contains a {} directory ({rel}) that {why}",
+                        rule.name
+                    ))
+                });
+            } else if let Some(name) = agg
+                .markers
+                .iter()
+                .find(|name| rule.ask_if_contains.iter().any(|m| marker_matches(m, name)))
+            {
+                build.node.ask_reason.get_or_insert_with(|| {
+                    diag(&format!(
+                        "contains a {} directory ({rel}) that holds {name}, which a generated \
+                         directory does not: it may be a user-level directory with settings or \
+                         credentials",
+                        rule.name
+                    ))
+                });
+            }
+        }
+    }
+    let hits = [
+        agg.state_hard.as_ref(),
+        agg.state_soft.as_ref().filter(|_| !build.dependency_store),
+    ];
+    for (name, k) in hits.into_iter().flatten() {
+        let kind = &rules.state_files()[*k].kind;
+        let at = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        build.node.ask_reason.get_or_insert_with(|| {
+            diag(&format!(
+                "holds a file that looks like {kind} ({at}), which can exist nowhere else; it is \
+                 not offered for removal until a person has looked"
+            ))
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -379,7 +463,9 @@ fn classify(
                 if let Some(o) = owner {
                     let rel_path = path.to_string_lossy();
                     builds[o].node.ask_reason.get_or_insert_with(|| {
-                        format!("contains a git repository ({rel_path}) that may hold unsaved work")
+                        diag(&format!(
+                            "contains a git repository ({rel_path}) that may hold unsaved work"
+                        ))
                     });
                 }
             }
@@ -439,6 +525,7 @@ fn classify(
                         node,
                         path: path.clone(),
                         scan_outputs: rule.map(|r| r.scan_outputs).unwrap_or(false),
+                        dependency_store: rule.map(|r| r.dependency_store).unwrap_or(false),
                         git_bytes: 0,
                         regen_bytes: 0,
                     });
@@ -447,6 +534,13 @@ fn classify(
                         // A bare repo is all git data.
                         now_in_git = true;
                     }
+                }
+            }
+            // Inside (or being) an artifact directory nothing is classified, but what rule
+            // evaluation would have said about it still counts.
+            if let Some(o) = new_owner {
+                if builds[o].node.class.is_artifact() && !now_in_git {
+                    note_nested_state(&mut builds[o], dirs, i, rules);
                 }
             }
         }
@@ -917,12 +1011,12 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
             Ok(Some(t)) => t,
             Ok(None) => continue,
             Err(why) => {
-                warnings.push(format!(
+                warnings.push(diag(&format!(
                     "alternates file {} was not read ({why}); the repo it borrows objects from \
                      cannot be identified, so no other repo in the scan is treated as free of \
                      dependents",
                     alt_path.display()
-                ));
+                )));
                 unresolved.push((i, alt_path.display().to_string()));
                 continue;
             }
@@ -965,10 +1059,10 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
         if let Some(info) = b.node.repo.as_mut() {
             if info.facts.no_dependents == Tri::Yes {
                 info.facts.no_dependents = Tri::Unknown;
-                info.notes.push(format!(
+                info.notes.push(diag(&format!(
                     "no_dependents: the alternates file {file} was not read, so a clone in the \
                      scan may borrow objects from this repo"
-                ));
+                )));
             }
         }
     }

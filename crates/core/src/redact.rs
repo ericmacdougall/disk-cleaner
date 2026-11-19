@@ -56,9 +56,61 @@ pub fn redact_text(text: &str) -> String {
     out
 }
 
+/// The one place text that may carry repository-controlled content (config keys, remote names,
+/// file names, git error output) passes through before it is stored in a note, reason or error.
+///
+/// URL credentials are stripped ([`redact_text`]) and control characters become spaces, so a
+/// value can neither carry a token into the output nor forge extra lines in it.
+pub fn diag(text: &str) -> String {
+    redact_text(text)
+        .chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect()
+}
+
+/// A config key reduced to what is safe to print: the section and the variable name.
+///
+/// A key is `section.name` or `section.<subsection>.name`, and the subsection is free text that
+/// can be a URL with a token in it (`credential.https://user:TOKEN@host.helper`). It is never
+/// printed: `credential.<redacted>.helper`. Section and variable names are limited to letters,
+/// digits and `-` by git; anything else is replaced.
+pub fn config_key_label(key: &str) -> String {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .take(40)
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '?' })
+            .collect()
+    };
+    match (key.find('.'), key.rfind('.')) {
+        (Some(first), Some(last)) if first < last => {
+            format!("{}.<redacted>.{}", clean(&key[..first]), clean(&key[last + 1..]))
+        }
+        (Some(first), _) => format!("{}.{}", clean(&key[..first]), clean(&key[first + 1..])),
+        (None, _) => "<unparsed key>".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_key_label_never_prints_the_subsection() {
+        assert_eq!(
+            config_key_label("credential.https://user:SYNTHETIC_TOKEN@example.invalid.helper"),
+            "credential.<redacted>.helper"
+        );
+        assert_eq!(config_key_label("filter.lfs.clean"), "filter.<redacted>.clean");
+        assert_eq!(config_key_label("core.fsmonitor"), "core.fsmonitor");
+        assert_eq!(config_key_label("nodots"), "<unparsed key>");
+        assert!(!config_key_label("a.b.c.d.name\u{1b}[0m").contains('\u{1b}'));
+    }
+
+    #[test]
+    fn diag_strips_credentials_and_control_characters() {
+        let d = diag("see https://u:tok@host.invalid/x\u{1b}[31m red");
+        assert!(!d.contains("tok") && !d.contains('\u{1b}'), "{d}");
+    }
 
     #[test]
     fn strips_user_and_token_from_https() {

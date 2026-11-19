@@ -51,6 +51,8 @@ fn all_yes() -> Facts {
         tree_clean: Tri::Yes,
         no_unique_ignored: Tri::Yes,
         no_dependents: Tri::Yes,
+        reflog_saved: Tri::Yes,
+        no_pending_state: Tri::Yes,
     }
 }
 
@@ -63,7 +65,9 @@ fn with_fact(index: usize, v: Tri) -> Facts {
         3 => f.stash_empty = v,
         4 => f.tree_clean = v,
         5 => f.no_unique_ignored = v,
-        _ => f.no_dependents = v,
+        6 => f.no_dependents = v,
+        7 => f.reflog_saved = v,
+        _ => f.no_pending_state = v,
     }
     f
 }
@@ -92,7 +96,7 @@ fn a_repo_with_any_fact_not_yes_never_gets_a_removing_action() {
         );
     }
     for class in [Class::Repo, Class::Worktree] {
-        for index in 0..7 {
+        for index in 0..9 {
             for (v, expected) in [
                 (Tri::No, Action::RecoverThenArchive),
                 (Tri::Unknown, Action::Ask),

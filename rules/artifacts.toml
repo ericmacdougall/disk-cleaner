@@ -16,6 +16,15 @@
 #   ask_if_contains
 #                 entries that, found directly inside the directory, show it is not what the rule
 #                 describes (a user-level home rather than a project cache); it then asks
+#   dependency_store
+#                 true for directories of third-party package contents (node_modules, virtual
+#                 environments, registries): packages ship key, certificate and database files
+#                 as test fixtures, so the `fixture_prone` [[state_file]] names do not make
+#                 them ask. Every other directory treats those names as unique state.
+#
+# [[state_file]] (end of file): file names that mean "this is not only generated files". They
+# are looked for anywhere under a regenerable or cache directory, and the same rules that carry
+# `ask` / `ask_if_contains` are applied to directories nested inside it.
 #
 # A cache or "regenerable" directory that tools also use to store what the user made (locally
 # installed packages, settings, credentials, state) must carry `ask`.
@@ -28,6 +37,7 @@ name = "node_modules"
 markers = ["package.json"]
 class = "regenerable"
 note = "npm, pnpm and yarn dependencies; restored by an install"
+dependency_store = true
 
 [[rule]]
 name = ".next"
@@ -122,12 +132,14 @@ name = ".cargo/registry"
 markers = []
 class = "cache"
 note = "Cargo crate registry cache"
+dependency_store = true
 
 [[rule]]
 name = ".cargo/git"
 markers = []
 class = "cache"
 note = "Cargo git dependency checkouts"
+dependency_store = true
 
 # ---- JVM ---------------------------------------------------------------------------------
 [[rule]]
@@ -151,6 +163,7 @@ name = ".gradle/caches"
 markers = []
 class = "cache"
 note = "Gradle user cache"
+dependency_store = true
 
 [[rule]]
 name = ".m2/repository"
@@ -165,12 +178,14 @@ name = ".venv"
 markers = ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile"]
 class = "regenerable"
 note = "Python virtual environment"
+dependency_store = true
 
 [[rule]]
 name = "venv"
 markers = ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile"]
 class = "regenerable"
 note = "Python virtual environment"
+dependency_store = true
 
 [[rule]]
 name = "__pycache__"
@@ -201,6 +216,7 @@ name = ".tox"
 markers = ["tox.ini", "pyproject.toml", "setup.cfg"]
 class = "regenerable"
 note = "tox environments"
+dependency_store = true
 
 [[rule]]
 name = "htmlcov"
@@ -213,12 +229,14 @@ name = ".cache/pip"
 markers = []
 class = "cache"
 note = "pip download cache"
+dependency_store = true
 
 [[rule]]
 name = ".cache/uv"
 markers = []
 class = "cache"
 note = "uv cache"
+dependency_store = true
 
 # ---- .NET --------------------------------------------------------------------------------
 [[rule]]
@@ -239,6 +257,7 @@ name = ".nuget/packages"
 markers = []
 class = "cache"
 note = "NuGet package cache"
+dependency_store = true
 
 # ---- Apple / Xcode -----------------------------------------------------------------------
 [[rule]]
@@ -246,6 +265,7 @@ name = "Pods"
 markers = ["Podfile"]
 class = "regenerable"
 note = "CocoaPods dependencies"
+dependency_store = true
 
 [[rule]]
 name = "DerivedData"
@@ -318,6 +338,7 @@ name = "deps"
 markers = ["mix.exs"]
 class = "regenerable"
 note = "Elixir dependencies"
+dependency_store = true
 
 # ---- User-level caches -------------------------------------------------------------------
 [[rule]]
@@ -325,12 +346,14 @@ name = ".npm"
 markers = []
 class = "cache"
 note = "npm cache"
+dependency_store = true
 
 [[rule]]
 name = ".pnpm-store"
 markers = []
 class = "cache"
 note = "pnpm content-addressable store"
+dependency_store = true
 
 [[rule]]
 name = ".cache/ms-playwright"
@@ -373,6 +396,81 @@ name = ".cache/pre-commit"
 markers = []
 class = "cache"
 note = "pre-commit environments"
+dependency_store = true
+
+# ---- Unique-state file names -------------------------------------------------------------
+# Matched on the file name only (never the contents), ignoring case. A pattern is `name`,
+# `*suffix` or `prefix*`. The first match wins, so the plain entries come before the
+# fixture-prone ones. A hit makes the enclosing regenerable or cache directory ask, and through
+# the plan every repo and directory around it.
+[[state_file]]
+pattern = "*.tfstate"
+kind = "Terraform state"
+
+[[state_file]]
+pattern = "terraform.tfstate.*"
+kind = "Terraform state"
+
+[[state_file]]
+pattern = "*.tfvars"
+kind = "Terraform variable values"
+
+[[state_file]]
+pattern = ".env"
+kind = "environment settings (.env)"
+
+[[state_file]]
+pattern = ".env.*"
+kind = "environment settings (.env)"
+except = [".env.example", ".env.sample", ".env.template", ".env.dist"]
+
+[[state_file]]
+pattern = "id_rsa"
+kind = "a private SSH key"
+
+[[state_file]]
+pattern = "id_ed25519"
+kind = "a private SSH key"
+
+[[state_file]]
+pattern = "*.sqlite"
+kind = "a local database"
+fixture_prone = true
+
+[[state_file]]
+pattern = "*.sqlite3"
+kind = "a local database"
+fixture_prone = true
+
+[[state_file]]
+pattern = "*.db"
+kind = "a local database"
+fixture_prone = true
+
+[[state_file]]
+pattern = "*.pem"
+kind = "a certificate or private key"
+fixture_prone = true
+
+[[state_file]]
+pattern = "*.key"
+kind = "a private key"
+fixture_prone = true
+
+[[state_file]]
+pattern = "*.keystore"
+kind = "a key store"
+fixture_prone = true
+
+[[state_file]]
+pattern = "*.jks"
+kind = "a key store"
+fixture_prone = true
+
+[[state_file]]
+pattern = "*.p12"
+kind = "a certificate bundle with its private key"
+fixture_prone = true
 
 # ---- Output files ------------------------------------------------------------------------
 # Files with these extensions are produced work, not artifacts. Found inside a build output

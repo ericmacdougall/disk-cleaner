@@ -1,7 +1,9 @@
 # Scan and plan JSON format
 
-Schema version: **1** (`schema_version` in every file). Any incompatible change bumps it; `plan`
-refuses a scan with a different version. All sizes are bytes. All times are unix seconds (UTC).
+Schema version: **2** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
+`no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
+have read a repo as saved without them, so it is refused: scan again). All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 
 Produce a scan with `disk-cleaner scan <path>... --out scan.json` (or `--json` for stdout) and a
@@ -13,7 +15,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 1 |
+| `schema_version` | integer, currently 2 |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots |
@@ -73,7 +75,11 @@ the rule's marker file or directory exists in the directory beside it, that is, 
 further up proves nothing; a rule without markers matches by name alone; ambiguous names such as
 `build` always have markers). Regenerable and cache directories are opaque: nothing inside them is
 classified, so a repo vendored inside `node_modules` is not reported as a node; instead the
-directory gets an `ask_reason`. A directory outside any repo that holds a project manifest or
+directory gets an `ask_reason`. Opaque does not mean unchecked: while the scan is inside one, the
+rules that carry `ask` or `ask_if_contains` are still evaluated for the directories nested in it,
+and file names are compared with the `[[state_file]]` list (below); any hit gives the enclosing
+artifact an `ask_reason`, and the plan's enclosing rule then makes every repo and directory around
+it ask. A directory outside any repo that holds a project manifest or
 source files is `loose-code` (a scan root counts only if it holds a manifest).
 
 A regenerable or cache node carries an `ask_reason`, and is never offered for removal, when: a git
@@ -84,7 +90,9 @@ it can hold content that exists nowhere else (`ask` in the rules file: the Maven
 which also holds artifacts installed with `mvn install`, and `.terraform`, which records backend
 configuration), or the directory holds an entry its rule says a generated directory never has
 (`ask_if_contains`: a `.gradle` beside a build file that holds `gradle.properties` or `init.d` is the
-Gradle user home, not a project cache). `unreadable` counts entries inside a node that could not
+Gradle user home, not a project cache), or a directory nested anywhere inside it matches such a rule
+(`build/.terraform`, a `.m2/repository` inside `node_modules`), or a file inside it has a
+unique-state name. `unreadable` counts entries inside a node that could not
 be read and `skipped_mounts` the mount points inside it that were not entered; such a node is
 incomplete and is never offered for removal.
 
@@ -95,12 +103,26 @@ Each is listed in `outputs` whatever its size and the directory is flagged `cont
 Dependency directories such as `node_modules` are not searched, because packages routinely ship
 fixture archives. Outside build directories only outputs of at least `min_output_bytes` are listed.
 
+**Unique-state file names** (`[[state_file]]` in `rules/artifacts.toml`, matched on the file name
+only, ignoring case; no file is opened). Found anywhere under a regenerable or cache directory they
+make it ask, whatever the rule: Terraform state (`*.tfstate`, `terraform.tfstate.*`) and variable
+values (`*.tfvars`), `.env` and `.env.*` (not `.env.example`, `.sample`, `.template`, `.dist`),
+`id_rsa`, `id_ed25519`, local databases (`*.sqlite`, `*.sqlite3`, `*.db`) and key material
+(`*.pem`, `*.key`, `*.keystore`, `*.jks`, `*.p12`). The reason names the kind and the path inside
+the directory, never contents. Trade-off: the databases and key material are `fixture_prone`, and
+directories of third-party packages (`dependency_store = true`: `node_modules`, virtual
+environments, `Pods`, `deps`, `.tox`, package registries and caches) skip those names, because
+packages ship them as test fixtures (a `test/fixtures/cert.pem`) and every JavaScript project would
+otherwise ask. The cost is that a real key placed inside `node_modules` is not noticed by name;
+Terraform state, `.env` and the SSH key names are not skipped even there. Build output
+directories, `target` and the like always treat all the names as state.
+
 ### `repo`
 
 | Field | Meaning |
 |---|---|
-| `facts` | the seven safety facts, each `"yes"`, `"no"` or `"unknown"` |
-| `notes` | why facts are not `yes` (git errors, ignored paths found); credentials removed |
+| `facts` | the nine safety facts, each `"yes"`, `"no"` or `"unknown"` |
+| `notes` | why facts are not `yes` (git errors, ignored paths found); every note passes one redaction function (see below) |
 | `remotes` | `name`, `url` (credentials stripped), `network` |
 | `head_commit`, `last_commit_time` | HEAD id; newest commit on any ref |
 | `worktrees` | live linked worktrees reported by git (may be outside the scan) |
@@ -120,6 +142,20 @@ Facts (the safe value is always `yes`):
 | `tree_clean` | no tracked changes and no untracked files in this repo's own tree (submodules are their own nodes), and no file marked skip-worktree or assume-unchanged (those hide local edits) |
 | `no_unique_ignored` | no ignored files outside regenerable and cache directories (`.env`, local databases...) |
 | `no_dependents` | no linked worktree and, within the scanned roots, no alternates clone depends on this object store |
+| `reflog_saved` | every commit reachable from any reflog entry (HEAD of this worktree and every ref's reflog) is contained in a network remote's tracking refs. An unpushed commit after `git reset --hard`, an amended or rebased-away commit and a stash's commits are `no`. No network remote is `no`; an unborn HEAD, any git failure or a timeout is `unknown` |
+| `no_pending_state` | no unfinished rebase, merge, cherry-pick, revert or bisect in this worktree's git directory (`rebase-merge`, `rebase-apply`, `sequencer`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `BISECT_*`) and no local-only content under `.git/lfs/objects` or `.git/annex/objects`. Found by name only. Never `no`: a finding is `unknown` (state that no ref records cannot be recovered into a ref, so a person decides) |
+
+`reflog_saved` is computed with `git rev-list -n 1 --reflog --not --remotes=<network remote>...`, which
+only reads refs, reflogs and objects (see git-rev-list(1); it takes no lock and writes nothing) and
+stops at the first commit no tracking ref contains; the command timeout bounds it. In a linked
+worktree it sees that worktree's HEAD reflog and the shared repo's other reflogs; the main repo may
+not see a linked worktree's HEAD reflog, but a repo with linked worktrees is already
+`no_dependents = no` and never archived. A bare repo keeps no reflog unless `core.logAllRefUpdates` is set. A zero-commit
+repo is never `yes`. Reflogs expire (90 days, 30 for unreachable entries), so the fact errs toward
+`no` for recent history: a branch squash-merged remotely keeps its original commits in its reflog and
+reads `no` until they expire. Other state git keeps outside refs: `refs/original` and
+`refs/rewritten` are refs and are covered by `all_branches_on_remote`; a non-empty `.git/rr-cache`
+only records conflict resolutions that can be derived again and is not work.
 
 Any git failure, timeout or missing binary makes the affected fact `unknown`, never `yes`. A bare
 repo has no working tree, so its `tree_clean` and `no_unique_ignored` are `unknown`. Remote-tracking
@@ -132,6 +168,14 @@ Remote URLs have embedded credentials removed (`https://user:token@host/x` is st
 `https://host/x`; everything up to the last `@` counts as userinfo, and query strings and fragments are
 dropped) before they are stored, and all git error text is redacted the same way.
 
+Everything stored from text a repository controls goes through one function (`redact::diag`):
+notes, remote names, ask reasons built from file names, git error output, warnings. It strips URL
+credentials and turns control characters into spaces. A rejected config key is never printed in
+full: a key's subsection is free text and can be a credential URL
+(`[credential "https://user:TOKEN@host"]`), so only the section and variable name are shown
+(`credential.<redacted>.helper`). Paths of scanned directories are not redacted; they are the
+data being reported.
+
 **The repo's own config is untrusted.** A scanned folder may be an unpacked download, and its
 `.git/config` can name programs that git would run (`filter.*.clean`, `gpg.program`, `core.fsmonitor`,
 `core.sshCommand`, ...). Before any other git command the tool lists the config keys
@@ -141,8 +185,8 @@ key is outside a small allowlist of plain-data keys (`core.*` format and line-en
 `branch.<n>.remote|merge|rebase|description|pushremote`, `user.name|email|signingkey`,
 `submodule.*.url|path|active|branch|ignore`, `url.*.insteadOf`, `extensions.*`, `commit.gpgsign`,
 `tag.gpgsign`, and simple `init`, `gc`, `pack`, `receive`, `transfer`, `fetch`, `pull`, `push`,
-`color`, `advice`, `gui`, `include` settings) then every fact is `unknown`, a note says
-which key, and no further git command is run in that repo. The same check is applied to every
+`color`, `advice`, `gui`, `include` settings) then every fact is `unknown`, a note names the
+section and variable of the key (not its subsection), and no further git command is run in that repo. The same check is applied to every
 `<gitdir>/modules/**/config` (bounded walk; a symlink, unreadable file or too many entries also
 counts as unsafe), because git runs a child status inside submodules using their own config; the
 outer status uses `--ignore-submodules=all` since each checked-out submodule is its own node. A
