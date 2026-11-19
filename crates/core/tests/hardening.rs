@@ -556,7 +556,8 @@ fn n2_control_two_checked_out_clean_submodules_make_the_parent_ask_for_its_layou
         "{why:#?}\n{notes:#?}"
     );
     assert!(
-        why.iter().any(|w| w.contains("unusual repository layout: modules")),
+        why.iter()
+            .any(|w| w.contains("unusual repository layout: modules")),
         "{why:#?}"
     );
 }
