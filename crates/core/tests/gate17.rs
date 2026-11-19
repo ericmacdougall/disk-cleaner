@@ -192,8 +192,7 @@ fn z1_with_verify_objects_a_midx_sidecar_is_backed_up_or_asks() {
     notes.extend_from_slice(b"my only copy of these notes\n");
     fs::write(pack_dir(&rev).join(MIDX_REV), &notes).unwrap();
     let bitmap = clone_of(tmp.path(), &root, &remotes, "bitmap");
-    fs::write(pack_dir(&bitmap).join(MIDX_BITMAP), notes_after(b"BITM"))
-        .unwrap();
+    fs::write(pack_dir(&bitmap).join(MIDX_BITMAP), notes_after(b"BITM")).unwrap();
 
     let res = scan_verified(&root);
     let rel = format!("objects/pack/{MIDX_REV}");
