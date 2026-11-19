@@ -190,6 +190,7 @@ fn the_worker_and_every_git_it_started_end() {
             describe(&[&gits[..], &[worker]].concat(), worker)
         );
         drop(w.stdin.take());
+        no_git_left(&pid_file, worker, "cancel");
     }
     std::env::remove_var("PRUNEDISK_FAKE_GIT_GRANDCHILD");
 
@@ -223,5 +224,18 @@ fn the_worker_and_every_git_it_started_end() {
                 describe(&[&gits[..], &[worker]].concat(), worker)
             );
         }
+        no_git_left(&pid_file, worker, "the parent going away");
     }
+}
+
+/// Every git the worker started, including one started after the pids were first read (core
+/// runs its next git command when one is killed), has ended too.
+fn no_git_left(pid_file: &Path, worker: u32, step: &str) {
+    std::thread::sleep(Duration::from_millis(300));
+    let all = pids(pid_file);
+    assert!(
+        wait_for(|| alive(&all).is_empty(), Duration::from_secs(2)),
+        "a git started by the worker outlived {step}: {} (all fake git pids {all:?})",
+        describe(&all, worker)
+    );
 }

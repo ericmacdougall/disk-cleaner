@@ -11,7 +11,7 @@ for i in $(seq 1 "$runs"); do
   else
     failed=$((failed + 1))
     echo "run $i: FAILED"
-    grep -E "panicked|still running|never started|sweep found" "containment-run-$i.log" || true
+    grep -E "panicked|still running|never started|sweep found|outlived" "containment-run-$i.log" || true
   fi
 done
 echo "containment: $failed of $runs runs failed"
