@@ -688,9 +688,8 @@ mod tests {
             fs::create_dir_all(p.parent().unwrap()).unwrap();
             fs::write(&p, b"x").unwrap();
         }
-        let names = |v: Vec<(String, u64)>| -> Vec<String> {
-            v.into_iter().map(|(p, _)| p).collect()
-        };
+        let names =
+            |v: Vec<(String, u64)>| -> Vec<String> { v.into_iter().map(|(p, _)| p).collect() };
         let plain = sort(dir.path(), false).unwrap();
         assert!(plain.own.is_empty(), "{:?}", plain.own);
         assert_eq!(names(plain.store).len(), unread.len() + read.len());

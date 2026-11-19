@@ -178,19 +178,36 @@ fn z1_a_midx_sidecar_holding_notes_is_under_the_object_store_obligation() {
     assert_obligations(&res, item(&p, &repo), &repo, false);
 }
 
+const MIDX_BITMAP: &str = "multi-pack-index-1111111111111111111111111111111111111111.bitmap";
+
+/// With `--verify-objects`, a multi-pack-index `.rev` (a kind no git command reads) is backed up
+/// with the git directory's own files and named in the examples; a multi-pack-index `.bitmap`
+/// with no multi-pack-index (a kind git reads, but this one is of nothing git verified) is
+/// unaccounted, so the repository asks.
 #[test]
-fn z1_with_verify_objects_an_unaccounted_midx_sidecar_asks() {
+fn z1_with_verify_objects_a_midx_sidecar_is_backed_up_or_asks() {
     let (tmp, root, remotes) = workspace();
-    let repo = clone_of(tmp.path(), &root, &remotes, "app");
+    let rev = clone_of(tmp.path(), &root, &remotes, "rev");
     let mut notes = b"RIDX".to_vec();
     notes.extend_from_slice(b"my only copy of these notes\n");
-    fs::write(pack_dir(&repo).join(MIDX_REV), &notes).unwrap();
+    fs::write(pack_dir(&rev).join(MIDX_REV), &notes).unwrap();
+    let bitmap = clone_of(tmp.path(), &root, &remotes, "bitmap");
+    fs::write(pack_dir(&bitmap).join(MIDX_BITMAP), notes_after(b"BITM"))
+        .unwrap();
 
     let res = scan_verified(&root);
-    let reason = assert_asks(&res, &repo);
-    assert!(reason.contains(MIDX_REV), "{reason}");
+    let rel = format!("objects/pack/{MIDX_REV}");
+    assert_preserved_or_asks(&res, &rev, &rel);
+    let p = plan_of(&res);
+    let it = item(&p, &rev);
+    assert_eq!(it.action, Action::BackupThenRemove, "{}", it.reason);
+    let ex = &it.preserve.as_ref().unwrap().git_admin.examples;
+    assert!(ex.contains(&format!(".git/{rel}")), "{ex:?}");
+
+    let reason = assert_asks(&res, &bitmap);
+    assert!(reason.contains(MIDX_BITMAP), "{reason}");
     assert_eq!(
-        facts_of(&res, &repo).no_local_admin_content,
+        facts_of(&res, &bitmap).no_local_admin_content,
         disk_cleaner_core::Tri::No
     );
 }
