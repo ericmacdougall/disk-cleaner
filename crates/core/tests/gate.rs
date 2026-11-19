@@ -80,7 +80,12 @@ fn g3_oversized_alternates_file_makes_every_possible_provider_ask() {
             "{}",
             provider.display()
         );
-        assert_eq!(action_for(&res, provider), Action::Ask, "{}", provider.display());
+        assert_eq!(
+            action_for(&res, provider),
+            Action::Ask,
+            "{}",
+            provider.display()
+        );
     }
 }
 

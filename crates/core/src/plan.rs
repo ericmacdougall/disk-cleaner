@@ -372,6 +372,17 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 );
                 action = Action::Ask;
                 reclaim = 0;
+            } else if node.skipped_mounts > 0 {
+                reason = format!(
+                    "{reason}; but {} director{} inside {} on another file system and {} not \
+                     scanned (--one-file-system), so what is there was never looked at",
+                    node.skipped_mounts,
+                    if node.skipped_mounts == 1 { "y" } else { "ies" },
+                    if node.skipped_mounts == 1 { "is" } else { "are" },
+                    if node.skipped_mounts == 1 { "was" } else { "were" },
+                );
+                action = Action::Ask;
+                reclaim = 0;
             } else if let Some(orphan) = orphan_submodule_gitdir(scan, idx) {
                 reason = format!(
                     "{reason}; but the submodule git directory {orphan} under .git/modules has \

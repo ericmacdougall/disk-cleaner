@@ -41,7 +41,9 @@ the directory that holds them); `output_bytes` counts them separately.
   are not detected and are counted per name.
 - Symlinks are never followed; a symlink counts as the small link object.
 - `--one-file-system` skips directories on another device than their scan root. It is ignored on
-  Windows and a warning says so.
+  Windows and a warning says so. A skipped directory's contents are never seen, so the node that
+  holds it (or the mount point itself, when a rule matches it) records it in `skipped_mounts` and is
+  never offered for removal; enclosing nodes then ask through the plan's enclosing rule.
 - Unreadable entries are counted and listed in `issues`; the scan continues.
 
 ### `nodes`
@@ -59,6 +61,9 @@ One entry per classified directory. A directory belongs to its innermost classif
 | `output_bytes` | allocated bytes of output-extension files in the subtree |
 | `contains_outputs` | build directory that holds output files; never offered for removal |
 | `newest_mtime` | newest modification time of files attributed to this node, excluding `.git` and nested nodes |
+| `unreadable` | entries inside this node that could not be read (omitted when 0) |
+| `skipped_mounts` | directories inside this node on another file system that `--one-file-system` did not enter (omitted when 0) |
+| `ask_reason` | why this regenerable or cache node is never offered for removal |
 | `repo` | present for `repo`, `worktree` and `bare-repo` |
 
 Classification rules (design section 3): a directory with a `.git` directory is a `repo`; with a
@@ -74,9 +79,14 @@ source files is `loose-code` (a scan root counts only if it holds a manifest).
 A regenerable or cache node carries an `ask_reason`, and is never offered for removal, when: a git
 repository lives inside it; it is a build directory (`scan_outputs`) in loose code, where no git
 history proves it holds no hand-written source; or, inside a repo, git does not show it as wholly
-ignored and untracked (a tracked or partly tracked `build/` may hold source). `unreadable` counts
-entries inside a node that could not be read; such a node is incomplete and is never offered for
-removal.
+ignored and untracked (a tracked or partly tracked `build/` may hold source); or its rule says
+it can hold content that exists nowhere else (`ask` in the rules file: the Maven local repository,
+which also holds artifacts installed with `mvn install`, and `.terraform`, which records backend
+configuration), or the directory holds an entry its rule says a generated directory never has
+(`ask_if_contains`: a `.gradle` beside a build file that holds `gradle.properties` or `init.d` is the
+Gradle user home, not a project cache). `unreadable` counts entries inside a node that could not
+be read and `skipped_mounts` the mount points inside it that were not entered; such a node is
+incomplete and is never offered for removal.
 
 Build directories (rule `scan_outputs = true`) are searched for output files (video, audio, images,
 documents, archives, datasets, model weights, VM disks, database files and dumps; the extension
@@ -95,7 +105,7 @@ fixture archives. Outside build directories only outputs of at least `min_output
 | `head_commit`, `last_commit_time` | HEAD id; newest commit on any ref |
 | `worktrees` | live linked worktrees reported by git (may be outside the scan) |
 | `parent_repo`, `parent_node` | for a linked worktree: its repo as git reports it, and its index in `nodes` if scanned |
-| `dependents` | clones in the scan that borrow objects from this repo (alternates; the file is read only if it is a regular file under 64 KiB, otherwise a warning is recorded) |
+| `dependents` | clones in the scan that borrow objects from this repo (alternates; the file is read only if it is a regular file under 64 KiB, otherwise a warning is recorded and `no_dependents` of the other git nodes becomes `unknown`, see below) |
 | `submodule_gitdirs`, `git_dir` | submodule git directories under `.git/modules`; this node's own git directory |
 | `sizes` | `total`, `git` (the `.git` directory), `regenerable`, `output` |
 
@@ -114,7 +124,9 @@ Facts (the safe value is always `yes`):
 Any git failure, timeout or missing binary makes the affected fact `unknown`, never `yes`. A bare
 repo has no working tree, so its `tree_clean` and `no_unique_ignored` are `unknown`. Remote-tracking
 refs can be stale; a later phase confirms them against the live remote with `git ls-remote` at apply
-time. `no_dependents` cannot see clones outside the scanned roots.
+time. `no_dependents` cannot see clones outside the scanned roots. An alternates file that was not
+read (a symlink, larger than 64 KiB, unreadable) leaves its provider unidentified, so every other
+git node in the scan that had `no_dependents = yes` gets `unknown` instead (a known `no` stays).
 
 Remote URLs have embedded credentials removed (`https://user:token@host/x` is stored as
 `https://host/x`; everything up to the last `@` counts as userinfo, and query strings and fragments are
@@ -137,8 +149,34 @@ outer status uses `--ignore-submodules=all` since each checked-out submodule is 
 `core.worktree` that does not resolve to the node's own directory is refused. Repos using Git LFS
 (`filter.lfs.*`, `lfs.*`) or custom merge or diff drivers are therefore reported `unknown`: no `lfs`
 key is allowed. Git runs with `core.fsmonitor=false`,
-`log.showSignature=false`, `core.ignoreStat=false`, `GIT_NO_LAZY_FETCH=1`, in its own process group
-that is killed on timeout.
+`log.showSignature=false`, `core.ignoreStat=false`, `core.hooksPath` set to the null device,
+`protocol.allow=never`, `GIT_NO_LAZY_FETCH=1`, in its own process group that is killed on timeout.
+
+**Configuration from outside the repo is not read either.** Git also reads the system config, the
+user's global config (`~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`) and configuration passed in the
+environment (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, `GIT_CONFIG_PARAMETERS`).
+None of it is checked, and a globally configured filter driver (Git LFS installs one) selected by
+a scanned repo's `.gitattributes` would run during `git status`. So every git command runs with
+`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_SYSTEM`, `GIT_CONFIG_GLOBAL`, `HOME` and `XDG_CONFIG_HOME` set
+to the null device (older git that ignores `GIT_CONFIG_GLOBAL` still finds no file under `HOME`),
+and with every `GIT_*` variable of the caller removed (`GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_INDEX_FILE`, `GIT_CONFIG_*`, `GIT_EXTERNAL_DIFF`, `GIT_PAGER`, `GIT_ASKPASS`, `GIT_SSH*`,
+`GIT_EXEC_PATH`, `GIT_TRACE*`, ...), plus `PAGER` and `SSH_ASKPASS`. What that changes:
+
+- A `.gitattributes` `filter`, `diff` or `merge` attribute whose driver is defined only
+  globally has no driver, so git compares the raw content. An LFS-tracked file that was touched
+  therefore shows as modified rather than clean (`tree_clean = no`, not `unknown`).
+- Global ignore rules (`core.excludesFile`, the default `$XDG_CONFIG_HOME/git/ignore`) and a global
+  or system `core.autocrlf` no longer apply. Both can only make more files look untracked or
+  modified, which moves `tree_clean` toward `no` and makes nothing newly ignored: the safe
+  direction.
+- `safe.directory` is honoured only from global and system config, so a repository owned by
+  another user is refused by git and every fact of it is `unknown`, never clean.
+- A global `url.<base>.insteadOf` rewrite is not applied, so a remote is classified by the URL
+  written in the repo's own config. This is the one change that can move a fact toward `yes`: a
+  remote whose written URL is a network address but which a global rewrite sends to a local mirror
+  now counts as a network remote. Remote facts are labelled unverified until apply re-checks them
+  against the live remote, which must resolve the effective URL.
 
 Remote facts come from local remote-tracking refs, which can be stale (a remote changed with
 `set-url` keeps its old refs). The plan therefore labels them unverified; apply (a later phase) must
@@ -194,12 +232,12 @@ With no evidence at all the state is `unknown`.
 `--active` paths, which are the user's. Rules, in order:
 
 1. Active: `keep`.
-2. Regenerable and cache: contains output files, has an `ask_reason`, is incomplete (`unreadable`),
-   or state unknown: `ask`; otherwise `remove-regenerable`.
+2. Regenerable and cache: contains output files, has an `ask_reason`, is incomplete (`unreadable`
+   or `skipped_mounts`), or state unknown: `ask`; otherwise `remove-regenerable`.
 3. Repo and worktree: state unknown: `ask`; any fact `unknown`: `ask`; any fact `no`:
    `recover-then-archive`; every fact `yes`: `archive` (labelled unverified, see
    `remote_facts_verified`). A repo whose `.git/modules` hold a submodule git directory that no scanned
-   git node inside it uses, or that is incomplete, asks.
+   git node inside it uses, or that is incomplete (`unreadable` or `skipped_mounts`), asks.
 4. Bare repo: `keep` when something depends on it, otherwise `ask`.
 5. Loose code: `ask`.
 6. Enclosing: a node that would be removed becomes `ask` when any node inside it is `keep`, `ask` or

@@ -64,8 +64,14 @@ impl Default for Git {
     }
 }
 
-/// Environment variables that would redirect git away from the directory we point it at.
-const REDIRECT_VARS: [&str; 7] = [
+/// The null device. Git reads it as an empty config file; Git for Windows maps this spelling to
+/// `NUL`, and where a git does not, the path does not exist and is skipped like a missing file.
+const NULL_DEVICE: &str = "/dev/null";
+
+/// Removed from git's environment even when they are not set in ours (so the list is also what
+/// the unit test checks). Every other `GIT_*` variable that is set is removed as well.
+const CLEARED_VARS: [&str; 22] = [
+    // Redirect git away from the directory we point it at.
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
@@ -73,7 +79,30 @@ const REDIRECT_VARS: [&str; 7] = [
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
     "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    // Add configuration that the repo config check never sees.
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    // Name programs, or let git write files of the caller's choosing.
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    "GIT_ASKPASS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_EXEC_PATH",
+    "GIT_TRACE",
+    "GIT_TRACE2",
+    "PAGER",
+    "SSH_ASKPASS",
 ];
+
+/// Should this variable of the caller's environment be withheld from git?
+fn withheld(name: &std::ffi::OsStr) -> bool {
+    let upper = name.to_string_lossy().to_ascii_uppercase();
+    upper.starts_with("GIT_") || CLEARED_VARS.contains(&upper.as_str())
+}
 
 impl Git {
     /// Use `program` (a name on `PATH` or a path) with a per-command timeout.
@@ -89,11 +118,17 @@ impl Git {
         self.timeout
     }
 
-    /// Run `git <args>` in `cwd` and return stdout (lossy UTF-8).
+    /// The command [`Git::run`] starts, before it is spawned.
     ///
-    /// `core.fsmonitor` is forced off because a repository's own config could otherwise make
-    /// `git status` execute an arbitrary program.
-    pub fn run(&self, cwd: &Path, args: &[&str]) -> Result<String, GitError> {
+    /// Git reads configuration from the repository (checked against an allowlist by the caller)
+    /// and also from the system file, the user's global files and the environment, any of which
+    /// can name a program (a `filter.<driver>.clean` selected by the scanned repo's
+    /// `.gitattributes`, as Git LFS installs globally). None of those is checked, so none is
+    /// read: the system file is off, the global file and `HOME`/`XDG_CONFIG_HOME` point at the
+    /// null device (older git ignores `GIT_CONFIG_GLOBAL` but still finds nothing under `HOME`),
+    /// and every `GIT_*` variable of the caller is withheld. Only the `-c` values below apply on
+    /// top of the repository's own config.
+    pub fn command(&self, cwd: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.arg("-c")
             .arg("core.fsmonitor=false")
@@ -103,18 +138,42 @@ impl Git {
             .arg("log.showSignature=false")
             .arg("-c")
             .arg("core.ignoreStat=false")
+            // No hook of the repo's runs even if some command wrote the index.
+            .arg("-c")
+            .arg(format!("core.hooksPath={NULL_DEVICE}"))
+            // No transport (a lazy fetch in a partial clone on a git without
+            // GIT_NO_LAZY_FETCH would start ssh or a remote helper).
+            .arg("-c")
+            .arg("protocol.allow=never")
             .args(args)
             .current_dir(cwd)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_NO_LAZY_FETCH", "1")
-            .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for var in REDIRECT_VARS {
+        for (name, _) in std::env::vars_os() {
+            if withheld(&name) {
+                cmd.env_remove(name);
+            }
+        }
+        for var in CLEARED_VARS {
             cmd.env_remove(var);
         }
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_SYSTEM", NULL_DEVICE)
+            .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+            .env("HOME", NULL_DEVICE)
+            .env("XDG_CONFIG_HOME", NULL_DEVICE)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("LC_ALL", "C");
+        cmd
+    }
+
+    /// Run `git <args>` in `cwd` and return stdout (lossy UTF-8), isolated from configuration
+    /// the caller did not check (see [`Git::command`]).
+    pub fn run(&self, cwd: &Path, args: &[&str]) -> Result<String, GitError> {
+        let mut cmd = self.command(cwd, args);
         // Own process group, so a timeout can kill git and everything it started.
         #[cfg(unix)]
         {
@@ -177,6 +236,65 @@ impl Git {
                 code: status.code(),
                 stderr,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn inherited_configuration_and_redirects_are_withheld() {
+        let cmd = Git::default().command(Path::new("."), &["status"]);
+        let envs: HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_ascii_uppercase(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let set = |k: &str| envs.get(k).cloned().flatten();
+        assert_eq!(set("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
+        for k in ["GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", "HOME", "XDG_CONFIG_HOME"] {
+            assert_eq!(set(k).as_deref(), Some(NULL_DEVICE), "{k}");
+        }
+        assert_eq!(set("GIT_OPTIONAL_LOCKS").as_deref(), Some("0"));
+        for k in [
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_SSH_COMMAND",
+            "GIT_EXEC_PATH",
+        ] {
+            assert_eq!(envs.get(k), Some(&None), "{k} must be removed");
+        }
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for a in [
+            "core.fsmonitor=false",
+            "protocol.allow=never",
+            "core.hooksPath=/dev/null",
+        ] {
+            assert!(args.iter().any(|x| x == a), "{a} missing from {args:?}");
+        }
+    }
+
+    #[test]
+    fn every_git_variable_of_the_caller_is_withheld() {
+        for k in ["GIT_TRACE_PACKET", "GIT_CONFIG_KEY_0", "git_dir", "PAGER"] {
+            assert!(withheld(OsStr::new(k)), "{k}");
+        }
+        for k in ["PATH", "LANG", "TMPDIR"] {
+            assert!(!withheld(OsStr::new(k)), "{k}");
         }
     }
 }

@@ -25,6 +25,15 @@ pub struct Rule {
     /// One line description.
     #[serde(default)]
     pub note: String,
+    /// The directory can hold content that exists nowhere else (locally installed artifacts,
+    /// settings, credentials), so it is never offered for removal: this is the reason shown.
+    #[serde(default)]
+    pub ask: Option<String>,
+    /// Entries (`name` or `*.suffix`) that, found directly inside the matched directory, show it
+    /// is not what the rule describes (a user-level home rather than a project cache); the
+    /// directory is then never offered for removal.
+    #[serde(default)]
+    pub ask_if_contains: Vec<String>,
 }
 
 impl Rule {
@@ -105,6 +114,12 @@ impl RuleSet {
             if r.name.is_empty() || r.name.starts_with('/') || r.name.ends_with('/') {
                 return Err(Error::Rules(format!("rule name {:?} is not valid", r.name)));
             }
+            if r.ask.as_deref().is_some_and(|a| a.trim().is_empty()) {
+                return Err(Error::Rules(format!(
+                    "rule {:?}: ask must give a reason",
+                    r.name
+                )));
+            }
         }
         let mut by_last: HashMap<String, Vec<usize>> = HashMap::new();
         let mut marker_specs: Vec<String> = Vec::new();
@@ -115,7 +130,9 @@ impl RuleSet {
                 scan_dir_names.insert(last.clone());
             }
             by_last.entry(last).or_default().push(i);
-            for m in &r.markers {
+            // Entries named by `ask_if_contains` are recorded like markers, so the scanner sees
+            // them among the matched directory's own entries.
+            for m in r.markers.iter().chain(&r.ask_if_contains) {
                 if !marker_specs.contains(m) {
                     marker_specs.push(m.clone());
                 }
@@ -238,6 +255,27 @@ mod tests {
         assert!(marker_matches("*.csproj", "App.csproj"));
         assert!(!marker_matches("*.csproj", "App.cs"));
         assert!(marker_matches("package.json", "package.json"));
+    }
+
+    #[test]
+    fn stores_that_can_hold_unique_content_always_ask() {
+        let rs = RuleSet::builtin();
+        for name in [".m2/repository", ".terraform"] {
+            let r = rs
+                .rules()
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap_or_else(|| panic!("no rule {name}"));
+            assert!(r.ask.is_some(), "{name} must ask");
+        }
+        let gradle = rs.rules().iter().find(|r| r.name == ".gradle").unwrap();
+        assert!(gradle
+            .ask_if_contains
+            .iter()
+            .any(|n| n == "gradle.properties"));
+        assert!(rs.is_marker("gradle.properties"));
+        let bad = "[[rule]]\nname = \"x\"\nclass = \"cache\"\nask = \" \"\n";
+        assert!(RuleSet::from_toml(bad).is_err());
     }
 
     #[test]

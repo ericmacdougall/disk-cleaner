@@ -80,6 +80,8 @@ jobs:
           echo hello | sudo tee "$f/README.md" > /dev/null
           sudo git -C "$f" add README.md
           sudo git -C "$f" -c user.name=Test -c user.email=test@example.invalid commit -q -m init
+          # Where the runner's inherited config trusts other users' directories, if it does.
+          git config --show-origin --show-scope --get-all safe.directory || true
       - name: Test a repository owned by another user
         if: success() || failure()
         env:

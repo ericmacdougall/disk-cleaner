@@ -11,6 +11,14 @@
 #                 (video, archives, model weights...) and are not offered for removal if any
 #                 are found. Dependency directories (node_modules, venv) leave this false.
 #   note          one line shown to the user
+#   ask           a reason (read after "it", e.g. "can hold ..."): the directory can hold content
+#                 that exists nowhere else, so it is shown but never offered for removal
+#   ask_if_contains
+#                 entries that, found directly inside the directory, show it is not what the rule
+#                 describes (a user-level home rather than a project cache); it then asks
+#
+# A cache or "regenerable" directory that tools also use to store what the user made (locally
+# installed packages, settings, credentials, state) must carry `ask`.
 #
 # Ambiguous names (dist, build, out, target, bin, obj, coverage, Library, deps) always carry markers.
 
@@ -134,6 +142,9 @@ name = ".gradle"
 markers = ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"]
 class = "regenerable"
 note = "Gradle project cache"
+# A build file in the home directory makes ~/.gradle (the Gradle user home) look like a project
+# cache; the user home holds gradle.properties (often credentials) and init scripts.
+ask_if_contains = ["gradle.properties", "init.d", "init.gradle", "init.gradle.kts", "caches", "wrapper"]
 
 [[rule]]
 name = ".gradle/caches"
@@ -146,6 +157,7 @@ name = ".m2/repository"
 markers = []
 class = "cache"
 note = "Maven local repository"
+ask = "can hold artifacts installed with mvn install or install:install-file that exist nowhere else; not offered for removal until each artifact is shown to be downloadable"
 
 # ---- Python ------------------------------------------------------------------------------
 [[rule]]
@@ -267,6 +279,7 @@ name = ".terraform"
 markers = ["*.tf"]
 class = "regenerable"
 note = "Terraform providers and modules"
+ask = "also records the backend configuration given to terraform init (possibly -backend-config values kept nowhere else) and the selected workspace"
 
 [[rule]]
 name = ".dart_tool"

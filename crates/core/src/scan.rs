@@ -143,6 +143,10 @@ struct Walk {
     issue_paths: Vec<PathBuf>,
     /// More unreadable entries than `MAX_ISSUE_PATHS`: every node counts as incomplete.
     issue_overflow: bool,
+    /// Directories on another device that `--one-file-system` did not enter (bounded).
+    skipped_paths: Vec<PathBuf>,
+    /// More skipped mount points than `MAX_ISSUE_PATHS`: every node counts as incomplete.
+    skipped_overflow: bool,
 }
 
 const MAX_ISSUE_PATHS: usize = 100_000;
@@ -190,6 +194,11 @@ impl Walk {
             self.totals.logical_bytes += meta.logical;
             if meta.mount_skipped {
                 self.totals.mount_points_skipped += 1;
+                if self.skipped_paths.len() < MAX_ISSUE_PATHS {
+                    self.skipped_paths.push(path.clone());
+                } else {
+                    self.skipped_overflow = true;
+                }
             }
             let agg = self.aggs.entry(path.clone()).or_default();
             agg.bytes += meta.alloc;
@@ -407,6 +416,24 @@ fn classify(
                                 .to_string(),
                         );
                     }
+                    if let Some(r) = rule {
+                        if let Some(why) = r.ask.as_deref() {
+                            node.ask_reason.get_or_insert_with(|| why.to_string());
+                        }
+                        let unexpected = agg.markers.iter().find(|name| {
+                            r.ask_if_contains.iter().any(|m| marker_matches(m, name))
+                        });
+                        if let Some(name) = unexpected {
+                            node.ask_reason.get_or_insert_with(|| {
+                                format!(
+                                    "holds {name}, which a {} directory does not: it may be a \
+                                     user-level directory with settings or credentials, not \
+                                     generated files",
+                                    r.name
+                                )
+                            });
+                        }
+                    }
                     builds.push(Build {
                         node,
                         path: path.clone(),
@@ -469,6 +496,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         issues: Vec::new(),
         issue_paths: Vec::new(),
         issue_overflow: false,
+        skipped_paths: Vec::new(),
+        skipped_overflow: false,
     };
     let mut warnings: Vec<String> = Vec::new();
     if opts.one_file_system && !cfg!(unix) {
@@ -518,6 +547,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         mut issues,
         issue_paths,
         issue_overflow,
+        skipped_paths,
+        skipped_overflow,
         ..
     } = walk;
     issues.truncate(MAX_ISSUES);
@@ -588,6 +619,20 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             builds[o].node.unreadable += 1;
         }
     }
+    // A mount point that was not entered: its contents were never seen, so the node that holds
+    // it (the mount point itself when a rule matched it) is incomplete in the same way. Enclosing
+    // nodes follow through the plan, where a nested `ask` blocks its parent.
+    if skipped_overflow {
+        for b in builds.iter_mut() {
+            b.node.skipped_mounts += 1;
+        }
+    }
+    for p in &skipped_paths {
+        let owner = owner_of(p.as_path()).or_else(|| p.parent().and_then(&owner_of));
+        if let Some(o) = owner {
+            builds[o].node.skipped_mounts += 1;
+        }
+    }
     let mut outputs: Vec<OutputFile> = Vec::new();
     for (path, bytes) in outputs_raw {
         let owner = path.parent().and_then(&owner_of);
@@ -635,6 +680,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                         && !c.node.contains_outputs
                         && c.node.ask_reason.is_none()
                         && c.node.unreadable == 0
+                        && c.node.skipped_mounts == 0
                 })
                 .map(|c| c.path.clone())
                 .collect();
@@ -850,6 +896,8 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
 
     let mut parent_links: Vec<(usize, usize)> = Vec::new();
     let mut dependents: Vec<(usize, String)> = Vec::new();
+    // Borrowers whose alternates file was not read: which repo they borrow from is unknown.
+    let mut unresolved: Vec<(usize, String)> = Vec::new();
     for (i, b) in builds.iter().enumerate() {
         if let Some(parent) = b.node.repo.as_ref().and_then(|r| r.parent_repo.as_ref()) {
             if let Some(&p) = by_path.get(&canon(Path::new(parent))) {
@@ -869,10 +917,12 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
             Ok(None) => continue,
             Err(why) => {
                 warnings.push(format!(
-                    "alternates file {} was not read ({why}); clones borrowing from other repos \
-                     through it are not detected",
+                    "alternates file {} was not read ({why}); the repo it borrows objects from \
+                     cannot be identified, so no other repo in the scan is treated as free of \
+                     dependents",
                     alt_path.display()
                 ));
+                unresolved.push((i, alt_path.display().to_string()));
                 continue;
             }
         };
@@ -899,6 +949,26 @@ fn link_repos(builds: &mut [Build], warnings: &mut Vec<String>) {
                 info.dependents.push(who);
             }
             info.facts.no_dependents = Tri::No;
+        }
+    }
+    // An unread alternates file may point at any repo in the scan. Every git node other than the
+    // borrower itself loses a `yes` it can no longer prove (a known `no` stays `no`), so none of
+    // them is offered for removal.
+    for (j, b) in builds.iter_mut().enumerate() {
+        if !b.node.class.is_git() {
+            continue;
+        }
+        let Some((_, file)) = unresolved.iter().find(|(i, _)| *i != j) else {
+            continue;
+        };
+        if let Some(info) = b.node.repo.as_mut() {
+            if info.facts.no_dependents == Tri::Yes {
+                info.facts.no_dependents = Tri::Unknown;
+                info.notes.push(format!(
+                    "no_dependents: the alternates file {file} was not read, so a clone in the \
+                     scan may borrow objects from this repo"
+                ));
+            }
         }
     }
 }

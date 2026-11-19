@@ -224,6 +224,11 @@ pub struct Node {
     /// of this node is incomplete, so it is never offered for removal.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unreadable: u64,
+    /// Directories inside this node (or the node itself) on another file system that
+    /// `--one-file-system` did not enter. Their contents were never looked at, so the node is
+    /// never offered for removal.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_mounts: u64,
     /// Why this node must not be removed without a person looking (regenerable and cache only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_reason: Option<String>,
@@ -250,6 +255,7 @@ impl Node {
             contains_outputs: false,
             newest_mtime: None,
             unreadable: 0,
+            skipped_mounts: 0,
             ask_reason: None,
             repo: None,
         }

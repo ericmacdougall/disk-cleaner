@@ -421,6 +421,34 @@ fn totals_do_not_double_count_nested_removals() {
     assert_eq!(p.totals.reclaimable_bytes, 10_000);
 }
 
+#[test]
+fn g2_a_skipped_mount_inside_a_node_makes_it_and_every_enclosing_node_ask() {
+    let now = 365 * DAY;
+    let mut repo = repo_node("/w/r", Class::Repo, all_yes());
+    repo.newest_mtime = Some(0);
+    let mut nm = Node::new("/w/r/node_modules", Class::Regenerable);
+    nm.parent = Some(0);
+    nm.bytes_total = 100;
+    // Control: fully scanned, both are removable.
+    let s = synthetic(vec![repo.clone(), nm.clone()]);
+    let p = plan(&s, &opts(vec![], 7, now));
+    assert_eq!(action_of(&p, Path::new("/w/r")), Action::Archive);
+    assert_eq!(
+        action_of(&p, Path::new("/w/r/node_modules")),
+        Action::RemoveRegenerable
+    );
+    // A mount point inside node_modules was not entered.
+    nm.skipped_mounts = 1;
+    let s = synthetic(vec![repo, nm]);
+    let p = plan(&s, &opts(vec![], 7, now));
+    for it in &p.items {
+        assert_eq!(it.action, Action::Ask, "{}: {}", it.path, it.reason);
+        assert_eq!(it.reclaimable_bytes, 0);
+    }
+    assert!(p.items[1].reason.contains("another file system"));
+    assert_eq!(p.totals.ready_bytes, 0);
+}
+
 fn child(path: &str, class: Class, parent: usize) -> Node {
     let mut n = Node::new(path, class);
     n.parent = Some(parent);
