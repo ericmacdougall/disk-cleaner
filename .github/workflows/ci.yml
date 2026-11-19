@@ -71,6 +71,19 @@ jobs:
         env:
           DC_TEST_MOUNT_ROOT: ${{ runner.temp }}/mnttest
         run: cargo test -p disk-cleaner-core --locked --test mount -- --nocapture
+      - name: Mount two tmpfs under node_modules in two more scan directories
+        if: success() || failure()
+        run: |
+          for m in withrepo/proj/node_modules/mnt control/proj/node_modules/mnt; do
+            mkdir -p "$RUNNER_TEMP/aliastest/$m"
+            sudo mount -t tmpfs -o size=16m tmpfs "$RUNNER_TEMP/aliastest/$m"
+            sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/aliastest/$m"
+          done
+      - name: Test a nested root spelled through a symlink alias
+        if: success() || failure()
+        env:
+          DC_TEST_ALIAS_MOUNT_ROOT: ${{ runner.temp }}/aliastest
+        run: cargo test -p disk-cleaner-core --locked --test mount_alias -- --nocapture
       - name: Create a repository owned by another user (root)
         if: success() || failure()
         run: |
