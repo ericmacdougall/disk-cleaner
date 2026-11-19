@@ -228,8 +228,9 @@ Removing an item removes everything inside it:
 - **regenerable children of a git item.** A `remove-regenerable` item inside a git item that is
   selected in the same run is **not** handled on its own first. It is part of the enclosing item:
   archived inside it (the archive includes regenerable children, so "every entry" has no exception)
-  and removed with it. The enclosing item's prompt lists these children and their bytes, and its
-  record lists their paths in `nested_regenerable`. If the enclosing item ends as anything but
+  and removed with it. The enclosing item's prompt lists these children and their bytes, its record
+  lists their paths in `nested_regenerable`, and each child gets a record with outcome
+  `removed-with` naming the enclosing record (counted as done by a rerun, exit 0). If the enclosing item ends as anything but
   removed, each child is then handled on its own as an ordinary item (re-checked and, in ask mode,
   asked). If a child is not selected (outside `--class` or `--item`), the enclosing item is skipped
   under `--remove`, as below. Cost: the archive holds regenerable bytes that could be rebuilt;
@@ -366,13 +367,14 @@ only through:
 - `git config --file FILE --get core.excludesFile` and
   `git config --file FILE --get-all include.path`, once per run for each of the user's global
   config files and the files they include (9.2), run from the file-system root;
-- `git ls-files -z --others --exclude-standard` and
+- `git status -z --porcelain`, `git ls-files -z --others --exclude-standard` and
   `git ls-files -z --others --ignored --exclude-from=FILE` in each working tree inside the item
   (9.2);
 - for history held only locally (9.2): `git for-each-ref` (remote-tracking tips),
-  `git rev-list --objects --all --reflog --missing=allow-any --stdin` (with the network remotes'
-  tracking tips as `^OID` lines on stdin), `git stash list`, `git ls-tree -r -z` of stash parents,
-  and `git cat-file --batch` (raw blob content, no filters) for the bounded content check.
+  `git rev-list --objects --all --reflog --indexed-objects --missing=allow-any --stdin` (with the
+  network remotes' tracking tips as `^OID` lines on stdin), `git stash list`, `git ls-tree -r -z`
+  of stash parents, and `git cat-file --batch` (raw blob content, no filters) for the bounded
+  content check.
 
 That list is the **allowed set**. Restore and removal never run git. A test (AC-9) records every git
 invocation through a logging shim and fails on any subcommand outside the allowed set; when core
@@ -443,8 +445,10 @@ item is skipped.
 A file is **secret-like** when any of these holds (best effort; anything not caught is uploaded,
 always to the user's own storage):
 
-- **by name**: it is untracked or ignored (a tracked file's content is in the object store, which
-  the history rule below covers) and its name is in the **secret name list**: the scan's
+- **by name**: it is untracked, ignored, or tracked with uncommitted changes (modified or added in
+  the index or the working tree, as `git status -z --porcelain` reports; a tracked `.env` pushed
+  with placeholders and then filled in locally is caught here), and its name is in the
+  **secret name list**: the scan's
   `[[state_file]]` names (`.env`, `.env.*`, Terraform state and variables, SSH key names) or one of
   `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519` (and their `*_sk` forms), `*.pem`, `*.key`, `*.p12`,
   `*.pfx`, `*.jks`, `*.keystore`, `*.ovpn`, `.netrc`, `_netrc`, `.npmrc`, `.pypirc`,
@@ -452,15 +456,17 @@ always to the user's own storage):
   `service-account*.json`, `secrets.yaml`, `secrets.yml`. For the `fixture_prone` key-material
   names (`*.pem`, `*.key`, `*.p12`, `*.jks`, `*.keystore`), a file that shows the scan's evidence
   of belonging to an installed package (SCAN-FORMAT.md, same rules file) is exempt from the name
-  rule; the content rule still applies to it;
+  rule; inside a regenerable directory (a regenerable child archived with a git item, 6.3) such a
+  file is exempt from the content rule as well, because installed packages ship test keys;
 - **in local-only history**: for each git directory in the item, a path that git history holds
   but no network remote's tracking refs contain has a name in the secret name list (the
   `fixture_prone` exemption does not apply here), or is a blob smaller than 1 MiB whose first
   64 KiB match the content rule below. The paths come from local commands only (7.5):
-  - `git rev-list --objects --all --reflog --missing=allow-any --stdin`, given on stdin a `^OID`
-    line for every remote-tracking tip of each network remote (core's definition of a network
-    remote), lists every object reachable from local refs, the stash and every reflog but not from
-    those tips, with the path git first reached it by;
+  - `git rev-list --objects --all --reflog --indexed-objects --missing=allow-any --stdin`, given
+    on stdin a `^OID` line for every remote-tracking tip of each network remote (core's definition
+    of a network remote), lists every object reachable from local refs, the stash, every reflog and
+    the index (so a file staged but never committed is included) but not from those tips, with the
+    path git first reached it by;
   - because that command shows one path per object, `git ls-tree -r -z` of each stash entry's
     index commit (`^2`) and untracked-files commit (`^3`, when present) lists every name in them;
     an entry counts when its object is in the local-only set above;
@@ -493,7 +499,8 @@ always to the user's own storage):
   - operating-system metadata files are exempt from this rule only: `.DS_Store`, `Thumbs.db`,
     `desktop.ini` and the macOS `Icon` file with a trailing carriage return. Without the exemption
     a global `.DS_Store` rule, which is common on macOS, would keep almost every repository;
-- **by content**: it is untracked or ignored, smaller than 1 MiB, and its first 64 KiB contain the
+- **by content**: it is untracked, ignored, or tracked with uncommitted changes (as for the name
+  rule), smaller than 1 MiB, and its first 64 KiB contain the
   header line of a PEM private key block, a URL that carries a credential (below), or a token in
   one of the documented formats of the common providers (AWS access keys, GitHub and GitLab
   tokens, Slack tokens, API secret keys of the common model providers, Google API keys); the exact
@@ -504,6 +511,10 @@ always to the user's own storage):
 A URL **carries a credential** when its userinfo has a password, or its user name matches a token
 pattern, is 40 or more hexadecimal characters, or is longer than 30 characters. A short plain user
 name (as in a default Azure DevOps clone URL) is not a credential.
+
+**Fail closed.** Any command of this section that fails, times out or cannot run, and any file the
+content rule cannot read, keeps the item (skipped before upload, the reason names the check). The
+one exception is the 64 MiB content budget for history, which is documented best effort.
 
 **Default: an item with any secret-like file is kept** (skipped before upload, reason naming up to
 five of them by relative path, or "a stash or a local-only commit holds NAME", never contents).
@@ -590,10 +601,12 @@ length).
   `config redacted`), checked at start (exit 1).
 - Every rclone command runs with `--ask-password=false`, so rclone fails instead of prompting; no
   rclone process ever reads a password from stdin, which for `rcat` is the archive.
-- **Temporary directory.** Every rclone command runs with `--temp-dir <state>/rclone-tmp`, so the
-  tool, not the environment (`TMPDIR`, rclone's own defaults), decides where rclone may spool. The
-  directory is emptied at the start of every non-dry apply. Its volume is the state volume, which
-  section 18 checks before each item and part.
+- **Temporary directory.** Every rclone command that moves archive data (`rcat`, `cat`) runs with
+  `--temp-dir <state>/rclone-tmp`, so the tool, not the environment (`TMPDIR`,
+  `RCLONE_TEMP_DIR`, rclone's own defaults), decides where rclone may spool. Those commands run
+  only in non-dry runs, so a dry run still creates no state directory. The directory is emptied at
+  the start of every non-dry apply. Its volume is the state volume, which section 18 checks before
+  each item and part.
 - At start, apply finds the configuration file with `rclone config file` and reads its first lines.
   An encrypted rclone configuration is refused (exit 1, "encrypted rclone configuration is not
   supported in this release"); the tool never asks for, reads or passes its password.
@@ -689,7 +702,9 @@ comparison make the loser skip the item.
 One JSON object per line. Every record has `record_id`, `item_id`, `run_id`, `machine_id`, `at`,
 `path`, `class`, `action` (the plan's action), `outcome` and `tool_version`. Outcomes: `backed-up`
 (written before removal), `removed`, `backed-up-kept` (with the reason), `regenerable-removed`,
-`vanished` (the item disappeared after its backup and before apply removed it). Where they apply:
+`removed-with` (a regenerable child removed inside an archived git item, 6.3; restore points to the
+enclosing record), `vanished` (the item disappeared after its backup and before apply removed it).
+Where they apply:
 
 - `bytes`, `files`, `xattrs_dropped`; the scan facts used, labelled `unverified` where the scan
   labels them so;
@@ -781,10 +796,11 @@ the second existence check passed. No remote fact is a condition.
    deepest first. **Not restored**: access and change times, inode numbers, owners and groups,
    ACLs, system file flags (`SF_*`; an item with immutable flags is never removed, 7.4), Linux
    `security.selinux` (9.3), and sparseness (section 17).
-6. Every entry is compared with the index: kind, size, SHA-256, symlink target, mode bits,
-   modification time (to the target file system's precision), hard-link structure (which names
-   share one file) and extended attributes (where the target supports them; otherwise the restore
-   lists the attributes it could not set and exits 2).
+6. Every entry is compared with the index. A difference in kind, size, SHA-256, symlink target or
+   hard-link structure (which names share one file) fails the restore: the staging directory is
+   deleted, nothing is created at the target, exit 1. Mode bits, modification times (to the
+   target file system's precision), user flags and extended attributes that the target cannot
+   hold are listed by name; the restore completes and exits 2.
 7. The staging directory is renamed to the target with no-replace semantics. A failure at any step
    leaves nothing at the target.
 
@@ -832,12 +848,17 @@ privilege; otherwise restore fails and says so.
     `git ls-remote` before removing anything"): the same correction;
   - `crates/cli/src/report.rs`, the subtree scope line "and apply re-verifies" becomes "and apply
     does not look for them either";
-  - `docs/SCAN-FORMAT.md`: the `scope` row ("the apply phase re-verifies"), the `ready_bytes`
-    paragraph ("unverified until apply re-checks them"), the paragraph on stale remote-tracking
-    refs, the global `insteadOf` note, and the `all_branches_on_remote` row, each changed to say
-    the first apply release does not contact remotes and archives the whole item instead.
+  - `docs/SCAN-FORMAT.md`, six places, each changed to say the first apply release does not
+    contact remotes and archives the whole item instead: the `scope` row ("the apply phase
+    re-verifies"); the `all_branches_on_remote` row ("until apply runs `git ls-remote`"); the
+    paragraph after the fact table ("a later phase confirms them against the live remote with
+    `git ls-remote` at apply"); the global `insteadOf` note ("unverified until apply re-checks them
+    against the live remote"); the paragraph on stale tracking refs ("apply (a later phase) must
+    re-check them with `git ls-remote`"); and the `ready_bytes` paragraph ("unverified until apply
+    re-checks them").
 
-  Tests that compare these strings change with them. C-4 belongs to the core owner; until it lands,
+  The quoted phrases above are the **C-4 phrase list**. Tests that compare these strings change with
+  them. C-4 belongs to the core owner; until it lands,
   apply prints the correction in the header of every run that selects a git item.
 
 No scan or plan safety rule changes.
@@ -884,7 +905,12 @@ TARGET_MISMATCH) and is reported to the user as such.
 - **D-14. Free-space floor** a fixed `--min-free` (default 1 GiB) and a part size derived from free
   space (section 18), so apply runs on a nearly full disk, which is the case it exists for.
 - **D-15. Regenerable children of a git item are archived with it** (6.3), not removed first
-  without a backup: the archive is then truly whole, at the cost of uploading rebuildable bytes.
+  without a backup. ASSUMPTION: the owner's choice between the two options the coordinator offered
+  (include or exclude), not the user's. Why: the archive is then truly whole, and a hand-edited file
+  in `node_modules` survives. Cost: rebuildable bytes are uploaded and read back (time, egress and
+  storage, shown in the dry run), and the secret checks read the children's small files once more
+  (package files are exempt, 9.2). Alternative: exclude them; then they are the only data not
+  archived, rebuildable by definition, and a hand edit inside them is lost.
 
 ## 17. Documented limits
 
@@ -921,7 +947,11 @@ TARGET_MISMATCH) and is reported to the user as such.
   later loss, it cannot prevent it.
 - The lock does not cover two users, or two machines sharing a network home.
 - Whether `rclone rcat --size` avoids a local spool is tested for the `local` backend only (9.4);
-  for other backends the part size is bounded by the state volume's free space instead.
+  for other backends the part size is bounded by the state volume's free space instead. The
+  `local` backend never spools, so the tmpfs test cannot show that a spooling backend honours
+  `--temp-dir`; that is unverified until the click-test's real remote (section 24).
+- Removal is refused on file systems outside the allowlist of 7.4, which includes the overlay file
+  systems of most development containers.
 - An encrypted rclone configuration is refused (9.6).
 
 ## 18. Resource limits
@@ -944,7 +974,8 @@ TARGET_MISMATCH) and is reported to the user as such.
 
 ## 19. Exit codes and output
 
-- 0: dry run completed, or every selected item ended removed, `backed-up-kept` by request
+- 0: dry run completed, or every selected item ended removed (alone or `removed-with` its
+  enclosing item), `backed-up-kept` by request
   (`--backup-only`, answer `s`), answered `n`, or was already done.
 - 1: refused before acting (usage, inputs not bound, plan too old, lock held, root without
   `--allow-root`, `--remove` on Windows, rclone or git missing or too old, an encrypted rclone
@@ -1092,8 +1123,8 @@ two steps; it exists only in test builds (AC-35).
 - **AC-32** No program named by scanned content runs during re-check, archive, removal or restore.
   Verify by: `hardening.rs` with hooks, a `.gitattributes` filter, an fsmonitor setting and config
   keys naming programs, each writing a marker file.
-- **AC-33** rclone is used as 9.6 states: minimum version checked, `--ask-password=false` and
-  `--temp-dir` on every call, an encrypted configuration refused at start, wrappers resolved with
+- **AC-33** rclone is used as 9.6 states: minimum version checked, `--ask-password=false` on every
+  call and `--temp-dir` on every data-moving call, an encrypted configuration refused at start, wrappers resolved with
   `config redacted` only (encrypted only when every path reaches `crypt`), stderr redacted. Verify
   by: `rclone_cli.rs` with a fake rclone that logs its arguments and stdin reads, and the real rclone job with a temporary config file that carries rclone's
   encrypted-configuration marker over random bytes (no password exists for it).
@@ -1111,8 +1142,8 @@ two steps; it exists only in test builds (AC-35).
   click-test` to the ticket, covering every flow of section 24.
 - **AC-37** The plan text the user approves promises no apply-time remote check (C-4); until C-4
   lands, every apply run that selects a git item prints the correction in its header. Verify by: a
-  core test that plan output and `SCAN-FORMAT.md` contain none of the strings C-4 lists; meanwhile
-  `output.rs` checks the header line.
+  core test that plan output, the report and `SCAN-FORMAT.md` contain none of the C-4 phrase list
+  (section 15); meanwhile `output.rs` checks the header line.
 
 ## 21. Negative cases
 
@@ -1224,14 +1255,23 @@ two steps; it exists only in test builds (AC-35).
   and `restore`, the edited file is back with its content.
 - **NEG-36 (AC-7)** A file bind-mounted into the item from outside, and an item on a vfat file
   system: skipped, and no byte of the bind-mounted file appears in any stored object.
-- **NEG-37 (AC-27)** A restored tree whose files' modification times or hard-link groups differ
-  from the index: the restore exits 2 naming them. A source with `security.selinux` labels restored
-  on a system that relabels: not reported as a difference.
+- **NEG-37 (AC-27)** An archive whose hard-link groups differ from the index: the restore fails,
+  nothing at the target, exit 1. A target that cannot hold nanosecond modification times or an
+  extended attribute: the restore completes, lists them, exit 2. A source with `security.selinux`
+  labels restored on a system that relabels: not reported as a difference.
 - **NEG-38 (AC-33)** A `union` remote with one `crypt` upstream and one plain upstream: reported
   unencrypted, and `--require-encrypted-remote` refuses it. `RCLONE_TEMP_DIR` set in the
   environment: rclone still uses the tool's `--temp-dir`.
 - **NEG-39 (AC-37)** A plan whose `remote_facts_note` still promises an `ls-remote` check: the run
   header states that apply does not contact remotes and archives the whole item.
+- **NEG-40 (AC-12)** A tracked `.env` pushed with placeholder values and then filled in locally
+  without a commit; a `credentials.json` staged with `git add` but never committed: each keeps the
+  item by default.
+- **NEG-41 (AC-12)** The history listing fails (a corrupt object) or times out, or a file cannot be
+  read for the content check: the item is kept, the reason names the check, nothing is uploaded.
+- **NEG-42 (AC-12)** A `node_modules` child of a git item whose installed package ships a test
+  private key: the repository is not kept for it. The same key file placed directly in
+  `node_modules` with no package evidence: the repository is kept.
 
 ## 22. Reviews: findings and changes
 
@@ -1241,16 +1281,16 @@ of revision 5.
 
 | Finding | Change in revision 6 | Criteria and negative cases |
 |---|---|---|
-| N1 secrets only in the object store (stash parents, local-only and reflog-only commits) uploaded by default | History rule in 9.2 with offline commands (7.5); limit restored in 17 | AC-12; NEG-32 |
+| N1 secrets only in the object store (stash parents, local-only and reflog-only commits) uploaded by default | History rule in 9.2 with offline commands (7.5), the index included; tracked files with uncommitted changes checked by name and content; fail closed; limit restored in 17 | AC-12; NEG-32, NEG-40, NEG-41 |
 | I-1 plan text promises an apply-time remote check | C-4 lists the exact strings; run header correction until it lands | AC-37; NEG-39 |
 | I-2 reconcile deletes under `--backup-only` | Reconcile by mode; second existence check against the journal's storage (6.1, 10.1) | AC-2, AC-21; NEG-34 |
-| I-3 name rule over-keeps | Name rule for untracked and ignored files only; `fixture_prone` package evidence honoured; kept counts by rule (9.2) | AC-12; NEG-33 |
+| I-3 name rule over-keeps | Name and content rules skip committed tracked files (history rule covers them); `fixture_prone` package evidence honoured, also for content inside regenerable children; kept counts by rule (9.2) | AC-12; NEG-33, NEG-42 |
 | I-4 `include.path` with `~` | Includes read and expanded by the tool (9.2) | AC-12; NEG-33 |
 | I-5 token as URL user name | Credential definition in 9.2 | AC-12; NEG-33 |
 | I-6 more sync clients | Nextcloud, ownCloud, MEGA, Resilio, Seafile default (7.4); limit (17) | AC-7 |
 | I-7 bind-mounted file | Every entry checked for a mount (7.4) | AC-7; NEG-36 |
 | I-8 Linux xattr namespaces; file system types | Namespace rules (9.3); removal only on an allowlist of local file systems (7.4) | AC-7, AC-13; NEG-36 |
-| I-9 nested regenerable children not archived | Archived and removed with the git item (6.3, 9.1, D-15) | AC-29; NEG-35 |
+| I-9 nested regenerable children not archived | Included: archived and removed with the git item, `removed-with` records (6.3, 9.1, D-15) | AC-29; NEG-35 |
 | I-10 restore metadata; device check in 7.2 | Restored and compared metadata listed, the rest named as not restored (13.3); 7.2 compares with the parent directory | AC-27; NEG-37 |
 | I-11 rclone temporary directory; wrappers | `--temp-dir` under the state directory; recursive wrappers, encrypted only when every path is `crypt` (9.6) | AC-24, AC-33; NEG-38 |
 | I-12 "no network" wording | No git command touches the network; rclone contacts only the user's storage and may refresh its own token (top, section 3) | AC-9 |
