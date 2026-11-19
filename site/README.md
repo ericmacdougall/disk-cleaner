@@ -29,11 +29,20 @@ They check the page structure, accessibility basics, status wording, absence of 
 brand tokens against the CSS, and the Pages workflows. CI runs them on every change to `site/`, and the
 Pages deploy runs them first.
 
-## Deploy
+## Publishing and rollback
 
-`.github/workflows/pages.yml` publishes `site/` to GitHub Pages on every push to `main` that touches
-`site/`. A maintainer must first enable Pages in the repository settings with the source set to
-"GitHub Actions". The workflow does not change settings.
+- **One-time setup:** a maintainer sets the Pages source to "GitHub Actions" in the repository
+  settings. The workflows do not change settings.
+- **Deploy:** `.github/workflows/pages.yml` runs the tests, builds the publishable copy with
+  `python3 site/tools/prepare.py _site` (no README, BRAND.md, tests or tools) and deploys it on every push
+  to `main` that touches `site/**`.
+- **Rehearsal:** on every pull request, the `pages-rehearsal` job in `.github/workflows/site.yml` runs the
+  same preparation script, packages the artifact without deploying, serves it under `/disk-cleaner/` (how a
+  project Pages site is served) and smoke-tests it with curl. Both workflows call the same script, and a
+  test checks that.
+- **Roll back:** re-run the previous successful "Pages" workflow run from the Actions tab, or revert the
+  commit and push.
+- **Take the site down:** disable Pages in the repository settings.
 
 ## Why the CSS is inline
 

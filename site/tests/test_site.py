@@ -389,13 +389,51 @@ class TestWorkflows(unittest.TestCase):
         self.assertIn(UNIT_CMD, y)
         self.assertLess(y.index(UNIT_CMD), y.index("upload-pages-artifact"))
 
-    def test_pages_removes_non_public_files_before_upload(self):
+    def test_both_workflows_call_the_prepare_script(self):
+        for path in (PAGES_YML, SITE_YML):
+            self.assertIn("python3 site/tools/prepare.py _site", read(path), path.name)
         y = read(PAGES_YML)
-        rm = [l for l in y.splitlines() if re.search(r"\brm\b", l)]
-        self.assertEqual(len(rm), 1, rm)
-        for p in ("site/README.md", "site/brand/BRAND.md", "site/tests"):
-            self.assertIn(p, rm[0])
-        self.assertLess(y.index(rm[0]), y.index("upload-pages-artifact"))
+        self.assertLess(y.index("site/tools/prepare.py"), y.index("upload-pages-artifact"))
+        self.assertNotRegex(y, r"\brm\b", "pages.yml must not prune files itself; prepare.py does")
+        self.assertRegex(y, r"upload-pages-artifact@[0-9a-f]{40}\s*\n\s*with:\s*\n\s*path: _site")
+
+    def test_prepare_script_excludes_contributor_files(self):
+        import importlib.util
+        import tempfile
+        spec = importlib.util.spec_from_file_location("prepare", SITE / "tools" / "prepare.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            mod.prepare(out)
+            for gone in ("README.md", "brand/BRAND.md", "tests", "tools"):
+                self.assertFalse((out / gone).exists(), gone)
+            for kept in ("index.html", "brand/logo.svg", "brand/logo-dark.svg", "brand/favicon.svg"):
+                self.assertTrue((out / kept).is_file(), kept)
+
+    def test_rehearsal_job_does_not_deploy(self):
+        y = read(SITE_YML)
+        self.assertIn("pages-rehearsal:", y)
+        self.assertRegex(y, r"pages-rehearsal:\s*\n\s*needs: test")
+        self.assertIn("/disk-cleaner", y)
+        self.assertIn("site/tools/smoke.py", y)
+        self.assertNotIn("deploy-pages", y)
+        self.assertNotIn("configure-pages", y)
+        for path in ("/README.md", "/brand/BRAND.md", "/tests/test_site.py"):
+            self.assertRegex(y, r"expect 404 " + re.escape(path))
+        for path in ("/brand/favicon.svg", "/brand/logo.svg", "/brand/logo-dark.svg"):
+            self.assertRegex(y, r"expect 200 " + re.escape(path) + r" image/svg\+xml")
+
+    def test_smoke_reference_parser(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("smoke", SITE / "tools" / "smoke.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        bad = '<link href="brand/x.svg"><a href="#a">a</a><a href="https://e.example/">e</a><img src="/root.png">'
+        self.assertEqual(mod.relative_refs(bad), ["/root.png", "brand/x.svg"])
+        real = mod.relative_refs(read(INDEX))
+        self.assertIn("brand/favicon.svg", real)
+        self.assertFalse([r for r in real if r.startswith("/")], "root-relative reference breaks a project subpath")
 
     def test_pages_does_not_deploy_on_pull_requests(self):
         y = read(PAGES_YML)

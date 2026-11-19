@@ -32,15 +32,16 @@ jobs:
           persist-credentials: false
       - name: Site tests
         run: python3 -m unittest discover -s site/tests -v
-      # Contributor docs and tests are not part of the public page.
-      - name: Remove files that should not be published
-        run: rm -rf site/README.md site/brand/BRAND.md site/tests
+      # Contributor docs, tests and tools are not part of the public page. Same script as the rehearsal
+      # in site.yml, so the rehearsal cannot drift from this deploy.
+      - name: Prepare the publishable site
+        run: python3 site/tools/prepare.py _site
       # actions/configure-pages v6.0.0
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
       # actions/upload-pages-artifact v5.0.0
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
         with:
-          path: site
+          path: _site
       # actions/deploy-pages v5.0.1
       - id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
