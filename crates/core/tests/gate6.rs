@@ -742,6 +742,54 @@ fn r16b_a_checkout_whose_git_directory_lies_inside_another_repos_git_directory_h
     assert_held(&res, &a);
 }
 
+/// A scanned checkout whose `.git` file names a git directory outside the scan, whose `commondir`
+/// names a repository kept inside `a`'s git directory (`a/.git/sub`, its own objects and refs):
+/// the checkout's commits live only there.
+#[test]
+fn r16b_a_checkout_whose_object_store_lies_inside_another_repos_git_directory_holds_it() {
+    let (tmp, root, remotes) = workspace();
+    let a = pushed_repo(&root, &remotes, "a");
+    let common = a.join(".git").join("sub");
+    init_bare(&common);
+    let gd = tmp.path().join("outside-gitdir");
+    write(&gd.join("HEAD"), "ref: refs/heads/main\n");
+    write(
+        &gd.join("commondir"),
+        &format!("{}\n", common.to_str().unwrap()),
+    );
+    let w = root.join("w");
+    write(
+        &w.join(".git"),
+        &format!("gitdir: {}\n", gd.to_str().unwrap()),
+    );
+    write(&w.join("w.txt"), "only here\n");
+    git(&w, &["add", "w.txt"]);
+    git(&w, &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "w"]);
+    let head = git(&w, &["rev-parse", "HEAD"]);
+    git(
+        &a,
+        &["--git-dir", common.to_str().unwrap(), "cat-file", "-e", &head],
+    );
+    let res = scan_with(&root, network_everywhere());
+    assert!(has_node(&res, &w), "w is a scanned checkout");
+    assert_held(&res, &a);
+}
+
+/// A `.git` directory inside an artifact holding only a `commondir` that names `a`. Git does not
+/// read it as a repository (it has no `HEAD`), so this hold is conservative; it matches the round
+/// 15 build, which checked every `.git` inside an artifact (a guard for the `.git` name rule).
+#[test]
+fn r16b_guard_a_dot_git_with_only_a_commondir_inside_an_artifact_holds_its_provider() {
+    let (_tmp, root, remotes) = workspace();
+    let a = pushed_repo(&root, &remotes, "a");
+    let js = root.join("js");
+    write(&js.join("package.json"), "{}\n");
+    let gd = js.join("node_modules").join("x").join(".git");
+    write(&gd.join("commondir"), "../../../../a/.git\n");
+    let res = scan_with(&root, network_everywhere());
+    assert_held(&res, &a);
+}
+
 // ---------------------------------------------------------------- round 16: controls
 
 #[test]
