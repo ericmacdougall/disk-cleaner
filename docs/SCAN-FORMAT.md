@@ -702,8 +702,10 @@ data being reported.
 **The repo's own config is untrusted.** A scanned folder may be an unpacked download, and its
 `.git/config` can name programs that git would run (`filter.*.clean`, `gpg.program`, `core.fsmonitor`,
 `core.sshCommand`, ...). Before any other git command the tool lists the config keys
-(`git config --local --includes --name-only --list`, plus `--worktree` when `extensions.worktreeConfig` is set and the git directory's `config.worktree` exists; a missing one has no keys, if git's own scoped listing agrees, and one that is not a regular file is refused). If any
-key is outside a small allowlist of plain-data keys (`core.*` format and line-ending settings,
+(`git config --local --includes --name-only --list`, plus `--worktree` when
+`extensions.worktreeConfig` is set and the git directory's `config.worktree` exists; a missing one
+has no keys if git's own scoped listing agrees, and one that is not a regular file is refused). If
+any key is outside a small allowlist of plain-data keys (`core.*` format and line-ending settings,
 `remote.<n>.url|pushurl|fetch|push|tagopt|prune|promisor|partialclonefilter`,
 `branch.<n>.remote|merge|rebase|description|pushremote`, `user.name|email|signingkey`,
 `submodule.*.url|path|active|branch|ignore`, `url.*.insteadOf`, `extensions.*`, `commit.gpgsign`,
@@ -715,8 +717,8 @@ counts as unsafe), because git runs a child status inside submodules using their
 outer status uses `--ignore-submodules=all` since each checked-out submodule is its own node. A
 `core.worktree` whose effective value (the shared config, then `config.worktree` when
 `extensions.worktreeConfig` is set, the later winning) does not resolve to the node's own directory
-is refused, and independently `git rev-parse --show-toplevel` must equal the node's real path
-(bare repos excepted); any mismatch or failure makes every fact `unknown`. Repos using Git LFS
+is refused, and independently `git rev-parse --show-toplevel` must equal the node's real path (for
+a bare repo, `git rev-parse --absolute-git-dir` must); any mismatch or failure makes every fact `unknown`. Repos using Git LFS
 (`filter.lfs.*`, `lfs.*`) or custom merge or diff drivers are therefore reported `unknown`: no `lfs`
 key is allowed. Git runs with `core.fsmonitor=false`,
 `log.showSignature=false`, `core.ignoreStat=false`, `core.hooksPath` set to the null device,

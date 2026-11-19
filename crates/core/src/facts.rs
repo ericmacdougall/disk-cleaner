@@ -1230,8 +1230,9 @@ fn local_config_keys(git: &crate::git::Git, path: &Path) -> Result<Vec<String>, 
                     Some((scope, _)) if scope != "worktree" => {}
                     _ => {
                         return Err(
-                            "git reads a config.worktree other than this git directory's; no \
-                             other git command was run in this repo"
+                            "git would read worktree-scoped config that was not judged (not \
+                             this git directory's config.worktree); no other git command was \
+                             run in this repo"
                                 .into(),
                         );
                     }
@@ -1409,12 +1410,24 @@ fn check_repo_config(
             );
         }
     }
+    // Whatever the config says, what git inspects must be the scanned directory: a directory git
+    // does not accept as a repository makes it walk up to the next one. Both run only after the
+    // config git reads (the `--local` listing is of the git directory git found, and the
+    // worktree scope is git's own) passed the allowlist.
     if class != Class::BareRepo {
-        // Whatever the config says, the tree git inspects must be the scanned directory.
         let top = printed_path(git, path, &["rev-parse", "--show-toplevel"], "work tree")?;
         if canon(&top) != canon(path) {
             return Err(
                 "git's work tree is not the scanned directory; facts would describe another tree"
+                    .into(),
+            );
+        }
+    } else {
+        let gitdir = printed_path(git, path, &["rev-parse", "--absolute-git-dir"], "git dir")?;
+        if canon(&gitdir) != canon(path) {
+            return Err(
+                "git's git directory is not the scanned directory; facts would describe another \
+                 repository"
                     .into(),
             );
         }
