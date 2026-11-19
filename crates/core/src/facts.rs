@@ -546,8 +546,7 @@ pub fn collect_repo_info(
                         Ok(_) => {
                             notes.push(
                                 "all_branches_on_remote: the repo has tags, whose presence on the \
-                                 remote cannot be verified from local refs"
-                                    .to_string(),
+                                 remote cannot be verified from local refs",
                             );
                             Tri::Unknown
                         }
