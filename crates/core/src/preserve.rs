@@ -140,8 +140,14 @@ fn everyday(rel: &str) -> bool {
     match parts.as_slice() {
         [top] => matches!(
             *top,
-            "HEAD" | "config" | "description" | "index" | "packed-refs" | "FETCH_HEAD"
-                | "ORIG_HEAD" | "shallow"
+            "HEAD"
+                | "config"
+                | "description"
+                | "index"
+                | "packed-refs"
+                | "FETCH_HEAD"
+                | "ORIG_HEAD"
+                | "shallow"
         ),
         ["info", "exclude" | "refs"] | ["objects", "info", "packs"] | ["logs", "HEAD"] => true,
         ["hooks", name] => STOCK_HOOKS.contains(name),
@@ -217,9 +223,7 @@ fn allocated(md: &fs::Metadata) -> u64 {
 /// Up to `n` bytes from the start of `path`.
 fn head(path: &Path, n: usize) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(n);
-    fs::File::open(path)?
-        .take(n as u64)
-        .read_to_end(&mut buf)?;
+    fs::File::open(path)?.take(n as u64).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
@@ -244,8 +248,8 @@ fn idx_ok(path: &Path, len: u64) -> io::Result<bool> {
         return Ok(false);
     }
     let mut prev = 0u32;
-    for k in h.chunks_exact(4) {
-        let n = u32::from_be_bytes([k[0], k[1], k[2], k[3]]);
+    for k in h.as_chunks::<4>().0 {
+        let n = u32::from_be_bytes(*k);
         if n < prev {
             return Ok(false);
         }
@@ -399,7 +403,9 @@ mod inflate {
         0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
         13, 13,
     ];
-    const ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+    const ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
 
     /// Most output bytes produced: a loose object's header is far shorter.
     pub(super) const MAX_OUT: usize = 64;
@@ -639,7 +645,10 @@ mod tests {
     fn the_inflater_reads_the_header_from_every_kind_of_block() {
         assert_eq!(inflate::head(&STORED).as_deref(), Some(&b"blob 5\0"[..]));
         assert_eq!(inflate::head(&FIXED).as_deref(), Some(&b"commit 12\0"[..]));
-        assert_eq!(inflate::head(&DYNAMIC).as_deref(), Some(&b"blob 1250\0"[..]));
+        assert_eq!(
+            inflate::head(&DYNAMIC).as_deref(),
+            Some(&b"blob 1250\0"[..])
+        );
         for good in [&STORED[..], &FIXED[..], &DYNAMIC[..]] {
             assert!(inflate::head(good).is_some_and(|h| header_ok(&h)));
         }
@@ -655,7 +664,10 @@ mod tests {
             &FIXED[..8],
             &DYNAMIC[..20],
         ] {
-            assert!(!inflate::head(bad).is_some_and(|h| header_ok(&h)), "{bad:?}");
+            assert!(
+                !inflate::head(bad).is_some_and(|h| header_ok(&h)),
+                "{bad:?}"
+            );
         }
         // Every truncation and every single-byte change of a valid stream is handled.
         for v in [&STORED[..], &FIXED[..], &DYNAMIC[..]] {
@@ -703,7 +715,9 @@ mod tests {
         assert!(object(format!(
             "objects/pack/multi-pack-index.d/multi-pack-index-{id}.midx"
         )));
-        assert!(object(format!("objects/info/commit-graphs/graph-{id}.graph")));
+        assert!(object(format!(
+            "objects/info/commit-graphs/graph-{id}.graph"
+        )));
         assert!(expect(&parts("objects/pack/multi-pack-index")).is_some());
         assert!(expect(&parts("objects/info/commit-graph")).is_some());
         // Markers, lists, chains and anything else are the git directory's own.

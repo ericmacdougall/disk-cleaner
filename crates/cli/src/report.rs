@@ -268,7 +268,7 @@ pub fn plan_summary(p: &Plan) -> String {
     for (a, t) in &p.totals.by_action {
         let _ = writeln!(
             o,
-            "  {:<22} {:>10}  {:>10}",
+            "  {:<26} {:>10}  {:>10}",
             a,
             count(t.items, "item", "items"),
             human_bytes(t.reclaimable_bytes)
@@ -284,7 +284,7 @@ pub fn plan_summary(p: &Plan) -> String {
     for it in items {
         let _ = writeln!(
             o,
-            "  {:<22} {:>10}  [{}] {}",
+            "  {:<26} {:>10}  [{}] {}",
             it.action.as_str(),
             human_bytes(it.reclaimable_bytes),
             it.class.as_str(),
