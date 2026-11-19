@@ -147,6 +147,8 @@ NUMBER_WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "
                 "eighteen", "nineteen", "twenty"]
 CORE_MODEL = ROOT / "crates" / "core" / "src" / "model.rs"
 CORE_PLAN = ROOT / "crates" / "core" / "src" / "plan.rs"
+CORE_FACTS = ROOT / "crates" / "core" / "src" / "facts.rs"
+CLI_REPORT = ROOT / "crates" / "cli" / "src" / "report.rs"
 
 
 def core_fact_names(src=None):
@@ -606,6 +608,51 @@ class TestContent(unittest.TestCase):
         self.assertIn("skip-worktree", para, "plan.rs asks when files are hidden from git, even if all facts are yes")
         self.assertIn("skip-worktree", read(CORE_PLAN))
 
+    def test_only_the_hidden_files_case_asks_with_every_fact_yes(self):
+        # Unknown facts, dependents, an unusual layout and the git directory's own files are each a
+        # fact that is not yes, so only the skip-worktree/assume-unchanged case can ask with all yes.
+        para = re.sub(r"<[^>]+>", "", re.search(r"all eleven are yes.*?</p>", re.sub(r"\s+", " ", self.html)).group(0))
+        sentences = [s for s in re.split(r"(?<=[.])\s", para) if re.search(r"(?i)every fact is yes|all facts are yes", s)]
+        self.assertEqual(len(sentences), 1, sentences)
+        s = sentences[0]
+        self.assertIn("skip-worktree", s)
+        for other in ("unknown", "dependents", "layout", "of its own"):
+            self.assertNotIn(other, s, f"{other!r} cannot occur with every fact yes")
+
+    def test_pending_state_bullet_names_what_the_check_covers(self):
+        facts = read(CORE_FACTS)
+        for needle in ('"REVERT_HEAD"', '"lfs/objects"', '"annex/objects"'):
+            self.assertIn(needle, facts)
+        bullet = re.search(r"<li>No rebase[^<]*</li>", self.html).group(0)
+        for word in ("rebase", "merge", "cherry-pick", "revert", "bisect", "Git LFS", "git-annex"):
+            self.assertIn(word, bullet, word)
+
+    def test_example_intro_says_what_is_left_out(self):
+        self.assertIn('"\\nBiggest files:"', read(CLI_REPORT), "report.rs prints a Biggest files section")
+        self.assertIn('facts.join(" ")', read(CLI_REPORT), "report.rs prints the facts on one line")
+        intro = re.sub(r"\s+", " ", re.search(r'<h2 id="h-example">.*?</h2>\s*<p>(.*?)</p>', self.html, re.S).group(1))
+        self.assertRegex(intro, r"(?i)biggest files")
+        self.assertRegex(intro, r"(?i)wrapped")
+        self.assertNotIn("Biggest files:", example_text(self.html), "if the example printed the section, say so")
+
+    def test_example_repo_with_a_linked_worktree_has_dependents(self):
+        # facts.rs: a repository whose `git worktree list` shows other worktrees gets no_dependents=NO.
+        self.assertRegex(read(CORE_FACTS), r"info\.worktrees = others.*\n\s*Tri::from_bool\(has_none\)")
+        intro = re.sub(r"\s+", " ", re.search(r'<h2 id="h-example">.*?</h2>\s*<p>(.*?)</p>', self.html, re.S).group(1))
+        intro = re.sub(r"<[^>]+>", "", intro)
+        pairs = re.findall(r"(\S+) is a linked worktree of (\S+?)[,.;]", intro)
+        self.assertTrue(pairs, "the intro must say which repo the example's worktree belongs to")
+        ex = parse_example(example_text(self.html))
+        names = {r["path"].rsplit("/", 1)[-1]: r for r in ex["repos"]}
+        for wt, parent in pairs:
+            self.assertEqual(names[wt]["class"], "worktree", wt)
+            self.assertEqual(names[parent]["class"], "repo", parent)
+            self.assertEqual(names[parent]["facts"].get("no_dependents"), "NO",
+                             f"{parent} has the linked worktree {wt}, so the scanner prints no_dependents=NO")
+        for name, r in names.items():
+            if r["class"] == "repo" and r["facts"].get("no_dependents") == "yes":
+                self.assertFalse([w for w, p in pairs if p == name], name)
+
     def test_download_wording_matches_ci(self):
         flat = re.sub(r"\s+", " ", self.text)
         # CI keeps unsigned binaries as workflow artifacts, so "no download" is not quite true; there is
@@ -761,7 +808,7 @@ class TestWorkflows(unittest.TestCase):
         for trigger in ("push", "pull_request"):
             block = re.search(rf"^  {trigger}:\s*\n((?:    .*\n)+)", y, re.M).group(1)
             for path in ("README.md", ".github/workflows/ci.yml", "crates/core/src/model.rs",
-                         "crates/core/src/plan.rs"):
+                         "crates/core/src/plan.rs", "crates/core/src/facts.rs", "crates/cli/src/report.rs"):
                 self.assertIn(f'- "{path}"', block, f"{trigger}: {path}")
 
     def test_pages_runs_tests_before_upload(self):
