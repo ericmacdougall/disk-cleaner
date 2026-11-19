@@ -715,7 +715,8 @@ fn pseudoref_check(git: &Git, path: &Path, gitdir: &Path, names: &[String]) -> P
     let top = match top_level(gitdir) {
         Ok(t) => t,
         Err(why) => {
-            out.unchecked.push(("the list of pseudorefs".to_string(), why));
+            out.unchecked
+                .push(("the list of pseudorefs".to_string(), why));
             return out;
         }
     };
@@ -1669,7 +1670,13 @@ mod tests {
 
     #[test]
     fn pseudoref_names_and_contents_are_recognised() {
-        for n in ["ORIG_HEAD", "AUTO_MERGE", "FOO_HEAD", "BISECT_EXPECTED_REV", "X1"] {
+        for n in [
+            "ORIG_HEAD",
+            "AUTO_MERGE",
+            "FOO_HEAD",
+            "BISECT_EXPECTED_REV",
+            "X1",
+        ] {
             assert!(pseudoref_name(n), "{n}");
         }
         for n in ["notes.txt", "gitk.cache", "Orig_head", "_", "123"] {
