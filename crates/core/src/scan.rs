@@ -7,6 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::facts::{collect_repo_info, FactsConfig, RepoCheck};
+use crate::gitshape;
 use crate::model::*;
 use crate::redact::diag;
 use crate::rules::{marker_matches, Rule, RuleSet};
@@ -158,6 +159,69 @@ struct DirAgg {
     state_soft: Option<(String, usize)>,
     /// Name of the first direct entry that is a symlink.
     first_symlink: Option<String>,
+    /// Direct entries below a `.git` directory that are not what git writes there
+    /// ([`crate::gitshape`]): their paths below the git directory (the first few) and how many.
+    git_local: Vec<String>,
+    git_local_count: u64,
+    /// The first such entry that could not be read to be judged (a ref file).
+    git_unread: Option<String>,
+}
+
+/// Fold what the walk found inside a repository's git directory ([`git_shape`]) into its facts:
+/// any entry that is not what git writes makes `no_local_admin_content` `no` and is named with
+/// the others the facts found (it is the repository's own content, which recovery does not
+/// save); an entry that could not be read makes a `yes` `unknown`.
+fn merge_git_shape(info: &mut RepoInfo, b: &Build) {
+    if b.git_local_count > 0 {
+        let mut all: Vec<String> = info.local_admin_content.clone();
+        all.extend(b.git_local.iter().map(|rel| diag(rel)));
+        all.sort();
+        all.dedup();
+        let shown = crate::words::some_of(&all, GIT_LOCAL_EXAMPLES);
+        info.notes.push(format!(
+            "no_local_admin_content: the git directory holds entries git does not write \
+             there: {shown}"
+        ));
+        info.local_admin_content_count += b.git_local_count;
+        info.local_admin_content = all.into_iter().take(GIT_LOCAL_EXAMPLES).collect();
+        info.facts.no_local_admin_content = Tri::No;
+    } else if let Some(rel) = &b.git_unread {
+        if info.facts.no_local_admin_content == Tri::Yes {
+            info.facts.no_local_admin_content = Tri::Unknown;
+        }
+        info.notes.push(diag(&format!(
+            "no_local_admin_content: {rel} in the git directory could not be read to check \
+             that it is a ref"
+        )));
+    }
+}
+
+/// Most paths of entries that are not what git writes kept per directory and per repository.
+const GIT_LOCAL_EXAMPLES: usize = 5;
+
+/// What [`git_shape`] found about one entry, by its path below the git directory.
+enum GitShape {
+    /// Not what git writes there: the repository's own content.
+    Local(String),
+    /// A ref file that could not be read to be judged.
+    Unread(String),
+}
+
+/// Judge an entry by the shape git writes below a `.git` directory ([`crate::gitshape`]):
+/// `None` when it is fine or not below one. `size` is its length in bytes.
+fn git_shape(path: &Path, kind: gitshape::Kind, size: u64) -> Option<GitShape> {
+    let rel = gitshape::below_git_dir(path)?;
+    let parts: Vec<&str> = rel.iter().map(String::as_str).collect();
+    let local = match gitshape::judge(&parts, kind) {
+        gitshape::Verdict::Fine => return None,
+        gitshape::Verdict::Local => true,
+        gitshape::Verdict::RefFile if size > gitshape::MAX_REF_BYTES => true,
+        gitshape::Verdict::RefFile => match gitshape::ref_file_ok(path) {
+            Ok(fine) => !fine,
+            Err(_) => return Some(GitShape::Unread(rel.join("/"))),
+        },
+    };
+    local.then(|| GitShape::Local(rel.join("/")))
 }
 
 struct Walk {
@@ -296,6 +360,9 @@ impl Walk {
             if entry.depth > 0 {
                 let parent = parent_agg(&mut self.aggs, entry.parent_path());
                 parent.note_entry(&name, true, rules);
+                if let Some(found) = git_shape(&path, gitshape::Kind::Dir, 0) {
+                    parent.note_git_shape(found);
+                }
             }
             return;
         }
@@ -349,7 +416,16 @@ impl Walk {
                 }
             }
         }
+        let kind = if is_file {
+            gitshape::Kind::File
+        } else {
+            gitshape::Kind::Other
+        };
+        let shape = git_shape(&path, kind, meta.logical);
         let agg = parent_agg(&mut self.aggs, entry.parent_path());
+        if let Some(found) = shape {
+            agg.note_git_shape(found);
+        }
         if name == ".git" && !is_file {
             agg.git_odd = true;
         }
@@ -443,6 +519,21 @@ fn parent_agg<'a>(aggs: &'a mut HashMap<PathBuf, DirAgg>, parent: &Path) -> &'a 
 }
 
 impl DirAgg {
+    /// Record what [`git_shape`] said about a direct child.
+    fn note_git_shape(&mut self, found: GitShape) {
+        match found {
+            GitShape::Local(rel) => {
+                self.git_local_count += 1;
+                if self.git_local.len() < GIT_LOCAL_EXAMPLES {
+                    self.git_local.push(rel);
+                }
+            }
+            GitShape::Unread(rel) => {
+                self.git_unread.get_or_insert(rel);
+            }
+        }
+    }
+
     /// Record a direct child by name: git markers, rule markers, manifests, source files.
     fn note_entry(&mut self, name: &str, is_dir: bool, rules: &RuleSet) {
         match (name, is_dir) {
@@ -491,6 +582,11 @@ struct Build {
     regen_bytes: u64,
     /// The first symlink found inside this node's own git directory, relative to it.
     gitdir_symlink: Option<String>,
+    /// Entries inside this node's git directory that are not what git writes there (paths
+    /// below it, a bounded sample), how many in all, and the first that could not be read.
+    git_local: Vec<String>,
+    git_local_count: u64,
+    git_unread: Option<String>,
     /// For a linked worktree: its main worktree as git printed it, exact (see `RepoCheck`).
     parent_path: Option<PathBuf>,
 }
@@ -792,6 +888,9 @@ fn classify(
                         git_bytes: 0,
                         regen_bytes: 0,
                         gitdir_symlink: None,
+                        git_local: Vec::new(),
+                        git_local_count: 0,
+                        git_unread: None,
                         parent_path: None,
                     });
                     new_owner = Some(idx);
@@ -998,6 +1097,15 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                             _ => b.path.join(".git"),
                         };
                         b.gitdir_symlink = Some(rel_slash(&dir.join(name), &gd));
+                    }
+                    b.git_local_count += agg.git_local_count;
+                    for rel in &agg.git_local {
+                        if b.git_local.len() < 10 * GIT_LOCAL_EXAMPLES {
+                            b.git_local.push(rel.clone());
+                        }
+                    }
+                    if b.git_unread.is_none() {
+                        b.git_unread.clone_from(&agg.git_unread);
                     }
                 } else if let Some(t) = agg.newest {
                     b.node.newest_mtime = Some(b.node.newest_mtime.map_or(t, |n| n.max(t)));
@@ -1220,6 +1328,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 }
                 info.notes.push(format!("layout: {issue}"));
             }
+            merge_git_shape(&mut info, b);
             b.node.repo = Some(info);
         }
     }

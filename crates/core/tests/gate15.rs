@@ -101,7 +101,12 @@ fn clone_of(tmp: &Path, root: &Path, remotes: &Path, name: &str) -> PathBuf {
     let url = remotes.join(format!("{name}.git"));
     git(
         root,
-        &["clone", "-q", url.to_str().unwrap(), clone.to_str().unwrap()],
+        &[
+            "clone",
+            "-q",
+            url.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
     );
     clone
 }
@@ -220,9 +225,13 @@ fn x2_control_commit_graphs_are_archivable() {
 #[test]
 fn x2_control_a_multi_pack_index_is_archivable() {
     let (tmp, root, remotes) = workspace();
+    // A clone from a local path copies loose objects, so pack them first: a multi-pack-index
+    // indexes packs, and git refuses to write one without any.
     let plain = clone_of(tmp.path(), &root, &remotes, "plain");
+    git(&plain, &["repack", "-q", "-d"]);
     git(&plain, &["multi-pack-index", "write"]);
     let bitmap = clone_of(tmp.path(), &root, &remotes, "bitmap");
+    git(&bitmap, &["repack", "-q", "-d"]);
     git(&bitmap, &["multi-pack-index", "write", "--bitmap"]);
     let res = scan_with(&root, network_everywhere());
     assert_archives(&res, &plain, "git multi-pack-index write");
@@ -239,7 +248,10 @@ fn x2_control_a_recorded_rerere_resolution_is_archivable() {
     commit_file(&repo, "README.md", "main\n");
     // `rerere.*` is not an allowed repository config key, so it is set per command.
     let merged = git_ok(&repo, &["-c", "rerere.enabled=true", "merge", "-q", "side"]);
-    assert!(!merged, "the merge must conflict for rerere to record anything");
+    assert!(
+        !merged,
+        "the merge must conflict for rerere to record anything"
+    );
     write(&repo.join("README.md"), "both\n");
     git(&repo, &["add", "README.md"]);
     git(

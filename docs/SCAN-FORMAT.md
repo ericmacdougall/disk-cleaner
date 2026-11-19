@@ -364,9 +364,10 @@ directory listings capped at 1000 entries and reads capped at 64 KiB per file, n
 | `TAG_EDITMSG`, `MERGE_MSG`, `SQUASH_MSG` | absent or empty | a message written and not used by a tag or commit: small, but it exists nowhere else |
 | `branches/`, `remotes/` | empty | any file: a legacy remote shorthand that no clone recreates |
 | `COMMIT_EDITMSG` | always | the last commit's message, which that commit holds; git overwrites it at every commit, so counting it would make every repository ask. Only the message of a commit that a hook or an empty message aborted is lost |
-| `HEAD`, `index`, `refs/`, `packed-refs`, `logs/`, `objects/`, `shallow` | always | covered by the ref, reflog, `tree_clean`, hidden-index and object checks; `shallow` lists boundary commits that came from the remote |
-| `MERGE_MODE`, `MERGE_RR`, `rr-cache/` | always | merge-mode text and recorded conflict resolutions, which rerere can learn again from the merge commits |
-| `gitk.cache`, `gc.log`, `gc.pid`, `fsmonitor--daemon*`, `lfs/` | always | caches, logs, a lock-holder's pid, the file-system monitor's state; LFS objects are `no_pending_state`'s |
+| `HEAD`, `index`, `packed-refs`, `shallow` | always | covered by the ref, reflog, `tree_clean` and hidden-index checks; `shallow` lists boundary commits that came from the remote |
+| `refs/`, `logs/`, `objects/`, `rr-cache/`, `lfs/`, `fsmonitor--daemon/` | what git writes inside them (see "Inside the git directory's own subdirectories" below) | anything else inside them is local content |
+| `MERGE_MODE`, `MERGE_RR` | always | merge-mode text and rerere's state for a conflict in progress, which `no_pending_state` sees through `MERGE_HEAD`; recorded resolutions in `rr-cache/` can be learned again from the merge commits |
+| `gitk.cache`, `gc.log`, `gc.pid`, `fsmonitor--daemon.ipc` | always | caches, logs, a lock-holder's pid, the file-system monitor's socket |
 | `worktrees/`, `modules/` | always | not plain when not empty (check 4) |
 | `config`, `config.worktree` | every key's family is one the next table marks not local | see below |
 
@@ -402,10 +403,39 @@ It is not inventoried: a linked worktree's `.git` is a file, so its layout is no
 (`no_local_admin_content` is `unknown` there), and the main repository asks because `worktrees/`
 is not empty. Submodule git directories under `modules/` likewise make the layout not plain.
 
-**Known limit: inside covered directories.** The directories marked "always" above are not
-listed: a file a person put inside one of them (`.git/rr-cache/notes.txt`, `.git/logs/todo`,
-`.git/lfs/tmp/x`) is not found, and such a repository can still be archived. Stray files inside
-`refs/` that are not refs and inside `objects/` that are not objects are likewise not looked for.
+**Inside the git directory's own subdirectories.** The scan's walk already visits every entry
+below a `.git` directory (it sizes it and looks for symlinks); it also judges each one against
+the shape git itself writes there (`crates/core/src/gitshape.rs`), by its path below the git
+directory and its kind (`lstat`, never followed). Only a regular file under `refs/` is read, at
+most 512 bytes of it.
+
+| Below the git directory | What git writes, and so nothing unique |
+|---|---|
+| `objects/` | two-hex-digit fanout directories, `pack/` and `info/`; nothing else |
+| `objects/<xx>/` | regular files named by the rest of an object id (38 or 62 lowercase hex digits) |
+| `objects/pack/` | regular files `pack-<id>.{pack,idx,rev,bitmap,keep,mtimes,promisor}`, `multi-pack-index`, `multi-pack-index-<id>.{bitmap,rev}`, and the directory `multi-pack-index.d/` holding `multi-pack-index-chain` and `multi-pack-index-<id>.{midx,bitmap,rev}` |
+| `objects/info/` | regular files `packs`, `commit-graph` (and `alternates`, `http-alternates`, which the layout check refuses first), and the directory `commit-graphs/` holding `commit-graph-chain` and `graph-<id>.graph` |
+| `refs/` | directories at any depth; regular files of at most 512 bytes holding one object id or `ref: refs/...` line |
+| `logs/` | `HEAD` and anything under `logs/refs/` (files and directories; the reflog check reads them) |
+| `rr-cache/` | directories named by an object id holding `preimage*`, `postimage*` and `thisimage*` files |
+| `lfs/` | `objects/` (local-only LFS content, which `no_pending_state` already reports) and an empty `tmp/` |
+| `fsmonitor--daemon/` | `cookies/` holding regular files |
+
+Anything else there, of any kind, is the repository's own content (a note in `rr-cache/` or
+`logs/`, a README in a fanout directory, a backup in `objects/pack/`, a file in `refs/heads/` that
+is not a ref, a symlink): it makes `no_local_admin_content` `no` and is named with the other
+findings (`objects/pack/backup.tar`), so the plan asks. A ref file that cannot be read makes the
+fact `unknown`. git's own leftovers of an interrupted operation (`tmp_pack_*`, `tmp_obj_*`,
+`.tmp-*-pack-*`, a stale `*.lock`) are not in the shape either: they mean an operation was cut
+short, and a person looks before anything is archived. The fact is used rather than
+`plain_layout` because git itself does not depend on these entries (the layout is still one git
+reads correctly); what is at stake is content of the repository's own that recovery does not
+save. `annex/` (check 3), `reftable/`, `lost-found/` and any other unknown top-level entry
+(check 4a) already make the layout not plain, and `worktrees/` and `modules/` do when not empty.
+The shapes were checked on git 2.56 on Linux, macOS and Windows against a fresh clone, `git gc`,
+`git repack -a -d --write-bitmap-index`, `git commit-graph write --reachable` (single and
+`--split`), `git multi-pack-index write` (plain and `--bitmap`), a recorded rerere resolution and
+`git pack-refs --all`: each stays archivable.
 
 A `shallow` file does not make a repository unplain (a shallow clone is complete for what it
 holds); the shape check ignores it. A failure is `no`; a check that cannot be made is `unknown`;

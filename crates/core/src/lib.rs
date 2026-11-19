@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod facts;
 pub mod git;
+mod gitshape;
 pub mod model;
 pub mod plan;
 pub mod procs;

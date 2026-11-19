@@ -540,6 +540,9 @@ enum Holds {
 ///   lost is only the message of a commit that a hook or an empty message aborted.
 /// - `MERGE_MODE`, `MERGE_RR`, `rr-cache`: merge-mode text and recorded conflict resolutions,
 ///   which `rerere` can learn again from the merge commits that hold the resolved results.
+/// - What lies inside `objects`, `refs`, `logs`, `rr-cache`, `lfs` and `fsmonitor--daemon` is
+///   judged by the scan's walk against the shape git writes there ([`crate::gitshape`]); the
+///   scan folds its findings into the same fact.
 /// - `gitk.cache`, `gc.log`, `gc.pid`, `fsmonitor--daemon`, `fsmonitor--daemon.ipc`, and the
 ///   split index's `sharedindex.*` files: caches, logs, a lock-holder's pid, the file-system
 ///   monitor's socket and cookies, and part of the index. None keeps an object alive.
