@@ -1,24 +1,18 @@
-import { invoke } from "@tauri-apps/api/core";
+import { tauriBackend } from "./api";
+import { App } from "./app";
 
-interface AppInfo {
-  version: string;
-  schema_version: number;
-  read_only: boolean;
-}
-
-async function start(): Promise<void> {
+async function boot(): Promise<void> {
   const root = document.getElementById("app");
   if (!root) return;
-  const heading = document.createElement("h1");
-  heading.textContent = "PruneDisk";
-  const line = document.createElement("p");
-  root.append(heading, line);
   try {
-    const info = await invoke<AppInfo>("app_info");
-    line.textContent = `Version ${info.version}, scan schema ${info.schema_version}. Read-only.`;
+    const app = new App(await tauriBackend());
+    root.replaceChildren(app.el);
+    await app.start();
   } catch (e) {
-    line.textContent = `The backend did not answer: ${String(e)}`;
+    const p = document.createElement("p");
+    p.textContent = `The backend did not answer: ${String(e)}`;
+    root.replaceChildren(p);
   }
 }
 
-void start();
+void boot();

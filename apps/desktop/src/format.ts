@@ -20,6 +20,20 @@ export function percentOf(part: number, whole: number): number {
   return Math.min(100, (part / whole) * 100);
 }
 
+/** A percentage with one decimal. */
+export function formatPercent(p: number): string {
+  if (!Number.isFinite(p) || p < 0) return "0.0%";
+  return `${Math.min(100, p).toFixed(1)}%`;
+}
+
+/** A Unix time as a local date (YYYY-MM-DD), or a dash when unknown. */
+export function formatDate(unix: number | null | undefined): string {
+  if (unix === null || unix === undefined || !Number.isFinite(unix)) return "-";
+  const d = new Date(unix * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
 /** Thousands separators for counts. */
 export function formatCount(n: number): string {
   return Math.round(n).toLocaleString("en-US");
