@@ -184,6 +184,164 @@ def example_actions(text):
     return re.findall(r"^  ([a-z][a-z-]+) +\S+ \S+ +\[", after[1], re.M)
 
 
+UNITS = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}
+SIZE = r"\d+(?:\.\d)? (?:B|KiB|MiB|GiB|TiB)"
+
+
+def size(s):
+    """A size as printed by the CLI ("1.9 GiB") as (bytes, rounding tolerance in bytes)."""
+    num, unit = s.split()
+    mult = UNITS[unit]
+    return float(num) * mult, (0 if unit == "B" else 0.05 * mult)
+
+
+def parse_example(text):
+    """The parts of the example scan summary and plan that carry numbers, in printed order."""
+    lines = text.splitlines()
+    ex = {"classes": [], "repos": [], "regen": [], "items": [], "repo_count": None, "regen_count": None,
+          "list_gaps": 0, "total": None, "scan_cmd": "", "plan_cmd": ""}
+    section, cur = None, None
+    for line in lines:
+        if line.startswith("$ disk-cleaner scan"):
+            ex["scan_cmd"] = line
+        elif line.startswith("$ disk-cleaner plan"):
+            ex["plan_cmd"] = line
+            section = "plan"
+            continue
+        m = re.search(r", (" + SIZE + r") allocated", line)
+        if m:
+            ex["total"] = size(m.group(1))
+        if line.startswith("Space by class"):
+            section = "classes"
+            continue
+        m = re.match(r"Repos and worktrees \((\d+)\):", line)
+        if m:
+            section, ex["repo_count"] = "repos", int(m.group(1))
+            continue
+        m = re.match(r"Regenerable and cache directories \((\d+)\):", line)
+        if m:
+            section, ex["regen_count"] = "regen", int(m.group(1))
+            continue
+        if line.startswith("Items:"):
+            section = "items"
+            continue
+        if not line.strip():
+            if section in ("classes", "repos", "regen"):
+                section = None
+            continue
+        if section == "classes":
+            m = re.match(r"^  ([a-z-]+) +(" + SIZE + r")$", line)
+            if m:
+                ex["classes"].append((m.group(1), size(m.group(2))))
+        elif section == "repos":
+            m = re.match(r"^  \[([a-z-]+)\] (\S+)  (" + SIZE + r")$", line)
+            if m:
+                cur = {"class": m.group(1), "path": m.group(2), "total": size(m.group(3)), "facts": {},
+                       "regen": None}
+                ex["repos"].append(cur)
+            elif line.strip() == "..." and line.startswith("  ") and not line.startswith("   "):
+                ex["list_gaps"] += 1
+            elif cur is not None:
+                cur["facts"].update(re.findall(r"\b([a-z_]+)=(yes|NO|UNKNOWN)\b", line))
+                m = re.search(r"regenerable (" + SIZE + r")", line)
+                if m:
+                    cur["regen"] = size(m.group(1))
+        elif section == "regen":
+            m = re.match(r"^ +(" + SIZE + r")  (\S+)$", line)
+            if m:
+                ex["regen"].append((m.group(2), size(m.group(1))))
+            elif line.strip() == "...":
+                ex["list_gaps"] += 1
+        elif section == "items":
+            m = re.match(r"^  ([a-z][a-z-]+) +(" + SIZE + r")  \[([a-z-]+)\] (\S+)$", line)
+            if m:
+                ex["items"].append({"action": m.group(1), "size": size(m.group(2)), "class": m.group(3),
+                                    "path": m.group(4)})
+    return ex
+
+
+def close(a, b, extra_tol=0.0):
+    """Two (bytes, tolerance) sizes agree within their combined rounding."""
+    return abs(a[0] - b[0]) <= a[1] + b[1] + extra_tol
+
+
+def total(sizes):
+    return (sum(s[0] for s in sizes), sum(s[1] for s in sizes))
+
+
+def descending(values):
+    return all(values[i] >= values[i + 1] for i in range(len(values) - 1))
+
+
+def example_problems(ex):
+    """Every way the example's numbers, order or commands disagree with what the CLI would print."""
+    p = []
+    if not (ex["classes"] and ex["repos"] and ex["regen"] and ex["items"] and ex["total"]):
+        return ["example is missing a section"]
+    if not descending([s[0] for _, s in ex["classes"]]):
+        p.append("Space by class is not sorted by size, descending")
+    if not descending([r["total"][0] for r in ex["repos"]]):
+        p.append("repos and worktrees are not sorted by size, descending")
+    if not descending([s[0] for _, s in ex["regen"]]):
+        p.append("regenerable and cache rows are not sorted by size, descending")
+    if not descending([i["size"][0] for i in ex["items"]]):
+        p.append("plan items are not sorted by reclaimable size, descending")
+    if ex["list_gaps"]:
+        p.append("a list is cut short with '...', so its rows cannot be checked against the totals")
+    if ex["repo_count"] != len(ex["repos"]):
+        p.append(f"Repos and worktrees ({ex['repo_count']}) lists {len(ex['repos'])}")
+    if ex["regen_count"] != len(ex["regen"]):
+        p.append(f"Regenerable and cache directories ({ex['regen_count']}) lists {len(ex['regen'])}")
+    classes = dict(ex["classes"])
+    if not close(total(classes.values()), ex["total"]):
+        p.append("class totals do not add up to the allocated total")
+    regen_classes = [classes[c] for c in ("regenerable", "cache") if c in classes]
+    if not close(total(regen_classes), total([s for _, s in ex["regen"]])):
+        p.append("regenerable + cache class totals differ from the listed directories")
+    for cls in ("repo", "worktree", "bare-repo"):
+        rows = [r for r in ex["repos"] if r["class"] == cls]
+        if not rows and cls not in classes:
+            continue
+        if any(r["regen"] is None for r in rows):
+            p.append(f"a {cls} row has no sizes line")
+            continue
+        own = (sum(r["total"][0] - r["regen"][0] for r in rows), sum(r["total"][1] + r["regen"][1] for r in rows))
+        if not close(own, classes.get(cls, (0, 0))):
+            p.append(f"{cls} class total differs from its rows minus their regenerable directories")
+    for r in ex["repos"]:
+        inside = [s for path, s in ex["regen"] if path.startswith(r["path"] + "/")]
+        if r["regen"] is not None and not close(total(inside), r["regen"]):
+            p.append(f"{r['path']}: regenerable size differs from the listed directories inside it")
+    sizes = {path: s for path, s in ex["regen"]}
+    sizes.update({r["path"]: r["total"] for r in ex["repos"]})
+    facts = {r["path"]: r["facts"] for r in ex["repos"]}
+    for it in ex["items"]:
+        if it["path"] not in sizes:
+            p.append(f"plan item {it['path']} is not in the scan")
+        elif it["action"] != "keep" and it["action"] != "ask" and not close(it["size"], sizes[it["path"]]):
+            p.append(f"plan item {it['path']} reclaims a different size than the scan shows")
+        f = facts.get(it["path"])
+        if f:
+            vals = set(f.values())
+            want = "ask" if "UNKNOWN" in vals else ("recover-backup-then-remove" if "NO" in vals else "backup-then-remove")
+            if it["action"] not in (want, "keep", "ask"):
+                p.append(f"plan item {it['path']} is {it['action']}, its facts give {want}")
+    m = re.search(r"--out (\S+)", ex["scan_cmd"])
+    n = re.search(r"--scan (\S+)", ex["plan_cmd"])
+    if not m or not n or m.group(1) != n.group(1):
+        p.append("the plan reads a scan file the example scan did not write with --out")
+    return p
+
+
+def class_table_defaults(html):
+    """Class name to the text of its Default cell in the class table."""
+    out = {}
+    for m in re.finditer(r'<th scope="row" role="rowheader"><span class="dot"[^>]*></span>([^<]+)</th>'
+                         r'<td[^>]*>.*?</td><td[^>]*data-label="[^"]*"[^>]*>(.*?)</td>', html):
+        out[m.group(1).strip()] = re.sub(r"<[^>]+>", "", m.group(2))
+    return out
+
+
 def css_tokens(html):
     """(light, dark) dicts of custom properties from the inline stylesheet."""
     style = re.search(r"<style>(.*?)</style>", html, re.S).group(1)
@@ -233,6 +391,27 @@ class TestDetectorsAreNotVacuous(unittest.TestCase):
                "Items:\n  recover-then-archive    0 B     [repo] ~/a\n")
         self.assertEqual(example_fact_groups(old), [["has_network_remote", "stash_empty"]])
         self.assertEqual(example_actions(old), ["recover-then-archive"])
+
+    def test_example_checker_fires(self):
+        good = ("$ disk-cleaner scan ~/p --out s.json\nScanned ~/p\n3 files, 2 directories, 3.0 GiB allocated (3.0 GiB logical)\n\n"
+                "Space by class (innermost classified ancestor):\n  regenerable     2.0 GiB\n  repo            1.0 GiB\n\n"
+                "Repos and worktrees (1):\n  [repo] ~/p/a  3.0 GiB\n      has_network_remote=yes stash_empty=NO\n"
+                "      .git 1.0 MiB, regenerable 2.0 GiB, outputs 0 B\n\n"
+                "Regenerable and cache directories (1):\n     2.0 GiB  ~/p/a/node_modules\n\n"
+                "$ disk-cleaner plan --scan s.json\nItems:\n  recover-backup-then-remove     3.0 GiB  [repo] ~/p/a\n")
+        self.assertEqual(example_problems(parse_example(good)), [])
+        bad = {
+            "unsorted": good.replace("  regenerable     2.0 GiB\n  repo            1.0 GiB",
+                                     "  repo            1.0 GiB\n  regenerable     2.0 GiB"),
+            "no --out": good.replace(" --out s.json", ""),
+            "wrong count": good.replace("Repos and worktrees (1)", "Repos and worktrees (3)"),
+            "cut short": good.replace("     2.0 GiB  ~/p/a/node_modules\n", "     2.0 GiB  ~/p/a/node_modules\n  ...\n"),
+            "class sum": good.replace("  repo            1.0 GiB", "  repo            1.9 GiB"),
+            "wrong action": good.replace("stash_empty=NO", "stash_empty=UNKNOWN"),
+            "size mismatch": good.replace("3.0 GiB  [repo]", "88.0 MiB  [repo]"),
+        }
+        for name, text in bad.items():
+            self.assertTrue(example_problems(parse_example(text)), name)
 
     def test_permissions_and_pin_parsers_fire(self):
         yml = "permissions:\n  contents: read\n  issues: write\njobs:\n  a:\n    steps:\n      - uses: actions/x@v4\n"
@@ -412,6 +591,47 @@ class TestContent(unittest.TestCase):
         used = example_actions(example_text(self.html))
         self.assertTrue(used, "no plan items in the example")
         self.assertEqual([a for a in used if a not in actions], [])
+
+    def test_example_adds_up_and_is_ordered_like_the_cli(self):
+        self.assertEqual(example_problems(parse_example(example_text(self.html))), [])
+
+    def test_removal_rule_is_stated_precisely(self):
+        flat = re.sub(r"\s+", " ", self.text)
+        self.assertNotRegex(flat, r"(?i)only when all \w+ (?:facts )?are yes",
+                            "a repo with some facts no can still be proposed for recover-backup-then-remove")
+        para = re.search(r"all eleven are yes.*?</p>", re.sub(r"\s+", " ", self.html)).group(0)
+        for needle in ("backup-then-remove", "recover-backup-then-remove", "unknown", "ask"):
+            self.assertIn(needle, para)
+
+    def test_class_defaults_say_what_todays_plan_does(self):
+        d = class_table_defaults(self.html)
+        self.assertEqual(len(d), 9, sorted(d))
+        self.assertIn("Today's plan", self.html)
+        self.assertIn("remove-regenerable", d["cache"])
+        self.assertIn("Planned", d["cache"])
+        self.assertIn("keep", d["output"].lower())
+        self.assertIn("Planned", d["output"])
+        self.assertIn("Planned", d["agent-session"])
+        for cls, text in d.items():
+            self.assertNotRegex(text, r"(?i)^remove by age", f"{cls}: an age or size policy is not built")
+
+    def test_card_headings_do_not_state_planned_features_as_fact(self):
+        self.assertNotIn("Everything removed is findable", self.html)
+        self.assertIn("Everything removed will be findable", self.html)
+
+    def test_brand_link_goes_to_the_document_top(self):
+        page = parse_page()
+        tops = [t for t, d in page.tags if d.get("id") == "top"]
+        self.assertEqual(tops, ["body"])
+
+    def test_phone_legend_does_not_rely_on_color_alone(self):
+        svg = re.search(r'<figure>.*?</figure>', self.html, re.S).group(0)
+        tiles = re.findall(r'<rect class="tile-([a-z]+)"', svg)
+        keys = re.findall(r'<text class="tile-key"[^>]*>(\d+)</text>', svg)
+        self.assertEqual(len(keys), len(tiles), "every tile needs a visible key at phone width")
+        legend = re.findall(r'<li><span class="dot"[^>]*></span><span class="key">(\d+)</span>', svg)
+        self.assertEqual(sorted(set(keys)), sorted(legend))
+        self.assertRegex(self.html, r"@media \(max-width: 44rem\) \{[^}]*\.tile-key \{ display: inline; \}")
 
     def test_page_weight_under_300_kb(self):
         total = INDEX.stat().st_size + sum(f.stat().st_size for f in (SITE / "brand").glob("*.svg"))
