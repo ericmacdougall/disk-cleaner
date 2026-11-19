@@ -1271,8 +1271,7 @@ fn worktree_config_exists(path: &Path) -> Result<bool, String> {
 /// differently (more than one line, a NUL, no path) is refused.
 fn gitfile_dir(path: &Path, file: &Path) -> Result<PathBuf, String> {
     let bad = |why: &str| format!("the .git file {why}, so its config.worktree was not found");
-    let bytes = read_bounded(file)
-        .map_err(|e| bad(&format!("was not read ({e})")))?;
+    let bytes = read_bounded(file).map_err(|e| bad(&format!("was not read ({e})")))?;
     let rest = bytes
         .strip_prefix(b"gitdir: ")
         .ok_or_else(|| bad("does not name a git directory"))?;
@@ -1284,9 +1283,12 @@ fn gitfile_dir(path: &Path, file: &Path) -> Result<PathBuf, String> {
     if target.iter().any(|&b| matches!(b, b'\n' | b'\r')) {
         return Err(bad("holds more than one line"));
     }
-    let dir = path_from_git(target)
-        .ok_or_else(|| bad("names no path valid on this system"))?;
-    Ok(if dir.is_absolute() { dir } else { path.join(dir) })
+    let dir = path_from_git(target).ok_or_else(|| bad("names no path valid on this system"))?;
+    Ok(if dir.is_absolute() {
+        dir
+    } else {
+        path.join(dir)
+    })
 }
 
 fn unsafe_key(keys: &[String], whose: &str) -> Result<(), String> {

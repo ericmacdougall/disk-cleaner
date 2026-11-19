@@ -49,9 +49,8 @@ fn assert_inspected(res: &ScanResult, repo: &Path) {
 fn assert_refused(res: &ScanResult, repo: &Path, want: &str) {
     let f = facts_of(res, repo);
     let why = issues(res, repo);
-    let unknown = |(name, t): &(&str, Tri)| {
-        *t == Tri::Unknown || (*name == "plain_layout" && *t == Tri::No)
-    };
+    let unknown =
+        |(name, t): &(&str, Tri)| *t == Tri::Unknown || (*name == "plain_layout" && *t == Tri::No);
     assert!(
         f.entries().iter().all(unknown),
         "{}: every fact must be unknown: {f:?} ({why})",
