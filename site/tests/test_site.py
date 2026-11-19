@@ -631,7 +631,8 @@ class TestContent(unittest.TestCase):
         self.assertEqual(len(keys), len(tiles), "every tile needs a visible key at phone width")
         legend = re.findall(r'<li><span class="dot"[^>]*></span><span class="key">(\d+)</span>', svg)
         self.assertEqual(sorted(set(keys)), sorted(legend))
-        self.assertRegex(self.html, r"@media \(max-width: 44rem\) \{[^}]*\.tile-key \{ display: inline; \}")
+        self.assertRegex(self.html, r"@media \(max-width: 44rem\) \{(?:[^{}]*\{[^{}]*\})*?\s*\.tile-key \{ display: inline; \}")
+        self.assertRegex(self.html, r"\.tile-key \{ display: none;", "keys only replace the labels on a phone")
 
     def test_page_weight_under_300_kb(self):
         total = INDEX.stat().st_size + sum(f.stat().st_size for f in (SITE / "brand").glob("*.svg"))

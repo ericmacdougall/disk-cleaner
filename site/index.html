@@ -158,12 +158,16 @@ figcaption { color: var(--muted); font-size: 0.9rem; margin-top: 0.5rem; max-wid
 .tile-label { fill: var(--on-class); font: 700 15px var(--sans); }
 .tile-sub { fill: var(--on-class); font: 13px var(--mono); }
 
-/* Small screens: tile text would shrink below legibility, so a legend replaces it. */
+/* Small screens: tile text would shrink below legibility, so a numbered legend replaces it.
+   The numbers on the tiles match the legend, so it does not rely on color alone. */
+.tile-key { display: none; fill: var(--on-class); font: 700 40px var(--sans); }
 .legend { display: none; list-style: none; margin: 0.75rem 0 0; padding: 0; font-size: 0.9rem; }
 .legend li { margin-bottom: 0.3rem; }
+.legend .key { display: inline-block; min-width: 1.2em; font-weight: 700; }
 @media (max-width: 44rem) {
   .legend { display: block; }
   .tile-label, .tile-sub { display: none; }
+  .tile-key { display: inline; }
 }
 
 /* Tables */
@@ -220,7 +224,7 @@ pre code { background: none; padding: 0; font: inherit; }
 }
 </style>
 </head>
-<body>
+<body id="top">
 <a class="skip" href="#main">Skip to content</a>
 
 <header class="site-header">
@@ -246,7 +250,7 @@ pre code { background: none; padding: 0; font: inherit; }
 </header>
 
 <main id="main">
-  <section class="hero" id="top" aria-labelledby="h-hero">
+  <section class="hero" aria-labelledby="h-hero">
     <div class="wrap">
       <p class="status-note"><strong>Early.</strong> Only a read-only command-line scanner and planner exists. It is merged into the main branch but not released. It deletes nothing. There is no desktop app, installer or store listing yet.</p>
       <h1 id="h-hero">Know what is safe to remove.</h1>
@@ -258,41 +262,49 @@ pre code { background: none; padding: 0; font: inherit; }
 
       <figure>
         <svg viewBox="0 0 640 340" role="img" aria-labelledby="fig-t fig-d">
-          <title id="fig-t">Illustration of a disk drawn as a treemap, colored by class</title>
+          <title id="fig-t">Illustration of a disk drawn as a treemap, colored and numbered by class</title>
           <desc id="fig-d">A rectangle split into eight blocks of seven classes. The largest is regenerable folders such as node_modules and target. Others are a git repo, linked worktrees, caches, agent session logs, output files and loose code. The sizes are invented.</desc>
           <rect class="tile-regen" x="0" y="0" width="300" height="200" rx="6"/>
+          <text class="tile-key" x="16" y="54">1</text>
           <text class="tile-label" x="14" y="30">regenerable</text>
           <text class="tile-sub" x="14" y="52">node_modules, target, .venv</text>
           <rect class="tile-cache" x="0" y="204" width="300" height="136" rx="6"/>
+          <text class="tile-key" x="16" y="258">2</text>
           <text class="tile-label" x="14" y="234">cache</text>
           <text class="tile-sub" x="14" y="256">package manager caches</text>
           <rect class="tile-repo" x="304" y="0" width="200" height="160" rx="6"/>
+          <text class="tile-key" x="320" y="54">3</text>
           <text class="tile-label" x="318" y="30">repo</text>
           <text class="tile-sub" x="318" y="52">a git clone</text>
           <rect class="tile-worktree" x="304" y="164" width="200" height="90" rx="6"/>
+          <text class="tile-key" x="320" y="218">4</text>
           <text class="tile-label" x="318" y="194">worktree</text>
           <text class="tile-sub" x="318" y="216">linked checkouts</text>
           <rect class="tile-agent" x="304" y="258" width="200" height="82" rx="6"/>
+          <text class="tile-key" x="320" y="312">5</text>
           <text class="tile-label" x="318" y="288">agent-session</text>
           <text class="tile-sub" x="318" y="310">transcripts, logs</text>
           <rect class="tile-output" x="508" y="0" width="132" height="120" rx="6"/>
+          <text class="tile-key" x="524" y="54">6</text>
           <text class="tile-label" x="522" y="30">output</text>
           <text class="tile-sub" x="522" y="52">video, models</text>
           <rect class="tile-loose" x="508" y="124" width="132" height="70" rx="6"/>
+          <text class="tile-key" x="524" y="178">7</text>
           <text class="tile-label" x="522" y="154">loose-code</text>
           <text class="tile-sub" x="522" y="176">no repo</text>
           <rect class="tile-repo" x="508" y="198" width="132" height="142" rx="6"/>
+          <text class="tile-key" x="524" y="252">3</text>
           <text class="tile-label" x="522" y="228">repo</text>
           <text class="tile-sub" x="522" y="250">another clone</text>
         </svg>
         <ul class="legend">
-          <li><span class="dot" style="background:var(--c-regen)"></span>regenerable: node_modules, target, .venv</li>
-          <li><span class="dot" style="background:var(--c-cache)"></span>cache: package manager caches</li>
-          <li><span class="dot" style="background:var(--c-repo)"></span>repo: a git clone</li>
-          <li><span class="dot" style="background:var(--c-worktree)"></span>worktree: linked checkouts</li>
-          <li><span class="dot" style="background:var(--c-agent)"></span>agent-session: transcripts, logs</li>
-          <li><span class="dot" style="background:var(--c-output)"></span>output: video, models</li>
-          <li><span class="dot" style="background:var(--c-loose)"></span>loose-code: source outside any repo</li>
+          <li><span class="dot" style="background:var(--c-regen)"></span><span class="key">1</span>regenerable: node_modules, target, .venv</li>
+          <li><span class="dot" style="background:var(--c-cache)"></span><span class="key">2</span>cache: package manager caches</li>
+          <li><span class="dot" style="background:var(--c-repo)"></span><span class="key">3</span>repo: a git clone</li>
+          <li><span class="dot" style="background:var(--c-worktree)"></span><span class="key">4</span>worktree: linked checkouts</li>
+          <li><span class="dot" style="background:var(--c-agent)"></span><span class="key">5</span>agent-session: transcripts, logs</li>
+          <li><span class="dot" style="background:var(--c-output)"></span><span class="key">6</span>output: video, models</li>
+          <li><span class="dot" style="background:var(--c-loose)"></span><span class="key">7</span>loose-code: source outside any repo</li>
         </ul>
         <figcaption>A drawing of the idea, not a screenshot: color says what a folder is, and area says how much space it takes. The sizes are invented. The desktop views are planned and do not exist yet.</figcaption>
       </figure>
@@ -310,22 +322,22 @@ pre code { background: none; padding: 0; font: inherit; }
   <section id="safety" aria-labelledby="h-safety">
     <div class="wrap">
       <h2 id="h-safety">How it decides what is safe</h2>
-      <p>Every directory gets one class. Each class has a default disposition. These are the rules in the project's <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/docs/DESIGN.md">design document</a>; the read-only scanner assigns repo, worktree, bare-repo, regenerable, cache and loose-code (everything else is "other"), and lists output files individually. Agent-session handling is designed but not built. Nothing is removed yet: a default is what a plan proposes, and the step that applies a plan is planned.</p>
+      <p>Every directory gets one class. The classes come from the project's <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/docs/DESIGN.md">design document</a>; the read-only scanner assigns repo, worktree, bare-repo, regenerable, cache and loose-code (everything else is "other"), and lists output files individually. Agent-session handling is designed but not built. The last column says what today's plan proposes for an idle project; what the design adds later is marked Planned. Nothing is removed yet: the step that applies a plan is planned too.</p>
 
       <div class="table-wrap">
         <table class="stack" role="table">
-          <caption role="caption">Classes and what happens to them by default</caption>
-          <thead role="rowgroup"><tr role="row"><th scope="col" role="columnheader">Class</th><th scope="col" role="columnheader">What it is</th><th scope="col" role="columnheader">Default</th></tr></thead>
+          <caption role="caption">Classes and what today's plan proposes for them</caption>
+          <thead role="rowgroup"><tr role="row"><th scope="col" role="columnheader">Class</th><th scope="col" role="columnheader">What it is</th><th scope="col" role="columnheader">Today's plan</th></tr></thead>
           <tbody role="rowgroup">
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-repo)"></span>repo</th><td role="cell" data-label="What it is">A directory with a <code>.git</code> directory.</td><td role="cell" data-label="Default">Keep. When idle and fully on a remote, the plan proposes backing it up, then removing it.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-worktree)"></span>worktree</th><td role="cell" data-label="What it is">A linked git worktree.</td><td role="cell" data-label="Default">Like a repo, checked against its own HEAD.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--text)"></span>bare-repo</th><td role="cell" data-label="What it is">A bare git repository.</td><td role="cell" data-label="Default">Never removed while a worktree or clone depends on it.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-regen)"></span>regenerable</th><td role="cell" data-label="What it is"><code>node_modules</code>, <code>target</code>, <code>.venv</code>, <code>.next</code>, <code>DerivedData</code>.</td><td role="cell" data-label="Default">Remove when the owning project is not active.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-cache)"></span>cache</th><td role="cell" data-label="What it is">Package manager and tool caches.</td><td role="cell" data-label="Default">Remove by age or size policy.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-agent)"></span>agent-session</th><td role="cell" data-label="What it is">Coding-agent transcripts, logs and work directories.</td><td role="cell" data-label="Default">Back up first, remove only after a verified backup and an age threshold.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-output)"></span>output</th><td role="cell" data-label="What it is">Video, audio, images, archives, model weights, datasets.</td><td role="cell" data-label="Default">Never to git. Back up, then remove by policy.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-loose)"></span>loose-code</th><td role="cell" data-label="What it is">Source files or a project manifest outside any repo.</td><td role="cell" data-label="Default">Ask: connect a remote, back up, remove, or leave.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--muted)"></span>system, user-data</th><td role="cell" data-label="What it is">Operating system files, documents, photos.</td><td role="cell" data-label="Default">Analyze only.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-repo)"></span>repo</th><td role="cell" data-label="What it is">A directory with a <code>.git</code> directory.</td><td role="cell" data-label="Today's plan">Keep while active. When idle: back up then remove, recover first, or ask, depending on the facts below.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-worktree)"></span>worktree</th><td role="cell" data-label="What it is">A linked git worktree.</td><td role="cell" data-label="Today's plan">Like a repo, checked against its own HEAD.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--text)"></span>bare-repo</th><td role="cell" data-label="What it is">A bare git repository.</td><td role="cell" data-label="Today's plan">Keep while a worktree or clone depends on it; otherwise ask.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-regen)"></span>regenerable</th><td role="cell" data-label="What it is"><code>node_modules</code>, <code>target</code>, <code>.venv</code>, <code>.next</code>, <code>DerivedData</code>.</td><td role="cell" data-label="Today's plan"><code>remove-regenerable</code> when the owning project is not active; ask if it holds output files.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-cache)"></span>cache</th><td role="cell" data-label="What it is">Package manager and tool caches.</td><td role="cell" data-label="Today's plan">Treated like a regenerable folder: <code>remove-regenerable</code> unless its project is active. Planned: age and size policies.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-agent)"></span>agent-session</th><td role="cell" data-label="What it is">Coding-agent transcripts, logs and work directories.</td><td role="cell" data-label="Today's plan">Not detected yet. Planned: back up first, remove only after a verified backup and an age threshold.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-output)"></span>output</th><td role="cell" data-label="What it is">Video, audio, images, archives, model weights, datasets.</td><td role="cell" data-label="Today's plan">Keep: listed for analysis only. Planned: never to git; back up, then remove by policy.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--c-loose)"></span>loose-code</th><td role="cell" data-label="What it is">Source files or a project manifest outside any repo.</td><td role="cell" data-label="Today's plan">Ask: connect a remote, back up, remove, or leave.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader"><span class="dot" style="background:var(--muted)"></span>system, user-data</th><td role="cell" data-label="What it is">Operating system files, documents, photos.</td><td role="cell" data-label="Today's plan">Keep: analysis only. Today these count as "other".</td></tr>
           </tbody>
         </table>
       </div>
@@ -345,11 +357,11 @@ pre code { background: none; padding: 0; font: inherit; }
         <li>The repository has a plain layout, with nothing unusual in its git directory.</li>
         <li>The git directory holds nothing of its own, such as a custom hook or a setting only this copy has.</li>
       </ul>
-      <p>A repo can be proposed for removal only when all eleven are yes, and even then the plan says to back up its git directory first. When a fact is no, the plan either proposes recovering the missing work first or asks you; when a fact is unknown, it asks. It always says why. Remote facts come from local remote-tracking refs, which can be stale, so the plan marks them unverified. Re-checking them against the live remote at the moment of removal is planned for the step that applies a plan.</p>
+      <p>For an idle repo the plan proposes <code>backup-then-remove</code> when all eleven are yes: back up its git directory, then remove it. When some facts are no and none is unknown, it proposes <code>recover-backup-then-remove</code>: recover the missing work first, then back up and remove. When any fact is unknown, or the repo has dependents, an unusual layout or files of its own in its git directory, it asks you (<code>ask</code>). It always says why. Remote facts come from local remote-tracking refs, which can be stale, so the plan marks them unverified. Re-checking them against the live remote at the moment of removal is planned for the step that applies a plan.</p>
 
       <div class="grid two">
         <div class="card"><h3>Plan, then apply</h3><p>Scanning and planning are read-only. A plan is a file you can read and edit. Apply, when it exists, will do exactly that plan.</p></div>
-        <div class="card"><h3>Everything removed is findable</h3><p>The design writes each removal to a manifest with a restore command. That part is planned, not built.</p></div>
+        <div class="card"><h3>Everything removed will be findable</h3><p>The design writes each removal to a manifest with a restore command. That part is planned, not built.</p></div>
       </div>
     </div>
   </section>
@@ -377,18 +389,18 @@ pre code { background: none; padding: 0; font: inherit; }
   <section id="example" aria-labelledby="h-example">
     <div class="wrap">
       <h2 id="h-example">What the scanner prints</h2>
-      <p>The shape below follows the summary the command-line scanner prints and the format in the project's scan documentation. The paths and sizes are invented for this page, and long lines are shortened. It is not output from a real machine.</p>
-<pre tabindex="0" role="region" aria-label="Example scanner output"><code>$ disk-cleaner scan ~/projects
+      <p>The shape below follows the summary the command-line scanner prints and the format in the project's scan documentation. The paths and sizes are invented for this page, and long lines are shortened. It is not output from a real machine. In it, example-app was changed two days ago, so it is active and kept with its <code>node_modules</code>, while the folders of example-service and the example-notes repo have been idle for weeks.</p>
+<pre tabindex="0" role="region" aria-label="Example scanner output"><code>$ disk-cleaner scan ~/projects --out scan.json
 Scanned ~/projects
-18402 files, 1311 directories, 9.4 GiB allocated (9.1 GiB logical)
+18402 files, 1311 directories, 4.3 GiB allocated (4.1 GiB logical)
 
 Space by class (innermost classified ancestor):
-  regenerable    5.2 GiB
-  repo           1.9 GiB
-  cache          1.3 GiB
-  worktree     612.4 MiB
-  loose-code   180.0 MiB
-  other        208.0 MiB
+  regenerable     3.0 GiB
+  repo          600.0 MiB
+  worktree      240.6 MiB
+  other         208.0 MiB
+  loose-code    180.0 MiB
+  cache          96.0 MiB
 
 Repos and worktrees (3):
   [repo] ~/projects/example-app  2.4 GiB
@@ -397,19 +409,22 @@ Repos and worktrees (3):
       reflog_saved=yes no_pending_state=yes plain_layout=yes
       no_local_admin_content=yes
       .git 310.2 MiB, regenerable 1.9 GiB, outputs 0 B
+  [worktree] ~/projects/example-app-fix  240.6 MiB
+      ...
+      .git 4.0 KiB, regenerable 0 B, outputs 0 B
   [repo] ~/projects/example-notes  88.0 MiB
       has_network_remote=yes head_on_remote=NO all_branches_on_remote=NO
       stash_empty=NO tree_clean=NO no_unique_ignored=yes no_dependents=yes
       reflog_saved=NO no_pending_state=yes plain_layout=yes
       no_local_admin_content=yes
       .git 12.5 MiB, regenerable 0 B, outputs 0 B
-  [worktree] ~/projects/example-app-fix  240.6 MiB
-      ...
 
-Regenerable and cache directories (4):
-    1.9 GiB  ~/projects/example-app/node_modules
-    1.1 GiB  ~/projects/example-service/target
-    ...
+Regenerable and cache directories (3):
+     1.9 GiB  ~/projects/example-app/node_modules
+     1.1 GiB  ~/projects/example-service/target
+    96.0 MiB  ~/projects/example-service/.mypy_cache
+
+Scan written to scan.json
 
 $ disk-cleaner plan --scan scan.json
 Dry-run plan (nothing is changed). Active window: 7 days (from default).
@@ -420,9 +435,10 @@ Remote facts verified: no (remote facts come from local remote-tracking refs, ..
 ...
 Items:
   remove-regenerable            1.1 GiB  [regenerable] ~/projects/example-service/target
+  remove-regenerable           96.0 MiB  [cache] ~/projects/example-service/.mypy_cache
   recover-backup-then-remove   88.0 MiB  [repo] ~/projects/example-notes
   ...
-      (states and reasons abridged)</code></pre>
+      (items that reclaim nothing, states and reasons abridged)</code></pre>
       <p class="muted">The command is still called <code>disk-cleaner</code> today; it will be renamed <code>prunedisk</code>. The plan only describes what would happen. In the current version no command removes, moves or changes anything. The scanner writes a file only where you give <code>--out</code>.</p>
     </div>
   </section>
