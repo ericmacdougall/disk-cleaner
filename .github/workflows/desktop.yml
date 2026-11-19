@@ -168,8 +168,10 @@ jobs:
         with:
           node-version: "22"
       - run: npm ci --no-audit --no-fund
-      - run: npm run typecheck
+      # Tests first, so a type error does not hide which tests fail; both gate the job.
       - run: npm test
+      - run: npm run typecheck
+        if: ${{ !cancelled() }}
       - run: npm run build
 
   desktop-check:
