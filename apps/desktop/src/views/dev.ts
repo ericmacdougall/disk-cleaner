@@ -6,7 +6,7 @@
 import type { Backend, DevItem, DevSummary, SessionFolder } from "../api";
 import { errorMessage } from "../api";
 import { h, replace } from "../dom";
-import { formatBytes, formatCount, formatDate } from "../format";
+import { countOf, formatBytes, formatCount, formatDate } from "../format";
 
 export const DEV_PAGE = 100;
 
@@ -19,7 +19,7 @@ export function summaryLines(s: DevSummary): string[] {
     `By action: ${Object.entries(t.by_action)
       .map(([a, x]) => `${a} ${formatCount(x.items)} (${formatBytes(x.reclaimable_bytes)})`)
       .join(", ") || "none"}.`,
-    `Active window: ${s.active_window_days} days (${s.window_source}). Process check: ${s.process_check}.`,
+    `Active window: ${countOf(s.active_window_days, "day", "days")} (${s.window_source}). Process check: ${s.process_check}.`,
   ];
   if (s.process_check_note) lines.push(s.process_check_note);
   lines.push(s.coverage_complete ? "Coverage: complete." : `Coverage: incomplete. ${s.coverage_note ?? ""}`);
@@ -273,7 +273,7 @@ export class DevView {
               h(
                 "li",
                 {},
-                `${s.layout}: ${s.path}, ${formatCount(s.files)} files, ${formatBytes(s.alloc)}, last changed ${formatDate(s.newest_mtime)}. ${s.plan_note}.`,
+                `${s.layout}: ${s.path}, ${countOf(s.files, "file", "files")}, ${formatBytes(s.alloc)}, last changed ${formatDate(s.newest_mtime)}. ${s.plan_note}.`,
                 s.enclosing ? ` Inside ${s.enclosing.path} (${s.enclosing.action}).` : "",
               ),
             ),

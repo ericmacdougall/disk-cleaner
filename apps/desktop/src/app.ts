@@ -5,7 +5,7 @@
 import type { Backend, Place, TopFile } from "./api";
 import { errorMessage } from "./api";
 import { announce, h, replace } from "./dom";
-import { formatBytes, formatCount } from "./format";
+import { countOf, formatBytes, formatCount } from "./format";
 import { ScanController, type ScanSnapshot } from "./scan";
 import { DevView } from "./views/dev";
 import { SettingsForm } from "./views/settings";
@@ -178,7 +178,7 @@ export class App {
     const p = s.progress;
     const secs = p ? Math.round(p.elapsed_ms / 1000) : 0;
     const body = p
-      ? `${formatCount(p.files)} files, ${formatCount(p.dirs)} folders, ${formatBytes(p.bytes)}, ${secs} s. Reading ${p.current}`
+      ? `${countOf(p.files, "file", "files")}, ${countOf(p.dirs, "folder", "folders")}, ${formatBytes(p.bytes)}, ${secs} s. Reading ${p.current}`
       : "Starting...";
     if (this.shownPhase === "walking" || this.shownPhase === "starting") {
       const line = this.main.querySelector(".progress-line");
@@ -307,7 +307,7 @@ export class App {
         : h(
             "table",
             { class: "items" },
-            h("caption", {}, `The ${formatCount(files.length)} largest files`),
+            h("caption", {}, files.length === 1 ? "The largest file" : `The ${formatCount(files.length)} largest files`),
             h("thead", {}, h("tr", {}, h("th", { scope: "col" }, "Allocated"), h("th", { scope: "col" }, "Path"))),
             h("tbody", {}, ...files.map((f) => h("tr", {}, h("td", { class: "c-num" }, formatBytes(f.bytes)), h("td", { class: "path" }, f.path)))),
           ),

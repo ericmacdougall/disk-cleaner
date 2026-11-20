@@ -213,11 +213,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(text), area);
 }
 
+/// `n` with the noun that agrees with it: "1 file", "2 files".
+fn counted(n: u64, one: &str, many: &str) -> String {
+    let noun = if n == 1 { one } else { many };
+    format!("{} {noun}", units::count(n))
+}
+
 fn progress_text(p: &disk_cleaner_view::walk::Progress) -> String {
     format!(
-        "Scanning: {} files, {} folders, {}, {:.1} s\n{}",
-        units::count(p.files),
-        units::count(p.dirs),
+        "Scanning: {}, {}, {}, {:.1} s\n{}",
+        counted(p.files, "file", "files"),
+        counted(p.dirs, "folder", "folders"),
         units::bytes(p.bytes),
         p.elapsed_ms as f64 / 1000.0,
         p.current
@@ -241,6 +247,10 @@ fn header_cell(
     };
     Cell::from(format!("{label}{mark}")).style(Style::default().add_modifier(Modifier::BOLD))
 }
+
+/// The size tree's fixed columns (11 + 11 + 11 + 10 + 9) and the five one-column gaps the
+/// table puts between its six columns.
+const FIXED_COLS: usize = 52 + 5;
 
 fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(view) = app.tree.as_ref() else {
@@ -268,12 +278,17 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         crumbs.join(" / ")
     };
-    let title = format!(
-        " Size tree: {place}  (source: size walk, {} files, {} in {:.1} s) ",
-        units::count(tree.stats.files),
+    let rest = format!(
+        "  (source: size walk, {}, {} in {:.1} s) ",
+        counted(tree.stats.files, "file", "files"),
         units::bytes(tree.stats.allocated_bytes),
         tree.stats.elapsed_ms as f64 / 1000.0
     );
+    // The title sits between the corners; a long path keeps its end (R2-1).
+    let head = " Size tree: ";
+    let used = 2 + width(head) + width(&rest);
+    let room = (area.width as usize).saturating_sub(used);
+    let title = format!("{head}{}{rest}", fit_tail(&place, room));
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -283,6 +298,8 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     app.scroll_into_view();
     let view = app.tree.as_ref().expect("checked above");
     let sort = view.sort();
+    // The name column gets what the five fixed columns and their spacing leave, at least 20.
+    let name_cols = (inner.width as usize).saturating_sub(FIXED_COLS).max(20);
     let rows: Vec<Row> = view
         .page(app.top, visible)
         .into_iter()
@@ -295,7 +312,8 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
                 (EntryKind::Symlink, _, _) => "@ ",
                 _ => "  ",
             };
-            let mut name = format!("{}{}{}", "  ".repeat(r.depth as usize), marker, r.name);
+            let prefix = format!("{}{}", "  ".repeat(r.depth as usize), marker);
+            let mut name = r.name.clone();
             if r.kind == EntryKind::Dir {
                 name.push('/');
             }
@@ -309,6 +327,9 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
                     name.push_str(note);
                 }
             }
+            // The indent and marker stay; the name keeps its end (extension, notes).
+            let room = name_cols.saturating_sub(width(&prefix));
+            let name = format!("{prefix}{}", fit_tail(&name, room));
             let style = if app.top + i == app.sel {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
@@ -395,7 +416,9 @@ pub fn dev_notes(app: &App) -> Vec<String> {
     }
     if let Some(view) = &app.tree {
         let st = &view.tree().stats;
-        if st.unreadable > 0 {
+        if st.unreadable == 1 {
+            lines.push(SIZE_WALK_ONE.to_string());
+        } else if st.unreadable > 1 {
             lines.push(format!(
                 "Size walk: {} entries could not be read; their sizes are not counted.",
                 units::count(st.unreadable)
@@ -418,12 +441,13 @@ pub fn dev_notes(app: &App) -> Vec<String> {
         })
         .collect();
     lines.push(format!("By action: {}", by_action.join(", ")));
-    lines.push(format!(
-        "Active window: {} days ({}).",
-        s.active_window_days, s.window_source
-    ));
+    let days = counted(s.active_window_days, "day", "days");
+    lines.push(format!("Active window: {days} ({}).", s.window_source));
     lines
 }
+
+/// The size walk's notice for a single unreadable entry.
+const SIZE_WALK_ONE: &str = "Size walk: 1 entry could not be read; its size is not counted.";
 
 /// Rows kept for the item list (at least) and the reason box under the header.
 const LIST_MIN: u16 = 3;
@@ -478,9 +502,9 @@ fn draw_dev(f: &mut Frame, app: &mut App, area: Rect) {
             DevRow::Header(g) => {
                 let grp = &dev.summary.groups[g];
                 format!(
-                    "{} ({} items, {} by core's class totals)",
+                    "{} ({}, {} by core's class totals)",
                     grp.label,
-                    units::count(grp.count as u64),
+                    counted(grp.count as u64, "item", "items"),
                     units::bytes(grp.class_bytes)
                 )
             }
@@ -538,9 +562,9 @@ fn draw_dev(f: &mut Frame, app: &mut App, area: Rect) {
         Some(DevRow::Session(k)) => {
             let s = &app.sessions[*k];
             let mut t = format!(
-                "{}: {} files, {}, last changed {}. {}.",
+                "{}: {}, {}, last changed {}. {}.",
                 s.layout,
-                units::count(s.files),
+                counted(s.files, "file", "files"),
                 units::bytes(s.alloc),
                 units::ago(s.newest_mtime, app.now),
                 s.plan_note

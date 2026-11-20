@@ -38,3 +38,8 @@ export function formatDate(unix: number | null | undefined): string {
 export function formatCount(n: number): string {
   return Math.round(n).toLocaleString("en-US");
 }
+
+/** A count with the noun that agrees with it: "1 file", "2 files". */
+export function countOf(n: number, one: string, many: string): string {
+  return `${formatCount(n)} ${Math.round(n) === 1 ? one : many}`;
+}

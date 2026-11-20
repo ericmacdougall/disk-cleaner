@@ -1,4 +1,4 @@
-import { formatBytes, formatCount, percentOf } from "./format";
+import { countOf, formatBytes, formatCount, percentOf } from "./format";
 
 describe("formatBytes", () => {
   it("uses binary units", () => {
@@ -27,5 +27,14 @@ describe("percentOf", () => {
 describe("formatCount", () => {
   it("groups thousands", () => {
     expect(formatCount(1234567)).toBe("1,234,567");
+  });
+});
+
+describe("countOf", () => {
+  it("agrees with the count", () => {
+    expect(countOf(0, "file", "files")).toBe("0 files");
+    expect(countOf(1, "file", "files")).toBe("1 file");
+    expect(countOf(2, "day", "days")).toBe("2 days");
+    expect(countOf(1001, "item", "items")).toBe("1,001 items");
   });
 });
