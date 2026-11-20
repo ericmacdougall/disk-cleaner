@@ -1,7 +1,8 @@
 // A small W3C WebDriver client over fetch (Node 22), enough to drive the packaged app through
 // tauri-driver: sessions, elements, clicks, keys and scripts. No dependencies.
 
-const ELEMENT = "element-6066-11e4-a52f-4a6a43c3c0d1";
+// The W3C web element identifier (an earlier copy had it wrong: probe run 44684705816).
+const ELEMENT = "element-6066-11e4-a52e-4f735466cecf";
 
 /** An element reference from a WebDriver reply (the W3C key, or the legacy one). */
 function ref(v, what) {
@@ -80,9 +81,8 @@ export class Session {
   /** The first element matching `css` whose trimmed text is `text` (or starts with it, when
    * `prefix`); waits up to `timeoutMs`. */
   async findText(css, text, { prefix = false, timeoutMs = 30_000 } = {}) {
-    // The match is tagged and then found with /element, rather than returned from the script:
-    // WebKitWebDriver did not hand back a usable reference for a returned element (probe run
-    // 44682996385).
+    // The match is tagged and then found with /element, so the click goes through the
+    // driver's own element lookup.
     const token = String(++this.tagged);
     await this.until(
       `const [css, text, prefix, token] = arguments;

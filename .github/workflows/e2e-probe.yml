@@ -102,8 +102,20 @@ jobs:
           extra=()
           [ "$RUNNER_OS" = Linux ] && extra=(--config e2e/linux-automation.conf.json)
           npx tauri build --ci --no-bundle --features e2e "${extra[@]}"
+          mkdir -p "$RUNNER_TEMP/bin"
           ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
           cp "src-tauri/target/release/prunedisk-desktop$ext" "$RUNNER_TEMP/bin/e2e$ext"
+      - name: A/B probe (Windows) - the e2e build with incognito off
+        # Probe run 44684705816: the shipped config (InPrivate) gave "DevToolsActivePort file
+        # doesn't exist". This tells whether incognito is the cause.
+        if: runner.os == 'Windows' && matrix.variant == 'none'
+        continue-on-error: true
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          npx tauri build --ci --no-bundle --features e2e --config e2e/linux-automation.conf.json
+          cp src-tauri/target/release/prunedisk-desktop.exe "$RUNNER_TEMP/bin/e2e-noincognito.exe"
+          node e2e/probe.mjs --app "$(cygpath -w "$RUNNER_TEMP/bin/e2e-noincognito.exe")" --out probe-noincognito.json
       - name: Build the CLI (writes the scan file the app opens)
         shell: bash
         run: cargo build --release --locked -p disk-cleaner-cli
@@ -135,6 +147,7 @@ jobs:
             ${{ runner.temp }}/e2e/*.json
             ${{ runner.temp }}/e2e/*.txt
             ${{ runner.temp }}/e2e/inputs/
+            apps/desktop/probe-*.json
             !${{ runner.temp }}/e2e/before.json
             !${{ runner.temp }}/e2e/after.json
           retention-days: 7
