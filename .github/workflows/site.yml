@@ -1,0 +1,109 @@
+name: Site tests
+
+# The tests also read the root README, ci.yml, the core's model, plan and facts sources and the CLI's
+# report to check the page's claims against them, so a change to any of those runs them too.
+on:
+  push:
+    paths:
+      - "site/**"
+      - ".github/workflows/site.yml"
+      - ".github/workflows/pages.yml"
+      - "README.md"
+      - ".github/workflows/ci.yml"
+      - "crates/core/src/model.rs"
+      - "crates/core/src/plan.rs"
+      - "crates/core/src/facts.rs"
+      - "crates/cli/src/report.rs"
+  pull_request:
+    paths:
+      - "site/**"
+      - ".github/workflows/site.yml"
+      - ".github/workflows/pages.yml"
+      - "README.md"
+      - ".github/workflows/ci.yml"
+      - "crates/core/src/model.rs"
+      - "crates/core/src/plan.rs"
+      - "crates/core/src/facts.rs"
+      - "crates/cli/src/report.rs"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Site tests
+        run: python3 -m unittest discover -s site/tests -v
+
+  # Runs the gate that pages.yml uses before it deploys, read-only, so every change shows what the deploy
+  # would decide today. With Pages not enabled this prints a notice and enabled=false and passes.
+  pages-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Would the Pages deploy run?
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I site/tools/pages_gate.py
+
+  # Rehearses the Pages deploy without deploying: same preparation as pages.yml, then served under
+  # the /disk-cleaner/ subpath that a project Pages site uses.
+  pages-rehearsal:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Site tests
+        run: python3 -m unittest discover -s site/tests -v
+      - name: Prepare the publishable site
+        run: python3 site/tools/prepare.py _site
+      # actions/upload-pages-artifact v5.0.0 (packages the artifact only; nothing is deployed)
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
+        with:
+          path: _site
+      - name: Serve under the project subpath
+        run: |
+          mkdir -p tmp
+          cp -R _site tmp/disk-cleaner
+          nohup python3 -m http.server 8080 --bind 127.0.0.1 --directory tmp > server.log 2>&1 &
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            curl -fs -o /dev/null http://127.0.0.1:8080/disk-cleaner/ && break
+            sleep 1
+          done
+      - name: Smoke test with curl
+        run: |
+          base=http://127.0.0.1:8080/disk-cleaner
+          fail=0
+          expect() {
+            want="$1"; path="$2"; ctype="${3:-}"
+            line=$(curl -s -o /dev/null -w '%{http_code} %{content_type}' "$base$path")
+            echo "$line $base$path"
+            case "$line" in "$want"*) ;; *) echo "FAIL: expected $want"; fail=1 ;; esac
+            if [ -n "$ctype" ]; then case "$line" in *"$ctype"*) ;; *) echo "FAIL: expected content type $ctype"; fail=1 ;; esac; fi
+          }
+          expect 200 /
+          curl -s "$base/" | grep -q '<title>PruneDisk' && echo "title ok: PruneDisk" || { echo "FAIL: title"; fail=1; }
+          expect 200 /brand/favicon.svg image/svg+xml
+          expect 200 /brand/logo.svg image/svg+xml
+          expect 200 /brand/logo-dark.svg image/svg+xml
+          expect 404 /README.md
+          expect 404 /brand/BRAND.md
+          expect 404 /tests/test_site.py
+          expect 404 /tools/prepare.py
+          exit $fail
+      - name: Every relative reference resolves under the prefix
+        run: python3 -I site/tools/smoke.py http://127.0.0.1:8080/disk-cleaner/
