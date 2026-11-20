@@ -994,8 +994,12 @@ is not the item.
   - the first Ctrl-C prints "finishing the deletion of PATH (N entries left); press Ctrl-C again to
     stop and leave a partial folder you must remove yourself; the item is in archive RECORD_ID"
     (for an unarchived regenerable item: "the item was not archived; it is rebuildable"), lets the
-    pass finish, then exits 3. The pass takes about as long as reading the rest of the item (13.2,
-    18), which can be minutes for a large `node_modules`;
+    pass finish, then completes that item as usual (`deleted`, the `removed` record and its
+    manifest segment, 12), starts no other item, and exits 3. The pass takes about as long as
+    reading the rest of the item (13.2, 18), which can be minutes for a large `node_modules`. A
+    second Ctrl-C or a SIGTERM after the pass ended, or a failed segment upload, stops before the
+    remaining steps; the next `--remove` run or resume writes them by the rows `delete-started`
+    and `deleted` of the table above;
   - a second Ctrl-C, or a SIGTERM at any point (a shutdown or a service manager, which may follow
     with SIGKILL), stops the pass before its next entry, journals `left`, prints the leftover as
     `quarantine list` does, and exits 3;
@@ -1393,8 +1397,12 @@ which the user chose (option (i), sourced in D-16).
     manifest record for each vaulted file with its digest, a restore that merges vault and
     archive and refuses when either is missing, and a decision for history secrets.
   Cost: until the user chooses upload, items with secret-like material are not reclaimed; the
-  summary counts them by rule. The user was shown three options and gets two in this release; the
-  coordinator reports that to the user.
+  summary counts them by rule. **Automatic upload does not reach every item**: `--secrets upload`
+  still keeps every item with an unnamed object or a history check not completed, which D-16
+  expects to be common in hand-worked repositories; only the prompt in ask mode reclaims those.
+  So the user's stated intent, to back such folders up to their own storage anyway, is fully met
+  only in ask mode. The user was shown three options and gets two in this release. The
+  coordinator reports both points to the user.
 - **D-5. Recovery refs.** Moot in this release: nothing is pushed (D-1, section 8).
 - **D-6. rclone command line**, not the rc API that DESIGN.md named: `rcat --size`, `cat`, `lsjson`
   behind a `Store` trait; minimum rclone version 1.64, checked at start.
@@ -1624,7 +1632,8 @@ two steps; it exists only in test builds (AC-35).
   do with the fresh re-check result and writes nothing: no state directory, no storage object, no
   file anywhere, and runs no git command outside 7.5. It runs the secret checks of 9.2, the
   history check included, reports "would keep" with the reasons a real run gives, and prints the
-  per-rule counts of kept items. Verify by: `dry_run.rs` snapshots the tree, state path and store before and after (zero store writes), and compares the dry run's kept items and per-rule counts with a `--backup-only` run on a copy of the same fixtures.
+  per-rule counts of kept items and the bytes the deletion pass would read again (18); the ask
+  prompt shows the same figure per item. Verify by: `dry_run.rs` snapshots the tree, state path and store before and after (zero store writes), compares the dry run's kept items and per-rule counts with a `--backup-only` run on a copy of the same fixtures, and checks the bytes-to-read figure against the fixtures' logical size counted once per hard-link name.
 - **AC-2** `--backup-only` does steps 1 to 6 and removes nothing, also when an earlier run left a
   quarantine or a leftover (reported only, 6.1), and so does a resume of a `--backup-only` run;
   `--remove` does the whole sequence. Verify by: `modes.rs` on macOS and Linux, with a leftover
@@ -1817,7 +1826,7 @@ two steps; it exists only in test builds (AC-35).
   journal names that still exists, in each state, with the text 5 gives for that state (the
   put-back commands for one not started; the record, archive, restore command with an absolute
   target outside the quarantine's parent and both statements for a leftover or a leftover moved
-  back); no command deletes a quarantine; restore refuses a target or staging directory inside a
+  back; what is there and the restore command for a replaced Q); no command deletes a quarantine; restore refuses a target or staging directory inside a
   quarantine; an item that holds or lies inside a quarantine, a restore staging directory or a
   leftover moved back is kept in every mode, `--backup-only` and dry runs included, and no walk
   descends into it, by apply and by core's plan (C-6). Verify by: `quarantine.rs` with a not
@@ -1837,7 +1846,8 @@ two steps; it exists only in test builds (AC-35).
   and, for one, an unnamed object, under each combination of mode, answer and setting, searching
   every stored object for each fake value (NEG-67).
 - **AC-41** Signals during a deletion pass follow 10.1: the first Ctrl-C prints the message 10.1
-  gives and lets the pass finish; a second Ctrl-C or a SIGTERM stops it before the next entry and
+  gives, lets the pass finish and completes that item's record and segment, starting no other
+  item; a second Ctrl-C or a SIGTERM stops it before the next entry and
   journals `left`; SIGHUP lets it finish; outside a pass each stops before the next step; every
   case exits 3 with the run id. Verify by: `signals.rs` runs the real binary on a large fixture
   through a pseudo-terminal and sends each signal through the step hook at a chosen entry
@@ -2162,8 +2172,10 @@ two steps; it exists only in test builds (AC-35).
   a non-`crypt` remote with `u` (the unencrypted statement shown before the answer). Every stored
   object is inflated and searched for every fake value.
 - **NEG-68 (AC-41)** On a large fixture through a pseudo-terminal, during the deletion pass: one
-  Ctrl-C (the message of 10.1 printed once, the pass reaches an empty Q, `removed` recorded, exit
-  3); two Ctrl-C (the pass stops before the next entry, `left` journaled, the leftover printed,
+  Ctrl-C (the message of 10.1 printed once, the pass reaches an empty Q, `deleted` journaled and
+  the `removed` record in a synced segment, no later item started, exit 3); one Ctrl-C, then a
+  second one while that segment is uploaded (stops after `deleted`; the next `--remove` run
+  writes and syncs the `removed` record once, and `manifest list` shows one record); two Ctrl-C (the pass stops before the next entry, `left` journaled, the leftover printed,
   exit 3); SIGTERM alone (same as two Ctrl-C); SIGHUP with the terminal closed (the pass
   finishes, no write error escapes, exit 3); Ctrl-C during an upload (stops before the next step,
   nothing quarantined, exit 3). Each is checked against the journal and the file system.
@@ -2180,7 +2192,7 @@ and earlier findings, and the user's answer on D-4.
 | r10 F1 a later hard-link name could be rewritten after the first name's check | One rule: just before each entry's unlink, its full preserved record is recomputed through a descriptor with the archive writer's function and compared, content digest included, for every hard-link name; never mtime or size as a stand-in (13.2). Cost: every byte is read again | AC-19; NEG-61 |
 | r10 F2 directory extended attributes were not compared | The same rule covers every extended attribute of every entry, directories included; the excluded fields are named and justified (13.2) | AC-19; NEG-61 |
 | r10 F3 two spool cleanup paths, and a descendant of rclone keeps the descriptor | One teardown routine through the two-lock barrier, at an operation's end and for others' spools (9.6) | AC-23; NEG-63 |
-| r10 F4 a negative case promised more than the pass can give | NEG-61 states the achievable outcome for a file added to a listed directory; every NEG was checked for the same kind of promise (NEG-19, 53, 62 changed) | AC-19; NEG-61 |
+| r10 F4 a negative case promised more than the pass can give | NEG-61 states the achievable outcome for a file added to a listed directory; the negative cases of AC-2, AC-19, AC-20, AC-21, AC-29 and AC-39, which the new stop conditions could falsify, were reread in full and the rest searched for absolute claims (NEG-19, 53, 62 changed) | AC-19; NEG-61 |
 | r10 S-1 quarantines not started were invisible, an occupied O was unhandled, Q was not checked | `quarantine list` shows every state, a replaced Q included (5); the identity check with `lstat` before any rename; "present" means any entry (6.1, 10.1) | AC-21, AC-39; NEG-65 |
 | r10 S-2 a leftover moved back looked like a new folder | A directory at O with F0's device and inode after `delete-started` is `moved-back`: warned and kept, never `removed` (10.1, 7.4) | AC-21, AC-39; NEG-64 |
 | r10 S-3 walks entered a leftover before the enclosing item was kept | Every walk in every mode stops at a quarantine, staging name or moved-back folder; `--backup-only` never archives one (7.4, C-6) | AC-39; NEG-53 |
@@ -2190,8 +2202,8 @@ and earlier findings, and the user's answer on D-4.
 | r10 S-7 the cost statement was incomplete | D-17 lists every cost; signals during deletion are defined (10.1); two stale texts removed | AC-41; NEG-68 |
 | The user's answer on D-4 | A secrets handling the user chooses: keep (default) or upload, per item in ask mode and by setting in automatic mode; the vault deferred (9.2, 11, D-4) | AC-12, AC-38, AC-40; NEG-51, NEG-67 |
 
-Rewritten in place: AC-12, 19, 21, 23, 30, 38, 39 and NEG-12, 19, 32, 43, 47, 51, 53, 58, 60,
-61, 62. Added: AC-40, 41 and NEG-63 to 68. None was withdrawn.
+Rewritten in place: AC-1, 12, 19, 21, 23, 30, 38, 39 and NEG-12, 19, 32, 43, 47, 51, 53, 58,
+60, 61, 62. Added: AC-40, 41 and NEG-63 to 68. None was withdrawn.
 
 ### 22.1 Minor items left for a later revision
 
@@ -2223,9 +2235,9 @@ data; each is either a disclosure, a fidelity detail or a test addition.
   spool (tmpfs, directory and file bind mounts, a vfat loop mount, with `sudo`), real rclone (a
   pinned release whose published SHA-256 is checked before use, `local` remotes only), and a release build that checks the hook is absent
   (AC-35). The pseudo-terminal tests of the secrets prompt (AC-38, NEG-51) and of signals
-  (AC-41, NEG-68), the spool tests (NEG-56, NEG-63), the deletion-pass tests (NEG-61, NEG-62,
-  NEG-66) and the quarantine-state tests (NEG-64, NEG-65) run in the ordinary test job of both
-  runners; the signals test sends real signals to the real binary and has a bound of 120 seconds.
+  (AC-41, NEG-68), the spool tests (NEG-56, NEG-63), the deletion-pass tests (NEG-61, NEG-62
+  and NEG-66) and the quarantine-state tests (NEG-64, NEG-65) run in the ordinary test job of
+  both runners; the signals test sends real signals to the real binary and has a bound of 120 seconds.
   A Windows runner builds the binary and runs NEG-60 and core's tests. Core's FIFO test for
   `rescan_item` (C-7) runs in core's own job.
 - No test touches any directory outside its own temporary directory, and no test uses a network
@@ -2291,10 +2303,7 @@ runs the real binary before the work is called ready.
   with `secrets_choice` recorded), with the unencrypted statement on (b) when it is not `crypt`;
   `--remove --auto repo --secrets upload` over all the secrets repositories (the `.env` and
   dropped-stash ones archived, the staged-and-replaced one kept for its unnamed objects) and the
-  same without `--secrets` (all kept); the tool killed with `kill -9` after `quarantined` (the
-  tester reads the journal for the moment), then `quarantine list` (shown as not started, with
-  `apply --resume RUN_ID` and `mv -n`), and the `mv -n` run by hand (the folder is complete);
-  Ctrl-C once during the deletion of the large `node_modules` (the message of 10.1 printed, the
+  same without `--secrets` (all kept); Ctrl-C once during the deletion of the large `node_modules` (the message of 10.1 printed, the
   pass finishes, exit 3), and twice (a leftover, exit 3); the tool killed with `kill -9` during
   the deletion of the large `node_modules`, once removed on its own and once inside its archived
   repository, then `apply --resume` and a new `--remove` run (each reports the leftover and
@@ -2305,7 +2314,10 @@ runs the real binary before the work is called ready.
   keeps it); and finally the tester removing the other leftover by hand and running
   `apply --remove` once more (the record is written once, the leftover no longer listed).
   After each flow the tester compares the restored trees with the fixture and searches every
-  output for the fake `.env` value.
+  output for the fake `.env` value. A quarantine whose deletion never started cannot be reached
+  by hand on a release binary (the step hook is compiled out, AC-35, and the window between the
+  rename and the first unlink is short), so that state is covered by NEG-65 and `quarantine.rs`,
+  not by this flow.
 - **Killed parent, macOS and Linux, against (b).** During an upload the tester stops the rclone
   child with `kill -STOP`, kills the tool with `kill -9`, starts a `--backup-only` run, and checks
   that the stopped child's spool directory is still there and is reported with its pid; then sends
