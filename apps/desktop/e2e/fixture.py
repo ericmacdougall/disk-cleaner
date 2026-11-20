@@ -2,7 +2,7 @@
 """Build the end-to-end fixture tree (PR gate F1). Deterministic: names and sizes come from
 seed 16452. Every name is made up.
 
-usage: fixture.py ROOT [--wide N]
+usage: fixture.py ROOT [--wide N] [--many M]
 
 ROOT/
   proj-web/            a git repository, committed, then one tracked file touched so the
@@ -12,6 +12,7 @@ ROOT/
   proj-old/            a git repository whose last change is a year old, with a target/ folder
   wide/                N files in one folder (default 5,000), for scrolling
   loose/               loose files of several sizes
+  many/appNNN/         M small projects with node_modules (default 150), for paging
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ def main(argv: list[str]) -> int:
         return 2
     root = Path(argv[0])
     wide = int(argv[argv.index("--wide") + 1]) if "--wide" in argv else 5000
+    many = int(argv[argv.index("--many") + 1]) if "--many" in argv else 150
     rng = random.Random(SEED)
     root.mkdir(parents=True, exist_ok=True)
 
@@ -90,8 +92,13 @@ def main(argv: list[str]) -> int:
         write(root / "wide" / f"w{i:05}.bin", rng.randrange(0, 8192), rng)
     for i, size in enumerate([0, 1, 4095, 4096, 1 << 20, 3 << 20]):
         write(root / "loose" / f"loose{i}.dat", size, rng)
+    # Enough small projects that one developer-view class has more than one page (100 items).
+    for i in range(many):
+        app = root / "many" / f"app{i:03}"
+        write(app / "package.json", 120, rng)
+        write(app / "node_modules" / "dep" / "index.js", rng.randrange(1024, 8192), rng)
     count = sum(len(f) + len(d) for _, d, f in os.walk(root))
-    print(f"fixture: {count} entries under {root} (seed {SEED}, wide {wide})")
+    print(f"fixture: {count} entries under {root} (seed {SEED}, wide {wide}, many {many})")
     return 0
 
 

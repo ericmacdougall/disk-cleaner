@@ -4,6 +4,7 @@
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import path from "node:path";
 import { Session } from "./webdriver.mjs";
 
 const require = createRequire(import.meta.url);
@@ -21,6 +22,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Start tauri-driver on `port`; resolves once it answers /status. */
 export async function startDriver({ driver = "tauri-driver", port = 4444, nativeDriver, env }) {
+  // Windows runners name the Edge driver's folder in EDGEWEBDRIVER (Git Bash does not pass it
+  // on reliably; Node reads it case-insensitively).
+  if (!nativeDriver && process.platform === "win32" && process.env.EDGEWEBDRIVER) {
+    nativeDriver = path.join(process.env.EDGEWEBDRIVER, "msedgedriver.exe");
+  }
+  if (nativeDriver) console.log(`native driver: ${nativeDriver}`);
   const argv = ["--port", String(port)];
   if (nativeDriver) argv.push("--native-driver", nativeDriver);
   const proc = spawn(driver, argv, { env, stdio: ["ignore", "inherit", "inherit"] });

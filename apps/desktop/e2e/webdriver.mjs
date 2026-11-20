@@ -69,8 +69,49 @@ export class Session {
     return v.map((e) => e[ELEMENT]);
   }
 
+  /** The first element matching `css` whose trimmed text is `text` (or starts with it, when
+   * `prefix`); waits up to `timeoutMs`. */
+  async findText(css, text, { prefix = false, timeoutMs = 30_000 } = {}) {
+    const v = await this.until(
+      `const [css, text, prefix] = arguments;
+       return [...document.querySelectorAll(css)].find((e) => {
+         const t = e.textContent.trim();
+         return prefix ? t.startsWith(text) : t === text;
+       }) ?? null;`,
+      timeoutMs,
+      css,
+      text,
+      prefix,
+    );
+    return v[ELEMENT];
+  }
+
   click(el) {
     return this.cmd("POST", `/element/${el}/click`, {});
+  }
+
+  /** Click a button by its text (waits for it, and for it to be enabled). */
+  async clickText(text, css = "button", opts = {}) {
+    const el = await this.findText(`${css}:not([disabled])`, text, opts);
+    await this.click(el);
+    return el;
+  }
+
+  dblclick(el) {
+    const press = [
+      { type: "pointerDown", button: 0 },
+      { type: "pointerUp", button: 0 },
+    ];
+    return this.cmd("POST", "/actions", {
+      actions: [
+        {
+          type: "pointer",
+          id: "mouse",
+          parameters: { pointerType: "mouse" },
+          actions: [{ type: "pointerMove", origin: { [ELEMENT]: el }, x: 0, y: 0 }, ...press, ...press],
+        },
+      ],
+    });
   }
 
   text(el) {
