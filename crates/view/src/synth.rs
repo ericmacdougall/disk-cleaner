@@ -185,11 +185,75 @@ pub fn synthetic_scan(nodes: usize, seed: u64) -> ScanResult {
         files += node.files_total;
         out.push(node);
     }
+    scan_document("/synthetic", out, by_class, total, files)
+}
+
+/// A size-walk tree and a matching scan for the widest case the desktop installs: one root
+/// folder `/wide` holding `dirs` folders `d0`, `d1`, ..., each holding one file, and a scan in
+/// which every one of those folders is a regenerable folder (so each becomes a plan item).
+pub fn wide_dir_scan(dirs: usize, seed: u64) -> (Tree, ScanResult) {
+    let mut rng = SplitMix64::new(seed);
+    let mut b = TreeBuilder::with_capacity(2 * dirs + 1, true);
+    let root = b
+        .push(NewEntry {
+            parent: None,
+            name: "/wide",
+            kind: EntryKind::Dir,
+            size: 0,
+            alloc: 4096,
+            files: 0,
+            mtime: EPOCH,
+            flags: 0,
+        })
+        .expect("root");
+    let mut out: Vec<Node> = Vec::with_capacity(dirs);
+    let mut by_class: BTreeMap<String, u64> = BTreeMap::new();
+    let mut total = 0u64;
+    for i in 0..dirs {
+        let name = format!("d{i}");
+        let dir = b
+            .push(NewEntry {
+                parent: Some(root),
+                name: &name,
+                kind: EntryKind::Dir,
+                size: 0,
+                alloc: 4096,
+                files: 0,
+                mtime: EPOCH - 400 * 86_400,
+                flags: 0,
+            })
+            .expect("dir");
+        let e = file_entry(dir, "f.bin", &mut rng);
+        let bytes = e.alloc;
+        b.push(e).expect("file");
+        let mut node = Node::new(format!("/wide/{name}"), Class::Regenerable);
+        node.bytes_self = bytes;
+        node.bytes_total = bytes;
+        node.files_total = 1;
+        node.newest_mtime = Some(EPOCH - 400 * 86_400);
+        node.rule = Some("synthetic".into());
+        let key = Class::Regenerable.as_str().to_string();
+        *by_class.entry(key).or_default() += bytes;
+        total += bytes;
+        out.push(node);
+    }
+    let tree = b.finish(Vec::new(), WalkStats::default());
+    (tree, scan_document("/wide", out, by_class, total, dirs as u64))
+}
+
+fn scan_document(
+    root: &str,
+    out: Vec<Node>,
+    by_class: BTreeMap<String, u64>,
+    total: u64,
+    files: u64,
+) -> ScanResult {
+    let nodes = out.len();
     ScanResult {
         schema_version: SCHEMA_VERSION,
         tool_version: "synthetic".into(),
         generated_at: EPOCH,
-        roots: vec!["/synthetic".into()],
+        roots: vec![root.into()],
         options: ScanOptionsRecord {
             one_file_system: true,
             top_files: 0,

@@ -18,7 +18,7 @@ use disk_cleaner_view::settings::{
     self, AppSettings, CoreChanges, Loaded, SaveHooks, SaveOutcome, SettingsError,
 };
 use disk_cleaner_view::table::TreeView;
-use disk_cleaner_view::tree::{NodeId, TopFile, WalkStats};
+use disk_cleaner_view::tree::{NodeId, TopFile, Tree, WalkStats};
 use disk_cleaner_view::units;
 use disk_cleaner_view::walk::{check_root, walk, Progress, WalkError, WalkOptions};
 use serde::Serialize;
@@ -142,7 +142,17 @@ pub struct Inner {
     /// The worker executable and git program (tests use the built app and a fake git).
     worker_exe: Mutex<Option<PathBuf>>,
     git_program: Mutex<OsString>,
+    /// Test builds: runs while an analysis's tree tags are prepared.
+    #[cfg(debug_assertions)]
+    prepare_hook: Mutex<Option<Hook>>,
+    /// Test builds: runs once an import has been admitted, before the file is read.
+    #[cfg(debug_assertions)]
+    import_hook: Mutex<Option<Hook>>,
 }
+
+/// A test hook.
+#[cfg(debug_assertions)]
+pub type Hook = Arc<dyn Fn() + Send + Sync>;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -170,7 +180,48 @@ impl Inner {
             app_settings: Mutex::new(app),
             worker_exe: Mutex::new(None),
             git_program: Mutex::new("git".into()),
+            #[cfg(debug_assertions)]
+            prepare_hook: Mutex::new(None),
+            #[cfg(debug_assertions)]
+            import_hook: Mutex::new(None),
         })
+    }
+
+    /// Test builds: run `hook` while an analysis's tree tags are prepared.
+    #[cfg(debug_assertions)]
+    pub fn set_prepare_hook(&self, hook: Option<Hook>) {
+        *lock(&self.prepare_hook) = hook;
+    }
+
+    /// Test builds: run `hook` once an import has been admitted, before the file is read.
+    #[cfg(debug_assertions)]
+    pub fn set_import_hook(&self, hook: Option<Hook>) {
+        *lock(&self.import_hook) = hook;
+    }
+
+    fn run_prepare_hook(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let hook = lock(&self.prepare_hook).clone();
+            if let Some(h) = hook {
+                h();
+            }
+        }
+    }
+
+    fn run_import_hook(&self) {
+        #[cfg(debug_assertions)]
+        {
+            let hook = lock(&self.import_hook).clone();
+            if let Some(h) = hook {
+                h();
+            }
+        }
+    }
+
+    /// Whether nobody holds the session lock right now (tests).
+    pub fn session_is_free(&self) -> bool {
+        self.session.try_lock().is_ok()
     }
 
     /// Tests: run this executable as the worker, with this git program.
@@ -313,6 +364,7 @@ impl Inner {
             if self.settings_gen.load(Ordering::SeqCst) != gen {
                 continue;
             }
+            self.run_prepare_hook();
             install_analysis(&mut s, built);
             return Ok(true);
         }
@@ -437,6 +489,37 @@ impl Inner {
             Err(WalkError::Cancelled) => return,
             Err(e) => return self.fail(id, e.to_string(), &emit),
         };
+        let Some(view_id) = self.show_walk(id, tree, &roots) else {
+            return;
+        };
+        emit(&ScanEvent {
+            job: id,
+            state: JobState::Analysing,
+            progress: None,
+            view: Some(view_id),
+            error: None,
+        });
+        let scan_result = match self.run_worker(id, &roots, scan, &app) {
+            Ok(Some(s)) => s,
+            Ok(None) => return,
+            Err(m) => return self.fail(id, m, &emit),
+        };
+        match self.show_scan(id, view_id, Arc::new(scan_result)) {
+            Ok(true) => emit(&ScanEvent {
+                job: id,
+                state: JobState::Done,
+                progress: None,
+                view: Some(view_id),
+                error: None,
+            }),
+            Ok(false) => {}
+            Err(m) => self.fail(id, m, &emit),
+        }
+    }
+
+    /// Show job `id`'s size walk: the tree goes on screen and the job moves to Analysing.
+    /// Returns the new view id, or `None` when the job is no longer current.
+    pub fn show_walk(&self, id: JobId, tree: Tree, roots: &[PathBuf]) -> Option<u64> {
         let top_files = tree.top_files.clone();
         let stats = tree.stats.clone();
         let mut view = TreeView::new(tree);
@@ -448,7 +531,7 @@ impl Inner {
         let old = {
             let mut s = self.session();
             if !self.jobs.advance(id, JobState::Analysing) {
-                return;
+                return None;
             }
             std::mem::replace(
                 &mut *s,
@@ -469,45 +552,30 @@ impl Inner {
             )
         };
         drop(old);
-        emit(&ScanEvent {
-            job: id,
-            state: JobState::Analysing,
-            progress: None,
-            view: Some(view_id),
-            error: None,
-        });
-        let scan_result = match self.run_worker(id, &roots, scan, &app) {
-            Ok(Some(s)) => s,
-            Ok(None) => return,
-            Err(m) => return self.fail(id, m, &emit),
-        };
-        let scan_result = Arc::new(scan_result);
+        Some(view_id)
+    }
+
+    /// Show job `id`'s analysis in view `view_id` and finish the job. `Ok(false)` when the job
+    /// or the view was replaced meanwhile (nothing is shown).
+    pub fn show_scan(&self, id: JobId, view_id: u64, scan: Arc<ScanResult>) -> Result<bool, String> {
         for _ in 0..3 {
-            let (inputs, gen) = match self.plan_inputs() {
-                Ok(x) => x,
-                Err(e) => return self.fail(id, format!("cannot read the settings: {e}"), &emit),
-            };
-            let built = build_analysis(Arc::clone(&scan_result), &inputs, gen, false, units::now());
+            let (inputs, gen) = self
+                .plan_inputs()
+                .map_err(|e| format!("cannot read the settings: {e}"))?;
+            let built = build_analysis(Arc::clone(&scan), &inputs, gen, false, units::now());
             let mut s = self.session();
             if !self.jobs.is_current(id) || s.view_id != view_id {
-                return;
+                return Ok(false);
             }
             if self.settings_gen.load(Ordering::SeqCst) != gen {
                 continue;
             }
+            self.run_prepare_hook();
             install_analysis(&mut s, built);
             self.jobs.advance(id, JobState::Done);
-            drop(s);
-            emit(&ScanEvent {
-                job: id,
-                state: JobState::Done,
-                progress: None,
-                view: Some(view_id),
-                error: None,
-            });
-            return;
+            return Ok(true);
         }
-        self.fail(id, "the settings kept changing; scan again".into(), &emit);
+        Err("the settings kept changing; scan again".into())
     }
 
     /// Run the analysis worker; `Ok(None)` when the job was cancelled.
@@ -625,6 +693,7 @@ impl Inner {
     /// Show a scan file: import protocol of spec AC-11, then plan. Refused while a scan runs.
     pub fn import_file(&self, path: &Path) -> Result<u64, AppError> {
         self.refuse_while_running()?;
+        self.run_import_hook();
         let imported = import::import(path, Limits::default()).map_err(|e| AppError::refused(e.to_string()))?;
         let scan = Arc::new(imported.scan);
         let roots = scan.roots.iter().map(|r| display_name(r)).collect();

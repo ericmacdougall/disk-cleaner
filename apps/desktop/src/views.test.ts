@@ -1,3 +1,4 @@
+import axe from "axe-core";
 import { describe, expect, it } from "vitest";
 import { App } from "./app";
 import { flush, mockBackend, syntheticPage, SETTINGS } from "./testing";
@@ -90,7 +91,8 @@ describe("tree grid (spec AC-4, AC-9, NEG-12)", () => {
     Object.defineProperty(scroller, "clientHeight", { value: 1_000_000 });
     await g.load();
     expect(g.el.querySelectorAll('.tg-body [role="row"]').length).toBe(MAX_DOM_ROWS);
-    expect(scroller.getAttribute("aria-rowcount")).toBe("1000000");
+    // The header row counts: one million entries and one header (PR gate F6).
+    expect(scroller.getAttribute("aria-rowcount")).toBe("1000001");
     for (const call of b.calls.filter((c) => c.name === "treePage")) expect(call.args[2]).toBeLessThanOrEqual(MAX_DOM_ROWS);
   });
 
@@ -115,6 +117,26 @@ describe("tree grid (spec AC-4, AC-9, NEG-12)", () => {
       [1, 0],
       [1, 40],
     ]);
+  });
+
+  it("owns its column headers and rows in one treegrid, with matching counts and indexes (PR gate F6)", async () => {
+    const b = mockBackend({ treePage: async (view, offset, limit) => syntheticPage(view, 50, offset, limit) });
+    const g = new TreeGrid(b, 1, () => undefined, "Linux");
+    document.body.replaceChildren(g.el);
+    await g.load();
+    const grids = g.el.querySelectorAll('[role="treegrid"]');
+    expect(grids.length).toBe(1);
+    const grid = grids[0] as HTMLElement;
+    expect(grid.querySelectorAll('[role="columnheader"]').length).toBe(6);
+    // Every row is inside the grid, in a rowgroup.
+    expect(grid.querySelectorAll('[role="row"]').length).toBe(g.el.querySelectorAll('[role="row"]').length);
+    for (const row of grid.querySelectorAll('[role="row"]')) expect(row.parentElement?.getAttribute("role")).toBe("rowgroup");
+    expect(grid.getAttribute("aria-rowcount")).toBe("51");
+    const head = grid.querySelector('[role="columnheader"]')?.closest('[role="row"]');
+    expect(head?.getAttribute("aria-rowindex")).toBe("1");
+    expect(grid.querySelector('.tg-body [role="row"]')?.getAttribute("aria-rowindex")).toBe("2");
+    const result = await axe.run(g.el, { rules: { "color-contrast": { enabled: false } } });
+    expect(result.violations.map((v) => `${v.id}: ${v.nodes.length}`)).toEqual([]);
   });
 
   it("says file length, not allocated size, only on Windows", () => {
@@ -514,6 +536,56 @@ describe("agent session folders (spec AC-13)", () => {
 });
 
 describe("app shell (spec AC-4, AC-7)", () => {
+  it("Open a scan file is disabled while a file is read, and a second click reads nothing (PR gate F5)", async () => {
+    let release: (v: null) => void = () => undefined;
+    let calls = 0;
+    const b = mockBackend({
+      openScanFile: () => {
+        calls += 1;
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      },
+    });
+    const app = new App(b);
+    document.body.replaceChildren(app.el);
+    await app.start();
+    await flush(20);
+    const open = () => [...app.el.querySelectorAll("button")].find((x) => x.textContent === "Open a scan file...") as HTMLButtonElement;
+    open().click();
+    open().click();
+    await flush(5);
+    expect(calls).toBe(1);
+    expect(open().disabled).toBe(true);
+    expect(app.el.textContent).toContain("Reading the scan file");
+    release(null);
+    await flush(5);
+    expect(open().disabled).toBe(false);
+  });
+
+  it("after a refused open, Open works again (PR gate F5)", async () => {
+    let calls = 0;
+    const b = mockBackend({
+      openScanFile: async () => {
+        calls += 1;
+        if (calls === 1) throw { kind: "refused", message: "a scan file is being opened" };
+        return null;
+      },
+    });
+    const app = new App(b);
+    document.body.replaceChildren(app.el);
+    await app.start();
+    await flush(20);
+    const open = () => [...app.el.querySelectorAll("button")].find((x) => x.textContent === "Open a scan file...") as HTMLButtonElement;
+    open().click();
+    await flush(5);
+    expect(app.el.textContent).toContain("Cannot open that scan file");
+    expect(open().disabled).toBe(false);
+    open().click();
+    await flush(5);
+    expect(calls).toBe(2);
+  });
+
   it("Apply exists only as a disabled explanation", async () => {
     const b = mockBackend({
       currentState: async () => ({ job: null, state: "idle", view: 5, imported: true, has_tree: false, has_analysis: true, roots: [] }),
