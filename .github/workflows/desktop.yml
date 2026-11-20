@@ -373,7 +373,9 @@ jobs:
           fi
           kill "$pid"; wait "$pid" 2>/dev/null || true
           echo "Written by a 20 s idle launch:"
-          find "$data" "$cache" -maxdepth 4 2>/dev/null | sed "s|^$HOME|~|"
+          # find fails on a folder that does not exist, which is the good case.
+          listing=$(find "$data" "$cache" -maxdepth 4 2>/dev/null | sed "s|^$HOME|~|" || true)
+          echo "${listing:-nothing under ~/Library/WebKit/$id or ~/Library/Caches/$id}"
           du -sk "$data" "$cache" 2>/dev/null || true
           if [ -e "$data/WebsiteData/ResourceLoadStatistics" ]; then
             echo "::error::the webview keeps a persistent ResourceLoadStatistics store"; exit 1

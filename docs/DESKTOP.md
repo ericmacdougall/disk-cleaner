@@ -89,8 +89,8 @@ account's home folder. The app runs the webview in incognito mode (`"incognito":
   with a `ResourceLoadStatistics` database still being written while idle) and
   `~/Library/Caches/<bundle id>/WebKit/` (8 KiB). CI (job "bundle (macos-arm64)") launches
   the app idle for 20 s, lists what it wrote and fails if the statistics database is written.
-  An idle launch may still create the folders themselves and the cache folder; the job log
-  lists them.
+  With incognito, CI saw an idle launch create neither folder. Folders that an older build
+  created are not removed; delete them by hand if wanted.
 - Windows (not observed here): WebView2 keeps a user data folder,
   `%LOCALAPPDATA%\io.github.ericmacdougall.prunedisk\EBWebView\`; incognito runs it InPrivate,
   which keeps browsing data out of it, but the runtime still creates the folder.
