@@ -103,13 +103,15 @@ try {
 
   // Refused IPC (before the fixture is offered, so the root check is the one under test).
   for (const [id, cmd, payload, expect] of [
-    ["ipc.refused.not_in_capabilities.dialog_open", "plugin:dialog|open", { options: {} }, null],
-    ["ipc.refused.not_in_capabilities.path", "plugin:path|resolve_directory", { directory: 10 }, null],
-    ["ipc.refused.not_in_capabilities.window_close", "plugin:window|close", { label: "main" }, null],
-    ["ipc.refused.unregistered", "delete_everything", {}, null],
+    // Refused by the capability list itself, not by the command (a granted path command
+    // answers "unknown path" for a bad argument: probe run 44686507550, capability variant).
+    ["ipc.refused.not_in_capabilities.dialog_open", "plugin:dialog|open", { options: {} }, "not allowed by ACL"],
+    ["ipc.refused.not_in_capabilities.path", "plugin:path|resolve_directory", { directory: 10 }, "not allowed by ACL"],
+    ["ipc.refused.not_in_capabilities.window_close", "plugin:window|close", { label: "main" }, "not allowed by ACL"],
+    ["ipc.refused.unregistered", "delete_everything", {}, "not allowed by ACL"],
     ["ipc.refused.root_not_offered", "start_scan", { roots: [a.fixture], settings: { collect_git_facts: false } }, "was not offered"],
     ["ipc.refused.too_many_roots", "start_scan", { roots: Array.from({ length: 65 }, () => a.fixture), settings: { collect_git_facts: false } }, "at most 64"],
-    ["ipc.refused.oversized_root", "start_scan", { roots: [a.fixture + "/x".repeat(1 << 19)], settings: { collect_git_facts: false } }, null],
+    ["ipc.refused.oversized_root", "start_scan", { roots: [a.fixture + "/x".repeat(1 << 19)], settings: { collect_git_facts: false } }, '"kind":"refused"'],
   ]) {
     await run.check(id, () => refused(cmd, payload, expect));
   }
@@ -199,7 +201,13 @@ try {
     return { rows: total };
   });
 
+  // The timings mean something only over the wide folder (probe run 44686507550 measured a
+  // short tree when the drill failed).
+  const wideShown = () => {
+    if (total < 1000) throw new Error(`the wide folder is not shown (${total} rows); not measured`);
+  };
   await run.check("timing.ipc_tree_page_p95", async () => {
+    wideShown();
     const view = (await state()).view;
     const ms = await app.s.execAsync(
       `const [view, total, warm, n, done] = arguments;
@@ -228,6 +236,7 @@ try {
   });
 
   await run.check("timing.scroll_p95", async () => {
+    wideShown();
     const ms = await app.s.execAsync(
       `const [n, step, rowH, done] = arguments;
        (async () => {

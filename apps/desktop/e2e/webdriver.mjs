@@ -83,23 +83,33 @@ export class Session {
   async findText(css, text, { prefix = false, timeoutMs = 30_000 } = {}) {
     // The match is tagged and then found with /element, so the click goes through the
     // driver's own element lookup.
-    const token = String(++this.tagged);
-    await this.until(
-      `const [css, text, prefix, token] = arguments;
-       const e = [...document.querySelectorAll(css)].find((e) => {
-         const t = e.textContent.trim();
-         return prefix ? t.startsWith(text) : t === text;
-       });
-       if (!e) return false;
-       e.setAttribute("data-e2e-find", token);
-       return true;`,
-      timeoutMs,
-      css,
-      text,
-      prefix,
-      token,
-    );
-    return this.find(`[data-e2e-find="${token}"]`);
+    // A re-render can replace the tagged element before the lookup (probe run 44686507550):
+    // tag and look up again until the deadline.
+    const end = Date.now() + timeoutMs;
+    for (;;) {
+      const token = String(++this.tagged);
+      await this.until(
+        `const [css, text, prefix, token] = arguments;
+         const e = [...document.querySelectorAll(css)].find((e) => {
+           const t = e.textContent.trim();
+           return prefix ? t.startsWith(text) : t === text;
+         });
+         if (!e) return false;
+         e.setAttribute("data-e2e-find", token);
+         return true;`,
+        Math.max(1000, end - Date.now()),
+        css,
+        text,
+        prefix,
+        token,
+      );
+      try {
+        return await this.find(`[data-e2e-find="${token}"]`);
+      } catch (e) {
+        if (Date.now() > end) throw e;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
   }
 
   click(el) {
