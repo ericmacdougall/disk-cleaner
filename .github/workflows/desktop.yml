@@ -62,15 +62,17 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         with:
           manifest-path: apps/desktop/src-tauri/Cargo.toml
+          # --config is a global option, so it goes before the subcommand.
+          arguments: --all-features --config apps/desktop/src-tauri/deny.toml
           command: list
-          command-arguments: --config apps/desktop/src-tauri/deny.toml --layout crate
+          command-arguments: --layout crate
       - name: Licences and advisories
         if: ${{ !cancelled() }}
         uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         with:
           manifest-path: apps/desktop/src-tauri/Cargo.toml
+          arguments: --all-features --config apps/desktop/src-tauri/deny.toml
           command: check licenses advisories
-          command-arguments: --config apps/desktop/src-tauri/deny.toml
 
   readonly-guard:
     name: read-only guard

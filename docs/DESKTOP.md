@@ -18,7 +18,27 @@ Keys: Up/Down (or `k`/`j`), PageUp/PageDown, Home/End (or `g`/`G`) move; in the 
 Enter, Right or `l` opens a folder, Left, Backspace or `h` goes up, Space expands or
 collapses, `s` and `r` change the sort; Tab (or `1`, `2`) switches between the size tree and
 the developer view; `e` exports the plan JSON to a new file in the current folder (never
-overwriting one); `?` shows help; `q` or Ctrl+C quits.
+overwriting one); `i` shows every notice of the developer view in a scrolling box (Up/Down,
+PageUp/PageDown, Home/End; Esc, `i` or `q` closes it); `?` shows help; `q` or Ctrl+C quits.
+
+The developer view's header lists, in this order: the source, the scan's time and that the
+plan is a dry run; the reclaimable total; then the safety notices (an old imported scan, that
+an imported scan's process check describes this computer, the process check and its note,
+incomplete coverage, entries the size walk could not read, unverified remote facts); then the
+breakdown by action and the active window. It grows to fit and keeps at least the item list
+and the reason box; when a small terminal cuts it, its title says how many lines are hidden
+and that `i` shows them all.
+
+Size tree columns: Allocated is the disk space used (on Windows the column is Length, the
+file length, as in core); Size is the apparent size, file lengths with each folder's own
+directory entry included, as `du --apparent-size` counts; % parent is the entry's share of its
+parent folder's allocated space, so it orders like Allocated and is not a sort key.
+
+Disclosed limit: quitting while the analysis runs does not stop the git commands it already
+started. They are local and read-only and normally end within a second (the click-test saw
+three outlive the view by about 0.13 s), but core's 30 s git timeout is enforced by the view
+itself, so after it exits nothing ends a git that hangs, for example on a stuck network file
+system. The desktop app runs its analysis in a contained worker and has no such gap (below).
 
 ## Desktop app
 
@@ -74,3 +94,4 @@ All in CI; nothing is built on a developer machine by default.
 | frontend unit tests (vitest, jsdom, mocked backend) | job "frontend unit tests" (`npm test` in `apps/desktop`) |
 | desktop backend, worker and containment | jobs "desktop backend (linux)", "worker containment" (`cargo test` in `apps/desktop/src-tauri`, then `scripts/repeat-containment.sh 10`) |
 | one million nodes | job "performance at one million nodes" (results in the job summary and the `perf-results` artifact) |
+| licences and advisories of the desktop lockfile | job "cargo deny (desktop workspace)" (`apps/desktop/src-tauri/deny.toml`; each advisory ignore gives its reason). ci.yml's "cargo deny licenses" covers the root lockfile, licences only |

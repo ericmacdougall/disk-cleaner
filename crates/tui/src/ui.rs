@@ -34,18 +34,120 @@ const HELP: &[(&str, &str)] = &[
     ("Enter, Right, l", "open the selected folder (drill down)"),
     ("Left, Backspace, h", "go up one folder"),
     ("Space", "expand or collapse the selected folder in place"),
-    (
-        "s",
-        "sort by the next column (allocated, size, files, modified, name)",
-    ),
+    ("s", "sort by the next column ({sort})"),
     ("r", "reverse the sort order"),
     (
         "e",
         "export the plan as JSON to a new file in the current folder",
     ),
+    (
+        "i",
+        "show every notice of the developer view (Up and Down scroll it)",
+    ),
     ("?", "show or hide this help"),
     ("q, Ctrl-C", "quit"),
 ];
+
+/// The help's last line.
+const NOTHING_CHANGES: &str = "Nothing here deletes, moves or backs up anything.";
+
+/// The order `s` goes through, as the help names it.
+fn sort_order() -> String {
+    format!(
+        "{}, size, files, modified, name",
+        allocated_header().to_lowercase()
+    )
+}
+
+/// What the size tree's columns mean (F8: Size and % parent are easy to misread).
+fn columns_note() -> String {
+    let first = if cfg!(windows) {
+        "Length: file length."
+    } else {
+        "Allocated: disk space used."
+    };
+    format!(
+        "{first} Size: apparent size (file lengths, folders' own entries included, as du \
+         --apparent-size). % parent: share of the parent folder's allocated space, so it \
+         orders like {}; not a sort key.",
+        allocated_header()
+    )
+}
+
+/// Display width of a string.
+fn width(s: &str) -> usize {
+    Span::raw(s).width()
+}
+
+/// Display width of a character.
+fn char_width(c: char) -> usize {
+    let mut buf = [0u8; 4];
+    width(c.encode_utf8(&mut buf))
+}
+
+/// Word-wrap `text` to `cols` display columns. A word wider than a line is broken by width,
+/// never inside a character.
+pub fn wrap(text: &str, cols: usize) -> Vec<String> {
+    let cols = cols.max(1);
+    let mut out = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let w = width(word);
+        if used > 0 && used + 1 + w <= cols {
+            line.push(' ');
+            line.push_str(word);
+            used += 1 + w;
+            continue;
+        }
+        if used > 0 {
+            out.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        if w <= cols {
+            line.push_str(word);
+            used = w;
+            continue;
+        }
+        for c in word.chars() {
+            let cw = char_width(c);
+            if used > 0 && used + cw > cols {
+                out.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            line.push(c);
+            used += cw;
+        }
+    }
+    if used > 0 || out.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+/// `s` if it fits in `cols` display columns, else an ellipsis and as much of its end as fits
+/// (the end of a path names the folder).
+pub fn fit_tail(s: &str, cols: usize) -> String {
+    if width(s) <= cols {
+        return s.to_string();
+    }
+    if cols == 0 {
+        return String::new();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 1;
+    for c in s.chars().rev() {
+        let cw = char_width(c);
+        if used + cw > cols {
+            break;
+        }
+        used += cw;
+        tail.push(c);
+    }
+    let mut out = String::from("\u{2026}");
+    out.extend(tail.iter().rev());
+    out
+}
 
 /// Draw the whole screen.
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -61,6 +163,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Tab::Dev => draw_dev(f, app, body),
     }
     draw_footer(f, app, foot);
+    if app.details {
+        draw_details(f, app, f.area());
+    }
     if app.help {
         draw_help(f, f.area());
     }
@@ -243,7 +348,13 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(table, inner);
 }
 
-fn dev_summary(app: &App) -> Vec<Line<'static>> {
+/// Said when core reports incomplete coverage without a note.
+const NO_COVERAGE_DETAIL: &str = "Coverage is incomplete (the scan gave no detail), so links \
+                                  or clones in what was not read were not checked.";
+
+/// The developer view's notices, one paragraph each: what the numbers are and how far to trust
+/// them first, then the safety notices (they must never be cut off), then the breakdown.
+pub fn dev_notes(app: &App) -> Vec<String> {
     let Some(dev) = &app.dev else {
         let text = match &app.analysis {
             AnalysisState::Waiting => "The analysis starts after the size walk.".to_string(),
@@ -251,21 +362,47 @@ fn dev_summary(app: &App) -> Vec<Line<'static>> {
             AnalysisState::Failed(e) => format!("The analysis failed: {e}"),
             AnalysisState::Done => String::new(),
         };
-        return vec![Line::from(text)];
+        return vec![text];
     };
     let s = &dev.summary;
     let t = &s.plan_totals;
     let mut lines = vec![
-        Line::from(format!(
+        format!(
             "Source: analysis (core scan and plan), scan made {}. Dry run: nothing is changed.",
             units::ago(Some(s.scan_generated_at), app.now)
-        )),
-        Line::from(format!(
+        ),
+        format!(
             "Reclaimable if every removing action completed: {}  (ready now, regenerable only: {})",
             units::bytes(t.reclaimable_bytes),
             units::bytes(t.ready_bytes)
-        )),
+        ),
     ];
+    if let Some(n) = &s.stale_warning {
+        lines.push(format!("Warning: {n}"));
+    }
+    if let Some(n) = &s.imported_note {
+        lines.push(n.clone());
+    }
+    let process = match &s.process_check_note {
+        Some(n) => format!("Process check: {}. {n}", s.process_check),
+        None => format!("Process check: {}.", s.process_check),
+    };
+    lines.push(process);
+    if let Some(n) = &s.coverage_note {
+        lines.push(n.clone());
+    } else if !s.coverage_complete {
+        lines.push(NO_COVERAGE_DETAIL.to_string());
+    }
+    if let Some(view) = &app.tree {
+        let st = &view.tree().stats;
+        if st.unreadable > 0 {
+            lines.push(format!(
+                "Size walk: {} entries could not be read; their sizes are not counted.",
+                units::count(st.unreadable)
+            ));
+        }
+    }
+    lines.push(format!("Remote facts not verified: {}.", s.remote_facts_note));
     let by_action: Vec<String> = t
         .by_action
         .iter()
@@ -277,37 +414,45 @@ fn dev_summary(app: &App) -> Vec<Line<'static>> {
             )
         })
         .collect();
-    lines.push(Line::from(format!("By action: {}", by_action.join(", "))));
-    lines.push(Line::from(format!(
-        "Active window: {} days ({}). Remote facts not verified: {}",
-        s.active_window_days, s.window_source, s.remote_facts_note
-    )));
-    if let Some(n) = &s.coverage_note {
-        lines.push(Line::from(format!("Coverage: {n}")));
-    }
-    if let Some(n) = &s.stale_warning {
-        lines.push(Line::from(format!("Warning: {n}")));
-    }
-    if let Some(n) = &s.imported_note {
-        lines.push(Line::from(n.clone()));
-    }
+    lines.push(format!("By action: {}", by_action.join(", ")));
+    lines.push(format!(
+        "Active window: {} days ({}).",
+        s.active_window_days, s.window_source
+    ));
     lines
 }
 
+/// Rows kept for the item list (at least) and the reason box under the header.
+const LIST_MIN: u16 = 3;
+const DETAIL_ROWS: u16 = 6;
+
 fn draw_dev(f: &mut Frame, app: &mut App, area: Rect) {
-    let summary = dev_summary(app);
+    let cols = area.width.saturating_sub(2) as usize;
+    let notes = dev_notes(app);
+    let mut wrapped: Vec<String> = notes.iter().flat_map(|n| wrap(n, cols)).collect();
+    // The header grows to fit its notices, up to what leaves the list and the reason box
+    // their rows; whatever does not fit is in the `i` overlay, and the title says so.
+    let most = area.height.saturating_sub(LIST_MIN + DETAIL_ROWS).max(3);
+    let height = (wrapped.len() as u16).saturating_add(2).min(most);
+    let shown = height.saturating_sub(2) as usize;
+    let title = if wrapped.len() > shown {
+        format!(
+            " Developer view ({} more lines: press i for every notice) ",
+            wrapped.len() - shown
+        )
+    } else {
+        " Developer view (i: every notice) ".to_string()
+    };
     let [top, list, detail] = Layout::vertical([
-        Constraint::Length(summary.len() as u16 + 2),
-        Constraint::Min(3),
-        Constraint::Length(6),
+        Constraint::Length(height),
+        Constraint::Min(LIST_MIN),
+        Constraint::Length(DETAIL_ROWS),
     ])
     .areas(area);
+    wrapped.truncate(shown);
+    let summary: Vec<Line> = wrapped.into_iter().map(Line::from).collect();
     f.render_widget(
-        Paragraph::new(summary).wrap(Wrap { trim: true }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Developer view "),
-        ),
+        Paragraph::new(summary).block(Block::default().borders(Borders::ALL).title(title)),
         top,
     );
     let block = Block::default()
@@ -321,6 +466,8 @@ fn draw_dev(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     let mut lines: Vec<Line> = Vec::new();
+    // Columns left for the path after "  {action:<27} {bytes:>10}  ".
+    let path_cols = (inner.width as usize).saturating_sub(42);
     let end = (app.dev_top + inner.height as usize).min(app.dev_rows.len());
     for i in app.dev_top..end {
         let selected = i == app.dev_sel;
@@ -340,7 +487,7 @@ fn draw_dev(f: &mut Frame, app: &mut App, area: Rect) {
                     "  {:<27} {:>10}  {}",
                     it.action,
                     units::bytes(it.reclaimable_bytes),
-                    it.path
+                    fit_tail(&it.path, path_cols)
                 )
             }
             DevRow::SessionsHeader => format!(
@@ -353,7 +500,7 @@ fn draw_dev(f: &mut Frame, app: &mut App, area: Rect) {
                     "  {:<27} {:>10}  {}",
                     s.layout,
                     units::bytes(s.alloc),
-                    s.path
+                    fit_tail(&s.path, path_cols)
                 )
             }
         };
@@ -411,26 +558,78 @@ fn draw_dev(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
-    let w = area.width.min(78);
-    let h = (HELP.len() as u16 + 4).min(area.height);
-    let rect = Rect {
+/// The help text wrapped to `cols`: keys in a left column, their text wrapped beside it with a
+/// hanging indent, then what the columns mean.
+fn help_lines(cols: usize) -> Vec<String> {
+    let key_cols = (cols / 3).min(24);
+    let text_cols = cols.saturating_sub(key_cols).max(1);
+    let mut out = Vec::new();
+    for (k, v) in HELP {
+        let v = v.replace("{sort}", &sort_order());
+        // A key list too wide for its column gets a line of its own.
+        let mut key = *k;
+        if width(key) >= key_cols {
+            out.push(key.to_string());
+            key = "";
+        }
+        for part in wrap(&v, text_cols) {
+            out.push(format!("{key:<key_cols$}{part}"));
+            key = "";
+        }
+    }
+    out.push(String::new());
+    out.extend(wrap(&columns_note(), cols));
+    out.push(String::new());
+    out.extend(wrap(NOTHING_CHANGES, cols));
+    out
+}
+
+/// A box of `w` by `h` centred in `area` (never larger than it).
+fn centred(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + (area.height - h) / 2,
         width: w,
         height: h,
-    };
-    let mut lines: Vec<Line> = HELP
-        .iter()
-        .map(|(k, v)| Line::from(format!("{k:<24}{v}")))
-        .collect();
-    lines.push(Line::from(""));
-    lines.push(Line::from(
-        "Nothing here deletes, moves or backs up anything.",
-    ));
+    }
+}
+
+fn draw_help(f: &mut Frame, area: Rect) {
+    let w = area.width.min(78);
+    let lines = help_lines(w.saturating_sub(2) as usize);
+    let rect = centred(area, w, (lines.len() as u16).saturating_add(2));
+    let lines: Vec<Line> = lines.into_iter().map(Line::from).collect();
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Keys ")),
+        rect,
+    );
+}
+
+/// Every notice of the developer view, scrollable (`i`): the header shows only what fits.
+fn draw_details(f: &mut Frame, app: &mut App, area: Rect) {
+    let rect = centred(area, 100, area.height);
+    let cols = rect.width.saturating_sub(2) as usize;
+    let mut lines: Vec<String> = Vec::new();
+    for (i, n) in dev_notes(app).iter().enumerate() {
+        if i > 0 {
+            lines.push(String::new());
+        }
+        lines.extend(wrap(n, cols));
+    }
+    let rows = rect.height.saturating_sub(2) as usize;
+    app.details_page = rows.max(1);
+    app.details_top = app.details_top.min(lines.len().saturating_sub(rows));
+    let top = app.details_top;
+    let end = (top + rows).min(lines.len());
+    let (first, total) = (top + 1, lines.len());
+    let title = format!(" All notices, lines {first}-{end} of {total} (Up/Down, Esc closes) ");
+    let shown: Vec<Line> = lines[top..end].iter().cloned().map(Line::from).collect();
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(shown).block(Block::default().borders(Borders::ALL).title(title)),
         rect,
     );
 }

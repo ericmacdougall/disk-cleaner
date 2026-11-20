@@ -19,4 +19,12 @@ allow = [
 confidence-threshold = 0.8
 
 [advisories]
-ignore = []
+# Each of these comes with Tauri's Linux webview stack or its config parsing; none can be
+# updated from this repository without leaving Tauri 2. Found with the OSV database on
+# 2026-11-19 (the RustSec gtk-rs "unmaintained" notices RUSTSEC-2024-0411 to 0420 are
+# withdrawn there).
+ignore = [
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18 VariantStrIter is unsound; glib comes with webkit2gtk and gtk 0.18 (wry on Linux), which need glib 0.18, and the fix is in 0.20. This app never iterates a GVariant string array. Remove when Tauri's Linux webview moves past glib 0.18." },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is unmaintained; it is a build-time proc macro of glib-macros and gtk3-macros 0.18 (Tauri on Linux), with no code in the app at run time. Remove with the glib 0.18 stack." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (no known vulnerability); it comes through serde_with in tauri-utils. Remove when Tauri drops it." },
+]

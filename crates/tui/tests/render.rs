@@ -245,7 +245,10 @@ fn boxed(rows: &[Vec<String>], title: &str) -> Option<Vec<String>> {
 
 /// Text with every run of whitespace made one space, so wrapped sentences compare whole.
 fn flat(rows: &[String]) -> String {
-    rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+    rows.join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn flat_str(s: &str) -> String {
@@ -293,7 +296,9 @@ fn noisy_app(now: i64) -> App {
 fn notices(app: &App) -> Vec<String> {
     let s = &app.dev.as_ref().unwrap().summary;
     vec![
-        s.stale_warning.clone().expect("the scan is older than the window"),
+        s.stale_warning
+            .clone()
+            .expect("the scan is older than the window"),
         s.imported_note.clone().expect("imported"),
         s.process_check_note.clone().expect("partial"),
         s.coverage_note.clone().expect("incomplete"),
@@ -357,7 +362,10 @@ fn the_header_fits_every_notice_at_160x45() {
     let rows = cells(&mut app, 160, 45);
     let header = flat(&boxed(&rows, "Developer view").expect("the header box"));
     for n in &wanted {
-        assert!(header.contains(&flat_str(n)), "cut at 160x45: {n}\n{header}");
+        assert!(
+            header.contains(&flat_str(n)),
+            "cut at 160x45: {n}\n{header}"
+        );
     }
 }
 
@@ -462,7 +470,10 @@ fn long_paths_keep_their_tail_after_an_ellipsis() {
     let rows = cells(&mut app, 80, 30);
     let list = boxed(&rows, "Items by class").expect("the list box");
     let tails: Vec<&String> = list.iter().filter(|r| r.contains("modules")).collect();
-    assert!(!tails.is_empty(), "no item row shows its path's tail:\n{list:#?}");
+    assert!(
+        !tails.is_empty(),
+        "no item row shows its path's tail:\n{list:#?}"
+    );
     for r in tails {
         assert!(r.contains('…'), "a cut path must show an ellipsis: {r:?}");
         assert!(r.trim_end().ends_with("node_modules"), "{r:?}");

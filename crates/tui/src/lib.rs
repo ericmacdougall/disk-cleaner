@@ -104,8 +104,12 @@ pub fn run(args: TuiArgs) -> anyhow::Result<()> {
             }
         }
     }
-    // Stop the size walk; the analysis thread ends with the process. Git commands it started
-    // are local and read-only and stop at their own timeout.
+    // Stop the size walk; the analysis thread ends with the process. A documented limit
+    // (docs/DESKTOP.md, "Terminal view"): git commands the analysis already started are not
+    // stopped. They are read-only, and normally end within a second, but core's 30 s git
+    // timeout is enforced by this process, so once it has exited nothing ends a git that hangs
+    // (on a stuck network file system, say). The desktop app runs its analysis in a contained
+    // worker instead (apps/desktop/src-tauri/src/worker.rs).
     cancel.store(true, Ordering::Relaxed);
     Ok(())
 }

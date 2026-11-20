@@ -78,6 +78,11 @@ pub struct App {
     pub dev_top: usize,
     pub sessions: Vec<SessionFolder>,
     pub help: bool,
+    /// The overlay with every notice of the developer view (`i`), and its first line shown.
+    pub details: bool,
+    pub details_top: usize,
+    /// Lines the overlay could show in the last frame (set by drawing; paging uses it).
+    pub details_page: usize,
     pub status: String,
     pub walk: WalkState,
     pub analysis: AnalysisState,
@@ -103,6 +108,9 @@ impl App {
             dev_top: 0,
             sessions: Vec::new(),
             help: false,
+            details: false,
+            details_top: 0,
+            details_page: 20,
             status: String::new(),
             walk: WalkState::NotRun,
             analysis: AnalysisState::Waiting,
@@ -199,6 +207,9 @@ impl App {
             Msg::Analysing => self.analysis = AnalysisState::Running,
             Msg::Analysis(a) => {
                 let Analysis { scan, plan } = *a;
+                // The clock was read when the screen opened, and a live scan finishes later:
+                // without this its time would read as in the future, shown as unknown.
+                self.now = self.now.max(scan.generated_at).max(plan.generated_at);
                 self.set_analysis(&scan, plan, false);
             }
             Msg::AnalysisFailed(e) => self.analysis = AnalysisState::Failed(e),
@@ -329,6 +340,10 @@ impl App {
             }
             return Outcome::Continue;
         }
+        if self.details {
+            self.details_key(k.code);
+            return Outcome::Continue;
+        }
         let page = self.page.max(1);
         match k.code {
             KeyCode::Char('q') => return Outcome::Quit,
@@ -369,9 +384,33 @@ impl App {
             KeyCode::Char('s') if self.tab == Tab::Tree => self.resort(true),
             KeyCode::Char('r') if self.tab == Tab::Tree => self.resort(false),
             KeyCode::Char('e') => self.export(),
+            KeyCode::Char('i') => {
+                self.details = true;
+                self.details_top = 0;
+            }
             _ => {}
         }
         self.scroll_into_view();
         Outcome::Continue
+    }
+
+    /// Keys while the notices overlay is open: scroll it, or close it (Esc, `i`, `q`). Drawing
+    /// keeps the first line in range.
+    fn details_key(&mut self, code: KeyCode) {
+        let page = self.details_page.max(1);
+        let top = self.details_top;
+        self.details_top = match code {
+            KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
+                self.details = false;
+                0
+            }
+            KeyCode::Up | KeyCode::Char('k') => top.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => top.saturating_add(1),
+            KeyCode::PageUp => top.saturating_sub(page),
+            KeyCode::PageDown => top.saturating_add(page),
+            KeyCode::Home | KeyCode::Char('g') => 0,
+            KeyCode::End | KeyCode::Char('G') => usize::MAX,
+            _ => top,
+        };
     }
 }
