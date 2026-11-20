@@ -162,9 +162,11 @@ fn real_walk_over_a_million_empty_files() {
             "PERF real_walk_1m_files ms={t:.0} progress_events={events} per_second={per_s:.2} closest_gap_ms={closest:.1} threads={}",
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
         );
-        // Spec: at most 10 progress events per second, the last one included.
+        // Spec: at most 10 progress events per second, the last one included. The walk spaces
+        // its own timestamps 100 ms apart; this callback's clock reads a little later, so the
+        // gap seen here may be a few microseconds short (CI run 44645555857: "100.0").
         assert!(
-            per_s <= 10.0 && closest >= 100.0,
+            per_s <= 10.0 && closest >= 99.0,
             "{events} progress events in {t:.0} ms ({per_s:.2} a second), closest two {closest:.1} ms apart"
         );
         runs.push(t);
