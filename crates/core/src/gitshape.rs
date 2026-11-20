@@ -350,4 +350,17 @@ mod tests {
         assert_eq!(below_git_dir(&Path::new("w").join(".git")), None);
         assert_eq!(below_git_dir(Path::new("w/src")), None);
     }
+
+    /// Review M5: a ref file the walk saw as regular can be replaced by a FIFO before it is read.
+    #[cfg(unix)]
+    #[test]
+    fn a_ref_file_swapped_for_a_fifo_is_unread_without_blocking() {
+        use crate::test_fifo::{mkfifo, must_not_block};
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("main");
+        mkfifo(&fifo);
+        let p = fifo.clone();
+        let got = must_not_block(&fifo, move || ref_file_ok(&p).map_err(|e| e.to_string()));
+        assert_eq!(got, Err("not a regular file".to_string()));
+    }
 }
