@@ -41,6 +41,26 @@ grep -a -q PRUNEDISK_E2E_FOLDERS "$E2E_BIN" || { echo "::error::the e2e binary l
 if [ "$RELEASE_BIN" != none ] && grep -a -q remote-debugging-port "$RELEASE_BIN"; then
   echo "::error::the release binary contains remote-debugging-port"; exit 1
 fi
+# e2e/check-shipped.sh is the bundle job's proof that a shipped program is no e2e build. Its
+# control: on the e2e binary it must fail and name the strings that build holds (the
+# automation config's window title and the hooks everywhere, the DevTools switch on Windows).
+# The release binary must pass it.
+ext=""; if $win; then ext=.exe; fi
+mkdir -p "$OUT/shipped-e2e" "$OUT/shipped-release"
+cp "$E2E_BIN" "$OUT/shipped-e2e/prunedisk-desktop$ext"
+if bash e2e/check-shipped.sh "$OUT/shipped-e2e" "$OUT/shipped-e2e-work" > "$OUT/shipped-control.txt" 2>&1; then
+  cat "$OUT/shipped-control.txt"; echo "::error::check-shipped.sh passed the e2e binary (control)"; exit 1
+fi
+want=('holds "PRUNEDISK_E2E_"' 'holds "PruneDisk (end-to-end build)"')
+if $win; then want+=('holds "remote-debugging-port"'); fi
+for w in "${want[@]}"; do
+  grep -q -F "$w" "$OUT/shipped-control.txt" || { cat "$OUT/shipped-control.txt"; echo "::error::check-shipped.sh did not report: $w (control)"; exit 1; }
+done
+echo "control: check-shipped.sh fails the e2e binary, naming ${#want[@]} strings"
+if [ "$RELEASE_BIN" != none ]; then
+  cp "$RELEASE_BIN" "$OUT/shipped-release/prunedisk-desktop$ext"
+  bash e2e/check-shipped.sh "$OUT/shipped-release" "$OUT/shipped-release-work"
+fi
 
 echo "== fixture (seed 16452)"
 "$PY" e2e/fixture.py "$FIX"

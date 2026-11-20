@@ -3,7 +3,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "PruneDisk",
+        "title": "PruneDisk (end-to-end build)",
         "width": 1200,
         "height": 800,
         "minWidth": 720,

@@ -445,6 +445,12 @@ jobs:
         working-directory: apps/desktop
         shell: bash
         run: npx tauri build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: The shipped programs are not end-to-end builds (docs/DESKTOP.md)
+        # The bundle is built from src-tauri/tauri.conf.json alone: no --config and no e2e
+        # feature. This unpacks each bundle and looks for the strings only those add.
+        working-directory: apps/desktop
+        shell: bash
+        run: bash e2e/check-shipped.sh "src-tauri/target/${{ matrix.target }}/release/bundle" "$RUNNER_TEMP/shipped"
       - name: Stage bundles and checksums
         shell: bash
         run: |
