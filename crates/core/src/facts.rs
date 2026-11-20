@@ -853,10 +853,12 @@ fn parse_pseudoref(name: &str, bytes: &[u8]) -> Pseudo {
     }
 }
 
-/// Read at most [`MAX_PSEUDOREF_BYTES`] of a regular file.
+/// Read at most [`MAX_PSEUDOREF_BYTES`] of a regular file. Anything else, a FIFO or symlink
+/// swapped in after the caller's `lstat` included, is refused without blocking
+/// ([`crate::regular::open_regular`]).
 fn read_bounded(p: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+    let f = crate::regular::open_regular(p).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     f.take(MAX_PSEUDOREF_BYTES + 1)
         .read_to_end(&mut buf)
@@ -1206,9 +1208,98 @@ fn local_config_keys(git: &crate::git::Git, path: &Path) -> Result<Vec<String>, 
         .iter()
         .any(|k| k.eq_ignore_ascii_case("extensions.worktreeconfig"))
     {
-        keys.extend(list(&["--worktree"])?);
+        if worktree_config_exists(path)? {
+            keys.extend(list(&["--worktree"])?);
+        } else {
+            // git writes `config.worktree` only when a value is first set with `--worktree`, and
+            // `--worktree` fails when the file is missing. Missing means no keys, if git agrees:
+            // its own listing must show no worktree scope. (When git rejects this git directory
+            // and uses one above it, that one's file was not judged, so the repo is refused.)
+            // `--show-scope` is git 2.26; any failure of this listing is said in those words,
+            // with git's own error after them (its text is not matched).
+            let all = git
+                .run(
+                    path,
+                    &[
+                        "config",
+                        "--list",
+                        "--show-scope",
+                        "--includes",
+                        "--name-only",
+                    ],
+                )
+                .map_err(|e| {
+                    format!(
+                        "git config --show-scope failed (it needs git 2.26 or newer), so whether \
+                         git reads worktree-scoped config that was not judged is unknown: {}",
+                        note("config", &e)
+                    )
+                })?;
+            for line in all.lines() {
+                match line.split_once('\t') {
+                    Some((scope, _)) if scope != "worktree" => {}
+                    _ => {
+                        return Err(
+                            "git would read worktree-scoped config that was not judged (not \
+                             this git directory's config.worktree); no other git command was \
+                             run in this repo"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
     }
     Ok(keys)
+}
+
+/// Does this repo's per-worktree config file exist? Found by `lstat` and a bounded read of a
+/// `.git` file, never by running git: a `.git` directory holds it, a `.git` file names the git
+/// directory that does (a linked worktree's own `<common>/worktrees/<name>`), and with no `.git`
+/// (a bare repo) the directory itself does. A missing file is `false`; one that is not a regular
+/// file (a symlink, a directory) or cannot be looked at is refused, as `.git/modules` configs are
+/// ([`check_module_configs`]).
+fn worktree_config_exists(path: &Path) -> Result<bool, String> {
+    use std::io::ErrorKind::NotFound;
+    let dotgit = path.join(".git");
+    let gitdir = match std::fs::symlink_metadata(&dotgit) {
+        Ok(m) if m.is_dir() => dotgit,
+        Ok(m) if m.is_file() => gitfile_dir(path, &dotgit)?,
+        Ok(_) => return Err(".git is neither a directory nor a regular file".into()),
+        Err(e) if e.kind() == NotFound => path.to_path_buf(),
+        Err(e) => return Err(format!("cannot read .git: {e}")),
+    };
+    match std::fs::symlink_metadata(gitdir.join("config.worktree")) {
+        Ok(m) if m.is_file() => Ok(true),
+        Ok(_) => Err("config.worktree is not a regular file".into()),
+        Err(e) if e.kind() == NotFound => Ok(false),
+        Err(e) => Err(format!("cannot read config.worktree: {e}")),
+    }
+}
+
+/// The git directory a `.git` file names, as git reads it: everything after `gitdir: ` without
+/// the trailing line ending, relative to the directory holding the file. Anything git would read
+/// differently (more than one line, a NUL, no path) is refused.
+fn gitfile_dir(path: &Path, file: &Path) -> Result<PathBuf, String> {
+    let bad = |why: &str| format!("the .git file {why}, so its config.worktree was not found");
+    let bytes = read_bounded(file).map_err(|e| bad(&format!("was not read ({e})")))?;
+    let rest = bytes
+        .strip_prefix(b"gitdir: ")
+        .ok_or_else(|| bad("does not name a git directory"))?;
+    let mut end = rest.len();
+    while end > 0 && matches!(rest[end - 1], b'\n' | b'\r') {
+        end -= 1;
+    }
+    let target = &rest[..end];
+    if target.iter().any(|&b| matches!(b, b'\n' | b'\r')) {
+        return Err(bad("holds more than one line"));
+    }
+    let dir = path_from_git(target).ok_or_else(|| bad("names no path valid on this system"))?;
+    Ok(if dir.is_absolute() {
+        dir
+    } else {
+        path.join(dir)
+    })
 }
 
 fn unsafe_key(keys: &[String], whose: &str) -> Result<(), String> {
@@ -1329,12 +1420,24 @@ fn check_repo_config(
             );
         }
     }
+    // Whatever the config says, what git inspects must be the scanned directory: a directory git
+    // does not accept as a repository makes it walk up to the next one. Both run only after the
+    // config git reads (the `--local` listing is of the git directory git found, and the
+    // worktree scope is git's own) passed the allowlist.
     if class != Class::BareRepo {
-        // Whatever the config says, the tree git inspects must be the scanned directory.
         let top = printed_path(git, path, &["rev-parse", "--show-toplevel"], "work tree")?;
         if canon(&top) != canon(path) {
             return Err(
                 "git's work tree is not the scanned directory; facts would describe another tree"
+                    .into(),
+            );
+        }
+    } else {
+        let gitdir = printed_path(git, path, &["rev-parse", "--absolute-git-dir"], "git dir")?;
+        if canon(&gitdir) != canon(path) {
+            return Err(
+                "git's git directory is not the scanned directory; facts would describe another \
+                 repository"
                     .into(),
             );
         }
@@ -2287,6 +2390,61 @@ mod tests {
             "",
         ] {
             assert!(!is_network_url(u), "{u:?} should not be network");
+        }
+    }
+
+    /// Review M5: the callers `lstat` an entry before reading it, but the entry can be replaced
+    /// in between. A FIFO swapped in must be refused, not waited on (an open for reading blocks
+    /// until a writer comes), and a symlink swapped in must not be followed.
+    #[cfg(unix)]
+    mod swapped_in {
+        use super::*;
+        use crate::test_fifo::{mkfifo, must_not_block};
+
+        #[test]
+        fn read_bounded_refuses_a_fifo_without_blocking() {
+            let tmp = tempfile::tempdir().unwrap();
+            let fifo = tmp.path().join("ORIG_HEAD");
+            mkfifo(&fifo);
+            let p = fifo.clone();
+            let got = must_not_block(&fifo, move || read_bounded(&p));
+            assert_eq!(got, Err("not a regular file".to_string()));
+        }
+
+        #[test]
+        fn a_git_file_that_is_a_fifo_is_refused_without_blocking() {
+            let tmp = tempfile::tempdir().unwrap();
+            let wt = tmp.path().to_path_buf();
+            let fifo = wt.join(".git");
+            mkfifo(&fifo);
+            let (w, p) = (wt.clone(), fifo.clone());
+            let got = must_not_block(&fifo, move || gitfile_dir(&w, &p));
+            assert_eq!(
+                got,
+                Err(
+                    "the .git file was not read (not a regular file), so its config.worktree was \
+                     not found"
+                        .to_string()
+                )
+            );
+        }
+
+        #[test]
+        fn read_bounded_does_not_follow_a_symlink() {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("elsewhere");
+            std::fs::write(&target, "gitdir: /somewhere\n").unwrap();
+            let link = tmp.path().join(".git");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(read_bounded(&link).is_err(), "a symlink was followed");
+        }
+
+        #[test]
+        fn control_read_bounded_reads_a_regular_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = tmp.path().join("ORIG_HEAD");
+            std::fs::write(&file, "abc\n").unwrap();
+            assert_eq!(read_bounded(&file), Ok(b"abc\n".to_vec()));
         }
     }
 }

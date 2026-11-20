@@ -81,6 +81,13 @@ Inside a regenerable or cache directory it gives that directory an `ask_reason`;
 directory becomes a `repo` node whose facts are all `unknown` (note: the `.git` entry was not
 followed), so it and the artifacts under it ask and are not classified as plain loose code.
 
+Every file the tool reads itself (a `.git` file, `alternates`, pseudorefs, `info/` entries, ref
+files) is read only after `lstat` shows a regular file, and the open checks again: on unix it does
+not follow a symlink (`O_NOFOLLOW`) or wait for a writer (`O_NONBLOCK`), and the open file must
+still be a regular file, so a symlink or FIFO put there in between is refused, not followed or
+waited on. Windows has no FIFOs in the file system (opening a named pipe never waits); there the
+open file must be a regular file too, and a symlink put there in between is followed as before.
+
 A git directory that another directory reaches through a `.git` symlink has dependents: removing it
 would break that checkout's history. The link is read as a path only (`readlink`, then a
 canonicalisation of the path itself; nothing is opened and no git runs through it). When the
@@ -702,8 +709,17 @@ data being reported.
 **The repo's own config is untrusted.** A scanned folder may be an unpacked download, and its
 `.git/config` can name programs that git would run (`filter.*.clean`, `gpg.program`, `core.fsmonitor`,
 `core.sshCommand`, ...). Before any other git command the tool lists the config keys
-(`git config --local --includes --name-only --list`, plus the worktree config when enabled). If any
-key is outside a small allowlist of plain-data keys (`core.*` format and line-ending settings,
+(`git config --local --includes --name-only --list`, plus `--worktree` when
+`extensions.worktreeConfig` is set and the git directory's `config.worktree` exists; a missing one
+has no keys if git's own scoped listing agrees, and one that is not a regular file is refused). The
+git directory is found by `lstat`, not by git: a `.git` directory, the directory a `.git` file
+names, or the bare repo itself; a `.git` that is neither a directory nor a regular file (a symlink,
+as in a submodule checkout the superproject compares) is refused, which makes the superproject's
+`tree_clean` `unknown` (current git refuses a FIFO or socket `.git` itself, in the first listing,
+with the same result). The scoped listing is
+`git config --list --show-scope --includes --name-only`, which needs git 2.26 or newer; when it
+fails the repo is refused and the note says so in those words, followed by git's error. If
+any key is outside a small allowlist of plain-data keys (`core.*` format and line-ending settings,
 `remote.<n>.url|pushurl|fetch|push|tagopt|prune|promisor|partialclonefilter`,
 `branch.<n>.remote|merge|rebase|description|pushremote`, `user.name|email|signingkey`,
 `submodule.*.url|path|active|branch|ignore`, `url.*.insteadOf`, `extensions.*`, `commit.gpgsign`,
@@ -715,8 +731,8 @@ counts as unsafe), because git runs a child status inside submodules using their
 outer status uses `--ignore-submodules=all` since each checked-out submodule is its own node. A
 `core.worktree` whose effective value (the shared config, then `config.worktree` when
 `extensions.worktreeConfig` is set, the later winning) does not resolve to the node's own directory
-is refused, and independently `git rev-parse --show-toplevel` must equal the node's real path
-(bare repos excepted); any mismatch or failure makes every fact `unknown`. Repos using Git LFS
+is refused, and independently `git rev-parse --show-toplevel` must equal the node's real path (for
+a bare repo, `git rev-parse --absolute-git-dir` must); any mismatch or failure makes every fact `unknown`. Repos using Git LFS
 (`filter.lfs.*`, `lfs.*`) or custom merge or diff drivers are therefore reported `unknown`: no `lfs`
 key is allowed. Git runs with `core.fsmonitor=false`,
 `log.showSignature=false`, `core.ignoreStat=false`, `core.hooksPath` set to the null device,

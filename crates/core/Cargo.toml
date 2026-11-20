@@ -18,5 +18,9 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 thiserror = "1"
 toml = "0.8"
 
+# Only the O_NONBLOCK and O_NOFOLLOW constants (no unsafe code): see src/regular.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
 [dev-dependencies]
 tempfile = "3"
