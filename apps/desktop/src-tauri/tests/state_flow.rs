@@ -345,6 +345,31 @@ fn reloading_a_changed_config_replans() {
     assert_eq!(exported_window(&inner, tmp.path(), "plan.json"), want);
 }
 
+/// Spec AC-12, PR gate F1: Start scans only folders this window offered (a drive from the
+/// drive list or a folder picked in the dialog). A path the page made up is refused and no
+/// job starts.
+#[test]
+fn a_folder_the_window_did_not_offer_is_refused() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = inner_in(tmp.path());
+    let root = tmp.path().to_string_lossy().into_owned();
+    let r = inner.start_scan(
+        &[root],
+        ScanSettings {
+            collect_git_facts: false,
+        },
+        no_emit(),
+    );
+    if let Ok(id) = &r {
+        inner.cancel(*id, &no_emit());
+    }
+    assert!(
+        matches!(&r, Err(e) if e.to_string().contains("was not offered")),
+        "a folder the window never offered was scanned: {r:?}"
+    );
+}
+
 #[test]
 fn one_import_at_a_time_and_no_scan_while_importing() {
     let _serial = serial();
