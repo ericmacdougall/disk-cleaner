@@ -33,7 +33,6 @@ mod bytes {
     use super::*;
     use std::ffi::{OsStr, OsString};
     use std::os::unix::ffi::OsStrExt;
-    use std::process::Command;
 
     /// A file name with the byte 0xFF, which is never valid UTF-8.
     pub fn bad_name(stem: &str) -> OsString {
@@ -64,7 +63,7 @@ mod bytes {
 
     /// Run git with arguments that may not be valid UTF-8.
     pub fn git_os(dir: &Path, args: &[&OsStr]) {
-        let out = Command::new("git")
+        let out = crate::common::git_command()
             .args(args)
             .current_dir(dir)
             .env("GIT_TERMINAL_PROMPT", "0")

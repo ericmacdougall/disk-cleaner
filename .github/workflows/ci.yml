@@ -53,6 +53,9 @@ jobs:
         run: git --version
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
+      - name: Show whether the wrong-case guard ran
+        if: ${{ !cancelled() }}
+        run: cargo test -p disk-cleaner-core --locked --test worktree_config a_bare_repo_under_a_wrong_case_scan_root -- --nocapture
 
   mount-test:
     name: one-file-system on a real mount (linux)

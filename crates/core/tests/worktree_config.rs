@@ -269,10 +269,12 @@ fn case_insensitive(dir: &Path) -> bool {
 #[test]
 fn a_bare_repo_under_a_wrong_case_scan_root_is_inspected_where_case_is_ignored() {
     let (tmp, root, remotes) = workspace();
+    // CI runs this test again with `--nocapture` so the log shows which branch was taken.
     if !case_insensitive(tmp.path()) {
-        eprintln!("skipped: {} is case-sensitive", tmp.path().display());
+        eprintln!("wrong-case guard skipped: the file system is case-sensitive");
         return;
     }
+    eprintln!("wrong-case guard ran: the file system ignores case");
     bare_clone(&root, &remotes);
     let name = root.file_name().unwrap().to_str().unwrap();
     let wrong = tmp.path().join(name.to_uppercase());
