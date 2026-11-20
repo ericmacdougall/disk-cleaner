@@ -354,13 +354,10 @@ fn a_folder_the_window_did_not_offer_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let inner = inner_in(tmp.path());
     let root = tmp.path().to_string_lossy().into_owned();
-    let r = inner.start_scan(
-        &[root],
-        ScanSettings {
-            collect_git_facts: false,
-        },
-        no_emit(),
-    );
+    let settings = ScanSettings {
+        collect_git_facts: false,
+    };
+    let r = inner.start_scan(&[root.clone()], settings, no_emit());
     if let Ok(id) = &r {
         inner.cancel(*id, &no_emit());
     }
@@ -368,6 +365,14 @@ fn a_folder_the_window_did_not_offer_is_refused() {
         matches!(&r, Err(e) if e.to_string().contains("was not offered")),
         "a folder the window never offered was scanned: {r:?}"
     );
+    assert_eq!(inner.jobs.current().0, None, "a job started for a refused folder");
+
+    // Offered (by the drive list or the folder dialog), the same folder starts.
+    inner.offer_roots([root.as_str()]);
+    let id = inner
+        .start_scan(&[root], settings, no_emit())
+        .expect("an offered folder starts");
+    inner.cancel(id, &no_emit());
 }
 
 #[test]
@@ -395,8 +400,11 @@ fn one_import_at_a_time_and_no_scan_while_importing() {
     inner.set_import_hook(None);
 
     let overlapping = inner.import_file(&second);
+    // An offered folder, so the refusal is the admission's, not the root check's.
+    let root = tmp.path().to_string_lossy().into_owned();
+    inner.offer_roots([root.as_str()]);
     let scan = inner.start_scan(
-        &[tmp.path().to_string_lossy().into_owned()],
+        &[root],
         ScanSettings {
             collect_git_facts: false,
         },

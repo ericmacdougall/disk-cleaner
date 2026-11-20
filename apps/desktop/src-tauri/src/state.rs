@@ -27,7 +27,7 @@ use disk_cleaner_view::tree::{NodeId, TopFile, Tree, WalkStats};
 use disk_cleaner_view::units;
 use disk_cleaner_view::walk::{check_root, walk, Progress, WalkError, WalkOptions};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -150,6 +150,9 @@ pub struct Inner {
     /// True while a scan file is being opened. Starting a scan and admitting an import both
     /// decide under this lock.
     importing: Mutex<bool>,
+    /// Folders this window offered the page: drives from the drive list and folders picked in
+    /// the folder dialog. Start scans only these (spec AC-12, PR gate F1).
+    offered: Mutex<HashSet<String>>,
     /// The worker executable and git program (tests use the built app and a fake git).
     worker_exe: Mutex<Option<PathBuf>>,
     git_program: Mutex<OsString>,
@@ -190,6 +193,7 @@ impl Inner {
             settings_gen: AtomicU64::new(1),
             app_settings: Mutex::new(app),
             importing: Mutex::new(false),
+            offered: Mutex::new(HashSet::new()),
             worker_exe: Mutex::new(None),
             git_program: Mutex::new("git".into()),
             #[cfg(debug_assertions)]
@@ -459,14 +463,31 @@ impl Inner {
         Ok(out)
     }
 
-    /// Start a scan of `roots`. The walk and the analysis run on a new thread.
+    /// Remember folders offered to the page (the drive list, the folder dialog), so Start
+    /// accepts them. A path is accepted exactly as it was offered.
+    pub fn offer_roots<'a>(&self, roots: impl IntoIterator<Item = &'a str>) {
+        lock(&self.offered).extend(roots.into_iter().map(str::to_string));
+    }
+
+    /// Start a scan of `roots`, each a folder this window offered. The walk and the analysis
+    /// run on a new thread.
     pub fn start_scan(
         self: &Arc<Self>,
         roots: &[String],
         scan: ScanSettings,
         emit: Emit,
     ) -> Result<JobId, AppError> {
-        let roots = Inner::check_roots(roots)?;
+        let checked = Inner::check_roots(roots)?;
+        {
+            let offered = lock(&self.offered);
+            if let Some(r) = roots.iter().find(|r| !offered.contains(r.as_str())) {
+                return Err(AppError::refused(format!(
+                    "{} was not offered by this window; add it with Add folders or pick a drive",
+                    display_name(r)
+                )));
+            }
+        }
+        let roots = checked;
         let ticket = {
             let importing = lock(&self.importing);
             if *importing {

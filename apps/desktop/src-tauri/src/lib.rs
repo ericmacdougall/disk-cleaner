@@ -4,6 +4,8 @@
 
 pub mod command_names;
 pub mod commands;
+#[cfg(feature = "e2e")]
+mod e2e;
 pub mod state;
 pub mod worker;
 

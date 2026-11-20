@@ -85,9 +85,11 @@ fn place(p: PathBuf) -> Res<Place> {
     })
 }
 
+/// The mounted drives. Each one listed may be scanned (Inner::offer_roots).
 #[tauri::command]
-pub async fn list_volumes() -> Res<Vec<Place>> {
-    blocking(|| {
+pub async fn list_volumes(state: State<'_, AppState>) -> Res<Vec<Place>> {
+    let inner = Arc::clone(&state.0);
+    blocking(move || {
         let disks = sysinfo::Disks::new_with_refreshed_list();
         let mut out = Vec::new();
         for d in disks.list() {
@@ -106,30 +108,42 @@ pub async fn list_volumes() -> Res<Vec<Place>> {
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
         out.dedup_by(|a, b| a.path == b.path);
+        inner.offer_roots(out.iter().map(|p| p.path.as_str()));
         Ok(out)
     })
     .await
 }
 
+/// Folders picked in the system dialog. Each one picked may be scanned (Inner::offer_roots).
 #[tauri::command]
-pub async fn choose_folders(app: AppHandle) -> Res<Vec<Place>> {
+pub async fn choose_folders(app: AppHandle, state: State<'_, AppState>) -> Res<Vec<Place>> {
+    let inner = Arc::clone(&state.0);
     blocking(move || {
-        let picked = app
-            .dialog()
-            .file()
-            .set_title("Choose folders to scan")
-            .blocking_pick_folders()
-            .unwrap_or_default();
-        picked
-            .into_iter()
-            .map(|f| {
-                f.into_path()
-                    .map_err(|e| AppError::refused(format!("cannot use that folder: {e}")))
-                    .and_then(place)
-            })
-            .collect()
+        let picked: Vec<PathBuf> = pick_folders(&app)?;
+        let places: Vec<Place> = picked.into_iter().map(place).collect::<Res<_>>()?;
+        inner.offer_roots(places.iter().map(|p| p.path.as_str()));
+        Ok(places)
     })
     .await
+}
+
+/// The folder dialog, or (test builds with the `e2e` feature) the folders it is told to pick.
+fn pick_folders(app: &AppHandle) -> Res<Vec<PathBuf>> {
+    #[cfg(feature = "e2e")]
+    if let Some(p) = crate::e2e::folders() {
+        return Ok(p);
+    }
+    app.dialog()
+        .file()
+        .set_title("Choose folders to scan")
+        .blocking_pick_folders()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| {
+            f.into_path()
+                .map_err(|e| AppError::refused(format!("cannot use that folder: {e}")))
+        })
+        .collect()
 }
 
 /// What the screen needs after an import or at start.
@@ -168,18 +182,9 @@ pub async fn current_state(state: State<'_, AppState>) -> Res<CurrentState> {
 pub async fn open_scan_file(app: AppHandle, state: State<'_, AppState>) -> Res<Option<CurrentState>> {
     let inner = Arc::clone(&state.0);
     blocking(move || {
-        let Some(picked) = app
-            .dialog()
-            .file()
-            .set_title("Open a scan file")
-            .add_filter("Scan JSON", &["json"])
-            .blocking_pick_file()
-        else {
+        let Some(path) = pick_scan_file(&app)? else {
             return Ok(None);
         };
-        let path = picked
-            .into_path()
-            .map_err(|e| AppError::refused(format!("cannot use that file: {e}")))?;
         inner.import_file(&path)?;
         Ok(Some(current(&inner)))
     })
@@ -200,24 +205,57 @@ pub async fn export_plan(app: AppHandle, state: State<'_, AppState>, view: u64) 
                 .ok_or_else(|| AppError::refused("the plan is not ready yet"))?;
             Arc::clone(&a.plan)
         };
-        let name = format!("prunedisk-plan-{}.json", stamp(disk_cleaner_view::units::now()));
-        let Some(picked) = app
-            .dialog()
-            .file()
-            .set_title("Export the plan")
-            .set_file_name(&name)
-            .add_filter("JSON", &["json"])
-            .blocking_save_file()
-        else {
+        let Some(path) = pick_export_file(&app)? else {
             return Ok(None);
         };
-        let path = picked
-            .into_path()
-            .map_err(|e| AppError::refused(format!("cannot use that file: {e}")))?;
         write_plan_new(&path, &plan).map_err(|e| AppError::refused(e.to_string()))?;
         Ok(Some(display_name(&path.to_string_lossy())))
     })
     .await
+}
+
+/// The open dialog, or (test builds with the `e2e` feature) the next file it is told to pick.
+fn pick_scan_file(app: &AppHandle) -> Res<Option<PathBuf>> {
+    #[cfg(feature = "e2e")]
+    if let Some(answer) = crate::e2e::next_open() {
+        return Ok(answer);
+    }
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .set_title("Open a scan file")
+        .add_filter("Scan JSON", &["json"])
+        .blocking_pick_file()
+    else {
+        return Ok(None);
+    };
+    picked
+        .into_path()
+        .map(Some)
+        .map_err(|e| AppError::refused(format!("cannot use that file: {e}")))
+}
+
+/// The save dialog, or (test builds with the `e2e` feature) the next file it is told to name.
+fn pick_export_file(app: &AppHandle) -> Res<Option<PathBuf>> {
+    #[cfg(feature = "e2e")]
+    if let Some(answer) = crate::e2e::next_export() {
+        return Ok(answer);
+    }
+    let name = format!("prunedisk-plan-{}.json", stamp(disk_cleaner_view::units::now()));
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .set_title("Export the plan")
+        .set_file_name(&name)
+        .add_filter("JSON", &["json"])
+        .blocking_save_file()
+    else {
+        return Ok(None);
+    };
+    picked
+        .into_path()
+        .map(Some)
+        .map_err(|e| AppError::refused(format!("cannot use that file: {e}")))
 }
 
 #[tauri::command]
