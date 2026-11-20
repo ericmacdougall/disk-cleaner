@@ -64,6 +64,29 @@ npx tauri icon app-icon.svg
 npx tauri dev
 ```
 
+### What the window may ask for
+
+- Scan roots: Start scans only folders offered to this window, exactly as they were offered:
+  a drive from the drive list or a folder picked with Add folders. Any other path, a subfolder
+  of an offered folder included, is refused with "... was not offered by this window; add it
+  with Add folders or pick a drive", and no scan starts. At most 64 roots per scan. (This
+  narrows spec AC-12, which only required absolute folders; PR gate F1.)
+- Scan files: one at a time. While a file is read, Open a scan file and Scan are disabled, and
+  the backend refuses a second file ("a scan file is being opened; wait for it to finish") and
+  a scan; a scan file cannot be opened while a scan runs. Focus returns to Open a scan file
+  when nothing was opened.
+- Settings: a save that wrote the plan settings but not the app's scan settings says "Plan
+  settings saved." with the reason the rest was not saved. A save that changes the plan
+  settings recomputes the shown plan. Opening Settings after another window or program changed
+  core's config file adopts the file's values and recomputes the plan ("The config file
+  changed; the plan was recomputed."); a plan export then uses the adopted values.
+- Large results: a new analysis is installed without holding the session lock while its tags
+  are prepared, so pages and Cancel are answered during the install (CI, 20,000 sibling
+  folders: Linux install 397 ms with the longest page wait 0.3 ms; Windows 726 ms and 0.6 ms;
+  macOS 2,265 ms and 80 ms against limits of 5 s and 250 ms).
+- The size tree is one treegrid: the column headers are row 1 and the data rows follow
+  (`aria-rowcount` is the row count plus one).
+
 ### Files the desktop app writes
 
 Its own files are in core's config folder, which follows `HOME` (macOS:
@@ -100,7 +123,9 @@ account's home folder. The app runs the webview in incognito mode (`"incognito":
   which keeps browsing data out of it, but the runtime still creates the folder.
 - Linux (not observed here): incognito gives webkit2gtk an ephemeral data manager, so no
   browsing data should be written under `~/.local/share/io.github.ericmacdougall.prunedisk/`
-  or `~/.cache/io.github.ericmacdougall.prunedisk/`.
+  or `~/.cache/io.github.ericmacdougall.prunedisk/`. With Mesa graphics drivers, the webview's
+  GPU process writes the driver's shader cache to `~/.cache/mesa_shader_cache/`, as any
+  program drawing with Mesa does (seen in the end-to-end job, below).
 
 What Tauri 2 offers here: `incognito` (every desktop platform; a non-persistent store),
 `dataDirectory` (Windows and Linux only; it moves the data, it does not turn it off) and
@@ -141,4 +166,115 @@ All in CI; nothing is built on a developer machine by default.
 | frontend unit tests (vitest, jsdom, mocked backend) | job "frontend unit tests" (`npm test` in `apps/desktop`) |
 | desktop backend, worker and containment (Cancel; the parent's input closing; the parent dying with every pipe; a real parent process killed; a stuck ending cut short by the deadline; a worker that dies on its own) | jobs "desktop backend (linux)", "worker containment" (`cargo build --examples`, then `cargo test` in `apps/desktop/src-tauri`, then `scripts/repeat-containment.sh 10`) |
 | one million nodes | job "performance at one million nodes" (results in the job summary and the `perf-results` artifact) |
+| a wide install: 20,000 sibling folders with pages and Cancel asked meanwhile | `tests/state_flow.rs` in the desktop backend and containment jobs (the `PERF install_wide` and `PERF cancel_wide` lines) |
+| the packaged app through WebDriver, Linux and Windows (below) | job "end-to-end" (`apps/desktop/e2e/check.sh`; results in the `e2e-<os>` artifact) |
+| each end-to-end check caught by a broken variant | workflow "e2e-variants" (`apps/desktop/e2e/variants/*.patch`, `e2e/expect_variant.py`) |
 | licences, advisories, bans and sources of the desktop lockfile | job "cargo deny (desktop workspace)" (`apps/desktop/src-tauri/deny.toml`, `--locked`; crates only from crates.io, no git sources; duplicate versions warn; the cargo-deny version is printed first; each advisory ignore gives its reason). ci.yml's "cargo deny licenses" covers the root lockfile, licences only |
+
+### End-to-end checks (PR gate F1)
+
+`apps/desktop/e2e/check.sh` drives the packaged app through tauri-driver 2.1.0:
+WebKitWebDriver on Linux (ubuntu-22.04, under Xvfb) and the Edge driver on Windows
+(windows-latest). The Edge driver's major version is matched to the newest WebView2 runtime
+folder installed on the runner. It builds two binaries:
+
+- the release binary, with the production config and without the `e2e` feature. Its string
+  table must hold no `PRUNEDISK_E2E_` name. It is opened once through WebDriver (`e2e/probe.mjs`)
+  to record whether the shipped config can be driven at all;
+- the e2e binary, built with `--features e2e`. In it, each native dialog answers from an
+  environment variable (`src-tauri/src/e2e.rs`), because WebDriver cannot click a native
+  dialog. The command then carries on exactly as after a real pick.
+
+The e2e binary also gets an automation config, which differs from the shipped one in a single
+window setting per OS:
+
+- Linux: incognito off (`e2e/automation.conf.json`). wry 0.57.3 gives an incognito webview an
+  ephemeral webkit2gtk context, and that context is created with automation disabled
+  (`WebContextImpl::new_ephemeral`). WebKitWebDriver therefore cannot open a browsing context
+  in the shipped app: "The remote session failed to create a new browsing context". CI shows
+  this on every run, from the release-binary probe. So the Linux WebDriver checks run on a
+  webview that keeps its data in `$XDG_DATA_HOME/<bundle id>/`. The no-write proof declares
+  that folder for this build only.
+- Windows: browser arguments that open a DevTools port (`e2e/windows-automation.conf.json`,
+  `additionalBrowserArgs`). The Edge driver hands the webview its switches, among them
+  `--remote-debugging-port=0`, in `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`. wry always sets
+  the webview's browser arguments itself, and on the runner the variable's switches never
+  reached the browser process. The driver then waits 60 s and fails with "DevToolsActivePort
+  file doesn't exist". The config passes wry's own defaults plus the driver's switches.
+  Incognito stays on, as shipped. `check.sh` fails if the release binary contains
+  `remote-debugging-port`.
+
+One session (`e2e/run.mjs`) covers these flows, in order:
+
+1. Choose folders (a seeded fixture tree from `e2e/fixture.py`, seed 16452, and a large
+   system folder).
+2. Scan, Cancel mid-walk, then rescan the fixture.
+3. Open each view, then check the tablist's arrow keys.
+4. Open the wide folder in the size tree (5,000 rows).
+5. Page the developer view (Next and Previous), keeping focus on the pager, then switch class.
+6. In Settings: save a longer window, then try a shorter one three times, answering with
+   Escape, Keep and Shorten. Each answer checks focus and the saved value.
+7. Export the plan, then try a second export, which is cancelled and writes nothing.
+8. Open a valid scan file, a malformed one (focus returns to Open) and a cancelled one.
+9. Check that the CSP blocks inline script.
+
+axe-core 4.14 runs on the chooser, each view and the imported developer view; any violation
+fails.
+
+Refused IPC, each with the job state checked unchanged:
+
+- commands outside the capability list (`plugin:dialog|open`, `plugin:path|resolve_directory`,
+  `plugin:window|close`) and an unregistered command;
+- a root the window did not offer, and a subfolder of an offered root;
+- 65 roots, and a 1 MiB root path.
+
+No-write proof:
+
+- The app runs with its home, config, data, cache, state and temp folders in a sandbox, or
+  `APPDATA` on Windows.
+- `e2e/manifest.py` records kind, size, mode, mtime and SHA-256 of every entry under the
+  fixture and the sandbox before and after the session. The fixture includes git
+  repositories, one with a stat-dirty index, and git facts are on. Any change outside a
+  declared path fails.
+- The declared paths are core's config folder, the export the test asked for, the webview's
+  data folders and, on Linux, the graphics driver's shader cache (below).
+- On Windows the real `%LOCALAPPDATA%\<bundle id>` and `%APPDATA%\disk-cleaner` folders are
+  watched too.
+- On Linux the app and its child processes also run under strace (writes only, via
+  seccomp-bpf), and `e2e/trace_report.py` lists every path written anywhere, including outside
+  the sandbox. That list is a report, not a gate.
+
+Graphics driver cache (Linux): the webview's GPU process writes Mesa's shader cache to
+`$XDG_CACHE_HOME/mesa_shader_cache/` (else `~/.cache/mesa_shader_cache/`). Any program drawing
+with Mesa does the same, the shipped app included. The app does not ask for it, and it is not
+the app's data.
+
+Timings, with thresholds registered before the first measurement (50 ms p95 for both;
+nearest-rank percentile, 10 warm-up calls, then 200 samples; release build with the e2e
+feature):
+
+- IPC: in-page `performance.now()` around `tree_page` calls over the wide folder.
+- Scroll: from setting `scrollTop` 40 rows further to the first animation frame that shows the
+  new top row.
+
+A p95 over the threshold fails the check; the threshold is not moved to fit a result. On Linux
+the app runs under strace, Xvfb and software rendering, which adds to both. Measured there so
+far: IPC p95 2 to 6 ms; scroll p95 36 to 44 ms, with the slowest sample up to 50 ms. The
+scroll check has little headroom.
+
+Broken variants (workflow "e2e-variants", Linux): each patch in `e2e/variants/` breaks one
+guarantee, and `e2e/expect_variant.py` passes only when the check written for it fails:
+
+| Patch | What it breaks | Check that must fail |
+|---|---|---|
+| `planted-write.patch` | writes a file into the first scan root | manifest: an UNDECLARED addition |
+| `offered-check-removed.patch` | Start no longer checks that a root was offered | `ipc.refused.root_not_offered`, `ipc.refused.subfolder_of_offered_root` |
+| `capability-broadened.patch` | grants `core:path:default` | `ipc.refused.not_in_capabilities.path` |
+| `focus-broken.patch` | the shorten question no longer takes focus | `settings.save_confirm_keep_escape` |
+
+macOS: no WebDriver exists for an app's WKWebView. Apple's safaridriver drives Safari only,
+and tauri-driver supports Linux and Windows only. On macOS the app is covered by:
+
+- the bundle job's idle launch and its webview-data check;
+- the backend, state-flow and containment tests on macos-latest;
+- the frontend unit tests, which are platform independent (jsdom).
