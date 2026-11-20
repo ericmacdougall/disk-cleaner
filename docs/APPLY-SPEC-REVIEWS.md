@@ -1,9 +1,30 @@
 # Apply spec: earlier reviews
 
-How revisions 5 to 8 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
+How revisions 5 to 9 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
 from section 22 (revision 5's answers in revision 6, revision 6's in revision 7, revision 7's in
-revision 8, revision 8's in revision 9). Criterion and negative-case ids are those of revision 5 and later; section numbers are
+revision 8, revision 8's in revision 9, revision 9's in revision 10). Criterion and negative-case ids are those of revision 5 and later; section numbers are
 those of APPLY-SPEC.md. Later changes to the same areas are listed in APPLY-SPEC.md section 22.
+
+## Reviews of revision 8 (adversarial and acceptance)
+
+F-ids are the adversarial plan review's; R8-ids and S-13 the acceptance review's. Revision 10
+removed two of the mechanisms below: the finishing of interrupted deletions (rows F1, R8-1 and
+the last S-13 row) and Windows operation (the Windows parts of F2 and R8-2). Revision 9's text is
+at commit `fbf25f3`; APPLY-SPEC.md 8.2 and 8.3 keep the entry conditions.
+
+| Finding | Change in revision 9 | Criteria and negative cases |
+|---|---|---|
+| F1 resumed deletion missed extended attributes, and checked directories by path and kind only | The preserved record (section 4), computed by the archive writer's function; resume compared it for every entry, with three deletion-caused exceptions; unarchived regenerable items never resumed on their own. Revision 10 removed resumed deletion; the record remains for restore's check | AC-21; NEG-19 |
+| F2 a killed parent released the spool lock while its rclone child still wrote | An operation lock held by the tool, close-on-exec, and a spool lock every rclone child inherits (`flock`); a job object on Windows; cleanup needs both locks; the hung-child case. Revision 10 kept the Unix design and removed Windows | AC-23; NEG-56 |
+| R8-1 no way out of a stranded quarantine | `quarantine list` and `quarantine finish`; a final stranded state. Revision 10 removed `finish`: a leftover is never deleted by the tool | AC-39; NEG-53 |
+| R8-2 lock semantics per platform | `flock`, never `fcntl`; close-on-exec except the spool lock; an erroring call counts as held; Windows `LockFileEx` and share-delete, removed in revision 10 | AC-23; NEG-54 |
+| R8-3 minimum git | 2.32, checked at start (ASSUMPTION on the value) | AC-9; NEG-55 |
+| R8-4 and the user's decision on D-16 | The answer `u`, with the three limits shown word for word | AC-38; NEG-51, NEG-52 |
+| S-13 network tips | The "only enlarges" sentence corrected; refs another remote's refspec writes excluded; hand-set refs disclosed | AC-12; NEG-59 |
+| S-13 NEG-47 end to end | Both outcomes of core's plan | NEG-47 |
+| S-13 step-2 secret checks | Run only for items that will be uploaded | AC-20; NEG-58 |
+| S-13 manifest segments | Written atomically; a damaged-segment record refused without `--accept-unverified` | AC-16; NEG-57 |
+| S-13 lost metadata changes | 17 listed what is not preserved and the excused changes; revision 10 removed the excused changes with resumed deletion | AC-21 |
 
 ## Reviews of revision 7 (adversarial and acceptance)
 
