@@ -1,10 +1,37 @@
 # Apply spec: earlier reviews
 
-How revisions 5 to 10 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
+How revisions 5 to 11 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
 from section 22 (revision 5's answers in revision 6, revision 6's in revision 7, revision 7's in
 revision 8, revision 8's in revision 9, revision 9's in revision 10, revision 10's in revision
-11). Criterion and negative-case ids are those of revision 5 and later; section numbers are
+11, revision 11's in revision 12). Criterion and negative-case ids are those of revision 5 and later; section numbers are
 those of APPLY-SPEC.md. Later changes to the same areas are listed in APPLY-SPEC.md section 22.
+
+## Reviews of revision 10 (adversarial and acceptance)
+
+F-ids are the adversarial plan review's and S-ids the acceptance review's, prefixed `r10` to
+avoid clashes with core changes and earlier findings; the last two rows answer the user's answer
+on D-4. Revision 12 changed three of the answers below: `upload-all` now also uploads an item
+whose history check could not run (last row; 9.2), the moved-back match uses the directory
+identity of section 4 (row r10 S-2), and the teardown wait moved out of the guard (row r10 F3).
+
+| Finding | Change in revision 11 | Criteria and negative cases |
+|---|---|---|
+| r10 F1 a later hard-link name could be rewritten after the first name's check | One rule: just before each entry's unlink, its full preserved record is recomputed through a descriptor with the archive writer's function and compared, content digest included, for every hard-link name; never mtime or size as a stand-in (13.2). Cost: every byte is read again | AC-19; NEG-61 |
+| r10 F2 directory extended attributes were not compared | The same rule covers every extended attribute of every entry, directories included; the excluded fields are named and justified (13.2) | AC-19; NEG-61 |
+| r10 F3 two spool cleanup paths, and a descendant of rclone keeps the descriptor | One teardown routine through the two-lock barrier, at an operation's end and for others' spools (9.6) | AC-23; NEG-63 |
+| r10 F4 a negative case promised more than the pass can give | NEG-61 states the achievable outcome for a file added to a listed directory; the negative cases of AC-2, AC-19, AC-20, AC-21, AC-29 and AC-39, which the new stop conditions could falsify, were reread in full and the rest searched for absolute claims (NEG-19, 53, 62 changed) | AC-19; NEG-61 |
+| r10 S-1 quarantines not started were invisible, an occupied O was unhandled, Q was not checked | `quarantine list` shows every state, a replaced Q included (5); the identity check with `lstat` before any rename; "present" means any entry (6.1, 10.1) | AC-21, AC-39; NEG-65 |
+| r10 S-2 a leftover moved back looked like a new folder | A directory at O with F0's device and inode after `delete-started` is `moved-back`: warned and kept, never `removed` (10.1, 7.4) | AC-21, AC-39; NEG-64 |
+| r10 S-3 walks entered a leftover before the enclosing item was kept | Every walk in every mode stops at a quarantine, staging name or moved-back folder; `--backup-only` never archives one (7.4, C-6) | AC-39; NEG-53 |
+| r10 S-4 the non-blocking open was not yet in core | Core change C-7, a release precondition, cites `open_regular` at `c81a341`; this branch merged `origin/main` | AC-19; NEG-62 |
+| r10 S-5 pre-unlink checks were uneven | Covered by the rule of r10 F1; the fsmonitor socket rule; the pnpm false stop stated as a cost (13.2, D-17) | AC-19; NEG-66 |
+| r10 S-6 Windows gaps | `manifest find TEXT --storage` refused; the platform check before configuration parsing; local listing reads a defined folder and creates nothing; WSL2 unsupported and untested (5, 14) | AC-30; NEG-60 |
+| r10 S-7 the cost statement was incomplete | D-17 lists every cost; signals during deletion are defined (10.1); two stale texts removed | AC-41; NEG-68 |
+| The user's answer on D-4 | A secrets handling the user chooses: keep (default) or upload, per item in ask mode and by setting in automatic mode; the vault deferred (9.2, 11, D-4) | AC-12, AC-38, AC-40; NEG-51, NEG-67 |
+| The same answer, for automatic runs ("in my case back it up to my private storage anyway") | `--secrets upload-all`: a separate, never-default value that uploads the whole secrets set of automatic items, unnamed objects and history past its limits included; a check that could not run still kept; a one-time notice; the record names the overridden rules (9.2, 12.1, D-4) | AC-42; NEG-69 |
+
+Rewritten in revision 11: AC-1, 12, 19, 21, 23, 30, 38, 39 and NEG-12, 19, 32, 43, 47, 51, 53,
+58, 60, 61, 62. Added: AC-40, 41, 42 and NEG-63 to 69. None was withdrawn.
 
 ## Reviews of revision 9 (adversarial and acceptance)
 

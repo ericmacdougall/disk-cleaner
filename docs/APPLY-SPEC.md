@@ -1,6 +1,6 @@
 # Apply phase specification
 
-Status: **draft for review, revision 11**. Nothing in this document is implemented yet. It defines
+Status: **draft for review, revision 12**. Nothing in this document is implemented yet. It defines
 what `disk-cleaner apply`, `disk-cleaner restore` and `disk-cleaner manifest` must do before any
 code is written, and it is the contract the tests are written against. Section 16 lists the
 decisions that are still open; text that depends on one of them says so. Section 22 maps the latest
@@ -11,7 +11,11 @@ revision 5. Revision 10 removed Windows operation and the finishing of interrupt
 removing it (13.2), gives spool teardown one routine (9.6), lists every quarantine state (5),
 lets the user choose the secrets handling, automatic runs included (`--secrets upload-all`; D-4,
 9.2, 11) and defines signals during deletion
-(10.1); its criteria are rewritten in place under the same numbers (section 22).
+(10.1). Revision 12 makes the archive writer judge the bytes it sends (9.4), removes the objects
+of failed attempts (9.4), separates what was not examined for secrets from what cannot be shown
+preserved (9.2), keeps an enclosing item whose nested items' secrets were not chosen for upload
+(6.3), and moves spool teardown's wait out of the guard (9.6). Criteria are rewritten in place
+under the same numbers (section 22).
 
 Read with [DESIGN.md](DESIGN.md) and [SCAN-FORMAT.md](SCAN-FORMAT.md). Where this document and
 SCAN-FORMAT.md disagree about the plan format, SCAN-FORMAT.md wins and this document is wrong. The
@@ -49,9 +53,12 @@ In scope:
 - Secret-like files: the user chooses what happens to an item that holds them, per item in ask mode
   or by a setting for automatic runs: keep the item, or upload them to the user's own storage with
   the rest, in automatic runs as `upload` or as `upload-all`, which also uploads unnamed objects
-  and history past its limits (D-4: offering the choice, and upload to the user's own storage, are the user's
-  decision; keeping when nothing is chosen and deferring the local vault option are the owner's
-  ASSUMPTIONs). Nothing chosen: kept.
+  and history that was not examined. **The user's decision** (D-4): the choice is offered, and
+  uploading secret-looking content to their own private storage anyway must be offered and is what
+  they want for themselves. **ASSUMPTIONs, not the user's:** the setting's name and values, what
+  `upload-all` covers (unnamed objects and unexamined history included), that automatic
+  `upload-all` does not ask the per-repository question the user chose for ask mode (D-16),
+  keeping when nothing is chosen, and deferring the local vault option. Nothing chosen: kept.
 - A journal that makes every step resumable and idempotent; a per-user lock so two applies never
   run at once on one machine.
 - The manifest (local and in storage), `disk-cleaner manifest list|find|verify|orphans`, and
@@ -177,6 +184,17 @@ and restore detect it, they cannot undo it); memory corruption.
   renamed it ever deletes from it (13.2). A quarantine whose deletion began (`delete-started`,
   10.1) and did not finish is a **leftover**: no later run deletes from it, renames it or reads
   its contents.
+- **Directory identity**: what shows that a directory found later is the item's directory of F0,
+  taken with F0 and journaled in `quarantine-intent` (10.1): the file system's identity (macOS:
+  the volume UUID from `getattrlist` `ATTR_VOL_UUID`; Linux: `statfs` `f_fsid`), the inode, and
+  the birth time (macOS `st_birthtime`; Linux `statx` with `STATX_BTIME`, when the file system
+  returns it). `st_dev` is journaled too and stands in for the file-system identity only when that
+  is zero or absent, since a device number can change across a reboot. A field the file system
+  does not return (no birth time, as on tmpfs with older kernels) is journaled as absent and left
+  out of the match. Inode numbers are reused after a deletion, so a match on the inode alone could
+  take a new folder for the item. ASSUMPTION (the owner's): the exact calls and their behaviour on
+  each allowed file system are to be confirmed against the platform manuals during
+  implementation; tests inject each absent field.
 - **Secret-like file**: defined in 9.2.
 
 ## 5. Commands
@@ -206,9 +224,12 @@ disk-cleaner quarantine list [--state-dir DIR] [--json]
   the journals and `lstat`s each quarantine path and original path, never anything inside them.
   No command deletes a quarantine.
   - **Not started** (`quarantine-intent` or `quarantined`): "This folder is the complete item;
-    nothing was deleted." Then the commands that put it back: `disk-cleaner apply --resume RUN_ID`,
-    and the manual `mv -n Q O`. When something occupies the original path, it says so and names
-    it, and says that the folder is put back only once the original path is free.
+    nothing was deleted." Then the commands that put it back: `disk-cleaner apply --resume RUN_ID`
+    and, **only when nothing is at the original path**, the manual `mv -n Q O` (on Linux
+    `mv -nT Q O`, which never moves Q into a directory that appears at O meanwhile). When something
+    occupies the original path, it prints no `mv` command (with a directory at O, `mv -n Q O`
+    would move Q inside it): it names what is there and says "first move or rename what is at O,
+    then run `disk-cleaner apply --resume RUN_ID`".
   - **Leftover** (`delete-started` or `left`): the record and archive that hold the verified copy
     (none for an unarchived regenerable item, which says "never archived; rebuildable"), the exact
     `disk-cleaner restore RECORD_ID --to DIR` command with an absolute DIR outside the
@@ -217,17 +238,18 @@ disk-cleaner quarantine list [--state-dir DIR] [--json]
     "disk-cleaner will not delete this folder. Removing it is your own action, after you have
     checked it."
   - **Moved back** (`moved-back`, or `delete-started` or `left` with Q absent and, by `lstat`, a
-    directory at O with F0's device and inode, 10.1): the original path, the same two statements,
-    and the restore command.
+    directory at O with the item's directory identity, section 4, 10.1): the original path, the
+    same two statements, and the restore command.
   - **Replaced** (something at Q's path fails the identity check of 6.1, in any state): what is
-    there (kind, and a symlink's target as text), that it is not the tool's quarantine and the
-    tool will not touch it, and the restore command for an archived item ("never archived;
-    rebuildable" otherwise).
+    there (kind, and a symlink's target as text), "disk-cleaner cannot confirm this is its
+    quarantine and will not touch it", and the restore command for an archived item ("never
+    archived; rebuildable" otherwise).
 - No mode flag: **dry run**. `--backup-only`: everything up to and including the manifest, then
   stop; nothing is removed. `--remove`: the full sequence. The two are mutually exclusive.
 - `--secrets keep|upload|upload-all` (or `[apply] secrets`) is the secrets handling for items that
   run in automatic mode (9.2, 11, D-4); default `keep`. `upload-all` is a separate value, never
-  the default and never implied by `upload`. Items in ask mode are asked.
+  the default and never implied by `upload`. Items in ask mode are asked. No handling uploads a
+  nested item's secrets that were not chosen for that nested item (6.3).
 - **Windows.** `apply` (every mode, `--resume` included), `restore`, `quarantine list`,
   `manifest list --storage`, `manifest find TEXT --storage`, `manifest find --files`,
   `manifest verify` and `manifest orphans` exit 4 ("not supported on this platform in this
@@ -248,7 +270,9 @@ disk-cleaner quarantine list [--state-dir DIR] [--json]
   none, so every item is asked. `repo` and `repo-recover` execute identically; they stay separate so
   the user decides about repositories with unsaved work on their own.
 - `--class` and `--item` narrow the selection; they never widen it.
-- `--resume RUN_ID` takes no other flags: the run's flags are in its journal.
+- `--resume RUN_ID` takes no other flags: the run's flags and every effective `[apply]` setting
+  are in its journal header (10.1), and a resume does not read `[apply]` from the configuration
+  file.
 - Running as root (uid 0) is refused unless `--allow-root`.
 - Configuration lives in the same `config.toml` as the plan settings, under `[apply]` (`auto`,
   `secrets`, `require_encrypted_remote`, `min_free`, `part_size`, `max_upload_bytes`,
@@ -268,12 +292,15 @@ lock (10.2) and reconciles what earlier runs left behind, according to its mode:
   state, and is not selected again.
 - **`--backup-only` and `--remove`:** in addition, records written but not yet in a synced
   segment are synced to the storage named in **that run's journal** (not the current `--storage`,
-  if it differs).
+  if it differs), and the objects of every incomplete attempt an earlier run journaled are removed
+  from that storage as 9.4 states for a failed attempt. A dry run lists those objects and removes
+  nothing.
 - **`--remove` and a resume:** in addition, a quarantine whose deletion never started
   (`quarantine-intent` or `quarantined`, 10.1) is renamed back to its original path when the
   **identity check** holds, and its item is recorded `kept`: `lstat` of Q (no-follow) shows a
-  directory with the device and inode the journal recorded from F0, and `lstat` of O shows that
-  nothing (no directory, file, symlink or other entry) is there. The rename back is no-replace.
+  directory with the directory identity the journal recorded from F0 (section 4), and `lstat` of O
+  shows that nothing (no directory, file, symlink or other entry) is there. The rename back is
+  no-replace.
   Otherwise Q is left as it is, the item is `failed`, and the summary and `quarantine list` name
   Q and what is at O. That check and the rename read nothing inside Q.
 
@@ -291,11 +318,13 @@ and the run continues with the next item; nothing that failed a check is ever re
 2. **Re-check** (section 7): take the fingerprint F0, re-scan and re-plan, refuse places that are
    never removed, check processes, run the secret checks of 9.2 when the item will be uploaded
    (an item removed without a backup uploads nothing, so they are not run for it and cannot keep
-   it), take the fingerprint again. The F0 walk is the first walk of the item and stops at a
-   quarantine (7.4), so no later walk reaches one.
+   it), recording each content verdict and each git directory's object inventory for the writer
+   (9.4), apply the nested-secrets rule (6.3), take the fingerprint again. The F0 walk is the
+   first walk of the item and stops at a quarantine (7.4), so no later walk reaches one.
 3. **Ask** (ask mode only, section 11).
 4. **Archive and upload** (section 9): fix the attempt number and part size in the journal, stream,
-   split into parts, upload, read back, compare; then the index object the same way.
+   split into parts, upload, read back, compare; then the index object the same way. The writer
+   judges again the bytes it is about to send (9.4). A failed attempt's objects are removed (9.4).
 5. **Manifest** (section 12): reserve the next segment number in the journal, write the item's
    `backed-up` record to that new segment, upload it, read it back, compare.
 6. Stop here for `--backup-only` (outcome `backed-up-kept`, by request).
@@ -336,8 +365,37 @@ Removing an item removes everything inside it:
 - any other selected item inside another selected item is handled first. With `--remove`, if it
   ends as anything but removed (skipped, failed, kept, answered `n`, outside `--class` or `--item`), the
   enclosing item is skipped ("the nested PATH was kept"), whatever its own checks say;
-- with `--backup-only` the veto does not apply: nothing is removed, and the enclosing item's
-  archive holds the nested item like any other content;
+- with `--backup-only` that veto does not apply: nothing is removed, and the enclosing item's
+  archive holds a nested item that is still there like any other content, **except for its
+  secrets**, to which the next rule applies in every mode;
+- **nested secrets, in every mode** (dry runs and `--backup-only` included). The **nested items**
+  of an item E are the plan items for the nodes inside E other than E's regenerable children
+  handled with it (above), selected in this run or not, whatever their action. Every entry of E's
+  secrets set (9.2) belongs to the innermost nested item whose path holds it: a working-tree file
+  below its path, or anything found in a git directory below its path, that directory's history
+  included. Entries that belong to no nested item are **E's own**; those that belong to a nested
+  item N are **N's part**. E is kept before any byte is uploaded, with the reason "the nested PATH
+  holds secrets not chosen for upload" or "the nested PATH was answered n", when for some nested
+  item N still inside E:
+  - N was answered `n` in this run, at its item prompt or at its secrets prompt; or
+  - N's part is not empty and N's own decision in this run did not cover exactly that part. It
+    covers it only when N was selected, N's answer `u` or the automatic handling N ran under
+    covered N's whole secrets set, and N's part as E's step 2 found it has the **set digest**
+    (9.2) that N's journal recorded with that decision. So an N outside `--class` or `--item`,
+    kept for its secrets, skipped before its decision, or changed after it, keeps E.
+
+  E's own decision (its answer `u`, or any automatic handling, `upload-all` included) covers only
+  E's own entries: nothing chosen for E uploads N's part. In a dry run, which never prompts, an N
+  in ask mode has no decision, so E is reported "would keep" for this reason, as a `--backup-only`
+  run without a terminal keeps it. A resume reads N's decision and set digest from the journal.
+  Which nested items a selected E can hold is bounded by core's plan, read at `feat/apply`: a
+  nested node whose action is `keep`, `ask` or `recover-backup-then-remove` turns E into `ask`
+  (`crates/core/src/plan.rs`, the veto after the per-node actions), so E is not selected; a bare
+  repository gets `keep` or `ask` (`plan.rs`, `Class::BareRepo`); a linked worktree never gets a
+  removing action (section 2); and a `modules/` directory in E's git directory makes E's layout
+  not plain (`plain_layout`, `crates/core/src/model.rs`). A plan edited to remove such an E fails
+  the re-check (7.2). What remains are nested `backup-then-remove` repositories and
+  `remove-regenerable` directories not handled with E, and the rule covers both;
 - the enclosing item's re-check compares the scan **net of** the nested items this run removed:
   each removed nested path must be absent and the journal must show it `deleted`, and those nodes'
   counts are subtracted before comparing. A nested **git** item that was removed changes the
@@ -351,9 +409,9 @@ start of step 2, before any fact is computed:
 
 - at the end of step 2 the fingerprint is taken again and must equal F0, so the facts were computed
   on exactly F0;
-- while archiving, every entry's metadata is compared with F0 as it is opened, and the index
-  written is F0 plus content digests; after the last part the fingerprint is taken again and must
-  equal F0;
+- while archiving, every entry's metadata is compared with F0 as it is opened and again before
+  each chunk of its content is sent (9.4), and the index written is F0 plus content digests;
+  after the last part the fingerprint is taken again and must equal F0;
 - at step 9 the quarantined directory must equal F0.
 
 Every entry is archived (9.1), so the chain is the only thing that ties the removed directory to
@@ -445,9 +503,11 @@ An item is skipped, with the reason, when:
 - **an entry's extended attributes cannot be archived** (9.3);
 - **it holds, or lies inside, a quarantine or a restore staging directory**: any entry whose name
   starts with `.disk-cleaner-removing-` or `.disk-cleaner-restoring-`, any path a journal names
-  as a quarantine, or a directory with the device and inode that a journal records from F0 for an
-  item past `delete-started` (a leftover moved back, 10.1), whether or not any run has journaled
-  `moved-back` yet. Such an item is kept **in every mode, `--backup-only` and dry runs
+  as a quarantine, or a directory with the directory identity (section 4) that a journal records
+  from F0 for an item past `delete-started` whose journal has no `deleted` line (a leftover moved
+  back, 10.1), whether or not any run has journaled `moved-back` yet. Once `deleted` is written,
+  the identity is no longer matched, so a new folder that reuses the inode is not taken for the
+  item. Such an item is kept **in every mode, `--backup-only` and dry runs
   included**, so a leftover is never archived; the reason names the directory, and the leftover
   stays the user's to check. **Every walk stops there without descending**: the F0 walk, which
   is the first walk of step 2, meets the name and skips the item before F0 is complete, so the
@@ -570,8 +630,10 @@ files, git directories and regenerable children (6.3) alike. No file is left out
 it is clean or regenerable, and no file is left out because a remote is believed to hold it. The
 one case where an enclosing archive lacks a nested directory is a nested item removed earlier in
 the run on its own, which only happens for items that are not regenerable children of a git item
-(6.3) and which have their own record. A `remove-regenerable` item on its own is archived only with
-`--backup-regenerable` or the answer `b`.
+(6.3) and which have their own record. An enclosing item whose archive would hold a nested item's
+secrets that were not chosen for that nested item is not archived at all: it is kept (6.3). A
+`remove-regenerable` item on its own is archived only with `--backup-regenerable` or the answer
+`b`.
 
 The **preserve sets** are a checked subset: for every git directory in
 `preserve.git_admin.git_dirs`, `git_admin_files` and `object_store_files` are called again at apply
@@ -701,13 +763,17 @@ always to the user's own storage):
     what it saw;
   - **limits**: a store of more than 10 million objects in one git directory, or more than
     600 seconds for all the commands of this rule on one item, keeps the item ("the history check
-    exceeded its limit"; a **limit reached**, the one kind of check not completed that
-    `upload-all` uploads anyway, 9.2). When the time limit is reached, the whole process group of the running
-    git command is killed. Section 18 gives the memory this needs. Both values are ASSUMPTIONs
-    (D-16); tests inject smaller ones through the library;
+    exceeded its limit"). It is a **limit reached** only when the tool's own object counter passed
+    the limit, or the tool's own timer fired and the tool then killed the whole process group of
+    the running git command; the tool records which before it sends the signal. A git process that
+    ends by a signal the tool did not send (the kernel's out-of-memory killer among them) or by a
+    crash is a check that **could not run** (below), also when that happens near the time limit.
+    Section 18 gives the memory this needs. Both values are ASSUMPTIONs (D-16); tests inject
+    smaller ones through the library;
   - a `pack-<id>.pack` without its `pack-<id>.idx` is invisible to git, so its objects cannot be
-    listed: it keeps the item. Core's layout check already gives `ask` to any other object-store
-    file it does not recognise, such as a `tmp_*` leftover.
+    listed or examined: a check that could not run (below). Its bytes are archived like every
+    other file, and a restore gives it back for `git index-pack`. Core's layout check already
+    gives `ask` to any other object-store file it does not recognise, such as a `tmp_*` leftover.
 
   This catches a `.env` set aside with `git stash -u` or `git stash -a`, whether the stash is kept
   or dropped; a key file added by an unpushed commit, also when a later commit renamed it or it is
@@ -754,25 +820,69 @@ A URL **carries a credential** when its userinfo has a password, or its user nam
 pattern, is 40 or more hexadecimal characters, or is longer than 30 characters. A short plain user
 name (as in a default Azure DevOps clone URL) is not a credential.
 
-**Fail closed.** Any command of this section that fails (a nonzero exit, or output that does not
-parse, such as a `missing` line from `cat-file --batch` for an object the store listed), exceeds
-the limits above or cannot run, and any file the content rule cannot read, keeps the item (skipped
-before upload, the reason names the check). A warning on stderr with exit 0, which git prints for
-every partial clone, is not a failure. The one exception is the 64 MiB content budget for named
-blobs in history, which is documented best effort. A check that failed or could not run, for any
-reason other than the two limits above (a git error, output that does not parse, a missing
-object, a pack without its index), is a **check that could not run**: it keeps the item under
-every automatic handling, `upload-all` included, because then the archive's completeness is in
-doubt, not only its secrecy. In ask mode it stays in the secrets set as before (11), so the
-answer `u` is the only route that uploads such an item. An item whose layout core's check refused is never selected at all
-(the plan gives it `ask`, as above, D-3), and a layout that fails only at apply's re-check (step 2)
-makes the item differ from the plan, so it is skipped; no handling applies to either.
+**Fail closed, with two kinds of failure that never overlap.** Every failure in step 2 or in the
+archive keeps the item (skipped before upload, the reason names the check), unless a secrets
+decision covers it, and only failures of the first kind can be covered:
+
+- **Not examined for secrets** (a secrecy question; the archive is unaffected): a secret check of
+  this section that did not complete for a git directory or working tree inside the item. Either
+  a **limit reached** (above), or a check that **could not run**: a command of this section that
+  exits nonzero, is ended by a signal the tool did not send, or prints output that does not parse
+  (such as a `missing` line from `cat-file --batch` for an object the store listed); a corrupt
+  object that git reports while the history check reads it; an object missing from a repository
+  that is not a partial clone; a pack without its index; a global excludes file or include that
+  cannot be read. None of these changes what is archived: every entry is archived as bytes (9.1),
+  the F0 chain ties the archive to the directory (6.4), parts and the index are read back and
+  compared (9.4), and each entry's record is compared again just before its unlink (13.2). A
+  damaged repository is archived and restored exactly as damaged as it is on disk. These enter the
+  secrets set as **not examined**, each with its reason: "could not run (REASON): this item's
+  history was not examined for secrets", or for a limit reached "exceeded its limit (objects or
+  time): this item's history was examined only in part". **Damage note.** When the tool knows the
+  kind of damage from structured output or its own listing of `objects/` (a `missing` line, a
+  pack without its `.idx`, git's report of a corrupt object by its exit status and the object
+  class of the command), the prompt (11) and the item's manifest record (12.1, field
+  `history_damage`: `corrupt-object`, `missing-object` or `pack-without-index`, no object names)
+  say that git reported the repository as damaged when it was archived, so that a later restore
+  of a broken repository is no surprise. The tool does not parse git's error text for this; a
+  failure it cannot name is only "could not run".
+- **Not shown to be preserved** (the archive would be incomplete or unverifiable): an entry that
+  cannot be opened or read, by the archive or by a secret check's content read (which the archive
+  could not read either); an entry kind or extended attribute that cannot be archived (9.3); any
+  difference from F0 (6.4, 9.4); a preserve-set call that fails or lists a file the index lacks
+  (9.1); a part or the index not verified (9.4). These keep the item in every mode, under every
+  handling and after every answer: no secrets answer or setting overrides them, and the secrets
+  prompt is not offered for such an item (11).
+- **No case is in both kinds.** The line is the definition, not a list of examples: a failure is
+  the second kind exactly when it makes the **archive itself** incomplete or unverifiable (an
+  entry that cannot be read, a file not stable around its read, a missing index record, a
+  read-back or digest mismatch, an upload that cannot be verified). A failure of git or of a
+  secret check that leaves the archive intact is the first kind, a corrupt object, a missing
+  object and a pack without its index included, because the archive copies the git directory's
+  bytes as files and restores exactly them. ASSUMPTION (the coordinator's, answering the
+  adversarial review's clarification by this definition and not by its list of examples; the
+  reviewer may object): a damaged repository is therefore a secrecy question that `u` may
+  override. A unit test maps every failure the checks and the archive can report to exactly one
+  kind (AC-44).
+
+A warning on stderr with exit 0, which git prints for every partial clone, is not a failure. The
+64 MiB content budget for named blobs in history is documented best effort and is neither kind.
+The places of 7.4, the process check and the other re-checks of section 7 are neither kind
+either: they keep the item whatever is chosen. An item whose layout core's check refused is never
+selected at all (the plan gives it `ask`, as above, D-3), and a layout that fails only at apply's
+re-check (step 2) makes the item differ from the plan, so it is skipped; no handling applies to
+either. A corrupt or missing object that makes core's own re-scan fail is that kind of re-check
+failure, not a secrets question.
 
 **The secrets set and the user's choice (D-4).** Everything the rules above find in one item is
 that item's **secrets set**: secret-like files (by name, content, global excludes or git
 directory rule), secret-like names in history the network remotes do not hold, unnamed objects,
-and every history check that hit a limit or could not run ("not checked"). For each item with a
-non-empty secrets set the user chooses one handling:
+and every check **not examined** (a limit reached or a check that could not run, above). Its
+**set digest** is the SHA-256 of its canonical list: for each entry its rule, its path relative to
+the item the set belongs to (for history, the git directory's relative path and the object id)
+and, for a file, its content digest, sorted. The journal holds the digest, never the list. Paths
+are relative to the owning item, so a nested item's part computed inside its enclosing item has
+the digest of the nested item's own set (6.3). For each item with a non-empty secrets set the
+user chooses one handling:
 
 - **keep** (the default whenever nothing was chosen): the item is skipped before upload, the
   reason naming up to five entries by relative path or, for history, by file name ("a stash, a
@@ -784,14 +894,18 @@ In ask mode the choice is made at the secrets prompt (11), for that item only. F
 runs in automatic mode it is `--secrets keep|upload|upload-all` or `[apply] secrets`, default
 `keep`:
 
-- `upload` covers the item's secrets set **except unnamed objects and history checks not
-  completed**, which it never uploads (D-16, the user's per-repository choice; a check not
-  completed may hide unnamed objects), so an automatic item whose set holds either is kept;
+- `upload` covers the item's secrets set **except unnamed objects and checks not examined**,
+  which it never uploads (D-16, the user's per-repository choice; an unexamined history may hide
+  unnamed objects), so an automatic item whose set holds either is kept;
 - `upload-all` (the **upload-all handling**) covers the item's **whole** secrets set: secret-like
-  files, history names, unnamed objects (read in full, in part or not at all) and a history check
-  that reached a limit. It still keeps an item with a **check that could not run** (above). It is
-  never the default, never implied by `upload`, and has no effect on items in ask mode, which are
-  asked as before.
+  files, history names, unnamed objects (read in full, in part or not at all) and every check not
+  examined, a limit reached or a check that could not run, the same set the answer `u` covers. It
+  is never the default, never implied by `upload`, and has no effect on items in ask mode, which
+  are asked as before. ASSUMPTION (the owner's, D-4): a check that could not run is included
+  because the archive is complete and verified whatever git reported (above) and the user asked
+  for such folders to be backed up anyway; the summary lists each item uploaded with history not
+  examined, with its reason, so a failure that hits every repository (a broken git) is visible.
+  Neither handling covers a failure of the second kind, nor a nested item's part (6.3).
 
 **The upload-all notice.** In a run where `upload-all` is in effect, apply prints this notice
 exactly once on stderr, before the first upload of any item (in a dry run, before the first item
@@ -799,20 +913,22 @@ is reported); `apply --resume` is a new process and prints it once again before 
 upload. The run summary repeats it once at its end, as part of the summary, not as a second
 notice. The notice: "--secrets upload-all: items that run automatically are uploaded whole to REMOTE,
 even when they hold secret-like files, secret-like names in local history, unnamed git objects
-or a history check that exceeded its limit. Unnamed objects and objects of 1 MiB or more may be
-uploaded unread; 'no pattern matched' is not evidence that an object holds no secret. Items whose
-history check could not run are still kept." It is followed by "REMOTE is encrypted (rclone
+or history that was not examined for secrets because its check exceeded a limit or could not
+run. Unnamed objects and objects of 1 MiB or more may be uploaded unread; 'no pattern matched' is
+not evidence that an object holds no secret." It is followed by "REMOTE is encrypted (rclone
 crypt)." or "REMOTE is not encrypted: these files will be stored unencrypted in REMOTE." (9.6).
 With `--require-encrypted-remote` and a plain remote the run is refused before this notice, as
 for any upload.
 
 The option overrides the setting; any other value of either is a usage error (exit 1) before any
 item is read. A choice covers exactly the set it was made for: it binds to F0 (11), so a
-secret-like entry that appears later keeps the item or asks again, and no choice uploads another
-item's secrets. The third option the user was shown, a local vault for the secret-like files with the
-rest archived, is deferred (D-4 says why). The run summary counts the items kept by each rule and
-the items uploaded with a secrets set, so the cost of over-keeping (mainly the global-excludes
-rule, the unnamed-object rule and the history limits) is visible.
+secret-like entry that appears later keeps the item or asks again; the archive writer judges
+again the bytes it sends (9.4); and no choice uploads another item's secrets, a nested item's
+included (6.3). The third option the user was shown, a local vault for the secret-like files with
+the rest archived, is deferred (D-4 says why). The run summary counts the items kept by each rule
+and the items uploaded with a secrets set, and lists each item uploaded with history not
+examined, so the cost of over-keeping (mainly the global-excludes rule, the unnamed-object rule,
+the history limits and the nested-secrets rule) is visible.
 
 **Encryption.** Before the first upload, apply reads the storage remote's type (9.6). When it is not
 `crypt`, the run summary and every ask prompt say that the archive is stored unencrypted in the
@@ -864,18 +980,80 @@ such a remote (exit 1). The tool does no encryption of its own in this release (
   avoids spooling when `--size` is given is **unverified**, so the part size is bounded by the free
   space of rclone's temporary directory (section 18), and the click-test exercises one real
   non-local remote (section 24).
-- An entry whose metadata differs from F0 when opened, or whose size changes while read, or that
-  cannot be read, fails the item before the part completes (fail closed).
+- An entry whose metadata differs from F0 when opened, or that cannot be read, fails the item
+  (fail closed). Symlinks are read under 13.2's rule for symlinks.
+- **What is checked is what is sent.** The writer reads every regular file through its descriptor
+  in chunks of at most 1 MiB; the first chunk holds at least the file's first 64 KiB. A chunk is
+  emitted (handed to the hasher, the counter and rclone) only after:
+  - `fstat` on the descriptor, after the chunk was read, shows F0's kind, device, inode, size,
+    modification time and change time;
+  - for the first chunk of a file that step 2 judged by the content rule (untracked, ignored or
+    modified, smaller than 1 MiB, not exempt), the content rule has run again on that chunk's
+    first 64 KiB, in memory, and given the verdict step 2 recorded for that path (match or no
+    match, and the pattern kind);
+  - for a file of a git directory outside `objects/`, the credential-URL rule has run on a window
+    of the chunk plus the previous chunk's last 64 KiB, with the same verdicts as step 2. The
+    writer holds back each chunk's last 64 KiB until the next window is judged, so a URL of up to
+    64 KiB is judged whole before any byte of it is sent.
+
+  Any difference, or a failed read, fails the item before that chunk is emitted; in the first
+  chunk, before any byte of the file, its header included, is sent. The bytes judged are the
+  buffer that is emitted, so nothing written between the judgement and the emission is sent. The
+  writer also applies the **name rule** to each path it is about to emit, on the path it opened
+  (an entry whose name the rule matches and whose step 2 verdict is not "chosen for upload" stops
+  the item before any byte of it is sent). A file's git status (untracked, ignored, modified)
+  comes from step 2 and is not recomputed: it decides whether the content rule applies, and a
+  tracked file that is modified after step 2 shows a new change time, which the per-chunk `fstat`
+  catches. A modified tracked file whose change is not seen is the upload race below.
+- **Git object stores.** The history check judges objects through git, while the archive sends
+  the files below `objects/` (packs, their indexes, loose objects, `multi-pack-index`, `info/`).
+  So step 2 records each git directory's **object inventory**: every file below `objects/` by
+  relative path, size and SHA-256, read under the open rule of 13.2 and with no git command, after
+  the history commands and before step 2's second fingerprint, which shows nothing changed during
+  the check. Immediately before the first byte of that git directory is sent, the writer derives
+  the inventory again the same way and compares it; any difference (a file added or removed, or
+  another size or digest) fails the item before any byte of the git directory is sent. Each file
+  is then sent under the chunk rule above, and the SHA-256 of what was sent must equal the
+  inventory's.
+- **What remains: the upload race** (section 17). A write that moves the change time is caught
+  before the bytes it wrote are sent: the write path updates the times before it copies the data,
+  so the writer either read the old bytes or sees the new time before it sends (ASSUMPTION, the
+  owner's, for each file system of the 7.4 allowlist; NEG-71 tests detection on both CI runners).
+  Two kinds of write can still put bytes no check judged into storage: a write through a memory
+  mapping, whose times are not updated on every write, and a write within the timestamp
+  granularity of the writer's previous `fstat` (coarse kernel timestamps on Linux). Either must
+  land where the content rule does not look (past a file's first 64 KiB, a file of 1 MiB or more,
+  a file step 2 found tracked and unmodified, an object-store file after the comparison). The
+  pack digest, the end-of-archive fingerprint or the deletion pass (13.2) fails the item when it
+  sees the change, but those bytes were sent. Removing the attempt's objects (below) does not
+  undo a disclosure to the provider.
+- **Rejected: a staged copy.** Copying the item, or the files the checks judge, to local storage
+  and sending the copy would close the race, but it needs free space on the disk the tool exists
+  to free, and apply is meant to run on a nearly full disk (18, D-14). A reflink copy (APFS
+  `clonefile`, Linux `FICLONE`) needs no space, but ext4, f2fs and tmpfs, which the 7.4 allowlist
+  includes, have no reflinks, and copying a directory file by file is not atomic either.
+  ASSUMPTION (the owner's).
 - The part is then read back with `rclone cat` into a second hasher. It is **verified** only if
   rcat exited 0, the bytes read back equal the bytes sent and the computed length, both digests are
   equal, and `rclone lsjson` reports that size.
 - Object names are unique per attempt:
   `disk-cleaner/v1/<machine id>/archives/<run_id>/<item_id>.a<attempt>.p<part>.tar`. Nothing is ever
   overwritten; the store interface refuses to write a name that exists.
-- A failed attempt (nonzero exit, mismatch, no progress for 10 minutes) is never retried in place:
-  the item restarts from step 2 with attempt + 1, at most 3 attempts. Objects of failed attempts
-  (including a lost response, where the object arrived but the tool saw a failure) are orphans,
-  listed by `manifest orphans`, never deleted automatically.
+- A failed attempt (nonzero exit, mismatch, no progress for 10 minutes, or a check above) is
+  never retried in place: the item restarts from step 2 with attempt + 1, at most 3 attempts.
+  **Its objects are removed first**: the journal line `attempt-removing` with the names is synced;
+  each name the attempt's `attempt-started` line lists is deleted with `rclone deletefile` (a
+  name that does not exist is not an error); `rclone lsjson` of those names must then show none;
+  and `attempt-removed` journals the result. This covers a lost response, where the object
+  arrived but the tool saw a failure. A name that could not be removed, or that the listing still
+  shows, is named in the summary (the run exits 2) and stays visible to `manifest orphans`, which
+  is also the backstop for an object that arrives after the listing. On a provider that keeps
+  versions or hides deleted objects, a deletion may leave an old version (section 17).
+- **The tool deletes nothing else in storage.** The store interface refuses to delete a name that
+  is not in an `attempt-started` line of this machine's journals, or one of an attempt for which
+  `recorded` was journaled (its record references it, or may). A complete attempt superseded
+  before its record (a crash between `index-verified` and `recorded`) is removed like a failed
+  one, since nothing references it.
 - After the last part, the index object is uploaded and verified the same way.
 
 ### 9.5 Rate limits and budgets
@@ -926,26 +1104,36 @@ length).
     the apply locks, stops with exit 1.
   - **Guard.** `rclone-tmp/guard` is a fixed file that is created once and never removed. Creating
     an operation's lock files and cleaning up both happen only while the exclusive lock on the
-    guard is held. That lock is held for milliseconds, never during a transfer.
+    guard is held. While it is held the tool does only file-system changes of the state directory
+    and non-blocking lock probes: it never waits for a process, a transfer or a blocking lock. It
+    is taken with `LOCK_NB`, retried for at most 10 seconds; an operation that cannot take it in
+    that time leaves other operations' spools alone and reports it, and one that cannot take it
+    to create its own lock files stops with exit 1.
   - **Start.** Holding the guard, the operation creates `OP.lock` and `OP.spool` with create-new
     semantics, takes both locks, creates the directory `OP/` and releases the guard. It is the only
     writer of `OP/`, through its children.
   - **Teardown of a spool `ID`: one routine**, used both at the end of the tool's own operation
-    and, at the start of every operation, for every other `ID`. It runs holding the guard, and only
-    when the state directory is on a file system of the 7.4 allowlist (elsewhere advisory locks are
-    not trusted: spools are reported and never removed).
-    1. Own operation only: wait for the operation's direct children, then close every descriptor
-       the tool holds on `OP.lock` and `OP.spool`. Waiting for a direct child proves nothing about
-       rclone's own subprocesses, and the tool's own description would make the next step succeed
-       or fail for the wrong reason, so neither is the test.
-    2. Open `ID.lock` and `ID.spool` afresh (new open file descriptions) and try non-blocking
+    and, at the start of every operation, for every other `ID`. It runs only when the state
+    directory is on a file system of the 7.4 allowlist (elsewhere advisory locks are not trusted:
+    spools are reported and never removed). Step 1 runs **before** the guard is taken; steps 2
+    and 3 run holding it.
+    1. Own operation only, without the guard: wait for the operation's direct children, at most
+       30 seconds; then send SIGTERM to those still alive (the tool's own children only), wait at
+       most 10 seconds more, send SIGKILL, and wait at most 5 seconds; then close every descriptor
+       the tool holds on `OP.lock` and `OP.spool`, whether or not a child is still alive (one
+       stuck in an uninterruptible wait keeps its inherited spool descriptor, and step 3 then
+       keeps the spool). Waiting for a direct child proves nothing about rclone's own
+       subprocesses, and the tool's own description would make the next step succeed or fail for
+       the wrong reason, so neither is the test.
+    2. Take the guard. Open `ID.lock` and `ID.spool` afresh (new open file descriptions) and try non-blocking
        exclusive locks on both. A missing lock file next to an existing `ID/` counts as held: the
        tool creates both files before `ID/` and removes them after it, so a missing one means
        someone else removed it, perhaps while a process still holds the old one (with no `ID/`,
        the lock files that exist are locked and removed the same way).
     3. Only when **both** are granted, so no process holds either description, are `ID/`, then
        `ID.spool` and `ID.lock`, removed while both are held. Otherwise nothing of `ID` is
-       touched and the spool is reported (below).
+       touched and the spool is reported (below). Then the guard is released. Another
+       operation's start or teardown therefore never waits on this operation's children.
   - **A surviving holder.** When an rclone child hangs after the tool died, or a subprocess of
     rclone outlives rclone at the tool's own end, it keeps `ID.spool` locked. The spool then stays:
     the operation that found it, and every later one, reports it ("a process of operation ID still
@@ -978,15 +1166,22 @@ length).
 
 - `<state>/journal/<run_id>.jsonl` is append-only. Each line is one transition of one item
   (`selected`, `rechecked`, `answered`, `attempt-started`, `part-uploaded`, `part-verified`,
-  `index-verified`, `segment-reserved`, `recorded`, `segment-synced`, `checked-again`,
-  `quarantine-intent`, `quarantined`, `delete-started`, `deleted`, `removed-recorded`, `skipped`,
-  `failed`, `kept`, `vanished`, `left`, `moved-back`) with the attempt, object names, sizes and
-  digests; `quarantine-intent` also holds Q's path and the item directory's device, inode and
-  mount id from F0. Each line is flushed and `fsync`ed before the step it records takes effect;
-  renames are followed by an `fsync` of the parent directory where the platform supports it.
+  `index-verified`, `attempt-removing`, `attempt-removed`, `segment-reserved`, `recorded`,
+  `segment-synced`, `checked-again`, `quarantine-intent`, `quarantined`, `delete-started`,
+  `deleted`, `removed-recorded`, `skipped`, `failed`, `kept`, `vanished`, `left`, `moved-back`)
+  with the attempt, object names, sizes and digests; `rechecked` and `answered` also hold the
+  item's secrets set digest and how its secrets were decided (9.2, 6.3), and `quarantine-intent`
+  holds Q's path and the item directory's mount id and directory identity from F0 (section 4).
+  Each line is flushed and `fsync`ed before the step it records takes effect; renames are
+  followed by an `fsync` of the parent directory where the platform supports it.
 - `segment-reserved` holds the next manifest segment number and is synced before that segment name
   is used, so a segment name is never reused, also across a crash.
-- The header records the plan and scan SHA-256, the storage, the flags and the build.
+- The header records the plan and scan SHA-256, the storage, the flags, the build, and **every
+  effective setting** (the automatic classes, the secrets handling, `require_encrypted_remote`,
+  `min_free`, `part_size`, `max_upload_bytes`, `max_plan_age`), each with its source (option,
+  configuration file or default). A resume uses these and does not read `[apply]` from the
+  configuration file; when the file now says otherwise, the resume names each difference once
+  and goes on with the journaled value. To change a setting, the user starts a new run.
 - `apply --resume RUN_ID` continues each unfinished item from its last durable state, but only
   work before deletion (re-checks, uploads, verification, records, items not yet quarantined). A
   resumed `--backup-only` run never deletes. **A deletion that began is never continued.**
@@ -1001,13 +1196,14 @@ list` (5) shows how to restore the item and that removing the folder is up to th
 In the table, **O** is the original path and **Q** the quarantine path, both examined with
 `lstat` (no-follow), never read inside. "Present" for O means any entry is there: a directory, a
 file, a symlink or anything else. "Present" for Q means Q passes the identity check of 6.1 (a
-directory with the journaled device and inode); anything else at Q's path is a **replaced Q**:
+directory with the journaled directory identity, section 4); anything else at Q's path is a
+**replaced Q**:
 touch nothing, `failed`, and `quarantine list` names it. A resume never touches an entry at O that
 is not the item.
 
 | Last state | O | Q | On resume |
 |---|---|---|---|
-| Archived item: before `segment-synced`. Unarchived regenerable item: any state before `quarantine-intent` | any | absent | Start the item again from step 2 with the next attempt. Earlier objects are orphans. O absent: skipped `gone`. |
+| Archived item: before `segment-synced`. Unarchived regenerable item: any state before `quarantine-intent` | any | absent | Remove the objects of every attempt without `recorded` (9.4), then start the item again from step 2 with the next attempt. O absent: skipped `gone`. |
 | Archived item: `segment-synced` or `checked-again` | present | absent | Step 2 again (F0 must equal the index), then steps 7 to 11. |
 | Archived item: `segment-synced` or `checked-again` | absent | absent | Skipped `gone`; the `backed-up` record stays valid for restore. |
 | `quarantine-intent` | present | absent | The rename never happened: as `segment-synced`. |
@@ -1016,7 +1212,7 @@ is not the item.
 | `quarantined` | present | absent | Touch nothing; `failed` ("quarantine missing, something is at the original path"). |
 | `quarantine-intent` or `quarantined` | absent | absent | Something outside the tool removed the item. Archived item: write a `vanished` record (the archive is the copy; restore works); `failed` in the summary. Unarchived regenerable item: skipped `gone`, no record. Never `removed`, never `kept`. |
 | `delete-started` or `left` | any | present | A leftover: journal `left` if it is not there, report it, touch nothing (Q is not read; a directory at O is not touched). `failed` in the summary. |
-| `delete-started` or `left` | a directory with F0's device and inode | absent | **The leftover was moved back** (a rename keeps the inode): journal `moved-back`, write no `removed` record, `failed` in the summary with "PATH is incomplete: some of its files were already deleted; `disk-cleaner restore RECORD_ID` gives the complete item" (for an unarchived regenerable item: "never archived; rebuildable"). The folder is kept by 7.4 in every mode, before and after this line is written. |
+| `delete-started` or `left` | a directory with the item's directory identity (section 4) | absent | **The leftover was moved back** (a rename keeps the inode and birth time): journal `moved-back`, write no `removed` record, `failed` in the summary with "PATH is incomplete: some of its files were already deleted; `disk-cleaner restore RECORD_ID` gives the complete item" (for an unarchived regenerable item: "never archived; rebuildable"). The folder is kept by 7.4 in every mode, before and after this line is written. |
 | `delete-started` or `left` | absent, or anything else | absent | Deletion finished before `deleted` was written, or the user removed the leftover: write `deleted`, then the `removed` record (`regenerable-removed` for an unarchived regenerable item) with `completed_by: "unknown"`, once. An entry at O is new and is not touched; the summary names it. |
 | `moved-back` | any | any | Report only, as `quarantine list` prints it. |
 | `deleted` | any | absent | Write and sync the `removed` record if no synced segment has it. |
@@ -1027,7 +1223,9 @@ is not the item.
   verified segment, and `manifest list` shows one.
 - Applying a finished plan again changes nothing and reports items as already done.
 - **Signals.** Outside a deletion pass, Ctrl-C (SIGINT), SIGTERM and SIGHUP all finish the
-  current journal write, stop before the next step, and exit 3 with the run id. **During a
+  current journal write, stop before the next step, and exit 3 with the run id. During an upload
+  that means stopping the transfer and first removing the incomplete attempt's objects (9.4); a
+  second signal skips that removal, which the next non-dry run or resume then does (6.1). **During a
   deletion pass** (ASSUMPTION, the owner's):
   - the first Ctrl-C prints "finishing the deletion of PATH (N entries left); press Ctrl-C again to
     stop and leave a partial folder you must remove yourself; the item is in archive RECORD_ID"
@@ -1081,8 +1279,11 @@ its re-check.
   handling options are offered and that uploading to their own storage is a choice they intend
   to use (D-4); the user chose a per-repository answer for unnamed objects (D-16). The mechanics
   below (one prompt, its contents, when it is offered, what it binds to) are the owner's
-  ASSUMPTION. An item whose only reasons to be kept are in its secrets set is not skipped
-  silently in ask mode on a terminal. It gets this prompt first, listing the whole set:
+  ASSUMPTION. An item whose only reasons to be kept are in its own secrets set is not skipped
+  silently in ask mode on a terminal. An item that is also kept for any other reason (a failure
+  that leaves it not shown to be preserved, 9.2; a place of 7.4; a re-check difference; a nested
+  item's secrets not chosen for upload, 6.3) gets no secrets prompt and is kept. The prompt lists
+  the whole set:
   - secret-like files: up to 20 by relative path with the rule that matched (name, content,
     global excludes, git directory file), then a count of the rest; never contents;
   - history: each secret-like file name and where it sits (a stash, a local-only commit, an
@@ -1093,7 +1294,15 @@ its re-check.
     pattern matched" (64 KiB to 1 MiB); "not read: 1 MiB or more"; "not read: the item's 64 MiB
     content budget was spent" (the figures here and in statement 1 are the limits in effect; the
     binary has no option to change them, and only the library's tests inject smaller ones);
-  - checks not completed: each history check that hit a limit or could not run, "not checked";
+  - checks not examined, each with its reason: "could not run (REASON): this item's history was
+    not examined for secrets; u uploads it unexamined", or "exceeded its limit (objects or time):
+    this item's history was examined only in part; u uploads the rest unexamined". For a damaged
+    repository (a corrupt or missing object, a pack without its index, as 9.2 says the tool can
+    tell) the line adds "git reported this repository as damaged; the archive holds it exactly as
+    it is on disk, the damage included, and a restore gives it back damaged";
+  - entries inside a nested item that its own decision in this run covered (6.3), marked "inside
+    PATH, uploaded under your decision for PATH"; they are listed for information and are not part
+    of this item's answer;
   - the storage they would go to, and for a remote that is not `crypt`, "these files will be
     stored unencrypted in REMOTE";
   - when the set holds unnamed objects, these three statements, shown every time, word for word:
@@ -1115,7 +1324,7 @@ its re-check.
   item is kept; the summary line for such an item says that ask mode on a terminal offers the
   choice. In automatic mode the setting of 9.2 decides and no prompt is shown. The answer binds to
   F0, which includes the store's files, so a new secret-like entry or object before step 9 keeps
-  the item. The record carries `secrets_uploaded` (the count of secret-like files and history
+  the item, and the writer judges again what it sends (9.4). The record carries `secrets_uploaded` (the count of secret-like files and history
   names, no names), `unnamed_uploaded` (the count and total bytes, no names or ids),
   `secrets_choice` and `kept_reasons_overridden` (12.1); the summary counts such items.
 - Every answer, `u` included, binds to the F0 it was given against. A failed attempt or a resume
@@ -1158,7 +1367,12 @@ Where they apply:
   otherwise have kept the item, each with its count and no names: `name`, `content`,
   `global-excludes`, `git-directory`, `history-name`, `unnamed-object` (with the counts read in
   full, in part and not read), `history-limit` (`objects` or `time`) and `history-not-run` (the
-  check that could not run; only after `u`, since no automatic handling uploads such an item);
+  check that could not run, after `u` or under `upload-all`);
+- `history_damage`: on the record of an item archived with a damaged repository (9.2), the kind
+  of failure, `corrupt-object`, `missing-object` or `pack-without-index`, one per git directory
+  with its relative path and no object names, so a restore of a broken repository is no surprise;
+- `nested_secrets`: for each nested item whose part of the secrets set this archive holds under
+  that nested item's own decision (6.3), its path and record id;
 - `completed_by`: `"unknown"` on a `removed` or `regenerable-removed` record written after the
   tool found a leftover's quarantine gone (10.1): the user, or the interrupted pass, finished it;
 - `restore`: the method (`archive` or `regenerable`) and the exact `disk-cleaner restore
@@ -1192,8 +1406,9 @@ secret.
 - `manifest verify` lists every object the records reference and checks that it exists with the
   recorded size (`lsjson`), so a lifecycle rule or a manual deletion is noticed; `--deep` also reads
   each object back and compares its SHA-256.
-- `manifest orphans` lists objects under the machine's storage path that no record references. It
-  deletes nothing.
+- `manifest orphans` lists objects under the machine's storage path that no record references:
+  objects of a failed attempt whose removal failed (9.4), an object that arrived after its
+  removal was verified, and anything else placed there. It deletes nothing.
 
 ## 13. Removal and restore
 
@@ -1220,6 +1435,15 @@ the second existence check passed. No remote fact is a condition.
   non-blocking and no-follow, then a regular-file check on the open file. It opens by path and
   does not compare the inode, so apply's opens add the handle-relative open and the inode check;
   that every reader of core's item re-scan goes through it is core change C-7.
+- **A symlink** cannot be opened under that rule (`O_NOFOLLOW` fails on it with `ELOOP`), so it is
+  read by name, between two `fstatat(..., AT_SYMLINK_NOFOLLOW)` calls on its directory handle:
+  `readlinkat` for the target, and the no-follow attribute calls for its extended attributes
+  (macOS `getxattr` and `listxattr` with `XATTR_NOFOLLOW`; Linux `lgetxattr` and `llistxattr`).
+  Both `fstatat` results must show F0's kind, device and inode, and the same size, modification
+  time and change time as each other; otherwise the read is a difference. A symlink's target
+  changes only by replacing the link, which gives a new inode, and a change to its attributes,
+  mode or flags moves its change time. This applies wherever a symlink is read: the archive, the
+  fingerprint, the deletion pass and restore's check.
 - A symlink is removed as a link, never followed. A directory whose device or mount id differs from
   the item's, or that is a mount root, is never entered: deletion stops, leaves the rest in
   quarantine and reports the item `failed` (for an archived item the data is in the verified
@@ -1235,12 +1459,13 @@ the second existence check passed. No remote fact is a condition.
   stops the pass. **One rule, for every entry of an archived item** (regular file, every name of
   a hard-link group, symlink, directory): immediately before the entry's `unlinkat`, its
   **preserved record** (section 4) is computed again, through a descriptor opened on it by the
-  open rule above (a symlink is read with `readlinkat`), by the same function that wrote its
-  archive entry, and compared with the index record for that path: kind, content SHA-256 and size
-  for every name of a hard-link group, symlink target, mode bits, user flags, modification time,
-  and every archived extended attribute by name, size and value digest. `fstat` on the
-  descriptor before and after the read must show the same device and inode as F0 and the same
-  size, modification time and change time as each other, so a write during the read is seen. No
+  open rule above (a symlink by name, under the symlink rule above), by the same function that
+  wrote its archive entry, and compared with the index record for that path: kind, content
+  SHA-256 and size for every name of a hard-link group, symlink target, mode bits, user flags,
+  modification time, and every archived extended attribute by name, size and value digest.
+  `fstat` on the descriptor (for a symlink, `fstatat` by name) before and after the read must show
+  the same device and inode as F0 and the same size, modification time and change time as each
+  other, so a write during the read is seen. No
   field stands in for another: size and modification time never replace the content digest. An
   entry with no index record, any difference, or any failed call stops the pass. The only fields
   not compared are the ones this pass has itself changed by then, each for its own reason:
@@ -1416,27 +1641,36 @@ which the user chose (option (i), sourced in D-16).
 - **D-4. Secrets: a handling the user chooses** (9.2, 11). **The user's decision** (Source:
   answer:4577b940-1ee7-4a57-a14c-89e1db1f9384/149728c7-19cb-470a-8dec-786c239d4d77 "offer
   options to user, in my case back it up to my private storage anyway"): the handling options are
-  offered to the user, and uploading secret-like files to the user's own private storage is a
-  legitimate choice that this user intends to use. The options shown were: keep the whole folder;
-  keep those files in a local vault and archive the rest; upload them with the rest. The same
-  words make an **automatic handling that uploads such folders anyway** something the tool must
-  offer: a user who wants their own folders backed up regardless must be able to say so for
-  automatic runs too (the coordinator's reading of the user's words, Source as above). That is
-  `--secrets upload-all` (9.2).
-  **Everything else is the owner's ASSUMPTION**, not the user's:
+  offered to the user, and uploading secret-looking content to their own private storage anyway
+  must be offered and is what this user wants for themselves. The options shown were: keep the
+  whole folder; keep those files in a local vault and archive the rest; upload them with the rest.
+  The words do not mention automatic runs, unnamed objects or history that was not examined.
+  **Everything else is an ASSUMPTION**, not the user's: that the "anyway" option takes the form
+  of an automatic setting, `--secrets upload-all` (9.2), the coordinator's; and the rest below,
+  the owner's. The coordinator reports to the user that `upload-all` changes the effect of the
+  user's D-16 choice in automatic runs:
   - two options in the first release, keep and upload; one prompt per item for the whole secrets
     set, merged with D-16's answer `u` so the two cannot contradict (11); for automatic runs the
     setting `--secrets` / `[apply] secrets`, whose `upload` value never uploads unnamed objects
-    and keeps an item whose history checks did not complete (unnamed objects stay per
+    and keeps an item with a check not examined (unnamed objects stay per
     repository, as the user chose in D-16);
   - for `upload-all`: its name; that it is a separate value, never the default and never implied
-    by `upload`; the one-time notice and its wording; the record fields
-    `secrets_choice: upload-all` and `kept_reasons_overridden`; and its exclusions: a history
-    check that could not run (a git error, unparsable output, a missing object, a pack without its
-    index) still keeps the item, because the archive's completeness is then in doubt, and an item
-    whose layout core refused is never selected. Under `upload-all` the unnamed objects of an
-    automatic item are uploaded without the per-repository question of D-16; that question stays
-    the only route in ask mode;
+    by `upload`; its scope, the whole secrets set, unnamed objects and every check not examined
+    included, a check that could not run among them (revision 12; revision 11 kept those on the
+    wrong ground that the archive's completeness was in doubt, while 9.2 shows it is not); the
+    one-time notice and its wording; the record fields `secrets_choice: upload-all` and
+    `kept_reasons_overridden`; and what it never covers: a failure that leaves the item not shown
+    to be preserved (9.2), a nested item's part (6.3), and an item whose layout core refused,
+    which is never selected. Under `upload-all` the unnamed objects of an automatic item are
+    uploaded without the per-repository question of D-16; that question stays the only route in
+    ask mode;
+  - the two kinds of failure of 9.2 (not examined, not shown to be preserved) and which cases
+    fall in each: a git error, a corrupt or missing object and a pack without its index are
+    secrecy questions, because the archive holds every byte and is verified without git. This
+    placement follows the definition (a failure is a preservation failure only when it makes the
+    archive itself incomplete or unverifiable), not the examples in the adversarial review's
+    clarification; it is the coordinator's ASSUMPTION, and the record and the prompt say that git
+    reported the damage (`history_damage`, 9.2);
   - **the default when nothing was chosen is keep**, because keeping loses nothing and an upload by
     mistake cannot be taken back;
   - the unencrypted-storage statement in the prompt and summary, and `--require-encrypted-remote`
@@ -1454,18 +1688,24 @@ which the user chose (option (i), sourced in D-16).
     archive and refuses when either is missing, and a decision for history secrets.
   Cost: until the user chooses upload, items with secret-like material are not reclaimed; the
   summary counts them by rule. `--secrets upload` still keeps every item with an unnamed object
-  or a history check not completed, which D-16 expects to be common in hand-worked repositories;
+  or a check not examined, which D-16 expects to be common in hand-worked repositories;
   `--secrets upload-all` reclaims those in automatic runs too, so the user's stated intent, to
   back such folders up to their own storage anyway, can be met in both modes. What `upload-all`
   costs: unnamed objects, which may be real secrets that were staged and unstaged, and objects
   read only in part or not at all, go to the storage unread, unencrypted unless the remote is
-  `crypt`; the notice says so once per run. What it still keeps: items with a history check that
-  could not run (the summary counts them), so not every such folder is reclaimed. The user was
-  shown three options and gets two in this release (the vault is deferred); the coordinator
-  reports that to the user.
+  `crypt`; the notice says so once per run. It also uploads, unexamined, the history of a
+  repository whose check could not run, which a broken git could make every repository in a run;
+  the summary lists each such item with its reason. What every handling still keeps: an item
+  not shown to be preserved, and an item that encloses a nested item whose secrets were not
+  chosen for that nested item (6.3), so a repository holding a vendored clone with a dropped
+  stash is not reclaimed until the clone is decided too. The writer's own checks (9.4) can fail
+  an item whose files are being written during the upload; it is retried, and kept after three
+  attempts. The user was shown three options and gets two in this release (the vault is
+  deferred); the coordinator reports that to the user.
 - **D-5. Recovery refs.** Moot in this release: nothing is pushed (D-1, section 8).
 - **D-6. rclone command line**, not the rc API that DESIGN.md named: `rcat --size`, `cat`, `lsjson`
-  behind a `Store` trait; minimum rclone version 1.64, checked at start.
+  and, for a failed attempt's objects only, `deletefile` (9.4), behind a `Store` trait; minimum
+  rclone version 1.64, checked at start.
 - **D-7. Full read-back is mandatory.** The dry-run summary estimates the egress.
 - **D-8. Permanent deletion**, only under 13.2 (handle-relative, mount-aware, no sync folders);
   `manifest verify` notices objects lost later.
@@ -1502,7 +1742,8 @@ which the user chose (option (i), sourced in D-16).
   `fsck.*` settings). Revision 9 (commit `fbf25f3`) has the full comparison. Why: keeping
   loses nothing (D-4), while an upload by mistake cannot be taken back. Cost (not measured):
   every apply walks all pushed history of each git directory without the commit-graph, linear in
-  the object count; apply already reads and uploads every byte of the item twice. A measurement
+  the object count; apply already reads and uploads every byte of the item twice, and it reads
+  every file below `objects/` twice more for the object inventory (9.4). A measurement
   on a repository of at least 5 million objects, with apply's exact options, is a release
   precondition (section 23).
 
@@ -1541,9 +1782,15 @@ which the user chose (option (i), sourced in D-16).
   - until it is removed, **the item around it is kept too** (7.4, C-6): a leftover `node_modules`
     keeps its whole repository from being cleaned;
   - a leftover moved back by the user is detected and kept, never recorded as removed, but it is
-    still incomplete (10.1);
+    still incomplete (10.1). The match uses the directory identity (section 4): where the file
+    system gives no birth time, a new folder made at O after the user removed the leftover by
+    hand can reuse the inode and be kept as moved back until the user moves its contents into a
+    fresh directory (a safe but false keep). A leftover moved away, recorded removed, and later
+    moved back to O is no longer recognised: it is then an ordinary folder;
   - a quarantine whose deletion never started is complete and listed (5), but it is put back only
-    by a `--remove` run, a resume, or the user's own `mv`;
+    by a `--remove` run, a resume, or the user's own `mv`. Where the file system gives no stable
+    identity and the device number changed across a reboot, it is listed as one the tool cannot
+    confirm, and only the user's own `mv` puts it back;
   - Ctrl-C during a deletion no longer stops at once: the pass finishes unless Ctrl-C is pressed
     again (10.1), which can take minutes;
   - every false stop of the deletion pass (13.2), such as a link added to a file of an
@@ -1557,11 +1804,25 @@ which the user chose (option (i), sourced in D-16).
   The user's storage is therefore the single point of recovery, and `manifest verify` should be run
   after any change to its lifecycle rules.
 - The apply-time live remote check that SCAN-FORMAT.md describes is not performed (section 8).
-- **The one disclosed race.** A process can still write into an item through a file it opened
+- **The deletion race.** A process can still write into an item through a file it opened
   before the quarantine rename. The deletion pass compares each entry's full preserved record
   with the archive just before that entry's own unlink (13.2), so a write is lost only when it
   lands between one entry's comparison and its own unlink. Only working directories are checked,
   not open files.
+- **The upload race** (9.4). The tool judges each file's bytes in memory just before it sends
+  them and checks the file's change time before each chunk, so an ordinary write during the upload
+  stops the item before what it wrote is sent. A program that writes through a memory mapping, or
+  writes within a few milliseconds of the tool's last check (coarse timestamps on Linux), can
+  still get bytes into storage that no check judged: past a file's first 64 KiB, in a file of
+  1 MiB or more, in a tracked file git saw unmodified, or in the object store after its last
+  comparison. The item then fails and is not removed, and the failed attempt's objects are
+  deleted, but the bytes reached the provider. **What to do:** stop programs that write into the
+  folders you select (editors, builds, sync clients, coding agents) while apply runs, and use an
+  rclone `crypt` remote if the provider must never see such bytes.
+- **Deleting a failed attempt's objects** (9.4) removes them from the listing. On a provider that
+  keeps object versions or hides deleted files (an S3 bucket with versioning, B2 by default), an
+  old version can remain until the provider's own cleanup removes it; the tool does not purge
+  versions. A name the tool could not delete is named in the summary and in `manifest orphans`.
 - **A hand edit inside a rebuildable directory removed without a backup is lost**: an unarchived
   `remove-regenerable` item (a `node_modules`, a build cache) has no copy, and its deletion pass
   compares only F0's fields, not content (13.2).
@@ -1591,10 +1852,13 @@ which the user chose (option (i), sourced in D-16).
   `--secrets upload-all` (9.2); automatic runs under `keep` or `upload` keep them. After `u` or
   under `upload-all`, unnamed objects are uploaded as they are: those not read, or read only in
   part, and those in which no pattern matched may hold a secret.
-- A repository whose store has more than 10 million objects, or whose history check takes more
-  than 600 seconds, is kept unless `u` is answered for it or `upload-all` applies (9.2, D-4); its
-  history is then uploaded unchecked, as the prompt and the notice say. A repository whose history
-  check could not run is kept by every automatic handling; only `u` at the prompt uploads it.
+- A repository whose store has more than 10 million objects, whose history check takes more than
+  600 seconds, or whose history check could not run (a git error, a corrupt or missing object, a
+  pack without its index) is kept unless `u` is answered for it or `upload-all` applies (9.2,
+  D-4); its history is then uploaded unexamined, as the prompt and the notice say. Its archive is
+  complete either way: a damaged repository is restored exactly as damaged.
+- An item enclosing a nested item is kept while that nested item's secrets were not chosen for
+  upload in the same run (6.3), whatever is chosen for the enclosing item.
 - **Secrets the user chose to upload** (D-4) are stored in the user's own storage like the rest of
   the archive, unencrypted unless the remote is `crypt`. The local vault option is not in this
   release.
@@ -1661,6 +1925,12 @@ which the user chose (option (i), sourced in D-16).
   record of each entry needs the index record in memory (about the size of F0 again). A removal
   therefore takes about as long as reading the item, and longer than the unlinks alone; the dry run
   and the prompt show the bytes to be read.
+- **The writer's checks** (9.4) add one `fstat` per chunk of at most 1 MiB, the content rule on
+  first chunks it already ran in step 2, and a 64 KiB held-back window for git directory files.
+  The **object inventory** reads every file below `objects/` twice more (once in step 2, once
+  before the git directory is sent), so for a git item the files of the object store are read four
+  times (two inventories, the upload and the deletion pass), git's own reads during the history
+  check on top. Section 23 measures this with the history check.
 - Bytes freed are measured as the change in free space, alongside the sum of sizes.
 
 ## 19. Exit codes and output
@@ -1672,7 +1942,8 @@ which the user chose (option (i), sourced in D-16).
   `--allow-root`, rclone or git missing or too old, an encrypted rclone
   configuration, storage unusable, `--require-encrypted-remote` with a plain remote).
 - 2: completed, but at least one item was skipped, failed, vanished, left in quarantine, or ended
-  `backed-up-kept` for any reason other than a request.
+  `backed-up-kept` for any reason other than a request, or an object of a failed attempt could not
+  be removed from storage (9.4).
 - 3: interrupted; the run id is printed for `--resume`.
 - 4: not supported on this platform in this release (Windows, 5). Nothing was created or run.
 - `quarantine list` exits 0, or 1 when the state directory cannot be read.
@@ -1765,8 +2036,13 @@ two steps; it exists only in test builds (AC-35).
   that each later hard-link name's record holds the group's size and digest.
 - **AC-14** A part counts as verified only after `rcat --size` succeeded, the read-back length and
   SHA-256 equal what was sent, and the listing shows that size; names are never reused; at most 3
-  attempts. Verify by: `upload.rs` with `FaultStore`, and `rclone_local.rs` with the real rclone
-  binary, which also checks the `--size` argument.
+  attempts. A failed or superseded attempt's objects are removed as 9.4 states (journaled first,
+  only names from its `attempt-started` line, never an attempt with `recorded`, verified by a
+  listing), at the failure, at a signal during an upload, on resume and by the next non-dry run;
+  a name that cannot be removed is named in the summary (exit 2) and by `manifest orphans`.
+  Verify by: `upload.rs` with `FaultStore`, which logs every delete call, and `rclone_local.rs`
+  with the real rclone binary, which also checks the `--size` argument and lists the remote after
+  each failed attempt (NEG-14).
 - **AC-15** The index object is uploaded and verified like a part. Verify by: `upload.rs`.
 - **AC-16** Records carry the fields of 12.1, segments are immutable with a valid trailer and are
   mirrored with read-back verification, and duplicate records collapse by identity. Verify by:
@@ -1783,10 +2059,11 @@ two steps; it exists only in test builds (AC-35).
   function and `fstat` stable around the read, and compares it with the index record, excluding
   only the pass-caused fields 13.2 names; an unarchived regenerable item is compared on F0's
   fields. Any difference, a missing record or a failed call stops the pass and leaves a leftover.
+  A symlink is read by name between two `fstatat` calls that must agree (13.2).
   Verify by: `remove.rs` (a symlink to an outside directory; a subdirectory swapped for such a
   symlink during archiving and during deletion through the step hook; a read-only tree; an
-  occupied rename target; the cases of NEG-61, NEG-62 and NEG-66 through the step hook between
-  unlinks); a unit test asserting that the pass and the archive writer call one record function
+  occupied rename target; the cases of NEG-61, NEG-62, NEG-66 and NEG-78 through the step hook
+  between unlinks); a unit test asserting that the pass and the archive writer call one record function
   and that every field the writer emits is compared or is one of 13.2's named exclusions; a
   broken variant that skips the content digest for later hard-link names, and one that skips
   directory extended attributes, each of which must fail NEG-61; and the Linux bind-mount job.
@@ -1798,10 +2075,14 @@ two steps; it exists only in test builds (AC-35).
   that began is never continued: after `delete-started`, no run in any mode deletes, renames,
   opens or lists anything inside Q. A rename back happens only after the identity check of 6.1
   with nothing at O; a leftover moved back to O is recorded `moved-back`, never `removed`, and
-  kept. Verify by: `resume.rs` stops at each transition in turn
+  kept. Both use the directory identity of section 4, and no identity is matched after `deleted`.
+  A resume uses the settings its journal header holds, not the configuration file.
+  Verify by: `resume.rs` stops at each transition in turn
   (between two `unlinkat` calls and before the `deleted` line included), then resumes and also
   runs a new `--remove` apply; builds each O and Q combination of the table by hand, with a
-  directory, a file and a symlink at O and a replaced Q (NEG-64, NEG-65); runs every
+  directory, a file and a symlink at O and a replaced Q (NEG-64, NEG-65), and with identities
+  injected through the library's metadata interface (NEG-77); edits the configuration file
+  before a resume (NEG-79); runs every
   later command through the library's recording file-system interface and asserts that no call
   names a path inside Q; and kills the real binary during an upload and during a deletion.
 - **AC-22** Applying a finished plan again changes nothing and reports items as done. Verify by:
@@ -1812,7 +2093,9 @@ two steps; it exists only in test builds (AC-35).
   operation's spool, removes a spool only when fresh exclusive locks on both lock files are
   granted after the tool's own descriptors are closed (9.6); every lock is a `flock` lock and is
   close-on-exec except the inherited spool lock, a lock call that errors counts as held, and a
-  missing lock file next to an existing spool directory counts as held.
+  missing lock file next to an existing spool directory counts as held. The wait for the tool's
+  own children is bounded and happens before the guard is taken; the guard is held only for
+  file-system changes and non-blocking probes and is taken with a bounded `LOCK_NB` retry (NEG-73).
   Verify by: `lock.rs` with two processes under different environments and state directories, a killed holder, and an injected lock error; and `spool.rs` on macOS and Linux, which runs a restore whose fake rclone stalls with a file in its `--temp-dir`, starts an apply meanwhile, and then lets the restore finish; kills only the parent while its fake rclone child stays stalled; deletes a dead operation's `ID.spool` while its child still holds it; lets a fake rclone exit normally while a descendant it started keeps the spool descriptor and keeps writing (NEG-63); and checks a killed operation's leftover spool directory that the next operation removes.
 - **AC-24** Free space and budgets follow section 18 and 9.5: the floor is checked on the state
   volume (which holds the spool directories) before each item and part, the part size is
@@ -1836,7 +2119,8 @@ two steps; it exists only in test builds (AC-35).
 - **AC-28** Restore works on a new machine from storage alone. Verify by: `restore.rs` with an empty
   state directory and `--storage`.
 - **AC-29** Nested items follow 6.3, including `--backup-only` and a nested git item; regenerable
-  children of a git item are archived and removed with it, not before it. Verify by: `nested.rs` (a
+  children of a git item are archived and removed with it, not before it; the nested-secrets rule
+  is AC-45. Verify by: `nested.rs` (a
   repository holding a removable `node_modules`: removed with the repository and present in its
   archive; the repository skipped, then `node_modules` handled on its own; `node_modules` outside
   `--class`; backup-only; a nested repository).
@@ -1856,7 +2140,8 @@ two steps; it exists only in test builds (AC-35).
   keys naming programs, each writing a marker file.
 - **AC-33** rclone is used as 9.6 states: minimum version checked, `--ask-password=false` on every
   call and `--temp-dir` set to the operation's own spool directory, `rclone-tmp/OP` in the state directory (9.6), on every data-moving call, an encrypted configuration refused at start, wrappers resolved with
-  `config redacted` only (encrypted only when every path reaches `crypt`), stderr redacted.
+  `config redacted` only (encrypted only when every path reaches `crypt`), stderr redacted, and
+  `deletefile` run only on names 9.4 allows.
   Verify by: `rclone_cli.rs` with a fake rclone that logs its arguments and stdin reads, and the real rclone job with a temporary config file that carries rclone's
   encrypted-configuration marker over random bytes (no password exists for it).
 - **AC-34** The attempt number, part size and object names (`attempt-started`) and the manifest
@@ -1879,9 +2164,10 @@ two steps; it exists only in test builds (AC-35).
   "re-check" or "re-verif"; a control copy of `SCAN-FORMAT.md` with one phrase restored, wrapped
   across a line break, must fail it; meanwhile `output.rs` checks the header line.
 - **AC-38** The secrets prompt follows 11. It is offered only in ask mode on a terminal, only when
-  every reason to keep the item is in its secrets set, and only for that item; it lists the whole
-  set (files by rule, history names, unnamed objects with each size and content result, checks
-  not completed, the storage and the unencrypted statement for a non-`crypt` remote), and shows
+  every reason to keep the item is in its own secrets set, and only for that item; it lists the
+  whole set (files by rule, history names, unnamed objects with each size and content result,
+  checks not examined with the reason text of 11, the storage and the unencrypted statement for a
+  non-`crypt` remote), marks the entries a nested item's own decision covered, and shows
   the three statements of 11 word for word whenever the set holds unnamed objects. `u` uploads
   the whole set of that item and nothing of any other; after `u` the item is asked about again;
   the record carries `secrets_uploaded`, `unnamed_uploaded`, `secrets_choice` and
@@ -1904,8 +2190,8 @@ two steps; it exists only in test builds (AC-35).
 - **AC-40** The secrets handling follows 9.2 and D-4: with nothing chosen, an item with a
   non-empty secrets set is kept; in ask mode on a terminal the user chooses per item at the
   secrets prompt; in automatic mode `--secrets` or `[apply] secrets` decides, default `keep`, and
-  `upload` there never uploads unnamed objects and keeps an item whose history checks did not
-  complete; a choice uploads only the secrets set of the item
+  `upload` there never uploads unnamed objects and keeps an item with a check not examined
+  (9.2); a choice uploads only the secrets set of the item
   it was made for, as seen at its F0; the vault option does not exist in this release. Verify by:
   `secrets.rs` and `ask.rs` with two items in one run, each holding a fake `.env`, a history name
   and, for one, an unnamed object, under each combination of mode, answer and setting, searching
@@ -1919,8 +2205,10 @@ two steps; it exists only in test builds (AC-35).
   (NEG-68).
 - **AC-42** The upload-all handling follows 9.2: only `--secrets upload-all` or `[apply] secrets
   = "upload-all"` selects it, never the default and never `upload`; for an automatic item it
-  uploads the whole secrets set, unnamed objects and a history check past its limits included,
-  and nothing of any other item; a check that could not run still keeps the item; the notice of
+  uploads the whole secrets set, unnamed objects and every check not examined included (a limit
+  reached, which only the tool's own counter or timer makes, and a check that could not run), and
+  nothing of any other item, a nested item's part included; it never covers a failure that
+  leaves the item not shown to be preserved; the notice of
   9.2 is printed on stderr exactly once per process, before the first upload (before the first
   report in a dry run), with the storage's encryption state, and repeated once in the summary; each such record has `secrets_choice: "upload-all"`
   and `kept_reasons_overridden` listing every rule that would otherwise have kept it; ask-mode
@@ -1928,6 +2216,33 @@ two steps; it exists only in test builds (AC-35).
   each limit and each could-not-run case, under `keep`, `upload` and `upload-all`, in automatic
   and ask mode, searching every stored object for each fake value and comparing each record and
   the captured output with 9.2 (NEG-69).
+- **AC-43** What is checked is what is sent (9.4): every chunk of a regular file is emitted only
+  after an `fstat` that equals F0; a file step 2 judged by the content rule has that rule run
+  again, in memory, on the buffer that is emitted, and any difference from step 2's verdict stops
+  the item before any byte of the file is sent; git directory files outside `objects/` are judged
+  for credential URLs with the held-back window; each git directory's object inventory is derived
+  again and compared before its first byte is sent. Verify by: `upload_race.rs` through the step
+  hook and the library's metadata interface, with `FaultStore` logging every byte it receives,
+  also for objects later removed (NEG-70, NEG-71, NEG-72); broken variants that judge only in step
+  2, skip the per-chunk `fstat`, emit before the held-back window is judged, or skip the inventory
+  comparison must each fail one of those cases.
+- **AC-44** The two kinds of failure of 9.2 do not overlap: a check not examined (a limit reached,
+  a check that could not run) enters the secrets set with its reason, and the answer `u` or
+  `upload-all` uploads the item, whose archive is complete, and the record names the damage when
+  git reported one (`history_damage`); a failure that leaves the item not
+  shown to be preserved keeps it in every mode, under every handling, with no secrets prompt. A
+  unit test maps every failure the checks and the archive can report to exactly one kind. Verify
+  by: `secrets.rs` and `ask.rs` with damaged repositories, a foreign signal and the preservation
+  cases (NEG-74, NEG-75), and a restore that compares the restored tree byte for byte with the
+  damaged fixture.
+- **AC-45** Nested secrets follow 6.3 in every mode: an enclosing item is kept, before any upload,
+  when a nested item was answered `n` or its non-empty part of the secrets set was not covered by
+  that nested item's own decision in the run, matched by set digest; nothing chosen for the
+  enclosing item uploads a nested part; the enclosing prompt marks the covered entries; a dry run
+  reports what a `--backup-only` run without a terminal does. Verify by: `nested.rs` and
+  `secrets.rs` under `upload`, `upload-all`, `--class` and ask-mode answers, searching every stored
+  object for each nested fake value, and core-plan cases for a bare repository, a linked worktree
+  and a `modules/` directory (NEG-76).
 
 ## 21. Negative cases
 
@@ -1970,7 +2285,12 @@ two steps; it exists only in test builds (AC-35).
   completeness test of AC-13 fails.
 - **NEG-14 (AC-14)** The store fails mid-part; one byte differs on read-back; the read-back is short;
   the upload succeeds but the tool sees a failure (lost response); the transfer stalls: never
-  verified, new attempt with new names, at most 3, orphans listed, nothing removed.
+  verified, new attempt with new names, at most 3, nothing removed from disk, and each failed
+  attempt's objects deleted, the lost response's included, with a listing that shows none of them
+  and `manifest orphans` empty. A delete made to fail by `FaultStore`: the name is in the summary,
+  exit 2, and `manifest orphans` lists it. A crash between `index-verified` and `recorded`, then a
+  resume: that complete attempt's objects are removed and the next attempt is used. No delete call
+  names an object outside an `attempt-started` line or of an attempt with `recorded`.
 - **NEG-15 (AC-17)** The segment upload fails: backed up and kept. A part deleted from storage
   between verification and the second existence check: skipped, nothing removed.
 - **NEG-16 (AC-18)** A truncated or altered segment in storage: reported damaged, its records
@@ -1992,7 +2312,9 @@ two steps; it exists only in test builds (AC-35).
   nothing, never hang, and make no call naming a path inside Q (failing any implementation that
   compares or finishes Q); only the `--remove` run and the resume journal `left`. Q removed by
   hand: the next `--remove` run, not a `--backup-only` or dry run, writes `deleted` and the record
-  with `completed_by: "unknown"` once; `quarantine list` omits Q; a new directory at O: untouched.
+  with `completed_by: "unknown"` once; `quarantine list` omits Q; a new directory at O, with
+  another inode or another birth time than the item's directory identity: untouched and not kept
+  as moved back (NEG-77 covers a reused inode).
 - **NEG-20 (AC-23)** Two applies at once with different `HOME`, `XDG_DATA_HOME` and `--state-dir`:
   the second exits 1. A killed holder: the next apply starts. Run as root without `--allow-root`:
   exit 1.
@@ -2014,8 +2336,10 @@ two steps; it exists only in test builds (AC-35).
   no marker file is written during re-check, archive, removal or restore.
 - **NEG-27 (AC-29)** A repository whose nested `node_modules` is outside `--class` or `--item`,
   with `--remove`: the repository is skipped. The repository answered `n` in ask mode: it is kept,
-  and its `node_modules` is then asked about on its own (6.3). The same with `--backup-only`: the
-  repository is archived with the `node_modules` inside.
+  and its `node_modules` is then asked about on its own (6.3). The same with `--backup-only`, the
+  `node_modules` holding no secret-like file: the repository is archived with the `node_modules`
+  inside. With a fake `.env` directly in that unselected `node_modules`: the repository is kept
+  by the nested-secrets rule and the value is in no stored object (6.3).
 - **NEG-28 (AC-33)** An encrypted rclone configuration, with or without a password in the
   environment: exit 1 before any upload, no prompt, and no rclone process reads stdin outside
   `rcat`. rclone older than 1.64:
@@ -2061,7 +2385,8 @@ two steps; it exists only in test builds (AC-35).
   that is not a partial clone (made with `git mktree --missing`, which `--missing=allow-any` would
   let through); the time limit reached (injected as 1 second, with a git shim that stalls); the
   object limit exceeded (injected as 10 objects); or a file cannot be read for the content check.
-  Each keeps the item, the reason names the check, and nothing is uploaded. A blobless partial
+  Each keeps the item by default, the reason names the check, and nothing is uploaded; the
+  unreadable file keeps it under every handling too (9.2, NEG-75). A blobless partial
   clone, with git's warning on stderr: not kept for the blobs it lacks, and no connection is
   counted (AC-9).
 - **NEG-42 (AC-12)** A `node_modules` child of a git item whose installed package ships a test
@@ -2226,18 +2551,21 @@ two steps; it exists only in test builds (AC-35).
   replaced by a symlink to a directory holding the same names; Q was replaced by a different
   directory (another inode). In each case no rename happens, nothing inside Q or O is opened or
   removed, the item is `failed` with the case named, and `quarantine list` shows, for an occupied
-  O, the quarantine as not started with `apply --resume RUN_ID`, the `mv -n` command and what
-  occupies O, and for a replaced Q, the replaced state of 5 with the restore command. A control
-  with O free and Q intact: `--resume` renames Q back and records `kept`.
+  O, the quarantine as not started with `apply --resume RUN_ID`, what occupies O and "first move
+  or rename what is at O", and **no** `mv` command; for a replaced Q, the replaced state of 5
+  ("cannot confirm this is its quarantine") with the restore command. A control with O free and
+  Q intact: `quarantine list` prints `mv -n Q O` (`mv -nT Q O` on Linux), and `--resume` renames Q
+  back and records `kept`.
 - **NEG-66 (AC-19)** Through the step hook during the deletion pass: the fsmonitor socket replaced
   by a regular file of the same name, and by a socket with another inode: the pass stops before
   it and the replacement survives; a control with the original socket: removed. In an unarchived
   `node_modules`, a hard link from a pnpm store outside it to a file not yet unlinked, made by
   another process during the pass: the link count differs from F0, so the pass stops (a false
   stop; the store's name still holds the content), the item is a leftover the user removes by
-  hand, and D-17's cost entry names this case. The same link in an archived item: no stop, since
-  the link count is not in the preserved record; Q is emptied and the store's name keeps the
-  content.
+  hand, and D-17's cost entry names this case. The same link in an archived item, made through
+  the step hook between two unlinks: no stop, since the link count is not in the preserved
+  record; Q is emptied and the store's name keeps the content. (A link made while that entry is
+  being read moves its change time and stops the pass, which is safe; the test does not do that.)
 - **NEG-67 (AC-40)** Two git items in one run, A with a fake `.env` and a history name and B with
   the same plus an unnamed object, each value distinct, each alone: no choice anywhere (both kept,
   no value stored); ask mode, `u` for A and `n` for B (A's values in its archive, no value of B in
@@ -2245,7 +2573,7 @@ two steps; it exists only in test builds (AC-35).
   object, no value of B stored); `[apply] secrets = "upload"` overridden by `--secrets keep`
   (both kept); `u` for A, then A changed before upload so F0 is taken again (asked again; with
   no terminal, kept); a third item C with a `.env` whose history check hit the object limit,
-  under `--secrets upload` (kept, "not checked"); `[apply] secrets = "vault"` and `--secrets
+  under `--secrets upload` (kept, its history not examined); `[apply] secrets = "vault"` and `--secrets
   vault` (exit 1, nothing read);
   a non-`crypt` remote with `u` (the unencrypted statement shown before the answer). Every stored
   object is inflated and searched for every fake value.
@@ -2256,17 +2584,23 @@ two steps; it exists only in test builds (AC-35).
   writes and syncs the `removed` record once, and `manifest list` shows one record); two Ctrl-C (the pass stops before the next entry, `left` journaled, the leftover printed,
   exit 3); SIGTERM alone (same as two Ctrl-C); SIGHUP with the terminal closed (the pass
   finishes, no write error escapes, exit 3); Ctrl-C during an upload (stops before the next step,
-  nothing quarantined, exit 3). Each is checked against the journal and the file system.
+  nothing quarantined, the attempt's objects removed and `attempt-removed` journaled, exit 3);
+  two Ctrl-C during an upload (exit 3 without the removal; the next `--backup-only` run removes
+  those objects before its first item). Each is checked against the journal, the file system and
+  a listing of the store.
 - **NEG-69 (AC-42)** Automatic repositories in one run, each with distinct fake values: R1 an
   unnamed object only; R2 a history check past the object limit, and R2' past the time limit
   (injected small limits); R3 a `.env` and an unnamed object; R4 a history command made to fail
   by a fake git (nonzero exit, and separately a `missing` line); R5 a pack without its `.idx`;
-  R6 a replace ref present at scan time (the plan gives `ask`), and R6' one added after the plan.
-  Under `--secrets upload`: R1, R2, R2' and R3 kept with their reasons, no value of theirs
-  stored. Under `--secrets upload-all`: R1, R2, R2' and R3 archived, each record with
-  `secrets_choice: "upload-all"` and `kept_reasons_overridden` naming its rules with counts and
-  no names; R4 and R5 kept with the could-not-run reason; R6 not selected and R6' skipped as
-  changed, with no value of R4 to R6' in any stored object. The notice: on stderr exactly once,
+  R6 a replace ref present at scan time (the plan gives `ask`), and R6' one added after the plan;
+  R7 a history command whose git shim kills itself with SIGKILL, as the out-of-memory killer
+  would, before the injected time limit, and R7' one the test kills with SIGTERM just after
+  that limit, before the tool's own timer fires. Under `--secrets upload`: R1 to R5, R7 and R7'
+  kept with their reasons, no value of theirs stored. Under `--secrets upload-all`: R1 to R5, R7
+  and R7' archived, each record with `secrets_choice: "upload-all"` and `kept_reasons_overridden`
+  naming its rules with counts and no names (`history-limit` only for R2 and R2'; R7 and R7'
+  `history-not-run`, never a limit reached); R6 not selected and R6' skipped as changed, with no
+  value of R6 or R6' in any stored object. The notice: on stderr exactly once,
   before the first part upload (the fake rclone's call log shows the order), and once in the
   summary, with "not encrypted" on a plain remote and "encrypted" on a `crypt` remote over a
   local one; on stderr once by a dry run, which writes nothing; once again by an `apply
@@ -2275,32 +2609,117 @@ two steps; it exists only in test builds (AC-35).
   An ask-mode item in the same run: prompted as before, and `n` keeps it with nothing uploaded.
   `[apply] secrets = "upload-all"` with `--secrets upload`: R1 kept. `--secrets upload_all`:
   exit 1, nothing read.
+- **NEG-70 (AC-43)** The examined part rewritten. An untracked `notes.txt` of 10 KiB with no
+  secret, judged "no match" in step 2, is rewritten through the step hook after the writer's
+  open and before its first chunk is read, with equal length and a fake provider token in its
+  first 64 KiB: (a) by an ordinary write, so the `fstat` after the read shows a new change time;
+  (b) with the times hidden by the library's metadata interface, as a write through a memory
+  mapping would leave them. In both the item fails and no byte of `notes.txt`, its tar header
+  included, is in any stored object or in `FaultStore`'s log of received bytes. A broken variant
+  that runs the content rule only in step 2 must fail (b). A `.git/config` with a fake credential
+  URL written with hidden times across the boundary of its first and second 1 MiB chunks: no byte
+  of the URL is received; a broken variant without the held-back window must fail.
+- **NEG-71 (AC-43)** The unexamined remainder rewritten. A tracked, unmodified 3 MiB file has a
+  fake value written into its last MiB through the step hook after its first chunk was emitted:
+  by an ordinary write, the item fails before the changed chunk, the attempt's objects are
+  removed, and the planted value is in no stored object and nowhere in `FaultStore`'s log of
+  received bytes, failed attempts included; a broken variant without the per-chunk `fstat` must
+  fail this. The same with the times hidden: the value is sent, the case section 17 discloses as
+  the upload race, and the test asserts this so a change to the rule is seen.
+- **NEG-72 (AC-43)** The object store changed after step 2's inventory, each alone: a new loose
+  object; a loose object replaced with equal length and its times hidden; a pack's bytes
+  rewritten with equal length and its times hidden. Each fails the item before any byte of its
+  git directory is received, while files that sort before `.git` may already have been sent (the
+  test asserts exactly that). A pack appended to by an ordinary write after the comparison, while
+  it is sent: the item fails before the changed chunk. A broken variant without the comparison
+  must fail the hidden-time cases.
+- **NEG-73 (AC-23)** Operation A reaches teardown while its fake rclone child stalls and ignores
+  SIGTERM (bounds injected as 2 seconds each). Meanwhile operation B starts: it takes and releases
+  the guard and creates its spool within 1 second, while A is still waiting, and A's spool and
+  the file in it stay intact while the child lives. After the SIGKILL, A's own teardown removes
+  its spool. A broken variant that waits for children while holding the guard must fail (B waits
+  longer than 1 second). The guard held by a stopped test process: an operation retries for the
+  injected bound, then stops with exit 1 before creating its lock files, and touches no spool.
+- **NEG-74 (AC-44)** Damaged repositories in ask mode on a pseudo-terminal, each alone: a corrupt
+  loose object that only local-only history reaches; a tree missing from a repository that is not
+  a partial clone, reachable only from local-only history; a pack without its `.idx`. The
+  fixtures are built so that core's re-scan gives the plan's facts; where it does not on a
+  platform, the test states that the item was skipped by 7.2 and asserts that nothing was stored.
+  The secrets prompt shows "could not run (REASON): this item's history was not examined for
+  secrets; u uploads it unexamined" and the damage line of 11 ("git reported this repository as
+  damaged"), never "not checked", and never a preservation reason; `n` keeps it with nothing
+  stored; `u` then `y` archives and removes it, the record carries `history_damage` with the kind
+  and no object name, and a restore gives a tree equal byte for byte to the damaged fixture (the
+  corrupt object, the missing tree still missing, the pack without its index). The same three
+  fixtures under `--secrets upload`: kept; under `upload-all`: archived with the same record
+  field. A history command killed by a signal the test sends: the reason is "could
+  not run", not "exceeded its limit". The object limit (injected as 10): the prompt shows the
+  limit text of 11.
+- **NEG-75 (AC-44)** An item holding a fake `.env` and, each alone, a file with mode 000, a FIFO,
+  an extended attribute over 64 KiB, or a file the step hook changes between step 2 and its
+  archive read: in ask mode no secrets prompt is shown and the item is kept with that reason; under
+  `--secrets upload` and `upload-all` it is kept; no value is in any stored object; the summary
+  names the reason, not the secrets set.
+- **NEG-76 (AC-45)** `mono` (`recover-backup-then-remove`) holds the independent clone
+  `mono/vendor/tool` (`backup-then-remove`), whose store has an unnamed object and a dropped stash
+  with a fake `.env`. With `--backup-only --auto repo-recover`, `vendor/tool` asked first: `n`,
+  under `--secrets upload-all` and again under `--secrets upload`: `mono` is kept with the
+  nested reason, and no value of `vendor/tool` is in any stored object. With `--class
+  repo-recover`, so that `vendor/tool` is not selected: `mono` kept, no value stored. `u` then `s`
+  for `vendor/tool`: `mono` is archived, its record lists `vendor/tool` in
+  `nested_secrets`, and its own secrets set excludes that part. `u` for `vendor/tool`, then a new
+  stash dropped in it before `mono`'s step 2: `mono` kept. A dry run: `mono` reported "would
+  keep" for the nested reason. A kill after `vendor/tool`'s record and a resume: `mono` uses the
+  journaled set digest and is archived. With `--remove` and `n`: `mono` skipped by the veto of
+  6.3. Core-plan cases: `mono` holding a bare repository, a linked worktree of an outside
+  repository, or a `modules/` directory in its git directory gets `ask` and is not selected; with
+  the plan edited to a removing action it is skipped by 7.2; no nested value is stored.
+- **NEG-77 (AC-21)** Directory identities injected through the library's metadata interface: after
+  a leftover's Q was removed by hand, a new directory at O with the item's file-system identity
+  and inode but another birth time: not moved back, and the next `--remove` run writes `deleted`
+  and the record and leaves the new folder untouched; one that also has the same birth time, but
+  after `deleted` was journaled: not matched. A not-started quarantine whose `st_dev` changed
+  with the same file-system identity, inode and birth time: renamed back, `kept`. The same with
+  no file-system identity: listed as one the tool cannot confirm, not renamed. Birth time absent,
+  as on tmpfs: the match uses the other fields.
+- **NEG-78 (AC-19)** Symlinks read by name: on macOS, a symlink's extended attribute changed
+  through the step hook between the first `fstatat` and the attribute read, during the deletion
+  pass (the pass stops before unlinking it, the symlink is in Q) and during archiving (the item
+  fails); on Linux, a symlink replaced by one with the same target between the two `fstatat`
+  calls (another inode): the same outcomes.
+- **NEG-79 (AC-21)** A `--backup-only` run under `[apply] secrets = "keep"` and `auto = ["repo"]`
+  is killed after its first item; the configuration is edited to `secrets = "upload-all"` and
+  `auto = ["repo", "repo-recover"]`; `apply --resume`: keeps the journaled `keep` and `repo`,
+  names each difference once, prints no upload-all notice, and stores no secret value. The
+  reverse, a run under `upload-all` resumed after the file was edited to `keep`: it goes on under
+  `upload-all`, prints the notice and names the difference.
 
 ## 22. Reviews: findings and changes
 
-Earlier reviews and how revisions 5 to 10 answered them are in
-[APPLY-SPEC-REVIEWS.md](APPLY-SPEC-REVIEWS.md). This table answers the revision 10 adversarial
-review (F-ids) and acceptance review (S-ids), prefixed `r10` to avoid clashes with core changes
-and earlier findings, and the user's answer on D-4.
+Earlier reviews and how revisions 5 to 11 answered them are in
+[APPLY-SPEC-REVIEWS.md](APPLY-SPEC-REVIEWS.md). This table answers the revision 11 adversarial
+review (F-ids and its clarification) and acceptance review (B- and S-ids), prefixed `r11` to
+avoid clashes with core changes and earlier findings.
 
-| Finding | Change in revision 11 | Criteria and negative cases |
+| Finding | Change in revision 12 | Criteria and negative cases |
 |---|---|---|
-| r10 F1 a later hard-link name could be rewritten after the first name's check | One rule: just before each entry's unlink, its full preserved record is recomputed through a descriptor with the archive writer's function and compared, content digest included, for every hard-link name; never mtime or size as a stand-in (13.2). Cost: every byte is read again | AC-19; NEG-61 |
-| r10 F2 directory extended attributes were not compared | The same rule covers every extended attribute of every entry, directories included; the excluded fields are named and justified (13.2) | AC-19; NEG-61 |
-| r10 F3 two spool cleanup paths, and a descendant of rclone keeps the descriptor | One teardown routine through the two-lock barrier, at an operation's end and for others' spools (9.6) | AC-23; NEG-63 |
-| r10 F4 a negative case promised more than the pass can give | NEG-61 states the achievable outcome for a file added to a listed directory; the negative cases of AC-2, AC-19, AC-20, AC-21, AC-29 and AC-39, which the new stop conditions could falsify, were reread in full and the rest searched for absolute claims (NEG-19, 53, 62 changed) | AC-19; NEG-61 |
-| r10 S-1 quarantines not started were invisible, an occupied O was unhandled, Q was not checked | `quarantine list` shows every state, a replaced Q included (5); the identity check with `lstat` before any rename; "present" means any entry (6.1, 10.1) | AC-21, AC-39; NEG-65 |
-| r10 S-2 a leftover moved back looked like a new folder | A directory at O with F0's device and inode after `delete-started` is `moved-back`: warned and kept, never `removed` (10.1, 7.4) | AC-21, AC-39; NEG-64 |
-| r10 S-3 walks entered a leftover before the enclosing item was kept | Every walk in every mode stops at a quarantine, staging name or moved-back folder; `--backup-only` never archives one (7.4, C-6) | AC-39; NEG-53 |
-| r10 S-4 the non-blocking open was not yet in core | Core change C-7, a release precondition, cites `open_regular` at `c81a341`; this branch merged `origin/main` | AC-19; NEG-62 |
-| r10 S-5 pre-unlink checks were uneven | Covered by the rule of r10 F1; the fsmonitor socket rule; the pnpm false stop stated as a cost (13.2, D-17) | AC-19; NEG-66 |
-| r10 S-6 Windows gaps | `manifest find TEXT --storage` refused; the platform check before configuration parsing; local listing reads a defined folder and creates nothing; WSL2 unsupported and untested (5, 14) | AC-30; NEG-60 |
-| r10 S-7 the cost statement was incomplete | D-17 lists every cost; signals during deletion are defined (10.1); two stale texts removed | AC-41; NEG-68 |
-| The user's answer on D-4 | A secrets handling the user chooses: keep (default) or upload, per item in ask mode and by setting in automatic mode; the vault deferred (9.2, 11, D-4) | AC-12, AC-38, AC-40; NEG-51, NEG-67 |
-| The same answer, for automatic runs ("in my case back it up to my private storage anyway") | `--secrets upload-all`: a separate, never-default value that uploads the whole secrets set of automatic items, unnamed objects and history past its limits included; a check that could not run still keeps; a one-time notice; the record names the overridden rules (9.2, 12.1, D-4) | AC-42; NEG-69 |
+| r11 F1 the archive streamed changed bytes before the final check could see them | What is checked is what is sent: an `fstat` equal to F0 before each chunk is emitted; the content verdict recomputed on the buffer that is emitted; a held-back window for git directory files; each object inventory compared before its git directory is sent; the residue disclosed as the upload race; a staged copy rejected (6.4, 9.4, 17, 18) | AC-43; NEG-70, NEG-71, NEG-72 |
+| r11 F1, its second part: failed attempts were kept in storage | A failed or superseded attempt's objects are removed, journaled first, verified by a listing, named when removal fails; versioned providers disclosed (6.1, 9.4, 10.1, 12.3, 17, 19) | AC-14, AC-33; NEG-14, NEG-68 |
+| r11 F2 teardown waited for children while holding the guard | The bounded wait comes first; the guard holds only file-system changes and non-blocking probes and is taken with a bounded retry (9.6) | AC-23; NEG-73 |
+| r11 clarification and r11 S-11 secrecy and preservation were mixed | Two kinds that never overlap: not examined for secrets (a limit reached, a check that could not run, a corrupt or missing object, a pack without its index), which `u` and `upload-all` may upload, and not shown to be preserved (the archive itself incomplete or unverifiable), which nothing overrides; the placement follows that definition, not the clarification's example list (the coordinator's ASSUMPTION); the prompt states the reason, and the prompt and the record say git reported damage, `history_damage` (9.2, 11, 12.1, D-4) | AC-38, AC-42, AC-44; NEG-41, NEG-74, NEG-75 |
+| r11 B-1 an enclosing item uploaded a nested item's secrets | The nested-secrets rule in every mode: the enclosing item is kept unless each nested part is empty or covered, by set digest, by that nested item's own decision; the prompt marks covered entries; core's veto bounds the nested cases (6.3, 9.1, 9.2, 11, 12.1) | AC-29, AC-45; NEG-27, NEG-76 |
+| r11 S-8 inode reuse and device numbers | The directory identity (file-system identity, inode, birth time) for the moved-back match and the rename back; no match after `deleted`; "cannot confirm" (4, 5, 6.1, 7.4, 10.1, D-17) | AC-21; NEG-19, NEG-77 |
+| r11 S-9 limit and could not run | Only the tool's own counter or timer makes a limit reached; a foreign signal or a crash is a check that could not run (9.2) | AC-42; NEG-69, NEG-74 |
+| r11 S-10 `fstat` is undefined for symlinks | Symlinks are read by name between two `fstatat` calls that must agree (9.4, 13.2) | AC-19; NEG-78 |
+| r11 S-12 labelling | Section 2 and D-4 name only the user's words as the user's decision; the setting, its scope and the D-16 bypass are ASSUMPTIONs (2, D-4) | none |
+| r11 S-13 costs | D-4, D-16, D-17 and 18 add the nested-secrets keep, the false moved-back keep, the unexamined uploads under `upload-all`, the writer's retries and the inventory reads | none |
+| r11 S-14 a resume could pick up an edited configuration | The header journals every effective setting with its source; a resume uses them (5, 10.1) | AC-21; NEG-79 |
+| r11 S-15 the `mv -n` hint with O occupied | Printed only when O is free, as `mv -nT` on Linux (5) | AC-39; NEG-65 |
+| r11 notes on two negative cases | NEG-66 places the archived link between unlinks; NEG-19's new folder at O is defined by the identity | AC-19, AC-21; NEG-19, NEG-66 |
 
-Rewritten in place: AC-1, 12, 19, 21, 23, 30, 38, 39 and NEG-12, 19, 32, 43, 47, 51, 53, 58,
-60, 61, 62. Added: AC-40, 41, 42 and NEG-63 to 69. None was withdrawn.
+Rewritten in place: AC-14, 19, 21, 23, 29, 33, 38, 40, 42 and NEG-14, 19, 27, 41, 65, 66, 67,
+68, 69.
+Added: AC-43, 44, 45 and NEG-70 to 79. None was withdrawn.
 
 ### 22.1 Minor items left for a later revision
 
@@ -2332,8 +2751,9 @@ data; each is either a disclosure, a fidelity detail or a test addition.
   spool (tmpfs, directory and file bind mounts, a vfat loop mount, with `sudo`), real rclone (a
   pinned release whose published SHA-256 is checked before use, `local` remotes only), and a release build that checks the hook is absent
   (AC-35). The pseudo-terminal tests of the secrets prompt (AC-38, NEG-51) and of signals
-  (AC-41, NEG-68), the spool tests (NEG-56, NEG-63), the deletion-pass tests (NEG-61, NEG-62
-  and NEG-66) and the quarantine-state tests (NEG-64, NEG-65) run in the ordinary test job of
+  (AC-41, NEG-68), the spool tests (NEG-56, NEG-63, NEG-73), the deletion-pass tests (NEG-61,
+  NEG-62, NEG-66 and NEG-78), the upload-race tests (NEG-70 to NEG-72) and the quarantine-state
+  tests (NEG-64, NEG-65, NEG-77) run in the ordinary test job of
   both runners; the signals test sends real signals to the real binary and has a bound of 120 seconds.
   A Windows runner builds the binary and runs NEG-60 and core's tests. Core's FIFO test for
   `rescan_item` (C-7) runs in core's own job.
@@ -2344,7 +2764,8 @@ data; each is either a disclosure, a fidelity detail or a test addition.
   - the history rule of 9.2 on a public repository of at least 5 million objects cloned locally,
     run with exactly the options of 7.5 (`core.commitGraph=false`, `--no-replace-objects`, the
     hardened runner): wall time and peak memory of the whole check, git's included, against the
-    limits of D-16 (10 million objects, 600 seconds), with the hardware stated. The same walk with
+    limits of D-16 (10 million objects, 600 seconds), with the hardware stated, and the time of
+    the two object inventory reads of 9.4 on the same store. The same walk with
     the commit-graph enabled is run once for comparison only, so the cost of the safe option is
     known; it is never the configuration apply ships;
   - on a corpus of real repositories prepared for the purpose: the number of items kept by each
@@ -2356,8 +2777,9 @@ data; each is either a disclosure, a fidelity detail or a test addition.
     consented. Never a user's own repositories without their consent. The thresholds for "too
     many kept" are set before the run and reported with the result. The user has chosen the
     answer `u` (D-16); the result is reported to the user as the share of items `u` could reclaim
-    in ask mode, the share automatic runs keep under `upload`, and the share `upload-all` still
-    keeps because a check could not run.
+    in ask mode, the share automatic runs keep under `upload`, the share uploaded under
+    `upload-all` with history not examined because a check could not run, and the share every
+    handling keeps by the nested-secrets rule (6.3).
 
 ## 24. Click-test plan
 
@@ -2376,7 +2798,10 @@ runs the real binary before the work is called ready.
   repository with a fake `.env`, one with a fake `.env` set aside with `git stash -u`, and one
   where that stash was then dropped with `git stash drop` (all three kept by default); one where a
   plain text file matching no secret pattern was staged and then replaced before a commit (kept by
-  the unnamed-object rule alone, so `u` is offered); a nested case with a hand-edited file in
+  the unnamed-object rule alone, so `u` is offered); a repository with uncommitted work holding an
+  independent clone, saved to its remote, whose dropped stash holds a fake `.env` (the
+  nested-secrets case of 6.3); a repository with a pack whose `.idx` was removed (the
+  could-not-run prompt); a nested case with a hand-edited file in
   `node_modules`; a file with an extended attribute; a `node_modules` large enough (a few hundred
   MiB in many files) that its deletion takes several seconds, so the tester can stop the tool
   during it. The script sets every modification time and every commit date 60 days in the past,
@@ -2390,7 +2815,12 @@ runs the real binary before the work is called ready.
   then `manifest list`, `find`, `verify`; `--remove` in ask mode answering `y`, `n`, `s` and `q`;
   `--remove --auto repo,regenerable`; Ctrl-C during an upload, then `apply --resume`; `restore` to
   the original path and with `--to`; `restore` with an empty `--state-dir` and `--storage` only;
-  `manifest orphans` after the interrupted run; `--require-encrypted-remote` on a plain remote
+  `manifest orphans` after the interrupted and resumed run (empty: the interrupted attempt's
+  objects were removed, and a listing of the remote shows none); `--backup-only --auto
+  repo-recover --secrets upload-all` with the nested clone answered `n` (the enclosing repository
+  kept with the nested reason, and the clone's fake `.env` in no stored object); the pack without
+  its `.idx` in ask mode (the prompt says its history was not examined; `n` keeps it);
+  `--require-encrypted-remote` on a plain remote
   (refused); a `restore` from (b) started while a `--backup-only` run is uploading, both
   completing, with the tester checking that `<state>/rclone-tmp/` holds one spool directory for
   each live operation and none after both end; `--remove` in ask mode on the staged-and-replaced
