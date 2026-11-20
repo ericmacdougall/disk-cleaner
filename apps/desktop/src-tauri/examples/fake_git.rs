@@ -26,7 +26,10 @@ fn main() {
         .append(true)
         .open(&pids)
         .expect("pid file");
-    writeln!(f, "{} {started}", std::process::id()).expect("write pid");
+    // One write per line: up to 4 copies append at once, and `writeln!` may split a line into
+    // several writes that interleave (seen in CI run 44644839972: a pid of "17111710").
+    let line = format!("{} {started}\n", std::process::id());
+    f.write_all(line.as_bytes()).expect("write pid");
     drop(f);
     if first && std::env::var_os("PRUNEDISK_FAKE_GIT_FIRST_EXITS").is_some() {
         std::process::exit(0);
