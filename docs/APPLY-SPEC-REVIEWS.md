@@ -1,10 +1,37 @@
 # Apply spec: earlier reviews
 
-How revisions 5 to 11 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
+How revisions 5 to 12 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
 from section 22 (revision 5's answers in revision 6, revision 6's in revision 7, revision 7's in
 revision 8, revision 8's in revision 9, revision 9's in revision 10, revision 10's in revision
-11, revision 11's in revision 12). Criterion and negative-case ids are those of revision 5 and later; section numbers are
+11, revision 11's in revision 12, revision 12's in revision 13). Criterion and negative-case ids are those of revision 5 and later; section numbers are
 those of APPLY-SPEC.md. Later changes to the same areas are listed in APPLY-SPEC.md section 22.
+
+## Reviews of revision 11 (adversarial and acceptance)
+
+F-ids are the adversarial plan review's and B- and S-ids the acceptance review's, prefixed `r11`.
+Revision 13 changed four of the answers below: the object inventory became a chain (row r11 F1),
+`upload-all` no longer runs the history check at all (row r11 clarification), the digest of a
+nested part is taken over the item's own entries (row r11 B-1), and the writer's repeat covers
+every row of one rule table (row r11 F1).
+
+| Finding | Change in revision 12 | Criteria and negative cases |
+|---|---|---|
+| r11 F1 the archive streamed changed bytes before the final check could see them | What is checked is what is sent: an `fstat` equal to F0 before each chunk is emitted; the content verdict recomputed on the buffer that is emitted; a held-back window for git directory files; each object inventory compared before its git directory is sent; the residue disclosed as the upload race; a staged copy rejected (6.4, 9.4, 17, 18) | AC-43; NEG-70, NEG-71, NEG-72 |
+| r11 F1, its second part: failed attempts were kept in storage | A failed or superseded attempt's objects are removed, journaled first, verified by a listing, named when removal fails; versioned providers disclosed (6.1, 9.4, 10.1, 12.3, 17, 19) | AC-14, AC-33; NEG-14, NEG-68 |
+| r11 F2 teardown waited for children while holding the guard | The bounded wait comes first; the guard holds only file-system changes and non-blocking probes and is taken with a bounded retry (9.6) | AC-23; NEG-73 |
+| r11 clarification and r11 S-11 secrecy and preservation were mixed | Two kinds that never overlap: not examined for secrets (a limit reached, a check that could not run, a corrupt or missing object, a pack without its index), which `u` and `upload-all` may upload, and not shown to be preserved (the archive itself incomplete or unverifiable), which nothing overrides; the placement follows that definition, not the clarification's example list (the coordinator's ASSUMPTION); the prompt states the reason, and the prompt and the record say git reported damage, `history_damage` (9.2, 11, 12.1, D-4) | AC-38, AC-42, AC-44; NEG-41, NEG-74, NEG-75 |
+| r11 B-1 an enclosing item uploaded a nested item's secrets | The nested-secrets rule in every mode: the enclosing item is kept unless each nested part is empty or covered, by set digest, by that nested item's own decision; the prompt marks covered entries; core's veto bounds the nested cases (6.3, 9.1, 9.2, 11, 12.1) | AC-29, AC-45; NEG-27, NEG-76 |
+| r11 S-8 inode reuse and device numbers | The directory identity (file-system identity, inode, birth time) for the moved-back match and the rename back; no match after `deleted`; "cannot confirm" (4, 5, 6.1, 7.4, 10.1, D-17) | AC-21; NEG-19, NEG-77 |
+| r11 S-9 limit and could not run | Only the tool's own counter or timer makes a limit reached; a foreign signal or a crash is a check that could not run (9.2) | AC-42; NEG-69, NEG-74 |
+| r11 S-10 `fstat` is undefined for symlinks | Symlinks are read by name between two `fstatat` calls that must agree (9.4, 13.2) | AC-19; NEG-78 |
+| r11 S-12 labelling | Section 2 and D-4 name only the user's words as the user's decision; the setting, its scope and the D-16 bypass are ASSUMPTIONs (2, D-4) | none |
+| r11 S-13 costs | D-4, D-16, D-17 and 18 add the nested-secrets keep, the false moved-back keep, the unexamined uploads under `upload-all`, the writer's retries and the inventory reads | none |
+| r11 S-14 a resume could pick up an edited configuration | The header journals every effective setting with its source; a resume uses them (5, 10.1) | AC-21; NEG-79 |
+| r11 S-15 the `mv -n` hint with O occupied | Printed only when O is free, as `mv -nT` on Linux (5) | AC-39; NEG-65 |
+| r11 notes on two negative cases | NEG-66 places the archived link between unlinks; NEG-19's new folder at O is defined by the identity | AC-19, AC-21; NEG-19, NEG-66 |
+
+Rewritten in revision 12: AC-14, 19, 21, 23, 29, 33, 38, 40, 42 and NEG-14, 19, 27, 41, 65, 66,
+67, 68, 69. Added: AC-43, 44, 45 and NEG-70 to 79. None was withdrawn.
 
 ## Reviews of revision 10 (adversarial and acceptance)
 
