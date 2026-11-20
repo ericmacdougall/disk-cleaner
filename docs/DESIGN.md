@@ -117,7 +117,10 @@ modification time of non-regenerable files, last commit time, running processes 
 directory is inside the tree, and agent sessions that reference it.
 
 The **active window** is a setting (`active_window_days`, default 7). A project is active when a
-process is running inside it or anything in it was touched within the window. The setting lives in
+process is running inside it, or when its non-regenerable files were modified or its last commit
+falls within the window. Files under `.git` do not count, and a regenerable directory such as
+`node_modules` takes its project's activity, so a write only inside it does not make the project
+active. The setting lives in
 the config file, is editable in the app's settings and can be overridden per run on the CLI
 (`--active-window-days`). The tool proposes the resulting active set; the user can pin a project as
 always active or mark one inactive. Active projects and everything under them are left untouched,
