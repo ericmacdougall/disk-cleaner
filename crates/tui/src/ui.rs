@@ -402,7 +402,10 @@ pub fn dev_notes(app: &App) -> Vec<String> {
             ));
         }
     }
-    lines.push(format!("Remote facts not verified: {}.", s.remote_facts_note));
+    lines.push(format!(
+        "Remote facts not verified: {}.",
+        s.remote_facts_note
+    ));
     let by_action: Vec<String> = t
         .by_action
         .iter()
