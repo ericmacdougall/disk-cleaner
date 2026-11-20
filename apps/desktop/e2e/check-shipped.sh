@@ -14,6 +14,9 @@ BUNDLE=${1:?bundle folder}
 WORK=${2:?scratch folder}
 rm -rf "$WORK"
 mkdir -p "$WORK"
+# Absolute paths: the AppImage is run from inside its scratch folder.
+BUNDLE=$(cd "$BUNDLE" && pwd)
+WORK=$(cd "$WORK" && pwd)
 MARKS=(PRUNEDISK_E2E_ remote-debugging-port 'PruneDisk (end-to-end build)')
 checked=0
 bad=0
