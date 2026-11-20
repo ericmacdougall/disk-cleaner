@@ -207,11 +207,12 @@ pub(crate) fn below_git_dir(path: &Path) -> Option<Vec<String>> {
     (!rest.is_empty()).then_some(rest)
 }
 
-/// Read at most [`MAX_REF_BYTES`] of a regular file under `refs/` and judge it.
+/// Read at most [`MAX_REF_BYTES`] of a regular file under `refs/` and judge it. An entry that is
+/// no longer a regular file when it is opened is an error ([`crate::regular::open_regular`]).
 pub(crate) fn ref_file_ok(path: &Path) -> std::io::Result<bool> {
     use std::io::Read;
     let mut buf = Vec::new();
-    std::fs::File::open(path)?
+    crate::regular::open_regular(path)?
         .take(MAX_REF_BYTES + 1)
         .read_to_end(&mut buf)?;
     Ok(buf.len() as u64 <= MAX_REF_BYTES && ref_content_ok(&buf))
@@ -349,5 +350,18 @@ mod tests {
         assert_eq!(below_git_dir(&nested), Some(vec!["refs".to_string()]));
         assert_eq!(below_git_dir(&Path::new("w").join(".git")), None);
         assert_eq!(below_git_dir(Path::new("w/src")), None);
+    }
+
+    /// Review M5: a ref file the walk saw as regular can be replaced by a FIFO before it is read.
+    #[cfg(unix)]
+    #[test]
+    fn a_ref_file_swapped_for_a_fifo_is_unread_without_blocking() {
+        use crate::test_fifo::{mkfifo, must_not_block};
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("main");
+        mkfifo(&fifo);
+        let p = fifo.clone();
+        let got = must_not_block(&fifo, move || ref_file_ok(&p).map_err(|e| e.to_string()));
+        assert_eq!(got, Err("not a regular file".to_string()));
     }
 }

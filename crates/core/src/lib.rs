@@ -16,8 +16,11 @@ pub mod plan;
 pub mod preserve;
 pub mod procs;
 pub mod redact;
+mod regular;
 pub mod rules;
 pub mod scan;
+#[cfg(all(test, unix))]
+mod test_fifo;
 pub mod words;
 
 pub use config::{Config, ConfigSource, DEFAULT_ACTIVE_WINDOW_DAYS, DEFAULT_MAX_GIT_ADMIN_BYTES};
