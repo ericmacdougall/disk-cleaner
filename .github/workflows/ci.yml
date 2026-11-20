@@ -56,41 +56,6 @@ jobs:
       - name: Show whether the wrong-case guard ran
         if: ${{ !cancelled() }}
         run: cargo test -p disk-cleaner-core --locked --test worktree_config a_bare_repo_under_a_wrong_case_scan_root -- --nocapture
-      # TEMPORARY (GoodQA #16418, hardening flake): removed again before the PR is ready.
-      - name: "TEMPORARY flake probe: maintenance lock right after a commit"
-        if: ${{ !cancelled() && runner.os == 'macOS' }}
-        shell: bash
-        run: |
-          d=$(mktemp -d)
-          git init -q -b main "$d/r"
-          cd "$d/r"
-          c() { git -c user.name=T -c user.email=t@example.invalid "$@"; }
-          hits=0
-          for i in $(seq 1 50); do
-            echo "$i" > f; git add f; c commit -q -m "$i"
-            if [ -e .git/objects/maintenance.lock ]; then hits=$((hits+1)); fi
-          done
-          echo "default config: objects/maintenance.lock present right after commit in $hits of 50"
-          GIT_TRACE=1 c commit -q --allow-empty -m trace 2>&1 | grep -E "maintenance" || true
-          hits=0
-          for i in $(seq 1 50); do
-            echo "n$i" > f; git add f; c -c maintenance.auto=false -c gc.auto=0 commit -q -m "n$i"
-            if [ -e .git/objects/maintenance.lock ]; then hits=$((hits+1)); fi
-          done
-          echo "maintenance.auto=false gc.auto=0: objects/maintenance.lock present right after commit in $hits of 50"
-      - name: "TEMPORARY flake loop: f1_filter_clean_in_repo_config_is_never_executed 50 times"
-        if: ${{ !cancelled() && runner.os == 'macOS' }}
-        shell: bash
-        run: |
-          fails=0
-          for i in $(seq 1 50); do
-            if ! cargo test -q -p disk-cleaner-core --locked --test hardening f1_filter_clean_in_repo_config_is_never_executed -- --exact > "$RUNNER_TEMP/f1.txt" 2>&1; then
-              fails=$((fails+1))
-              grep -E "panicked at|facts:" "$RUNNER_TEMP/f1.txt" | cut -c1-600
-            fi
-          done
-          echo "f1_filter_clean_in_repo_config_is_never_executed failed in $fails of 50 runs"
-          test "$fails" -eq 0
 
   mount-test:
     name: one-file-system on a real mount (linux)
