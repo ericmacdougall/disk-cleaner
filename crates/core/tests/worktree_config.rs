@@ -479,7 +479,8 @@ mod unix {
     /// submodule's config. With the extension on, a `.git` that is neither a directory nor a
     /// regular file is refused when `config.worktree` is looked for (by `lstat`, not by git), and
     /// the outer repo's `tree_clean` is unknown. (A node's own odd `.git` is never given to git.)
-    const ODD_DOTGIT: &str = "tree_clean: submodule sub: .git is neither a directory nor a regular file";
+    const ODD_DOTGIT: &str =
+        "tree_clean: submodule sub: .git is neither a directory nor a regular file";
 
     fn assert_odd_dotgit_refused(res: &ScanResult, outer: &Path) {
         let notes = notes(res, outer);
@@ -509,8 +510,10 @@ mod unix {
         assert_odd_dotgit_refused(&res, &outer);
     }
 
-    /// git does not take a FIFO as a `.git` and walks up to the outer repo, whose config has the
-    /// extension. Nothing opens the FIFO, so nothing waits on it.
+    /// A FIFO `.git`: git (2.56 on CI) itself refuses it, so the submodule's first config
+    /// listing fails before the `lstat`, and the refusal is git's (an older git that walked up
+    /// instead would reach the outer repo's config, extension on, and the `lstat` refusal). The
+    /// outer repo's `tree_clean` is unknown either way, and nothing opens the FIFO.
     #[test]
     fn a_submodule_checkout_whose_git_entry_is_a_fifo_is_refused() {
         let (tmp, root, remotes) = workspace();
@@ -523,7 +526,12 @@ mod unix {
             .unwrap();
         assert!(status.success());
         let res = scan_with(&root, network_everywhere());
-        assert_odd_dotgit_refused(&res, &outer);
+        let either = |n: &String| {
+            n == ODD_DOTGIT || n.starts_with("tree_clean: submodule sub: config: git exited")
+        };
+        let notes = notes(&res, &outer);
+        assert!(notes.iter().any(either), "{notes:?}");
+        assert_eq!(facts_of(&res, &outer).tree_clean, Tri::Unknown, "{notes:?}");
     }
 
     // ------------------------------------------------------------ a symlinked scan root

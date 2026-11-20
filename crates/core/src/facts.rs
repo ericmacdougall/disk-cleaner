@@ -2411,9 +2411,11 @@ mod tests {
             let got = must_not_block(&fifo, move || gitfile_dir(&w, &p));
             assert_eq!(
                 got,
-                Err("the .git file was not read (not a regular file), so its config.worktree was \
+                Err(
+                    "the .git file was not read (not a regular file), so its config.worktree was \
                      not found"
-                    .to_string())
+                        .to_string()
+                )
             );
         }
 
