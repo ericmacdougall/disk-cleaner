@@ -47,7 +47,9 @@ In scope:
   directories), streamed to an rclone remote, read back and compared.
 - Secret-like files: the user chooses what happens to an item that holds them, per item in ask mode
   or by a setting for automatic runs: keep the item, or upload them to the user's own storage with
-  the rest (D-4, the user's decision; the local vault option is deferred). Nothing chosen: kept.
+  the rest (D-4: offering the choice, and upload to the user's own storage, are the user's
+  decision; keeping when nothing is chosen and deferring the local vault option are the owner's
+  ASSUMPTIONs). Nothing chosen: kept.
 - A journal that makes every step resumable and idempotent; a per-user lock so two applies never
   run at once on one machine.
 - The manifest (local and in storage), `disk-cleaner manifest list|find|verify|orphans`, and
@@ -211,8 +213,9 @@ disk-cleaner quarantine list [--state-dir DIR] [--json]
     deleted. Do not use it as a working copy; the restore command gives the complete item." and
     "disk-cleaner will not delete this folder. Removing it is your own action, after you have
     checked it."
-  - **Moved back** (`moved-back`, 10.1): the original path, the same two statements, and the
-    restore command.
+  - **Moved back** (`moved-back`, or `delete-started` or `left` with Q absent and, by `lstat`, a
+    directory at O with F0's device and inode, 10.1): the original path, the same two statements,
+    and the restore command.
   - **Replaced** (something at Q's path fails the identity check of 6.1, in any state): what is
     there (kind, and a symlink's target as text), that it is not the tool's quarantine and the
     tool will not touch it, and the restore command for an archived item ("never archived;
@@ -438,8 +441,9 @@ An item is skipped, with the reason, when:
 - **an entry's extended attributes cannot be archived** (9.3);
 - **it holds, or lies inside, a quarantine or a restore staging directory**: any entry whose name
   starts with `.disk-cleaner-removing-` or `.disk-cleaner-restoring-`, any path a journal names
-  as a quarantine, or a directory with the device and inode a journal records for a leftover
-  moved back (10.1). Such an item is kept **in every mode, `--backup-only` and dry runs
+  as a quarantine, or a directory with the device and inode that a journal records from F0 for an
+  item past `delete-started` (a leftover moved back, 10.1), whether or not any run has journaled
+  `moved-back` yet. Such an item is kept **in every mode, `--backup-only` and dry runs
   included**, so a leftover is never archived; the reason names the directory, and the leftover
   stays the user's to check. **Every walk stops there without descending**: the F0 walk, which
   is the first walk of step 2, meets the name and skips the item before F0 is complete, so the
@@ -978,7 +982,7 @@ is not the item.
 | `quarantined` | present | absent | Touch nothing; `failed` ("quarantine missing, something is at the original path"). |
 | `quarantine-intent` or `quarantined` | absent | absent | Something outside the tool removed the item. Archived item: write a `vanished` record (the archive is the copy; restore works); `failed` in the summary. Unarchived regenerable item: skipped `gone`, no record. Never `removed`, never `kept`. |
 | `delete-started` or `left` | any | present | A leftover: journal `left` if it is not there, report it, touch nothing (Q is not read; a directory at O is not touched). `failed` in the summary. |
-| `delete-started` or `left` | a directory with F0's device and inode | absent | **The leftover was moved back** (a rename keeps the inode): journal `moved-back`, write no `removed` record, `failed` in the summary with "PATH is incomplete: some of its files were already deleted; `disk-cleaner restore RECORD_ID` gives the complete item" (for an unarchived regenerable item: "never archived; rebuildable"). The folder is kept from then on (7.4). |
+| `delete-started` or `left` | a directory with F0's device and inode | absent | **The leftover was moved back** (a rename keeps the inode): journal `moved-back`, write no `removed` record, `failed` in the summary with "PATH is incomplete: some of its files were already deleted; `disk-cleaner restore RECORD_ID` gives the complete item" (for an unarchived regenerable item: "never archived; rebuildable"). The folder is kept by 7.4 in every mode, before and after this line is written. |
 | `delete-started` or `left` | absent, or anything else | absent | Deletion finished before `deleted` was written, or the user removed the leftover: write `deleted`, then the `removed` record (`regenerable-removed` for an unarchived regenerable item) with `completed_by: "unknown"`, once. An entry at O is new and is not touched; the summary names it. |
 | `moved-back` | any | any | Report only, as `quarantine list` prints it. |
 | `deleted` | any | absent | Write and sync the `removed` record if no synced segment has it. |
@@ -2138,11 +2142,13 @@ two steps; it exists only in test builds (AC-35).
   descendant exits, the next operation's teardown removes it. A broken variant that removes the
   spool after reaping only direct children must fail this case.
 - **NEG-64 (AC-21)** After `delete-started` and some unlinks, the run is killed; the user renames Q
-  back to O by hand. The next run, in each of dry run, `--backup-only` and `--remove`, and `apply
-  --resume`: journals `moved-back` (no `removed` record), warns that the folder at O is an
-  incomplete leftover, keeps the enclosing item with that reason, and opens nothing inside O. A
-  different directory with a new inode at O instead: treated as a new folder, and Q is still a
-  leftover. `quarantine list` shows the moved-back folder with both statements.
+  back to O by hand. The next run, in each of dry run, `--backup-only`, `--remove` and `apply
+  --resume`: warns that the folder at O is an incomplete leftover, keeps the item and any item
+  enclosing it with that reason, archives nothing of it, writes no `removed` record, and opens
+  nothing inside O; only the `--remove` run and the resume journal `moved-back`, and the dry run
+  writes nothing. `quarantine list`, run before any of those and after, shows the moved-back
+  folder with both statements. A different directory with a new inode at O instead: treated as
+  a new folder, and Q is still a leftover.
 - **NEG-65 (AC-21)** A quarantine whose deletion never started (journal ends at `quarantined`),
   each alone: O holds a regular file; O holds a symlink, to a directory and dangling; Q was
   replaced by a symlink to a directory holding the same names; Q was replaced by a different
@@ -2310,8 +2316,8 @@ runs the real binary before the work is called ready.
   deletes nothing; the tester records the leftover's file count before and after),
   `quarantine list` (the restore command and both statements of 5), the printed restore command
   run for the archived case (the restored tree equals the fixture); one leftover renamed back to
-  its original path by hand (the next run warns that it is incomplete, records `moved-back`, and
-  keeps it); and finally the tester removing the other leftover by hand and running
+  its original path by hand (`quarantine list` shows it as moved back; the next `--remove` run
+  warns that it is incomplete, records `moved-back`, and keeps it); and finally the tester removing the other leftover by hand and running
   `apply --remove` once more (the record is written once, the leftover no longer listed).
   After each flow the tester compares the restored trees with the fixture and searches every
   output for the fake `.env` value. A quarantine whose deletion never started cannot be reached
