@@ -15,7 +15,6 @@ use common::*;
 use disk_cleaner_core::{plan, Action, Plan, PlanItem, PlanOptions, ScanResult};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 fn plan_of(res: &ScanResult) -> Plan {
     plan(res, &PlanOptions::new(7, far_future()))
@@ -39,7 +38,7 @@ fn fact(res: &ScanResult, repo: &Path, name: &str) -> String {
 
 /// Run git where failure is expected (a conflicting merge); true when it succeeded.
 fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
+    git_command()
         .args(["-c", "core.autocrlf=false"])
         .args(args)
         .current_dir(dir)

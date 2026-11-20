@@ -7,13 +7,33 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// A `git` command for building fixtures: no automatic maintenance, for it and every git it
+/// starts (the settings travel in the environment).
+///
+/// After a commit, merge, rebase or fetch git starts `git maintenance run --auto --detach`
+/// (`maintenance.autoDetach` defaults to true). The detached child holds
+/// `objects/maintenance.lock` after the command has returned, and a scan that walks the git
+/// directory meanwhile sees it as the repository's own content (`no_local_admin_content` = `no`).
+/// That made `f1_filter_clean_in_repo_config_is_never_executed` fail now and then on macOS; the
+/// CLI tests turn it off the same way.
+pub fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "gc.auto")
+        .env("GIT_CONFIG_VALUE_1", "0");
+    cmd
+}
+
 /// Run git in `dir`, panic with stderr on failure, return trimmed stdout.
 ///
 /// Line endings are pinned (`core.autocrlf=false`, which `args` can override): the scanner does
 /// not read system config, so a fixture checked out with a platform's default `autocrlf=true`
 /// would look modified to it (see `line_endings_converted_only_by_system_config_read_as_modified`).
+/// Automatic maintenance is off ([`git_command`]).
 pub fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = git_command()
         .args(["-c", "core.autocrlf=false"])
         .args(args)
         .current_dir(dir)
