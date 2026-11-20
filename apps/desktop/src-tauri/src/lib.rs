@@ -146,4 +146,17 @@ mod tests {
              form-action 'none'; frame-ancestors 'none'"
         );
     }
+
+    /// The webview keeps no browsing data on disk (docs/DESKTOP.md, "Files the desktop app
+    /// writes"); the macOS bundle job checks what an idle launch writes.
+    #[test]
+    fn the_window_runs_the_webview_in_incognito_mode() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let windows = conf["app"]["windows"].as_array().unwrap();
+        assert!(!windows.is_empty());
+        for w in windows {
+            assert_eq!(w["incognito"].as_bool(), Some(true), "{w}");
+        }
+    }
 }

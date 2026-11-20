@@ -1,9 +1,8 @@
 # PruneDisk desktop app and terminal view (read-only)
 
 Both show where the space went and what the dry-run plan proposes. Neither removes, moves,
-renames or backs up anything; the only files they write are a plan export (always a new
-file), the app's own settings, and, on an explicit Save in Settings, two keys of core's
-config file (`active_window_days`, `max_git_admin_bytes`) with a `config.toml.bak` beside it.
+renames or backs up anything. The terminal view writes only a plan export (`e`, always a new
+file). The desktop app writes the files listed under "Files the desktop app writes" below.
 
 ## Terminal view
 
@@ -64,6 +63,45 @@ npm ci
 npx tauri icon app-icon.svg
 npx tauri dev
 ```
+
+### Files the desktop app writes
+
+Its own files are in core's config folder, which follows `HOME` (macOS:
+`~/Library/Application Support/disk-cleaner/`), `APPDATA` (Windows: `%APPDATA%\disk-cleaner\`)
+or `XDG_CONFIG_HOME` (Linux: `$XDG_CONFIG_HOME/disk-cleaner/`, else `~/.config/disk-cleaner/`):
+
+- `prunedisk-app.json`, the app's scan settings;
+- on an explicit Save of the plan settings: `config.toml` (only `active_window_days` and
+  `max_git_admin_bytes` change), `config.toml.bak` (the text Settings loaded),
+  `config.toml.lock` (the save lock; it stays, empty, by design) and, during the save, a temp
+  file that is renamed over `config.toml` or removed;
+- a plan export, always a new file, in the folder chosen for it.
+
+Webview data. The window is the system webview, which keeps data in folders named after the
+bundle id `io.github.ericmacdougall.prunedisk`. These do not follow `HOME`: WebKit uses the
+account's home folder. The app runs the webview in incognito mode (`"incognito": true` in
+`apps/desktop/src-tauri/tauri.conf.json`); the app keeps no web storage, so nothing is lost by it.
+
+- macOS: incognito is WebKit's non-persistent data store (wry 0.57 uses
+  `WKWebsiteDataStore.nonPersistentDataStore`), so cookies, local storage, IndexedDB and the
+  resource-load statistics database are kept in memory. Without it, an idle launch wrote
+  `~/Library/WebKit/<bundle id>/WebsiteData/` (520 KiB in CI and 584 KiB in the click-test,
+  with a `ResourceLoadStatistics` database still being written while idle) and
+  `~/Library/Caches/<bundle id>/WebKit/` (8 KiB). CI (job "bundle (macos-arm64)") launches
+  the app idle for 20 s, lists what it wrote and fails if the statistics database is written.
+  An idle launch may still create the folders themselves and the cache folder; the job log
+  lists them.
+- Windows (not observed here): WebView2 keeps a user data folder,
+  `%LOCALAPPDATA%\io.github.ericmacdougall.prunedisk\EBWebView\`; incognito runs it InPrivate,
+  which keeps browsing data out of it, but the runtime still creates the folder.
+- Linux (not observed here): incognito gives webkit2gtk an ephemeral data manager, so no
+  browsing data should be written under `~/.local/share/io.github.ericmacdougall.prunedisk/`
+  or `~/.cache/io.github.ericmacdougall.prunedisk/`.
+
+What Tauri 2 offers here: `incognito` (every desktop platform; a non-persistent store),
+`dataDirectory` (Windows and Linux only; it moves the data, it does not turn it off) and
+`dataStoreIdentifier` (macOS 14 and later only; a separate persistent store). None turns off
+the resource-load statistics alone; incognito is the only way to stop them being stored.
 
 Disclosed limits:
 
