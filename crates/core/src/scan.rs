@@ -2309,7 +2309,8 @@ const MAX_SMALL_FILE: u64 = 64 * 1024;
 
 /// Read a regular file of at most 64 KiB. A missing file is `Ok(None)`. A symlink, FIFO, device
 /// or oversized file is an error: it is never followed or read to the end, so a hostile tree
-/// cannot make the scan block or grow without bound.
+/// cannot make the scan block or grow without bound. The `lstat` here gives the errors; the open
+/// checks again, so an entry swapped in after it is refused too ([`crate::regular::open_regular`]).
 fn read_small_regular_file(path: &Path) -> std::result::Result<Option<String>, String> {
     use std::io::Read;
     let md = match std::fs::symlink_metadata(path) {
@@ -2323,7 +2324,7 @@ fn read_small_regular_file(path: &Path) -> std::result::Result<Option<String>, S
     if md.len() > MAX_SMALL_FILE {
         return Err("file is too large".to_string());
     }
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let file = crate::regular::open_regular(path).map_err(|e| e.to_string())?;
     let mut buf = String::new();
     file.take(MAX_SMALL_FILE)
         .read_to_string(&mut buf)

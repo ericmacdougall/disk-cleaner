@@ -16,6 +16,7 @@ pub mod plan;
 pub mod preserve;
 pub mod procs;
 pub mod redact;
+mod regular;
 pub mod rules;
 pub mod scan;
 #[cfg(all(test, unix))]

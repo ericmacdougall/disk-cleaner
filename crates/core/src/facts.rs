@@ -853,10 +853,12 @@ fn parse_pseudoref(name: &str, bytes: &[u8]) -> Pseudo {
     }
 }
 
-/// Read at most [`MAX_PSEUDOREF_BYTES`] of a regular file.
+/// Read at most [`MAX_PSEUDOREF_BYTES`] of a regular file. Anything else, a FIFO or symlink
+/// swapped in after the caller's `lstat` included, is refused without blocking
+/// ([`crate::regular::open_regular`]).
 fn read_bounded(p: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+    let f = crate::regular::open_regular(p).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     f.take(MAX_PSEUDOREF_BYTES + 1)
         .read_to_end(&mut buf)
@@ -1213,6 +1215,8 @@ fn local_config_keys(git: &crate::git::Git, path: &Path) -> Result<Vec<String>, 
             // `--worktree` fails when the file is missing. Missing means no keys, if git agrees:
             // its own listing must show no worktree scope. (When git rejects this git directory
             // and uses one above it, that one's file was not judged, so the repo is refused.)
+            // `--show-scope` is git 2.26; any failure of this listing is said in those words,
+            // with git's own error after them (its text is not matched).
             let all = git
                 .run(
                     path,
@@ -1224,7 +1228,13 @@ fn local_config_keys(git: &crate::git::Git, path: &Path) -> Result<Vec<String>, 
                         "--name-only",
                     ],
                 )
-                .map_err(|e| note("config", &e))?;
+                .map_err(|e| {
+                    format!(
+                        "git config --show-scope failed (it needs git 2.26 or newer), so whether \
+                         git reads worktree-scoped config that was not judged is unknown: {}",
+                        note("config", &e)
+                    )
+                })?;
             for line in all.lines() {
                 match line.split_once('\t') {
                     Some((scope, _)) if scope != "worktree" => {}

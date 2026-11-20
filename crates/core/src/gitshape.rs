@@ -207,11 +207,12 @@ pub(crate) fn below_git_dir(path: &Path) -> Option<Vec<String>> {
     (!rest.is_empty()).then_some(rest)
 }
 
-/// Read at most [`MAX_REF_BYTES`] of a regular file under `refs/` and judge it.
+/// Read at most [`MAX_REF_BYTES`] of a regular file under `refs/` and judge it. An entry that is
+/// no longer a regular file when it is opened is an error ([`crate::regular::open_regular`]).
 pub(crate) fn ref_file_ok(path: &Path) -> std::io::Result<bool> {
     use std::io::Read;
     let mut buf = Vec::new();
-    std::fs::File::open(path)?
+    crate::regular::open_regular(path)?
         .take(MAX_REF_BYTES + 1)
         .read_to_end(&mut buf)?;
     Ok(buf.len() as u64 <= MAX_REF_BYTES && ref_content_ok(&buf))
