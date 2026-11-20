@@ -9,7 +9,8 @@ review to changes and lists the minor items left for later; earlier reviews are 
 revision 5. Revision 10 removed Windows operation and the finishing of interrupted deletions (8.2,
 8.3). Revision 11 makes the deletion pass compare every entry's full preserved record just before
 removing it (13.2), gives spool teardown one routine (9.6), lists every quarantine state (5),
-lets the user choose the secrets handling (D-4, 9.2, 11) and defines signals during deletion
+lets the user choose the secrets handling, automatic runs included (`--secrets upload-all`; D-4,
+9.2, 11) and defines signals during deletion
 (10.1); its criteria are rewritten in place under the same numbers (section 22).
 
 Read with [DESIGN.md](DESIGN.md) and [SCAN-FORMAT.md](SCAN-FORMAT.md). Where this document and
@@ -47,7 +48,8 @@ In scope:
   directories), streamed to an rclone remote, read back and compared.
 - Secret-like files: the user chooses what happens to an item that holds them, per item in ask mode
   or by a setting for automatic runs: keep the item, or upload them to the user's own storage with
-  the rest (D-4: offering the choice, and upload to the user's own storage, are the user's
+  the rest, in automatic runs as `upload` or as `upload-all`, which also uploads unnamed objects
+  and history past its limits (D-4: offering the choice, and upload to the user's own storage, are the user's
   decision; keeping when nothing is chosen and deferring the local vault option are the owner's
   ASSUMPTIONs). Nothing chosen: kept.
 - A journal that makes every step resumable and idempotent; a per-user lock so two applies never
@@ -183,7 +185,8 @@ and restore detect it, they cannot undo it); memory corruption.
 disk-cleaner apply --plan PLAN --scan SCAN --storage REMOTE:PATH
                    [--backup-only | --remove]
                    [--auto CLASS[,CLASS...]] [--class CLASS[,CLASS...]] [--item PATH]...
-                   [--backup-regenerable] [--secrets keep|upload] [--require-encrypted-remote]
+                   [--backup-regenerable] [--secrets keep|upload|upload-all]
+                   [--require-encrypted-remote]
                    [--max-plan-age HOURS] [--max-upload-bytes N] [--min-free BYTES]
                    [--part-size BYTES] [--state-dir DIR] [--machine-label TEXT]
                    [--rclone PATH] [--allow-root] [--json]
@@ -222,8 +225,9 @@ disk-cleaner quarantine list [--state-dir DIR] [--json]
     rebuildable" otherwise).
 - No mode flag: **dry run**. `--backup-only`: everything up to and including the manifest, then
   stop; nothing is removed. `--remove`: the full sequence. The two are mutually exclusive.
-- `--secrets keep|upload` (or `[apply] secrets`) is the secrets handling for items that run in
-  automatic mode (11, D-4); default `keep`. Items in ask mode are asked.
+- `--secrets keep|upload|upload-all` (or `[apply] secrets`) is the secrets handling for items that
+  run in automatic mode (9.2, 11, D-4); default `keep`. `upload-all` is a separate value, never
+  the default and never implied by `upload`. Items in ask mode are asked.
 - **Windows.** `apply` (every mode, `--resume` included), `restore`, `quarantine list`,
   `manifest list --storage`, `manifest find TEXT --storage`, `manifest find --files`,
   `manifest verify` and `manifest orphans` exit 4 ("not supported on this platform in this
@@ -691,12 +695,14 @@ always to the user's own storage):
     not want those objects, `git gc --prune=now` removes them, but it also destroys dropped
     stashes you could still recover, which is why apply never does it." In ask mode on a terminal,
     when the item's only reasons are in its secrets set, the user may answer `u` for that item at
-    the secrets prompt (11, D-16); automatic runs never upload unnamed objects. The
+    the secrets prompt (11, D-16); automatic runs upload unnamed objects only under
+    `--secrets upload-all` (9.2). The
     content rule above runs on unnamed blobs too, within the same budget, so that the prompt can say
     what it saw;
   - **limits**: a store of more than 10 million objects in one git directory, or more than
     600 seconds for all the commands of this rule on one item, keeps the item ("the history check
-    exceeded its limit"). When the time limit is reached, the whole process group of the running
+    exceeded its limit"; a **limit reached**, the one kind of check not completed that
+    `upload-all` uploads anyway, 9.2). When the time limit is reached, the whole process group of the running
     git command is killed. Section 18 gives the memory this needs. Both values are ASSUMPTIONs
     (D-16); tests inject smaller ones through the library;
   - a `pack-<id>.pack` without its `pack-<id>.idx` is invisible to git, so its objects cannot be
@@ -753,7 +759,13 @@ parse, such as a `missing` line from `cat-file --batch` for an object the store 
 the limits above or cannot run, and any file the content rule cannot read, keeps the item (skipped
 before upload, the reason names the check). A warning on stderr with exit 0, which git prints for
 every partial clone, is not a failure. The one exception is the 64 MiB content budget for named
-blobs in history, which is documented best effort.
+blobs in history, which is documented best effort. A check that failed or could not run, for any
+reason other than the two limits above (a git error, output that does not parse, a missing
+object, a pack without its index), is a **check that could not run**: it keeps the item under
+every handling, `upload-all` included, because then it is the archive's completeness that is in
+doubt, not only its secrecy. An item whose layout core's check refused is never selected at all
+(the plan gives it `ask`, as above, D-3), and a layout that fails only at apply's re-check (step 2)
+makes the item differ from the plan, so it is skipped; no handling applies to either.
 
 **The secrets set and the user's choice (D-4).** Everything the rules above find in one item is
 that item's **secrets set**: secret-like files (by name, content, global excludes or git
@@ -768,14 +780,33 @@ non-empty secrets set the user chooses one handling:
   everything else (the **upload choice**).
 
 In ask mode the choice is made at the secrets prompt (11), for that item only. For an item that
-runs in automatic mode it is `--secrets keep|upload` or `[apply] secrets`, default `keep`; there,
-`upload` covers the item's secrets set **except unnamed objects and history checks not
-completed**, which only the prompt uploads (D-16, the user's per-repository choice; a check not
-completed may hide unnamed objects), so an automatic item whose set holds either is kept. The
-option overrides the setting; any other value of either is a usage error (exit 1) before any
-item is read. A choice covers exactly the set it was made for: it binds to F0 (11), so a secret-like
-entry that appears later keeps the item or asks again, and no choice uploads another item's
-secrets. The third option the user was shown, a local vault for the secret-like files with the
+runs in automatic mode it is `--secrets keep|upload|upload-all` or `[apply] secrets`, default
+`keep`:
+
+- `upload` covers the item's secrets set **except unnamed objects and history checks not
+  completed**, which it never uploads (D-16, the user's per-repository choice; a check not
+  completed may hide unnamed objects), so an automatic item whose set holds either is kept;
+- `upload-all` (the **upload-all handling**) covers the item's **whole** secrets set: secret-like
+  files, history names, unnamed objects (read in full, in part or not at all) and a history check
+  that reached a limit. It still keeps an item with a **check that could not run** (above). It is
+  never the default, never implied by `upload`, and has no effect on items in ask mode, which are
+  asked as before.
+
+**The upload-all notice.** In a run where `upload-all` is in effect, before the first upload of
+any item (and in a dry run, before the first item is reported), apply prints once, on stderr and
+in the summary: "--secrets upload-all: items that run automatically are uploaded whole to REMOTE,
+even when they hold secret-like files, secret-like names in local history, unnamed git objects
+or a history check that exceeded its limit. Unnamed objects and objects of 1 MiB or more may be
+uploaded unread; 'no pattern matched' is not evidence that an object holds no secret. Items whose
+history check could not run are still kept." It is followed by "REMOTE is encrypted (rclone
+crypt)." or "REMOTE is not encrypted: these files will be stored unencrypted in REMOTE." (9.6).
+With `--require-encrypted-remote` and a plain remote the run is refused before this notice, as
+for any upload.
+
+The option overrides the setting; any other value of either is a usage error (exit 1) before any
+item is read. A choice covers exactly the set it was made for: it binds to F0 (11), so a
+secret-like entry that appears later keeps the item or asks again, and no choice uploads another
+item's secrets. The third option the user was shown, a local vault for the secret-like files with the
 rest archived, is deferred (D-4 says why). The run summary counts the items kept by each rule and
 the items uploaded with a secrets set, so the cost of over-keeping (mainly the global-excludes
 rule, the unnamed-object rule and the history limits) is visible.
@@ -1068,8 +1099,8 @@ its re-check.
     2. "'No pattern matched' is not evidence that an object holds no secret. These objects have no
        file name. One may be a real .env or key that was staged and then unstaged. Answering u
        uploads them as they are.";
-    3. "Unnamed objects are uploaded only by this answer. Automatic runs never upload them, and
-       without a terminal the answer is no.";
+    3. "In ask mode, unnamed objects are uploaded only by this answer. Automatic runs upload them
+       only under --secrets upload-all, and without a terminal the answer is no.";
   - the answers `u`, upload this item's whole secrets set with the rest of the item, and `n`, keep
     the item.
 
@@ -1082,8 +1113,8 @@ its re-check.
   choice. In automatic mode the setting of 9.2 decides and no prompt is shown. The answer binds to
   F0, which includes the store's files, so a new secret-like entry or object before step 9 keeps
   the item. The record carries `secrets_uploaded` (the count of secret-like files and history
-  names, no names), `unnamed_uploaded` (the count and total bytes, no names or ids) and
-  `secrets_choice` (`prompt` or `setting`); the summary counts such items.
+  names, no names), `unnamed_uploaded` (the count and total bytes, no names or ids),
+  `secrets_choice` and `kept_reasons_overridden` (12.1); the summary counts such items.
 - Every answer, `u` included, binds to the F0 it was given against. A failed attempt or a resume
   that restarts the item from step 2 takes a new F0, so a journaled answer is **never reused**:
   the item is asked again, and without a terminal it is kept. Any difference at step 9 keeps the
@@ -1115,10 +1146,15 @@ Where they apply:
 - `nested_regenerable`: the paths of regenerable children archived and removed with a git item
   (6.3);
 - `secrets_uploaded`: the count of secret-like files and history names archived under the upload
-  choice (9.2; no names);
+  choice or the upload-all handling (9.2; no names);
 - `unnamed_uploaded`: the count and total bytes of unnamed objects archived after the answer `u`
-  (11; no names or ids);
-- `secrets_choice`: `prompt` or `setting`, how the upload choice was made (9.2, 11);
+  or under `upload-all` (9.2, 11; no names or ids);
+- `secrets_choice`: how a non-empty secrets set came to be uploaded: `prompt` (the answer `u`),
+  `upload` or `upload-all` (the automatic setting, 9.2);
+- `kept_reasons_overridden`: on a record whose `secrets_choice` is set, every rule that would
+  otherwise have kept the item, each with its count and no names: `name`, `content`,
+  `global-excludes`, `git-directory`, `history-name`, `unnamed-object` (with the counts read in
+  full, in part and not read) and `history-limit` (`objects` or `time`);
 - `completed_by`: `"unknown"` on a `removed` or `regenerable-removed` record written after the
   tool found a leftover's quarantine gone (10.1): the user, or the interrupted pass, finished it;
 - `restore`: the method (`archive` or `regenerable`) and the exact `disk-cleaner restore
@@ -1378,13 +1414,25 @@ which the user chose (option (i), sourced in D-16).
   options to user, in my case back it up to my private storage anyway"): the handling options are
   offered to the user, and uploading secret-like files to the user's own private storage is a
   legitimate choice that this user intends to use. The options shown were: keep the whole folder;
-  keep those files in a local vault and archive the rest; upload them with the rest.
+  keep those files in a local vault and archive the rest; upload them with the rest. The same
+  words make an **automatic handling that uploads such folders anyway** something the tool must
+  offer: a user who wants their own folders backed up regardless must be able to say so for
+  automatic runs too (the coordinator's reading of the user's words, Source as above). That is
+  `--secrets upload-all` (9.2).
   **Everything else is the owner's ASSUMPTION**, not the user's:
   - two options in the first release, keep and upload; one prompt per item for the whole secrets
     set, merged with D-16's answer `u` so the two cannot contradict (11); for automatic runs the
-    setting `--secrets` / `[apply] secrets`, which never uploads unnamed objects and keeps an
-    item whose history checks did not complete (unnamed objects stay per repository, as the user
-    chose in D-16);
+    setting `--secrets` / `[apply] secrets`, whose `upload` value never uploads unnamed objects
+    and keeps an item whose history checks did not complete (unnamed objects stay per
+    repository, as the user chose in D-16);
+  - for `upload-all`: its name; that it is a separate value, never the default and never implied
+    by `upload`; the one-time notice and its wording; the record fields
+    `secrets_choice: upload-all` and `kept_reasons_overridden`; and its exclusions: a history
+    check that could not run (a git error, unparsable output, a missing object, a pack without its
+    index) still keeps the item, because the archive's completeness is then in doubt, and an item
+    whose layout core refused is never selected. Under `upload-all` the unnamed objects of an
+    automatic item are uploaded without the per-repository question of D-16; that question stays
+    the only route in ask mode;
   - **the default when nothing was chosen is keep**, because keeping loses nothing and an upload by
     mistake cannot be taken back;
   - the unencrypted-storage statement in the prompt and summary, and `--require-encrypted-remote`
@@ -1401,12 +1449,16 @@ which the user chose (option (i), sourced in D-16).
     manifest record for each vaulted file with its digest, a restore that merges vault and
     archive and refuses when either is missing, and a decision for history secrets.
   Cost: until the user chooses upload, items with secret-like material are not reclaimed; the
-  summary counts them by rule. **Automatic upload does not reach every item**: `--secrets upload`
-  still keeps every item with an unnamed object or a history check not completed, which D-16
-  expects to be common in hand-worked repositories; only the prompt in ask mode reclaims those.
-  So the user's stated intent, to back such folders up to their own storage anyway, is fully met
-  only in ask mode. The user was shown three options and gets two in this release. The
-  coordinator reports both points to the user.
+  summary counts them by rule. `--secrets upload` still keeps every item with an unnamed object
+  or a history check not completed, which D-16 expects to be common in hand-worked repositories;
+  `--secrets upload-all` reclaims those in automatic runs too, so the user's stated intent, to
+  back such folders up to their own storage anyway, can be met in both modes. What `upload-all`
+  costs: unnamed objects, which may be real secrets that were staged and unstaged, and objects
+  read only in part or not at all, go to the storage unread, unencrypted unless the remote is
+  `crypt`; the notice says so once per run. What it still keeps: items with a history check that
+  could not run (the summary counts them), so not every such folder is reclaimed. The user was
+  shown three options and gets two in this release (the vault is deferred); the coordinator
+  reports that to the user.
 - **D-5. Recovery refs.** Moot in this release: nothing is pushed (D-1, section 8).
 - **D-6. rclone command line**, not the rc API that DESIGN.md named: `rcat --size`, `cat`, `lsjson`
   behind a `Store` trait; minimum rclone version 1.64, checked at start.
@@ -1455,8 +1507,9 @@ which the user chose (option (i), sourced in D-16).
   `git add` or `git commit -a`; `git add -p`; GUI hunk staging. A repository with no remote and
   one harmless file staged twice is kept (NEG-46). Apply runs with `gc.auto=0` and automatic `gc`
   rarely runs in small repositories, so for hand-worked repositories this is likely the common
-  case. The only override is the answer `u` at the secrets prompt, in ask mode on a terminal
-  (D-4, 11); automatic runs keep these items. The remedy (9.2): inspect with
+  case. The overrides are the answer `u` at the secrets prompt, in ask mode on a terminal
+  (D-4, 11), and in automatic runs only `--secrets upload-all` (9.2); automatic runs under
+  `keep` or `upload` keep these items. The remedy (9.2): inspect with
   `git fsck --lost-found`, and prune with `git gc --prune=now` only if the objects are not
   wanted. Pruning also destroys dropped stashes, which is why apply never prunes. A corpus
   replayed from public clones understates the rate, so section 23 requires those habits in it.
@@ -1468,7 +1521,8 @@ which the user chose (option (i), sourced in D-16).
   sizes and content results; (ii) a local vault; (iii) as it is. The question said objects of
   1 MiB or more would be uploaded unscanned. It did not carry three further limits (r8
   acceptance review): partial or no reading, "no pattern matched" is not evidence, and the answer
-  exists only in ask mode on a terminal (`--auto` runs reclaim none of these items). Section 11
+  exists only in ask mode on a terminal (`--auto` runs reclaim these items only under
+  `--secrets upload-all`, added in revision 11 from the user's D-4 words). Section 11
   states them and the prompt shows them word for word. Revision 11 merges `u` into D-4's one
   secrets prompt (11): `u` there uploads the item's whole secrets set, so the unnamed objects of
   an item that also holds a `.env` are offered too, which revision 10 did not do. The rest of
@@ -1529,12 +1583,14 @@ which the user chose (option (i), sourced in D-16).
   detected for the commits the walk reads. A `core.excludesFile` inside `includeIf` is not seen.
 - Repositories where a file version was staged and then replaced before a commit are kept by the
   unnamed-object rule, likely most repositories worked on by hand (D-16), until the user prunes
-  them or answers `u` for them at the secrets prompt in ask mode (11); automatic runs keep them.
-  After `u`, unnamed objects are uploaded as they are: those not read, or read only in part, and
-  those in which no pattern matched may hold a secret.
+  them, answers `u` for them at the secrets prompt in ask mode (11), or runs automatic items under
+  `--secrets upload-all` (9.2); automatic runs under `keep` or `upload` keep them. After `u` or
+  under `upload-all`, unnamed objects are uploaded as they are: those not read, or read only in
+  part, and those in which no pattern matched may hold a secret.
 - A repository whose store has more than 10 million objects, or whose history check takes more
-  than 600 seconds, is kept unless the upload choice is made for it (9.2, D-4); its history is then
-  uploaded unchecked, as the prompt says.
+  than 600 seconds, is kept unless `u` is answered for it or `upload-all` applies (9.2, D-4); its
+  history is then uploaded unchecked, as the prompt and the notice say. A repository whose history
+  check could not run is kept under every handling.
 - **Secrets the user chose to upload** (D-4) are stored in the user's own storage like the rest of
   the archive, unencrypted unless the remote is `crypt`. The local vault option is not in this
   release.
@@ -1856,6 +1912,17 @@ two steps; it exists only in test builds (AC-35).
   case exits 3 with the run id. Verify by: `signals.rs` runs the real binary on a large fixture
   through a pseudo-terminal and sends each signal through the step hook at a chosen entry
   (NEG-68).
+- **AC-42** The upload-all handling follows 9.2: only `--secrets upload-all` or `[apply] secrets
+  = "upload-all"` selects it, never the default and never `upload`; for an automatic item it
+  uploads the whole secrets set, unnamed objects and a history check past its limits included,
+  and nothing of any other item; a check that could not run still keeps the item; the notice of
+  9.2 is printed exactly once per run, before the first upload (before the first report in a dry
+  run), with the storage's encryption state; each such record has `secrets_choice: "upload-all"`
+  and `kept_reasons_overridden` listing every rule that would otherwise have kept it; ask-mode
+  items are asked as before. Verify by: `secrets.rs` and `ask.rs` with fixtures for each rule,
+  each limit and each could-not-run case, under `keep`, `upload` and `upload-all`, in automatic
+  and ask mode, searching every stored object for each fake value and comparing each record and
+  the captured output with 9.2 (NEG-69).
 
 ## 21. Negative cases
 
@@ -2185,6 +2252,23 @@ two steps; it exists only in test builds (AC-35).
   exit 3); SIGTERM alone (same as two Ctrl-C); SIGHUP with the terminal closed (the pass
   finishes, no write error escapes, exit 3); Ctrl-C during an upload (stops before the next step,
   nothing quarantined, exit 3). Each is checked against the journal and the file system.
+- **NEG-69 (AC-42)** Automatic repositories in one run, each with distinct fake values: R1 an
+  unnamed object only; R2 a history check past the object limit, and R2' past the time limit
+  (injected small limits); R3 a `.env` and an unnamed object; R4 a history command made to fail
+  by a fake git (nonzero exit, and separately a `missing` line); R5 a pack without its `.idx`;
+  R6 a replace ref present at scan time (the plan gives `ask`), and R6' one added after the plan.
+  Under `--secrets upload`: R1, R2, R2' and R3 kept with their reasons, no value of theirs
+  stored. Under `--secrets upload-all`: R1, R2, R2' and R3 archived, each record with
+  `secrets_choice: "upload-all"` and `kept_reasons_overridden` naming its rules with counts and
+  no names; R4 and R5 kept with the could-not-run reason; R6 not selected and R6' skipped as
+  changed, with no value of R4 to R6' in any stored object. The notice: printed exactly once
+  before the first part upload (the fake rclone's call log shows the order), with "not
+  encrypted" on a plain remote and "encrypted" on a `crypt` remote over a local one; printed
+  once by a dry run, which writes nothing; absent under `keep` and `upload`. `upload-all` with
+  `--require-encrypted-remote` on a plain remote: exit 1 before the notice, nothing uploaded.
+  An ask-mode item in the same run: prompted as before, and `n` keeps it with nothing uploaded.
+  `[apply] secrets = "upload-all"` with `--secrets upload`: R1 kept. `--secrets upload_all`:
+  exit 1, nothing read.
 
 ## 22. Reviews: findings and changes
 
@@ -2207,9 +2291,10 @@ and earlier findings, and the user's answer on D-4.
 | r10 S-6 Windows gaps | `manifest find TEXT --storage` refused; the platform check before configuration parsing; local listing reads a defined folder and creates nothing; WSL2 unsupported and untested (5, 14) | AC-30; NEG-60 |
 | r10 S-7 the cost statement was incomplete | D-17 lists every cost; signals during deletion are defined (10.1); two stale texts removed | AC-41; NEG-68 |
 | The user's answer on D-4 | A secrets handling the user chooses: keep (default) or upload, per item in ask mode and by setting in automatic mode; the vault deferred (9.2, 11, D-4) | AC-12, AC-38, AC-40; NEG-51, NEG-67 |
+| The same answer, for automatic runs ("in my case back it up to my private storage anyway") | `--secrets upload-all`: a separate, never-default value that uploads the whole secrets set of automatic items, unnamed objects and history past its limits included; a check that could not run still keeps; a one-time notice; the record names the overridden rules (9.2, 12.1, D-4) | AC-42; NEG-69 |
 
 Rewritten in place: AC-1, 12, 19, 21, 23, 30, 38, 39 and NEG-12, 19, 32, 43, 47, 51, 53, 58,
-60, 61, 62. Added: AC-40, 41 and NEG-63 to 68. None was withdrawn.
+60, 61, 62. Added: AC-40, 41, 42 and NEG-63 to 69. None was withdrawn.
 
 ### 22.1 Minor items left for a later revision
 
@@ -2265,7 +2350,8 @@ data; each is either a disclosure, a fidelity detail or a test addition.
     consented. Never a user's own repositories without their consent. The thresholds for "too
     many kept" are set before the run and reported with the result. The user has chosen the
     answer `u` (D-16); the result is reported to the user as the share of items `u` could reclaim
-    in ask mode and the share automatic runs keep.
+    in ask mode, the share automatic runs keep under `upload`, and the share `upload-all` still
+    keeps because a check could not run.
 
 ## 24. Click-test plan
 
@@ -2308,8 +2394,11 @@ runs the real binary before the work is called ready.
   dropped-stash repository (each lists the file or history name; `n` keeps, `u` then `y` archives
   with `secrets_choice` recorded), with the unencrypted statement on (b) when it is not `crypt`;
   `--remove --auto repo --secrets upload` over all the secrets repositories (the `.env` and
-  dropped-stash ones archived, the staged-and-replaced one kept for its unnamed objects) and the
-  same without `--secrets` (all kept); Ctrl-C once during the deletion of the large `node_modules` (the message of 10.1 printed, the
+  dropped-stash ones archived, the staged-and-replaced one kept for its unnamed objects), then on
+  fresh fixtures the same with `--secrets upload-all` (the notice printed once before the first upload, with the
+  encryption state of (b); all three archived, and `manifest list --json` shows
+  `secrets_choice: "upload-all"` and the overridden rules on each record) and the same without
+  `--secrets` (all kept); Ctrl-C once during the deletion of the large `node_modules` (the message of 10.1 printed, the
   pass finishes, exit 3), and twice (a leftover, exit 3); the tool killed with `kill -9` during
   the deletion of the large `node_modules`, once removed on its own and once inside its archived
   repository, then `apply --resume` and a new `--remove` run (each reports the leftover and
