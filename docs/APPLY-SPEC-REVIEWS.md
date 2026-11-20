@@ -1,9 +1,33 @@
 # Apply spec: earlier reviews
 
-How revisions 5 to 9 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
+How revisions 5 to 10 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
 from section 22 (revision 5's answers in revision 6, revision 6's in revision 7, revision 7's in
-revision 8, revision 8's in revision 9, revision 9's in revision 10). Criterion and negative-case ids are those of revision 5 and later; section numbers are
+revision 8, revision 8's in revision 9, revision 9's in revision 10, revision 10's in revision
+11). Criterion and negative-case ids are those of revision 5 and later; section numbers are
 those of APPLY-SPEC.md. Later changes to the same areas are listed in APPLY-SPEC.md section 22.
+
+## Reviews of revision 9 (adversarial and acceptance)
+
+F-ids are the adversarial plan review's; B-, C- and D-ids the acceptance review's, prefixed `r9`
+to avoid clashes with core changes and decisions. The coordinator's two scope choices (D-13,
+D-17) removed mechanisms. Revision 11 changed two of the answers below: the deletion pass now
+compares each entry's full preserved record, content included, just before removing it (row r9
+C-2), and nothing reads a leftover or walks into one in any mode (row r9 C-3).
+
+| Finding | Change in revision 10 | Criteria and negative cases |
+|---|---|---|
+| r9 F1, F2 Windows spool cleanup | No Windows operation (D-13): exit 4 before any state (5, 14, 19); both findings are entry conditions (8.2) | AC-30; NEG-60 |
+| r9 B-1 finish deleted unseen changes; r9 C-6 an enclosing item removed a quarantine left behind | No finishing (D-17): leftovers are never deleted, renamed or read (10.1); `quarantine list` (5); restore refuses targets inside a quarantine (13.3); items holding one are kept (7.4, C-6) | AC-21, AC-39; NEG-19, NEG-53 |
+| r9 B-2 later hard-link names had no digest | Every name carries the group's size and digest (4), checked by restore (13.3) | AC-13; NEG-13 |
+| r9 C-2 directory fields the deletion moves | The deletion pass compared only fields unlinking cannot move (13.2); revision 11 compares the full record and names the excluded fields | AC-19; NEG-61 |
+| r9 C-3 a FIFO hangs readers | Nothing reads a leftover; every open is non-blocking with a kind check (13.2); revision 11 adds core's `open_regular` (C-7) | AC-19; NEG-19, NEG-62 |
+| r9 C-4 vacuous completeness test | It parses the tar stream (AC-13) | AC-13; NEG-13 |
+| r9 C-5 `u` reused after a new F0 | No answer is reused; asked again (11) | AC-38; NEG-52 |
+| r9 D-1 rclone subprocesses hold the spool lock (hypothesis) | Disclosed (9.6, 17); "last known rclone pid"; revision 11 tests a descendant that outlives rclone | AC-23; NEG-63 |
+| r9 minor items | Missing lock file counts as held (9.6); symlink xattrs (13.3); local index digest (12.3); macOS system flags (17); setgid (13.2); `u` labelling, object ids, automatic-mode hint (11) | AC-23, AC-38; NEG-56, NEG-61 |
+
+Rewritten in revision 10: AC-2, 13, 19, 21, 23, 30, 38, 39 and NEG-2, 13, 19, 24, 34, 52, 53,
+56. Added: NEG-60, 61, 62. None was withdrawn.
 
 ## Reviews of revision 8 (adversarial and acceptance)
 
