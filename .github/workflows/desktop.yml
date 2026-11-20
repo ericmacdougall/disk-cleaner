@@ -326,8 +326,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $key = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
-          $wv = (Get-ItemProperty $key).pv
+          # The newest installed runtime folder, not the EdgeUpdate registry value, which can lag
+          # behind it (156 against 157 on one runner).
+          $wv = (Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeWebView\Application' -Directory |
+            Where-Object Name -match '^\d+\.\d+\.\d+\.\d+$' | Sort-Object { [version]$_.Name } | Select-Object -Last 1).Name
           $have = (Get-Item "$env:EDGEWEBDRIVER\msedgedriver.exe").VersionInfo.ProductVersion
           "WebView2 runtime: $wv; runner's msedgedriver: $have"
           if ($have.Split('.')[0] -ne $wv.Split('.')[0]) {
@@ -352,13 +354,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
           cp "src-tauri/target/release/prunedisk-desktop$ext" "$RUNNER_TEMP/bin/release$ext"
-      - name: Build the e2e binary (--features e2e; on Linux incognito off, docs/DESKTOP.md)
+      - name: Build the e2e binary (--features e2e and an automation config, docs/DESKTOP.md)
         working-directory: apps/desktop
         shell: bash
         run: |
-          extra=()
-          [ "$RUNNER_OS" = Linux ] && extra=(--config e2e/automation.conf.json)
-          npx tauri build --ci --no-bundle --features e2e "${extra[@]}"
+          conf=e2e/automation.conf.json
+          [ "$RUNNER_OS" = Windows ] && conf=e2e/windows-automation.conf.json
+          npx tauri build --ci --no-bundle --features e2e --config "$conf"
           mkdir -p "$RUNNER_TEMP/bin"
           ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
           cp "src-tauri/target/release/prunedisk-desktop$ext" "$RUNNER_TEMP/bin/e2e$ext"

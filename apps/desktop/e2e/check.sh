@@ -2,9 +2,11 @@
 # End-to-end checks on the packaged app (PR gate F1), Linux and Windows (Git Bash).
 # Run from apps/desktop after building:
 #   RELEASE_BIN  the release binary (production config, no e2e feature)
-#   E2E_BIN      the same app built with --features e2e; on Linux also with
-#                --config e2e/automation.conf.json (incognito off: WebKitWebDriver cannot drive
-#                an incognito webkit2gtk webview; see docs/DESKTOP.md)
+#   E2E_BIN      the same app built with --features e2e and an automation config: on Linux
+#                e2e/automation.conf.json (incognito off: WebKitWebDriver cannot drive an
+#                incognito webkit2gtk webview), on Windows e2e/windows-automation.conf.json
+#                (browser arguments that open a DevTools port for the Edge driver); see
+#                docs/DESKTOP.md
 #   CLI_BIN      the disk-cleaner CLI (writes the valid scan file the app opens)
 #   OUT          a new folder for results, logs and the sandbox
 # Steps: string check of both binaries, fixture, probe of the release binary, snapshot,
@@ -34,6 +36,11 @@ if [ "$RELEASE_BIN" != none ] && grep -a -q PRUNEDISK_E2E_ "$RELEASE_BIN"; then
   echo "::error::the release binary contains PRUNEDISK_E2E_ strings"; exit 1
 fi
 grep -a -q PRUNEDISK_E2E_FOLDERS "$E2E_BIN" || { echo "::error::the e2e binary lacks its hooks (control)"; exit 1; }
+# On Windows the e2e binary opens a DevTools port for the Edge driver
+# (e2e/windows-automation.conf.json). The shipped binary must not.
+if [ "$RELEASE_BIN" != none ] && grep -a -q remote-debugging-port "$RELEASE_BIN"; then
+  echo "::error::the release binary contains remote-debugging-port"; exit 1
+fi
 
 echo "== fixture (seed 16452)"
 "$PY" e2e/fixture.py "$FIX"
