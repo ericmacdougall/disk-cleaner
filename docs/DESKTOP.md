@@ -70,7 +70,8 @@ npx tauri dev
   a drive from the drive list or a folder picked with Add folders. Any other path, a subfolder
   of an offered folder included, is refused with "... was not offered by this window; add it
   with Add folders or pick a drive", and no scan starts. At most 64 roots per scan. (This
-  narrows spec AC-12, which only required absolute folders; PR gate F1.)
+  narrows spec AC-12, which only required absolute folders; PR gate F1. It is an assumption
+  awaiting the owner's confirmation.)
 - Scan files: one at a time. While a file is read, Open a scan file and Scan are disabled, and
   the backend refuses a second file ("a scan file is being opened; wait for it to finish") and
   a scan; a scan file cannot be opened while a scan runs. Focus returns to Open a scan file
@@ -185,8 +186,9 @@ folder installed on the runner. It builds two binaries:
   environment variable (`src-tauri/src/e2e.rs`), because WebDriver cannot click a native
   dialog. The command then carries on exactly as after a real pick.
 
-The e2e binary also gets an automation config, which differs from the shipped one in a single
-window setting per OS:
+The e2e binary also gets an automation config, which differs from the shipped one in one
+window setting per OS, plus its window title, "PruneDisk (end-to-end build)" (a marker for the
+check below). These are assumptions awaiting the owner's confirmation:
 
 - Linux: incognito off (`e2e/automation.conf.json`). wry 0.57.3 gives an incognito webview an
   ephemeral webkit2gtk context, and that context is created with automation disabled
@@ -201,8 +203,23 @@ window setting per OS:
   the webview's browser arguments itself, and on the runner the variable's switches never
   reached the browser process. The driver then waits 60 s and fails with "DevToolsActivePort
   file doesn't exist". The config passes wry's own defaults plus the driver's switches.
-  Incognito stays on, as shipped. `check.sh` fails if the release binary contains
-  `remote-debugging-port`.
+  Incognito stays on, as shipped. CI confirmed it: with this config the suite passed on
+  windows-latest, and without it no session opened.
+
+The shipped bundles are not built from either automation config:
+
+- Which config each job uses: the bundle job runs `tauri build --target <t> --bundles <b>`
+  with `src-tauri/tauri.conf.json` alone (no `--config`, no `--features`). Only the e2e job
+  and e2e-variants pass `--features e2e --config e2e/<...>.conf.json`.
+- The shipped artifacts are checked on every bundle job (macOS arm64 and x64, Windows,
+  Linux). `e2e/check-shipped.sh` unpacks the program from each bundle (`.app`; `.deb` with
+  `dpkg-deb -x`; `.AppImage` with `--appimage-extract`; `.msi` with an administrative
+  install, which only unpacks; the NSIS installer with 7-Zip). It fails if any program holds
+  `PRUNEDISK_E2E_`, `remote-debugging-port` or "PruneDisk (end-to-end build)", or if a bundle
+  holds no program.
+- The check is not vacuous. `check.sh` runs it on the e2e binary and requires it to fail and
+  name those strings: the title and the hooks on both OSes, and the DevTools switch on
+  Windows. The release binary built in the e2e job must pass it.
 
 One session (`e2e/run.mjs`) covers these flows, in order:
 
@@ -247,7 +264,8 @@ No-write proof:
 Graphics driver cache (Linux): the webview's GPU process writes Mesa's shader cache to
 `$XDG_CACHE_HOME/mesa_shader_cache/` (else `~/.cache/mesa_shader_cache/`). Any program drawing
 with Mesa does the same, the shipped app included. The app does not ask for it, and it is not
-the app's data.
+the app's data. Declaring it in the no-write proof is an assumption awaiting the owner's
+confirmation.
 
 Timings, with thresholds registered before the first measurement (50 ms p95 for both;
 nearest-rank percentile, 10 warm-up calls, then 200 samples; release build with the e2e
@@ -257,10 +275,19 @@ feature):
 - Scroll: from setting `scrollTop` 40 rows further to the first animation frame that shows the
   new top row.
 
-A p95 over the threshold fails the check; the threshold is not moved to fit a result. On Linux
-the app runs under strace, Xvfb and software rendering, which adds to both. Measured there so
-far: IPC p95 2 to 6 ms; scroll p95 36 to 44 ms, with the slowest sample up to 50 ms. The
-scroll check has little headroom.
+A p95 over the threshold fails the check; the threshold is not moved to fit a result. Measured
+in the probe runs before the PR head (each run's numbers are in its `e2e.json`, under
+`measurements`):
+
+| | IPC p95 | Scroll p95 | Slowest scroll sample |
+|---|---|---|---|
+| Linux (under strace, Xvfb and software rendering) | 2 to 6 ms | 36 to 44 ms | up to 50 ms |
+| Windows (windows-latest) | 2.4 ms | 35.5 ms | 36.2 ms |
+
+The scroll check has little headroom, most of all on Linux, where strace and software
+rendering add to every frame. A slow runner can turn it red. The response is to read that
+run's samples (the `e2e-<os>` artifact) for a real regression against a slow runner. The
+limit stays at 50 ms.
 
 Broken variants (workflow "e2e-variants", Linux): each patch in `e2e/variants/` breaks one
 guarantee, and `e2e/expect_variant.py` passes only when the check written for it fails:
@@ -277,4 +304,8 @@ and tauri-driver supports Linux and Windows only. On macOS the app is covered by
 
 - the bundle job's idle launch and its webview-data check;
 - the backend, state-flow and containment tests on macos-latest;
-- the frontend unit tests, which are platform independent (jsdom).
+- the frontend unit tests, which are platform independent (jsdom);
+- the shipped-program check above, on both macOS bundles.
+
+No flow in the window itself is exercised on macOS. Accepting that coverage is an assumption
+awaiting the owner's confirmation.
