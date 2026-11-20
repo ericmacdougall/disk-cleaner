@@ -46,8 +46,10 @@ export class TreeGrid {
   ) {
     this.crumbs = h("nav", { "aria-label": "Folder path", class: "crumbs" });
     this.sourceLine = h("p", { class: "source" });
-    this.head = h("div", { role: "row", class: "tg-row tg-head" });
-    this.spacer = h("div", { class: "tg-spacer" });
+    // One treegrid owns the header row (row 1) and the data rows (rows 2 on), each in a
+    // rowgroup (PR gate F6). The header stays in view while the rows scroll under it.
+    this.head = h("div", { role: "row", class: "tg-row tg-head", "aria-rowindex": 1 });
+    this.spacer = h("div", { class: "tg-spacer", "aria-hidden": "true" });
     this.body = h("div", { class: "tg-body", role: "rowgroup" });
     this.scroller = h(
       "div",
@@ -60,10 +62,11 @@ export class TreeGrid {
         onkeydown: (e) => void this.onKey(e as KeyboardEvent),
         onscroll: () => void this.load(),
       },
+      h("div", { class: "tg-headgroup", role: "rowgroup" }, this.head),
       this.spacer,
       this.body,
     );
-    this.el = h("section", { class: "tree", "aria-label": "Size tree" }, this.sourceLine, this.crumbs, h("div", { class: "tg" }, this.head, this.scroller));
+    this.el = h("section", { class: "tree", "aria-label": "Size tree" }, this.sourceLine, this.crumbs, h("div", { class: "tg" }, this.scroller));
   }
 
   /** Visible row count for the scroller's height. */
@@ -122,7 +125,8 @@ export class TreeGrid {
     );
     this.spacer.style.height = `${p.total * ROW_HEIGHT}px`;
     this.body.style.transform = `translateY(${p.offset * ROW_HEIGHT}px)`;
-    this.scroller.setAttribute("aria-rowcount", String(p.total));
+    // The header row counts.
+    this.scroller.setAttribute("aria-rowcount", String(p.total + 1));
     replace(this.body, ...p.rows.map((r, i) => this.row(r, p.offset + i)));
     const sel = this.body.querySelector<HTMLElement>(`[data-index="${this.selected}"]`);
     if (sel) this.scroller.setAttribute("aria-activedescendant", sel.id);
@@ -145,7 +149,8 @@ export class TreeGrid {
         id: `tg-row-${index}`,
         class: `tg-row${index === this.selected ? " selected" : ""}`,
         "data-index": index,
-        "aria-rowindex": index + 1,
+        // Row 1 is the header.
+        "aria-rowindex": index + 2,
         "aria-level": r.depth + 1,
         "aria-expanded": r.kind === "dir" && r.has_children ? String(r.expanded) : null,
         "aria-selected": String(index === this.selected),
@@ -213,10 +218,11 @@ export class TreeGrid {
     const total = this.page?.total ?? 0;
     if (total === 0) return;
     this.selected = Math.max(0, Math.min(total - 1, to));
+    // Row i sits at ROW_HEIGHT * (i + 1): below the header row, which covers the top of the view.
     const top = this.selected * ROW_HEIGHT;
     const view = this.scroller.clientHeight || ROW_HEIGHT * 20;
     if (top < this.scroller.scrollTop) this.scroller.scrollTop = top;
-    else if (top + ROW_HEIGHT > this.scroller.scrollTop + view) this.scroller.scrollTop = top + ROW_HEIGHT - view;
+    else if (top + 2 * ROW_HEIGHT > this.scroller.scrollTop + view) this.scroller.scrollTop = top + 2 * ROW_HEIGHT - view;
     await this.load();
   }
 

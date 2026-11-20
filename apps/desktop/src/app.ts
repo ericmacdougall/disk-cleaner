@@ -32,6 +32,9 @@ export class App {
   private tab: Tab = "tree";
   private shownView: number | null = null;
   private shownPhase: string | null = null;
+  /** A scan file is being read. */
+  private opening = false;
+  private openButton: HTMLButtonElement | null = null;
   private views: { tree?: TreeGrid; treemap?: Treemap; dev?: DevView; settings?: SettingsForm } = {};
 
   constructor(private backend: Backend) {
@@ -124,6 +127,8 @@ export class App {
       ),
     );
     const starting = this.scan.snapshot.phase === "starting";
+    // Disabled while a file is read; the backend also refuses a second file or a scan then.
+    this.openButton = h("button", { type: "button", disabled: this.opening, onclick: () => void this.openFile() }, "Open a scan file...");
     replace(
       this.main,
       h("h2", {}, "Choose what to scan"),
@@ -131,7 +136,7 @@ export class App {
       list,
       h("button", { type: "button", onclick: () => void this.addFolders() }, "Add folders..."),
       " ",
-      h("button", { type: "button", onclick: () => void this.openFile() }, "Open a scan file..."),
+      this.openButton,
       h("h3", {}, "Chosen"),
       this.chosen.size ? chosenList : h("p", {}, "Nothing chosen yet."),
       h(
@@ -142,7 +147,7 @@ export class App {
       ),
       h(
         "button",
-        { type: "button", class: "primary", disabled: this.chosen.size === 0 || starting, onclick: () => void this.startScan() },
+        { type: "button", class: "primary", disabled: this.chosen.size === 0 || starting || this.opening, onclick: () => void this.startScan() },
         "Scan",
       ),
     );
@@ -157,8 +162,11 @@ export class App {
     this.renderChooser();
   }
 
+  /** Open a scan file. One at a time (PR gate F5): Open and Scan are disabled until it ends. */
   private async openFile(): Promise<void> {
-    if (this.scan.running) return;
+    if (this.scan.running || this.opening) return;
+    this.opening = true;
+    if (this.openButton?.isConnected) this.renderChooser();
     this.status("Reading the scan file...");
     try {
       const cur = await this.backend.openScanFile();
@@ -166,6 +174,13 @@ export class App {
       else this.status("");
     } catch (e) {
       this.status(`Cannot open that scan file: ${errorMessage(e)}`);
+    } finally {
+      this.opening = false;
+      // Still on the chooser (nothing was opened): enable Open again and put focus back on it.
+      if (this.openButton?.isConnected) {
+        this.renderChooser();
+        this.openButton.focus();
+      }
     }
   }
 

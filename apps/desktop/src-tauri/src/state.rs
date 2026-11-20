@@ -3,9 +3,14 @@
 //! Rules (spec AC-3, NEG-1, NEG-2, NEG-4):
 //! - A result is accepted, and Cancel decided, under the session lock, so a cancelled job's
 //!   result can never be stored after Cancel returned.
-//! - Expensive work (tree index, parse, plan, import) runs outside the session lock; the result
-//!   is swapped in under it after the job id and the settings generation are checked.
+//! - Expensive work (tree index, parse, plan, import, the tree's class tags) runs outside the
+//!   session lock; the result is swapped in under it after the job id, the view id and the
+//!   settings generation are checked, and what it replaced is dropped after the lock is let go.
 //! - The view commands name a view id; a stale id is refused, never answered from newer data.
+//! - One admission for scans and imports: a scan cannot start while a scan file is being
+//!   opened, and a second file cannot be opened meanwhile (PR gate F5).
+//! - The settings generation moves whenever what planning reads changes, whoever changed it:
+//!   this window's save, another window's save found on disk, or a reload (PR gate F4).
 
 use crate::worker::{spawn_worker, worker_exe, WorkerArgs, WorkerHandle, GIT_TIMEOUT, GO};
 use disk_cleaner_core::{running_cwds, Plan, ScanResult};
@@ -31,6 +36,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// At most this many roots per scan.
 pub const MAX_ROOTS: usize = 64;
+
+/// Why a scan or a second import is refused while a scan file is being opened.
+pub const OPENING_FILE: &str = "a scan file is being opened; wait for it to finish";
 
 /// What the screen hears about a job.
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +147,9 @@ pub struct Inner {
     loaded: Mutex<Option<Loaded>>,
     settings_gen: AtomicU64,
     app_settings: Mutex<AppSettings>,
+    /// True while a scan file is being opened. Starting a scan and admitting an import both
+    /// decide under this lock.
+    importing: Mutex<bool>,
     /// The worker executable and git program (tests use the built app and a fake git).
     worker_exe: Mutex<Option<PathBuf>>,
     git_program: Mutex<OsString>,
@@ -178,6 +189,7 @@ impl Inner {
             loaded: Mutex::new(None),
             settings_gen: AtomicU64::new(1),
             app_settings: Mutex::new(app),
+            importing: Mutex::new(false),
             worker_exe: Mutex::new(None),
             git_program: Mutex::new("git".into()),
             #[cfg(debug_assertions)]
@@ -262,11 +274,26 @@ impl Inner {
         self.config_path.clone().map_err(AppError::failed)
     }
 
-    /// Load (or reload) the config file as Settings shows it.
+    /// Load (or reload) the config file as Settings shows it. A file that changed what
+    /// planning reads moves the settings generation, so [`Inner::replan`] recomputes the plan.
     pub fn load_settings(&self) -> Result<Loaded, AppError> {
         let loaded = settings::load_core(&self.config_path()?)?;
-        *lock(&self.loaded) = Some(loaded.clone());
+        self.adopt(loaded.clone());
         Ok(loaded)
+    }
+
+    /// Take `loaded` as the settings in force. When what planning reads (the config, and where
+    /// the window came from) differs from before, the generation moves. It moves after the new
+    /// value is stored, so a plan built from the old value never carries the new generation.
+    fn adopt(&self, loaded: Loaded) {
+        let mut cur = lock(&self.loaded);
+        let changed = cur.as_ref().is_some_and(|c| {
+            c.config != loaded.config || c.window_source() != loaded.window_source()
+        });
+        *cur = Some(loaded);
+        if changed {
+            self.settings_gen.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// The config file as last loaded or saved (loaded now if it never was).
@@ -290,8 +317,10 @@ impl Inner {
         ))
     }
 
-    /// Save Settings: the two core keys (when changed) and the app's scan settings. A saved
-    /// plan setting recomputes the shown plan without rescanning.
+    /// Save Settings: the two core keys (when changed) and the app's scan settings. A change
+    /// to what planning reads recomputes the shown plan without rescanning, also when the file
+    /// already held the values (another window saved them) and when only the plan settings
+    /// could be saved (outcome `partial`, PR gate F3).
     pub fn save_settings(
         &self,
         changes: CoreChanges,
@@ -300,11 +329,12 @@ impl Inner {
     ) -> Result<SaveReport, AppError> {
         let path = self.config_path()?;
         let mut outcome = "unchanged";
-        let mut note = None;
+        let mut notes: Vec<String> = Vec::new();
         if let Some(a) = app {
             a.validate()?;
         }
-        if changes.active_window_days.is_some() || changes.max_git_admin_bytes.is_some() {
+        let core = changes.active_window_days.is_some() || changes.max_git_admin_bytes.is_some();
+        if core {
             let loaded = self.load_settings_cached()?;
             let saved = settings::save_core_config(
                 &loaded,
@@ -316,28 +346,37 @@ impl Inner {
                 SaveOutcome::Saved(_) => "saved",
                 SaveOutcome::Unchanged(_) => "unchanged",
                 SaveOutcome::SavedUnconfirmed(_, m) => {
-                    note = Some(format!("saved; could not confirm it is on disk ({m})"));
+                    notes.push(format!("saved; could not confirm it is on disk ({m})"));
                     "saved_unconfirmed"
                 }
             };
-            *lock(&self.loaded) = Some(saved.loaded().clone());
-            if outcome != "unchanged" {
-                self.settings_gen.fetch_add(1, Ordering::SeqCst);
-            }
+            // The file as it is now, whether this save wrote it or found it so.
+            self.adopt(saved.loaded().clone());
         }
         if let Some(a) = app {
             if a != self.app_settings() {
-                settings::save_app_settings(&settings::app_settings_path(&path), &a)?;
-                *lock(&self.app_settings) = a;
-                if outcome == "unchanged" {
-                    outcome = "saved";
+                match settings::save_app_settings(&settings::app_settings_path(&path), &a) {
+                    Ok(()) => {
+                        *lock(&self.app_settings) = a;
+                        if outcome == "unchanged" {
+                            outcome = "saved";
+                        }
+                    }
+                    // The plan settings are on disk: say what was not saved, and replan.
+                    Err(e) if core => {
+                        let m = AppError::from(e).to_string();
+                        let m = m.strip_prefix("not saved: ").unwrap_or(&m).to_string();
+                        notes.push(format!("scan settings were not saved: {m}"));
+                        outcome = "partial";
+                    }
+                    Err(e) => return Err(e.into()),
                 }
             }
         }
         let replanned = self.replan()?;
         Ok(SaveReport {
             outcome,
-            note,
+            note: (!notes.is_empty()).then(|| notes.join("; ")),
             replanned,
         })
     }
@@ -345,10 +384,16 @@ impl Inner {
     /// Recompute the shown plan with the current settings (no rescan). Returns whether it did.
     pub fn replan(&self) -> Result<bool, AppError> {
         for _ in 0..3 {
-            let (view, scan, imported, gen_shown) = {
+            let (view, scan, imported, gen_shown, shown) = {
                 let s = self.session();
                 match &s.analysis {
-                    Some(a) => (s.view_id, Arc::clone(&a.scan), a.imported, a.settings_gen),
+                    Some(a) => (
+                        s.view_id,
+                        Arc::clone(&a.scan),
+                        a.imported,
+                        a.settings_gen,
+                        Shown::of(&s),
+                    ),
                     None => return Ok(false),
                 }
             };
@@ -357,6 +402,7 @@ impl Inner {
                 return Ok(false);
             }
             let built = build_analysis(scan, &inputs, gen, imported, units::now());
+            let marks = self.mark(shown, &built.plan);
             let mut s = self.session();
             if s.view_id != view {
                 return Ok(false);
@@ -364,11 +410,34 @@ impl Inner {
             if self.settings_gen.load(Ordering::SeqCst) != gen {
                 continue;
             }
-            self.run_prepare_hook();
-            install_analysis(&mut s, built);
+            let old = install_analysis(&mut s, built, marks);
+            drop(s);
+            drop(old);
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Class tags for the tree and enclosing plan items for the session folders. Runs outside
+    /// the session lock: the tree is shared and never changed, and the lookup is indexed, so a
+    /// plan of N items under one folder costs O(N), not O(N squared) (PR gate F2).
+    fn mark(&self, shown: Shown, plan: &Plan) -> Marks {
+        self.run_prepare_hook();
+        let mut sessions = shown.sessions;
+        sessions::set_enclosing(&mut sessions, &plan.items);
+        let mut tags: HashMap<NodeId, String> = HashMap::new();
+        if let Some(tree) = shown.tree {
+            let paths: Vec<&Path> = plan.items.iter().map(|it| Path::new(&it.path)).collect();
+            for (it, id) in plan.items.iter().zip(tree.find_paths(&paths)) {
+                if let Some(id) = id {
+                    tags.insert(id, it.class.as_str().to_string());
+                }
+            }
+            for f in &sessions {
+                tags.entry(f.id).or_insert_with(|| "agent-session".to_string());
+            }
+        }
+        Marks { tags, sessions }
     }
 
     // ---- jobs -------------------------------------------------------------------------
@@ -398,10 +467,15 @@ impl Inner {
         emit: Emit,
     ) -> Result<JobId, AppError> {
         let roots = Inner::check_roots(roots)?;
-        let ticket = self
-            .jobs
-            .start()
-            .map_err(|e| AppError::refused(e.to_string()))?;
+        let ticket = {
+            let importing = lock(&self.importing);
+            if *importing {
+                return Err(AppError::refused(OPENING_FILE));
+            }
+            self.jobs
+                .start()
+                .map_err(|e| AppError::refused(e.to_string()))?
+        };
         let id = ticket.id;
         let me = Arc::clone(self);
         std::thread::Builder::new()
@@ -563,6 +637,14 @@ impl Inner {
                 .plan_inputs()
                 .map_err(|e| format!("cannot read the settings: {e}"))?;
             let built = build_analysis(Arc::clone(&scan), &inputs, gen, false, units::now());
+            let shown = {
+                let s = self.session();
+                if !self.jobs.is_current(id) || s.view_id != view_id {
+                    return Ok(false);
+                }
+                Shown::of(&s)
+            };
+            let marks = self.mark(shown, &built.plan);
             let mut s = self.session();
             if !self.jobs.is_current(id) || s.view_id != view_id {
                 return Ok(false);
@@ -570,9 +652,10 @@ impl Inner {
             if self.settings_gen.load(Ordering::SeqCst) != gen {
                 continue;
             }
-            self.run_prepare_hook();
-            install_analysis(&mut s, built);
+            let old = install_analysis(&mut s, built, marks);
             self.jobs.advance(id, JobState::Done);
+            drop(s);
+            drop(old);
             return Ok(true);
         }
         Err("the settings kept changing; scan again".into())
@@ -690,16 +773,19 @@ impl Inner {
         }
     }
 
-    /// Show a scan file: import protocol of spec AC-11, then plan. Refused while a scan runs.
+    /// Show a scan file: import protocol of spec AC-11, then plan. Refused while a scan runs
+    /// or another file is being opened; a scan cannot start until this returns (PR gate F5).
     pub fn import_file(&self, path: &Path) -> Result<u64, AppError> {
-        self.refuse_while_running()?;
+        let _slot = self.admit_import()?;
         self.run_import_hook();
         let imported = import::import(path, Limits::default()).map_err(|e| AppError::refused(e.to_string()))?;
         let scan = Arc::new(imported.scan);
-        let roots = scan.roots.iter().map(|r| display_name(r)).collect();
+        let roots: Vec<String> = scan.roots.iter().map(|r| display_name(r)).collect();
         for _ in 0..3 {
             let (inputs, gen) = self.plan_inputs()?;
             let built = build_analysis(Arc::clone(&scan), &inputs, gen, true, units::now());
+            // An imported scan has no size-walk tree and no session folders.
+            let marks = self.mark(Shown::default(), &built.plan);
             let mut s = self.session();
             self.refuse_while_running()?;
             if self.settings_gen.load(Ordering::SeqCst) != gen {
@@ -714,12 +800,24 @@ impl Inner {
                     ..Session::default()
                 },
             );
-            install_analysis(&mut s, built);
+            let replaced = install_analysis(&mut s, built, marks);
             drop(s);
-            drop(old);
+            drop((old, replaced));
             return Ok(view_id);
         }
         Err(AppError::failed("the settings kept changing; open the file again"))
+    }
+
+    /// Reserve the one import slot: refused while a scan runs or another file is being opened.
+    /// The slot is freed when the returned guard is dropped, on every path out of an import.
+    fn admit_import(&self) -> Result<ImportSlot<'_>, AppError> {
+        let mut importing = lock(&self.importing);
+        if *importing {
+            return Err(AppError::refused(OPENING_FILE));
+        }
+        self.refuse_while_running()?;
+        *importing = true;
+        Ok(ImportSlot(&self.importing))
     }
 
     fn refuse_while_running(&self) -> Result<(), AppError> {
@@ -732,7 +830,40 @@ impl Inner {
     }
 }
 
-/// What a save did.
+/// Holds the import slot; dropping it frees the slot.
+struct ImportSlot<'a>(&'a Mutex<bool>);
+
+impl Drop for ImportSlot<'_> {
+    fn drop(&mut self) {
+        *lock(self.0) = false;
+    }
+}
+
+/// What a view shows that an analysis marks: its tree (shared, read without the session lock)
+/// and its session folders.
+#[derive(Default)]
+struct Shown {
+    tree: Option<Arc<Tree>>,
+    sessions: Vec<SessionFolder>,
+}
+
+impl Shown {
+    fn of(s: &Session) -> Shown {
+        Shown {
+            tree: s.tree.as_ref().map(TreeView::tree_arc),
+            sessions: s.sessions.clone(),
+        }
+    }
+}
+
+/// What installing an analysis puts on the tree, prepared outside the session lock.
+struct Marks {
+    tags: HashMap<NodeId, String>,
+    sessions: Vec<SessionFolder>,
+}
+
+/// What a save did. `outcome` is `saved`, `unchanged`, `saved_unconfirmed`, or `partial` (the
+/// plan settings are on disk; the scan settings were not saved, and `note` says why).
 #[derive(Debug, Clone, Serialize)]
 pub struct SaveReport {
     pub outcome: &'static str,
@@ -759,21 +890,18 @@ fn build_analysis(
     }
 }
 
-/// Store an analysis in the session: class tags on the tree and session folders' enclosing
-/// plan items.
-fn install_analysis(s: &mut Session, a: Analysis) {
-    if let Some(t) = s.tree.as_mut() {
-        let mut tags: HashMap<NodeId, String> = HashMap::new();
-        for it in &a.plan.items {
-            if let Some(id) = t.tree().find_path(Path::new(&it.path)) {
-                tags.insert(id, it.class.as_str().to_string());
-            }
-        }
-        s.sessions = sessions::find(t.tree(), &sessions::builtin(), &a.plan.items);
-        for f in &s.sessions {
-            tags.entry(f.id).or_insert_with(|| "agent-session".to_string());
-        }
-        t.set_tags(tags);
-    }
-    s.analysis = Some(a);
+/// Store an analysis and its prepared marks in the session. Called under the session lock, so
+/// it only moves values; it returns what it replaced, to be dropped after the lock is let go.
+fn install_analysis(s: &mut Session, a: Analysis, m: Marks) -> Replaced {
+    let tags = s.tree.as_mut().map(|t| t.set_tags(m.tags));
+    let sessions = std::mem::replace(&mut s.sessions, m.sessions);
+    let analysis = s.analysis.replace(a);
+    (analysis, sessions, tags)
 }
+
+/// What [`install_analysis`] replaced.
+type Replaced = (
+    Option<Analysis>,
+    Vec<SessionFolder>,
+    Option<HashMap<NodeId, String>>,
+);

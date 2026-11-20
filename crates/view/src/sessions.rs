@@ -7,7 +7,8 @@ use crate::sanitize::display_name;
 use crate::tree::{EntryKind, NodeId, Tree};
 use disk_cleaner_core::PlanItem;
 use serde::Serialize;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// The built-in layout list.
 pub const BUILTIN_RULES: &str = include_str!("../rules/agent-sessions.toml");
@@ -84,6 +85,9 @@ pub struct SessionFolder {
     /// Always "no plan action yet": the tag is display only.
     pub plan_note: &'static str,
     pub enclosing: Option<Enclosing>,
+    /// The real path, to match plan items (never sent to the screen).
+    #[serde(skip)]
+    pub real: PathBuf,
 }
 
 /// The note every session folder carries.
@@ -119,6 +123,25 @@ pub fn enclosing_item<'a>(items: &'a [PlanItem], path: &Path) -> Option<&'a Plan
         .max_by_key(|it| it.path.len())
 }
 
+/// Set each folder's enclosing plan item (none without items). The items are looked up by
+/// each folder's ancestors, deepest first, so the cost is O(items + folders × depth).
+pub fn set_enclosing(folders: &mut [SessionFolder], items: &[PlanItem]) {
+    let by_path: HashMap<&Path, &PlanItem> = items
+        .iter()
+        .map(|it| (Path::new(it.path.as_str()), it))
+        .collect();
+    for f in folders.iter_mut() {
+        f.enclosing = f
+            .real
+            .ancestors()
+            .find_map(|a| by_path.get(a))
+            .map(|it| Enclosing {
+                action: it.action.as_str().to_string(),
+                path: display_name(&it.path),
+            });
+    }
+}
+
 /// Find the session folders in a size-walk tree. `items` are the plan's items, when a plan
 /// exists, to show the enclosing action.
 pub fn find(tree: &Tree, layouts: &[Layout], items: &[PlanItem]) -> Vec<SessionFolder> {
@@ -131,10 +154,6 @@ pub fn find(tree: &Tree, layouts: &[Layout], items: &[PlanItem]) -> Vec<SessionF
             continue;
         };
         let real = tree.path(id);
-        let enclosing = enclosing_item(items, &real).map(|it| Enclosing {
-            action: it.action.as_str().to_string(),
-            path: display_name(&it.path),
-        });
         out.push(SessionFolder {
             id,
             layout: layout.name.clone(),
@@ -144,10 +163,12 @@ pub fn find(tree: &Tree, layouts: &[Layout], items: &[PlanItem]) -> Vec<SessionF
             files: tree.files(id),
             newest_mtime: tree.mtime(id),
             plan_note: NO_PLAN_ACTION,
-            enclosing,
+            enclosing: None,
+            real,
         });
     }
     out.sort_by(|a, b| b.alloc.cmp(&a.alloc).then_with(|| a.path.cmp(&b.path)));
+    set_enclosing(&mut out, items);
     out
 }
 
@@ -245,6 +266,33 @@ mod tests {
         assert_eq!(enc.action, "ask");
         assert_eq!(enc.path, "/home-synthetic/.claude");
         assert!(find(&tree, &builtin(), &[])[0].enclosing.is_none());
+    }
+
+    /// The ancestor lookup picks the same item as the linear search: the deepest folder that
+    /// holds the path, never a mere string prefix.
+    #[test]
+    fn set_enclosing_agrees_with_the_linear_search() {
+        let mut b = TreeBuilder::new(true);
+        let root = dir(&mut b, None, "/h");
+        let claude = dir(&mut b, Some(root), ".claude");
+        let projects = dir(&mut b, Some(claude), "projects");
+        file(&mut b, projects, "s.jsonl", 4096);
+        let tree = b.finish(Vec::new(), WalkStats::default());
+        let cases: [Vec<PlanItem>; 6] = [
+            vec![],
+            vec![item("/h/.cla", Action::RemoveRegenerable)],
+            vec![item("/h", Action::Keep), item("/h/.claude", Action::Ask)],
+            vec![item("/h/.claude", Action::Ask), item("/h", Action::Keep)],
+            vec![item("/h/.claude/projects", Action::Keep)],
+            vec![item("/other", Action::Keep)],
+        ];
+        for (i, items) in cases.iter().enumerate() {
+            let found = find(&tree, &builtin(), items);
+            let real = found[0].real.clone();
+            let want = enclosing_item(items, &real).map(|it| it.path.clone());
+            let got = found[0].enclosing.as_ref().map(|e| e.path.clone());
+            assert_eq!(got, want, "case {i}");
+        }
     }
 
     /// A walk started at the session folder itself, or at its parent, names the root by its

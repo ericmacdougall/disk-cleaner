@@ -204,6 +204,8 @@ export interface SettingsPayload {
     top_files: [number, number];
     min_output_mib: [number, number];
   };
+  /** Opening Settings found the file changed and recomputed the shown plan (PR gate F4). */
+  replanned: boolean;
 }
 
 export interface CoreChanges {
@@ -212,7 +214,8 @@ export interface CoreChanges {
 }
 
 export interface SaveResult {
-  report: { outcome: "saved" | "unchanged" | "saved_unconfirmed"; note: string | null; replanned: boolean };
+  /** `partial`: the plan settings are on disk, the scan settings were not saved (`note` says why). */
+  report: { outcome: "saved" | "unchanged" | "saved_unconfirmed" | "partial"; note: string | null; replanned: boolean };
   settings: SettingsPayload;
 }
 

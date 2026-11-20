@@ -8,6 +8,7 @@ use crate::tree::{flags, EntryKind, NodeId, Tree};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Most rows one page may hold.
 pub const MAX_PAGE: usize = 1000;
@@ -126,9 +127,16 @@ pub struct Crumb {
 }
 
 /// The tree as a sortable, expandable, pageable table.
+///
+/// The tree itself is shared and never changed: the view keeps its own copy of the child
+/// order (one id per entry) and sorts that, so another thread can read the tree (to look up
+/// paths, say) while the view is in use.
 #[derive(Debug, Clone)]
 pub struct TreeView {
-    tree: Tree,
+    tree: Arc<Tree>,
+    /// The tree's child lists in this view's order, laid out as [`Tree::child_slab`].
+    order: Vec<NodeId>,
+    roots: Vec<NodeId>,
     sort: Sort,
     /// Per entry: the sort code its children were last sorted with (0: never).
     sorted_as: Vec<u8>,
@@ -142,8 +150,15 @@ pub struct TreeView {
 impl TreeView {
     /// A view of `tree`, roots shown, nothing expanded, largest first.
     pub fn new(tree: Tree) -> TreeView {
+        TreeView::shared(Arc::new(tree))
+    }
+
+    /// A view of a shared tree.
+    pub fn shared(tree: Arc<Tree>) -> TreeView {
         let n = tree.len();
         let mut v = TreeView {
+            order: tree.child_slab().to_vec(),
+            roots: tree.roots().to_vec(),
             tree,
             sort: Sort::default(),
             sorted_as: vec![0; n],
@@ -161,6 +176,16 @@ impl TreeView {
         &self.tree
     }
 
+    /// The tree, to read on another thread.
+    pub fn tree_arc(&self) -> Arc<Tree> {
+        Arc::clone(&self.tree)
+    }
+
+    /// `id`'s children in this view's order.
+    fn kids(&self, id: NodeId) -> &[NodeId] {
+        &self.order[self.tree.child_span(id)]
+    }
+
     pub fn sort(&self) -> Sort {
         self.sort
     }
@@ -174,9 +199,9 @@ impl TreeView {
         self.rows.len()
     }
 
-    /// Attach developer-view tags to entries.
-    pub fn set_tags(&mut self, tags: HashMap<NodeId, String>) {
-        self.tags = tags;
+    /// Attach developer-view tags to entries. Returns the tags they replace.
+    pub fn set_tags(&mut self, tags: HashMap<NodeId, String>) -> HashMap<NodeId, String> {
+        std::mem::replace(&mut self.tags, tags)
     }
 
     fn valid(&self, id: NodeId) -> bool {
@@ -189,9 +214,9 @@ impl TreeView {
             return;
         }
         let sort = self.sort;
-        let mut kids = self.tree.children(id).to_vec();
-        kids.sort_unstable_by(|&a, &b| compare(&self.tree, sort, a, b));
-        self.tree.children_mut(id).copy_from_slice(&kids);
+        let tree = &*self.tree;
+        self.order[tree.child_span(id)]
+            .sort_unstable_by(|&a, &b| compare(tree, sort, a, b));
         self.sorted_as[id as usize] = code;
     }
 
@@ -199,14 +224,14 @@ impl TreeView {
         match self.focus {
             Some(f) => {
                 self.ensure_sorted(f);
-                self.tree.children(f).to_vec()
+                self.kids(f).to_vec()
             }
             None => {
                 let sort = self.sort;
-                let mut roots = self.tree.roots().to_vec();
-                roots.sort_unstable_by(|&a, &b| compare(&self.tree, sort, a, b));
-                self.tree.roots_mut().copy_from_slice(&roots);
-                roots
+                let tree = &*self.tree;
+                self.roots
+                    .sort_unstable_by(|&a, &b| compare(tree, sort, a, b));
+                self.roots.clone()
             }
         }
     }
@@ -223,7 +248,7 @@ impl TreeView {
             self.depths.push(depth);
             if self.expanded[id as usize] {
                 self.ensure_sorted(id);
-                for &c in self.tree.children(id).iter().rev() {
+                for &c in self.kids(id).iter().rev() {
                     stack.push((c, depth.saturating_add(1)));
                 }
             }
@@ -277,7 +302,7 @@ impl TreeView {
         };
         self.ensure_sorted(id);
         let depth = self.depths[pos].saturating_add(1);
-        let kids = self.tree.children(id).to_vec();
+        let kids = self.kids(id).to_vec();
         let n = kids.len();
         self.rows.splice(pos + 1..pos + 1, kids);
         self.depths
@@ -289,8 +314,8 @@ impl TreeView {
     /// Open every folder under the focus (or under every root) in one pass.
     pub fn expand_all(&mut self) {
         let top: Vec<NodeId> = match self.focus {
-            Some(f) => self.tree.children(f).to_vec(),
-            None => self.tree.roots().to_vec(),
+            Some(f) => self.kids(f).to_vec(),
+            None => self.roots.clone(),
         };
         let mut stack = top;
         while let Some(id) = stack.pop() {
@@ -500,6 +525,26 @@ mod tests {
         // Collapsing the root closed alpha too.
         assert!(v.expand(0));
         assert_eq!(v.row_count(), 4);
+    }
+
+    /// Sorting a view never reorders the shared tree, and two views of one tree keep their
+    /// own orders.
+    #[test]
+    fn views_sort_their_own_order_and_leave_the_tree_alone() {
+        let tree = Arc::new(sample());
+        let walk_order = tree.children(0).to_vec();
+        let mut by_size = TreeView::shared(Arc::clone(&tree));
+        let mut by_name = TreeView::shared(Arc::clone(&tree));
+        by_name.set_sort(Sort {
+            key: SortKey::Name,
+            descending: false,
+        });
+        assert!(by_size.expand(0));
+        assert!(by_name.expand(0));
+        assert_eq!(names(&by_size), vec!["/root", "zeta.txt", "alpha", "Beta"]);
+        assert_eq!(names(&by_name), vec!["/root", "alpha", "Beta", "zeta.txt"]);
+        assert_eq!(tree.children(0), walk_order.as_slice());
+        assert!(Arc::ptr_eq(&by_size.tree_arc(), &tree));
     }
 
     #[test]

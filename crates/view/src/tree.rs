@@ -4,7 +4,8 @@
 //! [`crate::table::TreeView`].
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Index of an entry in a [`Tree`].
 pub type NodeId = u32;
@@ -149,24 +150,22 @@ impl Tree {
         (m != 0).then_some(m)
     }
 
-    /// Children in their current order.
+    /// Children in walk order. A tree is never changed once built, so it can be shared between
+    /// threads; [`crate::table::TreeView`] keeps its own sorted order.
     pub fn children(&self, id: NodeId) -> &[NodeId] {
-        let e = &self.entries[id as usize];
-        let start = e.first_child as usize;
-        &self.children[start..start + e.child_count as usize]
+        &self.children[self.child_span(id)]
     }
 
-    /// Children, mutable for sorting in place.
-    pub(crate) fn children_mut(&mut self, id: NodeId) -> &mut [NodeId] {
+    /// Where `id`'s children sit in [`Tree::child_slab`].
+    pub(crate) fn child_span(&self, id: NodeId) -> std::ops::Range<usize> {
         let e = &self.entries[id as usize];
         let start = e.first_child as usize;
-        let count = e.child_count as usize;
-        &mut self.children[start..start + count]
+        start..start + e.child_count as usize
     }
 
-    /// Sort the roots in place.
-    pub(crate) fn roots_mut(&mut self) -> &mut [NodeId] {
-        &mut self.roots
+    /// Every entry's children, grouped by parent.
+    pub(crate) fn child_slab(&self) -> &[NodeId] {
+        &self.children
     }
 
     /// Number of ancestors.
@@ -202,31 +201,48 @@ impl Tree {
     }
 
     /// Find the entry at `path` (as spelled by the walk), descending from the root whose name
-    /// is a prefix of it.
-    pub fn find_path(&self, path: &std::path::Path) -> Option<NodeId> {
+    /// is a prefix of it. For many paths use [`Tree::find_paths`].
+    pub fn find_path(&self, path: &Path) -> Option<NodeId> {
+        self.find_paths(&[path]).pop().flatten()
+    }
+
+    /// Find many paths at once, in order. The first time a folder's children are searched its
+    /// names are indexed, so N paths under one folder of C children cost O(N + C), not
+    /// O(N × C). Among children with the same name the first in walk order wins.
+    pub fn find_paths<P: AsRef<Path>>(&self, paths: &[P]) -> Vec<Option<NodeId>> {
+        let mut index: HashMap<NodeId, HashMap<&str, NodeId>> = HashMap::new();
+        paths
+            .iter()
+            .map(|p| self.find_indexed(p.as_ref(), &mut index))
+            .collect()
+    }
+
+    fn find_indexed<'a>(
+        &'a self,
+        path: &Path,
+        index: &mut HashMap<NodeId, HashMap<&'a str, NodeId>>,
+    ) -> Option<NodeId> {
         for &r in &self.roots {
             let Ok(rest) = path.strip_prefix(self.name(r)) else {
                 continue;
             };
-            let mut cur = r;
-            let mut found = true;
+            let mut cur = Some(r);
             for comp in rest.components() {
-                let want = comp.as_os_str().to_string_lossy();
-                match self
-                    .children(cur)
-                    .iter()
-                    .copied()
-                    .find(|&c| self.name(c) == want)
-                {
-                    Some(c) => cur = c,
-                    None => {
-                        found = false;
-                        break;
+                let Some(dir) = cur else {
+                    break;
+                };
+                let names = index.entry(dir).or_insert_with(|| {
+                    let mut m = HashMap::with_capacity(self.children(dir).len());
+                    for &c in self.children(dir) {
+                        m.entry(self.name(c)).or_insert(c);
                     }
-                }
+                    m
+                });
+                let want = comp.as_os_str().to_string_lossy();
+                cur = names.get(want.as_ref()).copied();
             }
-            if found {
-                return Some(cur);
+            if cur.is_some() {
+                return cur;
             }
         }
         None
@@ -464,6 +480,40 @@ mod tests {
             Some(3)
         );
         assert_eq!(t.find_path(&PathBuf::from("/r").join("nope")), None);
+    }
+
+    #[test]
+    fn find_paths_matches_find_path_and_takes_the_first_of_a_repeated_name() {
+        let mut b = TreeBuilder::new(true);
+        let root = b.push(entry(None, "/r", EntryKind::Dir, 0)).unwrap();
+        let a = b.push(entry(Some(root), "a", EntryKind::Dir, 0)).unwrap();
+        let first = b.push(entry(Some(a), "x", EntryKind::File, 1)).unwrap();
+        b.push(entry(Some(a), "x", EntryKind::File, 2)).unwrap();
+        let y = b.push(entry(Some(root), "y", EntryKind::File, 1)).unwrap();
+        let other = b.push(entry(None, "/s", EntryKind::Dir, 0)).unwrap();
+        let t = b.finish(Vec::new(), WalkStats::default());
+        let r = PathBuf::from("/r");
+        let paths = [
+            r.join("a").join("x"),
+            r.join("y"),
+            r.join("a").join("missing"),
+            r.join("y").join("under-a-file"),
+            PathBuf::from("/s"),
+            PathBuf::from("/elsewhere"),
+            r.clone(),
+        ];
+        let want = vec![
+            Some(first),
+            Some(y),
+            None,
+            None,
+            Some(other),
+            None,
+            Some(root),
+        ];
+        assert_eq!(t.find_paths(&paths), want);
+        let one: Vec<Option<NodeId>> = paths.iter().map(|p| t.find_path(p)).collect();
+        assert_eq!(one, want);
     }
 
     #[test]

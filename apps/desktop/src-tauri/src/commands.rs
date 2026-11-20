@@ -446,16 +446,21 @@ pub struct SettingsPayload {
     pub core: SettingsView,
     pub app: AppSettings,
     pub ranges: Ranges,
+    /// A reload found the file changed in a way that changes the plan, and the shown plan was
+    /// recomputed (PR gate F4).
+    pub replanned: bool,
 }
 
 fn settings_payload(inner: &Inner, reload: bool) -> Res<SettingsPayload> {
     use disk_cleaner_view::settings::{GIT_ADMIN_BYTES, WINDOW_DAYS};
-    let loaded = if reload {
-        inner.load_settings()?
+    let (loaded, replanned) = if reload {
+        let loaded = inner.load_settings()?;
+        (loaded, inner.replan()?)
     } else {
-        inner.load_settings_cached()?
+        (inner.load_settings_cached()?, false)
     };
     Ok(SettingsPayload {
+        replanned,
         core: loaded.view(),
         app: inner.app_settings(),
         ranges: Ranges {
@@ -467,7 +472,8 @@ fn settings_payload(inner: &Inner, reload: bool) -> Res<SettingsPayload> {
     })
 }
 
-/// Settings as the file holds them now (reloaded each time Settings opens).
+/// Settings as the file holds them now (reloaded each time Settings opens). A file another
+/// program changed recomputes the shown plan.
 #[tauri::command]
 pub async fn get_settings(state: State<'_, AppState>) -> Res<SettingsPayload> {
     let inner = Arc::clone(&state.0);

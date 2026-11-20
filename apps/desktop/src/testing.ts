@@ -58,6 +58,7 @@ export const SETTINGS: SettingsPayload = {
     top_files: [10, 1000],
     min_output_mib: [1, 1_048_576],
   },
+  replanned: false,
 };
 
 export interface Mock extends Backend {

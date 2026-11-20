@@ -121,7 +121,12 @@ export class SettingsForm {
 
   async load(): Promise<void> {
     try {
-      this.show(await this.backend.getSettings());
+      const p = await this.backend.getSettings();
+      this.show(p);
+      if (p.replanned) {
+        this.message.textContent = "The config file changed; the plan was recomputed.";
+        this.onSaved(true);
+      }
     } catch (e) {
       this.message.textContent = errorMessage(e);
     }
@@ -172,7 +177,12 @@ export class SettingsForm {
     try {
       const r = await this.backend.saveSettings(c.core, c.app, confirmShorten);
       this.show(r.settings);
-      const what = { saved: "Saved.", unchanged: "Nothing to save: the file already holds these values.", saved_unconfirmed: "Saved; could not confirm it is on disk." }[r.report.outcome];
+      const what = {
+        saved: "Saved.",
+        unchanged: "Nothing to save: the file already holds these values.",
+        saved_unconfirmed: "Saved; could not confirm it is on disk.",
+        partial: "Plan settings saved.",
+      }[r.report.outcome];
       this.message.textContent = `${what}${r.report.note ? ` ${r.report.note}` : ""}${r.report.replanned ? " The plan was recomputed." : ""}`;
       this.onSaved(r.report.replanned);
     } catch (e) {
