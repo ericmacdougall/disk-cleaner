@@ -27,7 +27,10 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
     }
     let file = opts.open(path)?;
     if !file.metadata()?.file_type().is_file() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
     Ok(file)
 }
