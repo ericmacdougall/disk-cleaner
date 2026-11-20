@@ -1,9 +1,28 @@
 # Apply spec: earlier reviews
 
-How revisions 5 to 7 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
+How revisions 5 to 8 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
 from section 22 (revision 5's answers in revision 6, revision 6's in revision 7, revision 7's in
-revision 8). Criterion and negative-case ids are those of revision 5 and later; section numbers are
+revision 8, revision 8's in revision 9). Criterion and negative-case ids are those of revision 5 and later; section numbers are
 those of APPLY-SPEC.md. Later changes to the same areas are listed in APPLY-SPEC.md section 22.
+
+## Reviews of revision 7 (adversarial and acceptance)
+
+F-ids are the adversarial plan review's, T-ids the acceptance review's.
+
+| Finding | Change in revision 8 | Criteria and negative cases |
+|---|---|---|
+| F1 the history walk trusts the commit-graph, which can name a parent the commit does not have | Every history command runs with `-c core.commitGraph=false`; the repository cannot re-enable it (core's config allowlist). Audit of the other repository-controlled inputs: grafts and alternates refused by core's layout check, replace refs and refs at blobs refused by its ref rule, `--no-replace-objects` as a second guard, bitmaps unused, shallow and promisor only shrink the walk, ids of parsed trees and tags recomputed, pack-index substitution disclosed (9.2, 7.5, 17); measured in the safe configuration (23) | AC-9, AC-12; NEG-47 |
+| F2 a resumed deletion trusted metadata, so an equal-length overwrite with its modification time set back was deleted unarchived | Subset check before any resumed deletion: digests with `fstat` identity checks for an archived item; the strict F0 rule with change time for an unarchived regenerable item; a check before each `unlinkat` (10.1). Revision 9 replaced the field list with the complete preserved record and stopped unarchived regenerable items from resuming on their own | AC-21; NEG-19 |
+| F3 apply emptied the spool directory that a running restore used; restore checked no state-volume space | One spool directory per operation (apply, restore and the manifest commands that read data) under a held lock, created and cleaned up only under a fixed guard lock, so cleanup removes only dead operations' spools (9.6, 10.2); restore's state-volume floor (13.3, 18); 13.2 never chmods files. Revision 9 added the spool lock that rclone children inherit | AC-23, AC-24, AC-33; NEG-48, NEG-49 |
+| T-1 does a dry run perform the history check | Yes, with the same reasons and per-rule counts (9.2) | AC-1; NEG-50 |
+| T-2 9.2 relies on core's private package evidence | C-5 exposes it, with a core equality test (15) | AC-12 |
+| T-3 AC-9 could not tell history commands apart; the replace case did not test the walk | `-c disk-cleaner.phase=history` marker; AC-9 asserts the three overrides on marked calls; graft case in NEG-45 with a control walk; the replace cases run through the library because core's layout check refuses replace refs first | AC-9; NEG-45 |
+| T-4 no SHA-256 fixture | NEG-43 case 6 | AC-12; NEG-43 |
+| T-5 network tips undefined for unconfigured remotes and custom refspecs | Defined as core's `--remotes=NAME` refs of configured network remotes; anything else only enlarges the examined set (9.2) | AC-12 |
+| T-6 when the history check runs | Inside step 2, between F0 and the end-of-step-2 comparison (9.2) | AC-8, AC-12 |
+| T-7 and question 4: the over-keeping cost was understated | Stated plainly in 9.2, D-4, D-16 and 17: likely the common case for repositories worked on by hand, the run-wide override also uploads real secrets, the reason gives the remedy, a replayed corpus understates it (23); three options left to the user (D-16) | AC-12; NEG-46 |
+| T-8 no case made the cost observable | NEG-46 | AC-12; NEG-46 |
+| Minor remarks of the acceptance review | 17 names nameless blobs of 1 MiB or more and content-only checks of git-directory files; the time limit kills the git process group (9.2); git's own memory is unbounded (18) | AC-12 |
 
 ## Review of revision 6 (acceptance)
 

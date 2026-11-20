@@ -1,12 +1,12 @@
 # Apply phase specification
 
-Status: **draft for review, revision 8**. Nothing in this document is implemented yet. It defines
+Status: **draft for review, revision 9**. Nothing in this document is implemented yet. It defines
 what `disk-cleaner apply`, `disk-cleaner restore` and `disk-cleaner manifest` must do before any
 code is written, and it is the contract the tests are written against. Section 16 lists the
 decisions that are still open; text that depends on one of them says so. Section 22 maps the latest
 review to changes and lists the minor items left for later; earlier reviews are answered in
 [APPLY-SPEC-REVIEWS.md](APPLY-SPEC-REVIEWS.md). Criterion and negative-case numbers are stable from
-revision 5; revisions 6 to 8 only add.
+revision 5; revisions 6 to 9 only add.
 
 Read with [DESIGN.md](DESIGN.md) and [SCAN-FORMAT.md](SCAN-FORMAT.md). Where this document and
 SCAN-FORMAT.md disagree about the plan format, SCAN-FORMAT.md wins and this document is wrong. The
@@ -126,13 +126,35 @@ and restore detect it, they cannot undo it); memory corruption.
   (bytes), kind (directory, regular file, symlink), size, modification time in nanoseconds, change
   time (not for the item directory, which the quarantine rename changes), device, inode and mount
   id where the platform provides one, mode bits, file flags (macOS `st_flags`), link count, the
-  names and sizes of its extended attributes, and, for a symlink, its target bytes. Any other kind
+  names and sizes of its extended attributes, and, for a symlink, its target bytes. For the item
+  directory alone, whose change time the rename moves, it also holds the SHA-256 of each extended
+  attribute's value, so that a change to them is still seen. Every other entry's change time moves
+  on any write, chmod, flag or attribute change, which is what makes the fingerprint sufficient
+  before deletion begins. Any other kind
   of entry (fifo, socket, device) makes the item unsupported, except the socket
   `.git/fsmonitor--daemon.ipc`, which SCAN-FORMAT.md allows in a plain git directory: it is
   recorded by name, not archived, and not recreated by restore.
-- **Index**: the item's fingerprint F0 plus the SHA-256 of every regular file (9.3). For a
+- **Preserved record**: for one entry, everything the archive carries for it **and restore writes
+  back** (9.3, 13.3), and nothing else:
+  - relative path (bytes) and kind;
+  - for a regular file, its size and the SHA-256 of its content;
+  - for a symlink, its target bytes;
+  - mode bits, macOS user file flags (`UF_*`) and modification time (nanoseconds);
+  - every archived extended attribute, by name, size and SHA-256 of its value. On macOS this
+    includes the resource fork and Finder info. `security.selinux` is written to the index beside
+    the record, for information only, and is not part of it;
+  - hard-link grouping (which names inside the item share one file).
+
+  The archive writer computes it, in the same function that writes the entry's tar header, pax
+  records and content, from the bytes it actually wrote, so the record and the archive cannot
+  disagree. Resume and `quarantine finish` (10.1) call that same function. What the archive does
+  not carry, or carries without restoring, is **not preserved**: owner and group, ACLs, access,
+  change and birth times, inode and device numbers, link counts, system file flags (`SF_*`),
+  sparseness, `security.selinux`, and the harmless attributes 9.3 drops. Section 17 lists these.
+- **Index**: the item's fingerprint F0 plus the preserved record of every entry (9.3). For a
   `remove-regenerable` item removed without a backup, the index is F0 alone, written to
-  `<state>/index/` before its quarantine (never in a dry run, which writes nothing).
+  `<state>/index/` before its quarantine (never in a dry run, which writes nothing). Nothing of
+  such an item is preserved.
 - **Quarantine**: renaming an item, with no-replace semantics, to `.disk-cleaner-removing-<item_id>`
   in the same parent directory before deleting it.
 - **Secret-like file**: defined in 9.2.
@@ -149,12 +171,20 @@ disk-cleaner apply --plan PLAN --scan SCAN --storage REMOTE:PATH
                    [--rclone PATH] [--allow-root] [--json]
 disk-cleaner apply --resume RUN_ID
 disk-cleaner restore RECORD_ID [--to DIR] [--storage REMOTE:PATH] [--machine ID]
-                     [--min-free BYTES] [--state-dir DIR] [--rclone PATH] [--json]
+                     [--min-free BYTES] [--accept-unverified] [--state-dir DIR]
+                     [--rclone PATH] [--json]
 disk-cleaner manifest list   [--storage REMOTE:PATH] [--machine ID] [--json]
 disk-cleaner manifest find TEXT [--files] [--storage REMOTE:PATH] [--machine ID] [--json]
 disk-cleaner manifest verify --storage REMOTE:PATH [--deep] [--machine ID] [--json]
 disk-cleaner manifest orphans --storage REMOTE:PATH [--machine ID] [--json]
+disk-cleaner quarantine list [--state-dir DIR] [--json]
+disk-cleaner quarantine finish ITEM_ID [--discard-changes] [--state-dir DIR] [--rclone PATH] [--json]
 ```
+
+- `quarantine list` prints every quarantine an unfinished or stranded journal names: item, path,
+  run, state and, for a stranded one, the differences recorded (10.1). `quarantine finish` is the
+  only way out of a stranded quarantine (10.1); it takes the apply locks (10.2) and is refused on
+  Windows, like `--remove`.
 
 - No mode flag: **dry run**. `--backup-only`: everything up to and including the manifest, then
   stop; nothing is removed. `--remove`: the full sequence (refused on Windows, exit 1). The two are
@@ -187,7 +217,9 @@ lock (10.2) and reconciles what earlier runs left behind, according to its mode:
   differs). No quarantine is renamed and nothing is deleted.
 - **`--remove`:** in addition, each quarantine is finished or renamed back as in the resume table
   (10.1). Before a deletion is completed, step 7 (the second existence check) is repeated against
-  the storage named in that run's journal; if it fails, the quarantine is left and reported.
+  the storage named in that run's journal; if it fails, the quarantine is left and reported. A
+  **stranded** quarantine (10.1) is final: it is reported with its recorded differences and is not
+  checked again, so no later run re-reads it, until the user runs `quarantine finish`.
 
 ### 6.2 For one item
 
@@ -199,7 +231,9 @@ and the run continues with the next item; nothing that failed a check is ever re
 1. **Select.** The item's plan action removes something and the item is within `--class` and
    `--item`.
 2. **Re-check** (section 7): take the fingerprint F0, re-scan and re-plan, refuse places that are
-   never removed, check processes, run the secret checks of 9.2, take the fingerprint again.
+   never removed, check processes, run the secret checks of 9.2 when the item will be uploaded
+   (an item removed without a backup uploads nothing, so they are not run for it and cannot keep
+   it), take the fingerprint again.
 3. **Ask** (ask mode only, section 11).
 4. **Archive and upload** (section 9): fix the attempt number and part size in the journal, stream,
    split into parts, upload, read back, compare; then the index object the same way.
@@ -211,7 +245,8 @@ and the run continues with the next item; nothing that failed a check is ever re
    directory of F0 (same device, inode and mount id).
 8. **Process check again.**
 9. **Quarantine**: rename with no-replace semantics; take the fingerprint of the renamed directory
-   through the handle opened on it, and compare with F0. Any difference: rename it back and end as
+   through the handle opened on it, and compare with F0 (the item directory's attribute values
+   included, section 4). Any difference: rename it back and end as
    `backed-up-kept` (the archive stays, the manifest says why). If the rename back fails because
    the original path was recreated, the quarantine stays, the record says where, and the summary
    names both paths.
@@ -384,6 +419,13 @@ only through:
   tips as lines on stdin, and never `--use-bitmap-index`); `git ls-files -s -z` (index entries);
   and `git cat-file --batch` (raw tree, tag and blob content, no filters).
 
+**Minimum git: 2.32.** At start, every apply runs `git --version` and refuses an older or
+unparsable version with exit 1, naming it, so an old git cannot silently keep every git item. The
+history commands need `--batch-all-objects`, `--missing=allow-promisor` and
+`rev-parse --show-object-format`, which are older than 2.32. 2.32 is also the first version that
+honours the runner's `GIT_CONFIG_GLOBAL`. The value is an ASSUMPTION: the owner has not checked
+the release each option arrived in, and NEG-55 tests the refusal, not the boundary.
+
 That list is the **allowed set**. Restore and removal never run git. A test (AC-9) records every git
 invocation through a logging shim and fails on any subcommand outside the allowed set. To find the
 subcommand, the shim skips the runner's `-c NAME=VALUE` pairs and `--no-replace-objects`. It also
@@ -480,9 +522,15 @@ always to the user's own storage):
   object in its store that is not reachable from the **network tips**. The network tips are the
   refs under `refs/remotes/NAME/` for each configured remote NAME whose URL core counts as a
   network URL (`is_network_url`). These are the same refs core's facts subtract with
-  `--remotes=NAME`. A tracking ref that a custom fetch refspec writes elsewhere, or one left
-  behind by a remote that is no longer configured, is not a network tip. It is therefore not
-  subtracted, which can only enlarge the examined set. The examined set holds what unpushed
+  `--remotes=NAME`, with one restriction core does not make: a ref under `refs/remotes/NAME/` that
+  also matches the destination of **another** remote's configured fetch refspec
+  (`remote.OTHER.fetch`, read from the config core already lists) is not a network tip of NAME. A
+  tracking ref that a custom fetch refspec writes outside `refs/remotes/NAME/`, or one left behind
+  by a remote that is no longer configured, is not a network tip either. Leaving a ref out can only
+  enlarge the examined set. The opposite is not prevented: a ref under `refs/remotes/NAME/` set by
+  hand (`git update-ref`) to a local-only commit, including one at a deeper name such as
+  `refs/remotes/NAME/sub/x`, is subtracted. This is the stale or hand-set tracking-ref case
+  section 17 discloses. The examined set holds what unpushed
   commits, stashes (live or dropped), reflogs, the index and unreachable objects hold (a dropped
   stash, a file staged and then unstaged, a deleted branch). It is computed with the history
   commands of 7.5 only, and they run inside step 2, after F0 and before step 2 takes the
@@ -559,7 +607,10 @@ always to the user's own storage):
     states the cost). The reason reads: "an unnamed object in the git store (a file version that
     was staged and then unstaged or replaced). Inspect it with `git fsck --lost-found`. If you do
     not want those objects, `git gc --prune=now` removes them, but it also destroys dropped
-    stashes you could still recover, which is why apply never does it.";
+    stashes you could still recover, which is why apply never does it." In ask mode on a terminal,
+    when this is the item's only reason, the user may answer `u` for that item (11, D-16). The
+    content rule above runs on unnamed blobs too, within the same budget, so that the prompt can say
+    what it saw;
   - **limits**: a store of more than 10 million objects in one git directory, or more than
     600 seconds for all the commands of this rule on one item, keeps the item ("the history check
     exceeded its limit"). When the time limit is reached, the whole process group of the running
@@ -627,10 +678,10 @@ unreachable object holds NAME"; never contents).
 With `--upload-secrets` (or `[apply] upload_secrets = true`) they are archived like everything else.
 No local vault exists (D-4). The run summary counts the items kept by each rule, so the cost of
 over-keeping (mainly the global-excludes rule, the unnamed-object rule and the history limits) is
-visible. **The only override is run-wide.** `--upload-secrets` uploads every secret-like file of
+visible. **Two overrides.** `--upload-secrets` is run-wide: it uploads every secret-like file of
 every selected item, a real `.env`, a key file or secret-bearing history included, unless the run
-is narrowed with `--item`. Ask mode has no per-item answer that uploads only an item's unnamed
-objects. D-16 lists the options for that, which are the user's decision.
+is narrowed with `--item`. The per-item answer `u` (11) uploads only one item's unnamed objects,
+exists only in ask mode on a terminal, and shows its limits to the person answering.
 
 **Encryption.** Before the first upload, apply reads the storage remote's type (9.6). When it is not
 `crypt`, the run summary and every ask prompt say that the archive is stored unencrypted in the
@@ -648,7 +699,8 @@ to upload to such a remote (exit 1).
 - Directories, regular files and symlinks (the target is stored as written, never followed). Two
   names of one file inside the item are stored as a hard-link entry after the first name. A hard
   link to a file outside the item is stored as a regular file. Fifos, sockets (except the fsmonitor
-  socket, see section 4) and devices make the item unsupported.
+  socket, see section 4) and devices make the item unsupported. A sparse file is stored with its
+  holes read as zeros and restored dense; its layout is not carried (section 17).
 - **Extended attributes** (macOS and Linux, including the macOS resource fork and Finder info) are
   stored as pax `SCHILY.xattr.<name>` records, up to 64 KiB per attribute and 1 MiB per file. These
   harmless attributes are dropped and listed by count: `com.apple.quarantine`,
@@ -665,8 +717,9 @@ to upload to such a remote (exit 1).
   changes within the attempt.
 - The **index** is a separate JSON Lines object, `<archive>.index.jsonl`: a header (format version,
   machine id, original path, plan action, HEAD for git items, the part list with sizes and SHA-256)
-  and one line per entry with its fingerprint fields and, for regular files, its SHA-256. A copy
-  stays in `<state>/index/`.
+  and one line per entry with its fingerprint fields and its preserved record (section 4), the
+  SHA-256 of a regular file's content and of each archived extended attribute's value included. A
+  copy stays in `<state>/index/`.
 
 ### 9.4 Upload and verification
 
@@ -716,26 +769,63 @@ length).
   `RCLONE_TEMP_DIR`, rclone's own defaults), decides where rclone may spool. Those commands run
   only in non-dry runs, so a dry run still creates no state directory.
   **One spool directory per operation.** Every command that runs a data-moving rclone command is
-  an operation with a fresh random id OP: a non-dry apply or resume, a restore, and
-  `manifest list --storage`, `manifest find --files` and `manifest verify --deep`. The operation
-  works under `<state>/rclone-tmp/`:
+  an operation with a fresh random id OP: a non-dry apply or resume, a restore, `quarantine
+  finish` and `manifest list --storage`, `manifest find --files` and `manifest verify --deep`.
+  The spool must outlive nobody who can still write to it, and a spool whose user is gone must not
+  be kept forever. One lock cannot do both, because a hung rclone that holds the lock that marks
+  an operation live would block cleanup and every later operation. So there are two locks, with
+  different holders and lifetimes:
+  - **Operation lock**, `rclone-tmp/OP.lock`: held by the tool's own process from the operation's
+    start until it exits, and opened close-on-exec, so no child ever holds it. It says "the
+    operation is live". The apply locks of 10.2 and the guard below are close-on-exec too, so a
+    surviving child can never block a later apply, restore or cleanup.
+  - **Spool lock**, `rclone-tmp/OP.spool`: taken before the first child is started and
+    deliberately **inherited by every rclone child**: its descriptor is the one descriptor passed
+    to the child (macOS and Linux). It is close-on-exec at all other times, and it is cleared only
+    in the forked child just before rclone is executed, so git and every other child never get it. A `flock` lock belongs to the open file description, which the
+    parent and every child share, so it is held while the tool **or any child** is alive. It says
+    "someone may still write to `OP/`".
+  - **Primitives.** macOS and Linux: `flock(LOCK_EX | LOCK_NB)`, never `fcntl` locks (a process
+    loses those when it closes any descriptor of the file, and they are not shared with a child).
+    Windows: `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` for the
+    operation lock and the guard. A Windows lock is not inherited by a child, so on Windows the
+    children are contained instead: each rclone child is created suspended, assigned to a job
+    object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then resumed. When the tool dies, the
+    system closes the job handle and kills every process in the job. Lock files on Windows are
+    opened with `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`, so a held lock file can
+    be deleted (End and Cleanup), and they are removed with delete-on-close.
+  - **A lock call that fails** with anything other than "held by another" (`EWOULDBLOCK`,
+    `ERROR_LOCK_VIOLATION`), for example `ENOLCK` or `ENOTSUP` on a network file system, counts as
+    **held**. Cleanup then leaves that spool, and an operation that cannot take its own locks, or
+    the apply locks, stops with exit 1.
   - **Guard.** `rclone-tmp/guard` is a fixed file that is created once and never removed. Creating
-    an operation's lock and cleaning up both happen only while the exclusive OS advisory lock on
-    the guard is held. That lock is held for milliseconds, never during a transfer.
-  - **Start.** Holding the guard, the operation creates `OP.lock` with create-new semantics, takes
-    an exclusive advisory lock on it, creates the directory `OP/` and releases the guard. It holds
-    the `OP.lock` lock until it exits, and it is the only writer of `OP/`.
-  - **Cleanup**, at the start of every operation, holding the guard. For each other `ID/` or
-    `ID.lock`, the operation tries a non-blocking lock on `ID.lock`, creating it if it is missing.
-    When the lock is granted, no live process holds it, so `ID/` is removed, then `ID.lock`, while
-    that lock is held. When the lock is refused, the operation is live and nothing of it is
-    touched. A starting operation cannot be caught between creating its lock file and locking it,
-    because both happen under the guard, which cleanup also needs.
-  - **End.** The operation removes `OP/`, then `OP.lock`, under the guard.
+    an operation's lock files and cleaning up both happen only while the exclusive lock on the
+    guard is held. That lock is held for milliseconds, never during a transfer.
+  - **Start.** Holding the guard, the operation creates `OP.lock` and `OP.spool` with create-new
+    semantics, takes both locks, creates the directory `OP/` and releases the guard. It is the only
+    writer of `OP/`, through its children.
+  - **Cleanup**, at the start of every operation, holding the guard, and only when the state
+    directory is on a file system of the 7.4 allowlist (elsewhere advisory locks are not trusted:
+    leftovers are reported and never removed). For each other `ID`, it tries non-blocking locks on
+    `ID.lock` and `ID.spool`, creating a missing one. Only when **both** are granted, so neither
+    the tool nor any child of it lives (on Windows: the operation lock is free and its job was
+    closed), are `ID/`, then `ID.spool` and `ID.lock`, removed while both are held. On Windows a
+    file in `ID/` that cannot be deleted because a process still has it open stops that cleanup
+    for `ID`, which counts as held. Otherwise nothing of `ID` is touched.
+  - **A hung child.** When the tool dies and an rclone child of it hangs (on macOS or Linux), the
+    child keeps `ID.spool` locked. Its spool then stays: every later operation reports it ("a
+    process of dead operation ID still holds its spool; PID N"; the child's pid is recorded in
+    `ID.pids` for this message only and is never trusted as a lock) and counts its bytes against
+    the state volume's floor. No later operation waits for it, because the operation lock and the
+    apply locks are close-on-exec, and the tool never kills a process it did not start in the
+    current operation. When the child exits, the next operation removes the spool.
+  - **End.** The operation waits for its children, then removes `OP/`, `OP.spool` and `OP.lock`
+    under the guard.
 
   An apply, a restore and a manifest command can therefore run at once, and none of them touches
-  another's spool. Two machines that share a network home are not covered (section 17). The spool
-  volume is the state volume, which section 18 (apply) and 13.3 (restore) check before each part.
+  another's spool, whoever of them dies first. Two machines that share a network home are not
+  covered (section 17). The spool volume is the state volume, which section 18 (apply) and 13.3
+  (restore) check before each part.
 - At start, apply finds the configuration file with `rclone config file` and reads its first lines.
   An encrypted rclone configuration is refused (exit 1, "encrypted rclone configuration is not
   supported in this release"); the tool never asks for, reads or passes its password.
@@ -755,8 +845,8 @@ length).
 - `<state>/journal/<run_id>.jsonl` is append-only. Each line is one transition of one item
   (`selected`, `rechecked`, `answered`, `attempt-started`, `part-uploaded`, `part-verified`,
   `index-verified`, `segment-reserved`, `recorded`, `segment-synced`, `checked-again`,
-  `quarantine-intent`, `quarantined`, `delete-started`, `deleted`, `removed-recorded`, `skipped`,
-  `failed`, `kept`, `vanished`) with the attempt, object names, sizes and digests. Each line is
+  `quarantine-intent`, `quarantined`, `delete-started`, `stranded`, `deleted`, `removed-recorded`,
+  `skipped`, `failed`, `kept`, `vanished`) with the attempt, object names, sizes and digests. Each line is
   flushed and `fsync`ed before the step it records takes effect; renames are followed by an `fsync`
   of the parent directory where the platform supports it.
 - `segment-reserved` holds the next manifest segment number and is synced before that segment name
@@ -768,40 +858,74 @@ length).
 
 In the table, **O** is the original path and **Q** the quarantine path. "Present" for O means a
 directory is there; a resume never touches a directory at O that is not the item (same device, inode
-and mount id as F0). **Equal** means the fingerprint of Q equals the index exactly. **Subset** means
-the following, and it is checked for every entry left in Q before any of them is deleted:
+and mount id as F0). **Equal** means the fingerprint of Q equals the index exactly, the item
+directory's attribute values included (section 4), so before deletion begins any change to an entry
+is seen through its change time or, for the item directory, through its preserved record.
 
-- every entry in Q has a relative path that is in the index, with the same kind, and Q's device and
-  mount id equal F0's. A directory is compared by path and kind only, because deleting its children
-  changes its times and link count, and 13.2 may change its mode. A symlink also has the same
-  target bytes, size and inode;
-- **an archived item** (its index holds a SHA-256 for every regular file): every regular file left
-  in Q is opened handle-relative (13.2) and checked with `fstat` before and after it is read. Device
-  and inode must equal F0's. Size, modification time and change time must be the same before and
-  after the read. The SHA-256 of the bytes read must equal the index's. Metadata alone is not
-  trusted, because an in-place overwrite of equal length whose modification time is set back (by a
-  timestamp-preserving copy, for example) leaves size, modification time and inode unchanged. The
-  index is the local copy in `<state>/index/`. When that copy is missing or damaged, the index
-  object is read from the storage named in the run's journal and checked against the SHA-256 in
-  the `backed-up` record. When neither is possible, the check fails;
-- **an unarchived regenerable item** (its index is F0 alone, with no digests): every regular file
-  left in Q has the same size, modification time, **change time**, inode and link count as in F0.
-  An overwrite changes the change time, and no timestamp-preserving copy can set it back, so the
-  overwrite above is caught. This rule is strict on purpose. A file whose link count or change
-  time moved for an innocent reason (a hard link to it inside the item was already deleted, or a
-  build touched it) also fails it, and then Q is left for the user;
-- during the deletion that follows, each regular file is compared once more, immediately before
-  its `unlinkat`, with the state checked above (`fstatat`: inode, size, modification time, change
-  time). The one expected difference is the change time and link count of an inode that has
-  another name this deletion has just removed. A write after that last comparison is lost, like the
-  one section 17 names for the first deletion.
+**Once deletion has begun, change times no longer prove anything**, because the deletion itself
+moves them. From then on the only question is whether deleting what is left loses anything the
+archive does not hold, and it is answered by the **preserved record** (section 4), never by a list
+of fields:
 
-When the check fails, nothing more is deleted. Q is left as it is, the item is `failed`, and the
-summary names Q and the first entries that differ ("changed after deletion began; not in the
-archive" for an archived item, "changed after deletion began; never archived" for an unarchived
-regenerable one). The user decides what to do with Q, and every later apply reports it again.
-Verifying an archived item reads its remaining bytes once more, at most the item's size, and only
-on resume.
+- **Archived item: the resume check.** Before anything more is deleted, every entry left in Q,
+  directories, regular files and symlinks alike, gets its preserved record computed again by the
+  archive writer's own function (section 4), through handles (13.2), with `fstat` before and after
+  each read; size, modification time and change time must not move during the read. It must equal
+  the index's record for that path in every field, with exactly these exceptions, which the
+  deletion itself causes:
+  - a directory's modification time;
+  - a directory's owner write bit, which 13.2 sets;
+  - a hard-link group's names that are no longer in Q. The names that remain must still share one
+    file and must all belong to the same group in the index.
+
+  Nothing else is excused. Every entry in Q must also be in the index, and Q's device and mount id
+  must equal F0's. The index is the local copy in `<state>/index/`. When that copy is missing or
+  damaged, the index object is read from the storage named in the run's journal and checked
+  against the SHA-256 in the `backed-up` record. When neither is possible, the check fails. When it
+  holds, deleting the rest loses only what is not preserved (section 17), the same as a deletion
+  that was never interrupted, so the deletion continues. During that deletion each entry is
+  compared once more, immediately before its `unlinkat`, with the state just checked (`fstatat`:
+  inode, size, modification time, change time; the change time and link count of an inode that has
+  another name this deletion has just removed are expected to move). A write after that last
+  comparison is lost, as section 17 states for the first deletion.
+- **Unarchived regenerable item: never on its own.** Nothing of such an item is preserved, so no
+  comparison can show that what is left is what the user agreed to lose. A resume never continues
+  its deletion. The quarantine is **stranded** at once.
+
+**Stranded.** When the check fails, or for an unarchived regenerable item at once, nothing more is
+deleted. A `stranded` line is journaled with the first differing entries and fields (at most 100),
+Q is left exactly as it is, the item is `failed`, and the summary names Q and the differences:
+"changed after deletion began; not in the archive" for an archived item, "deletion was interrupted;
+never archived" for an unarchived regenerable one. The state is final (6.1). Later runs report it
+from the journal and do not check it again; only `quarantine finish` reads a stranded Q again.
+
+**`quarantine finish ITEM_ID`** is the only way out. It takes the apply locks, and for an archived
+item it first repeats the second existence check (step 7) against the storage of that run's
+journal.
+- **Archived item.** It runs the resume check again. If the check holds now, it deletes Q and
+  writes the `removed` record. If not, it prints the differences and the way to keep the changed
+  data: `disk-cleaner restore RECORD_ID --to DIR`, then copy the changed entries from Q into DIR.
+  It deletes nothing unless `--discard-changes` is given and the user, on a terminal, types the
+  item id to confirm after the differences are shown. Then it writes the `removed` record with
+  `discarded_changes` listing the paths.
+- **Unarchived regenerable item.** It lists every remaining entry that differs from F0 (change time
+  and link count included, so a pnpm store link that moved shows up) and says that nothing of it was
+  archived. It deletes only after the user, on a terminal, types the item id, then writes the
+  `regenerable-removed` record.
+- Without a terminal, a confirmation is never assumed: the command exits 2 and deletes nothing. A
+  wrong id typed, or differences shown without `--discard-changes`, also exit 2 with nothing
+  deleted.
+- An id that no journal names as stranded is refused with exit 1 and nothing read: an unknown id,
+  a finished item, and an unfinished one not yet checked (the message names `apply --resume
+  RUN_ID`, which checks it and strands it or continues). A failed existence check (the archive or
+  its record is missing or unverified at the storage) also exits 1 with nothing deleted.
+
+Why not stop every interrupted deletion for an explicit command, archived items included? It is
+simpler, and it is what this revision does where nothing is archived. For an archived item the
+complete comparison can prove, against a verified archive, that nothing would be lost. The explicit
+command would run the same comparison anyway, and making the user act after every Ctrl-C during a
+deletion, a documented flow (24), costs a step the proof makes unnecessary. A resume reads the
+remaining bytes and attribute values once more, at most the item's size (18).
 
 | Last state | O | Q | On resume |
 |---|---|---|---|
@@ -813,8 +937,9 @@ on resume.
 | `quarantine-intent` or `quarantined` | present | present | Touch neither; `failed`; report both paths. |
 | `quarantined` | present | absent | Touch nothing; `failed` ("quarantine missing, a directory is at the original path"). |
 | `quarantine-intent` or `quarantined` | absent | absent | Something outside the tool removed the item. Archived item: write a `vanished` record (the archive is the copy; restore works); `failed` in the summary. Unarchived regenerable item: skipped `gone`, no record. Never `removed`, never `kept`. |
-| `delete-started` | any | present | Check Q as a subset (above: digests for an archived item, the strict F0 rule for an unarchived regenerable one). It holds: continue deleting Q. Otherwise: delete nothing more, leave Q as it is, `failed`, and report Q and the differing entries. A directory at O is never touched. |
-| `delete-started` | any | absent | Deletion finished before `deleted` was written: write `deleted`, then the `removed` record. A directory at O is new and is not touched; the summary names it. |
+| `delete-started` | any | present | Archived item: the resume check (above). It holds: continue deleting Q. Otherwise: stranded. Unarchived regenerable item: stranded. A directory at O is never touched. |
+| `stranded` | any | present | Report only (final); `quarantine finish` decides. |
+| `delete-started` | any | absent | Deletion finished before `deleted` was written: write `deleted`, then the `removed` record (`regenerable-removed` for an unarchived regenerable item). A directory at O is new and is not touched; the summary names it. |
 | `deleted` | any | absent | Write and sync the `removed` record if no synced segment has it. |
 | `removed-recorded` | any | absent | Sync the segment holding the record if it is not synced. |
 
@@ -829,7 +954,9 @@ on resume.
 
 One apply per user per machine (D-11): an OS advisory lock on `<data dir>/disk-cleaner/apply.lock`
 (the path from the user database, also when `--state-dir` points elsewhere) and a second one on
-`<state>/lock`. Both are released by the operating system when the process ends. The file holds the
+`<state>/lock`. Both are released by the operating system when the process ends. They use the
+primitives of 9.6 (`flock` on macOS and Linux, `LockFileEx` on Windows), are opened close-on-exec
+so no child can hold them, and a lock call that errors counts as held (exit 1). The file holds the
 run id and process id for the message; its content is never trusted as the lock. A second apply
 exits 1 at once naming the holder. A dry run takes no lock. Applies by different users, or by two
 machines sharing a network home, are not covered (section 17); the no-replace rename and the F0
@@ -856,6 +983,33 @@ its re-check.
   remove (regenerable only), `s` back up and keep, `a` yes to the rest of this class, `q` stop (no
   further item is started). Pending typed-ahead input is discarded before each prompt. End of input
   means `n`. Without a terminal on stdin, every item is `n`; nothing waits.
+- **Unnamed objects: the answer `u`** (D-16, the user's choice). An item whose only reason to be
+  kept is the unnamed-object rule of 9.2 is not skipped silently in ask mode on a terminal. It gets
+  this prompt first:
+  - the number of unnamed objects, and for each its size and what the content rule saw, which is
+    one of: "read in full, no pattern matched"; "first 64 KiB read, no pattern matched" (64 KiB to
+    1 MiB); "not read: 1 MiB or more"; "not read: the item's 64 MiB content budget was spent" (the
+    figures here and in statement 1 are the limits in effect; the binary has no option to change
+    them, and only the library's tests inject smaller ones);
+  - these three statements, shown every time, word for word:
+    1. "Objects of 64 KiB to 1 MiB were read only for their first 64 KiB. Objects of 1 MiB or more,
+       and any object after this item's 64 MiB reading budget, were not read at all.";
+    2. "'No pattern matched' is not evidence that an object holds no secret. These objects have no
+       file name. One may be a real .env or key that was staged and then unstaged. Answering u
+       uploads them as they are.";
+    3. "This answer exists only here. Automatic runs never offer it, and without a terminal the
+       answer is no.";
+  - the answers `u`, upload this item's unnamed objects, and `n`, keep the item.
+
+  `u` lifts the unnamed-object rule for this item only, never for later items (`a` does not carry
+  it). The item is then asked about as usual (`y`, `n`, `s` and the rest), and `n` there still keeps
+  it with nothing uploaded. An unnamed object whose content matches a pattern is secret-like by
+  content, so the item has another reason and the prompt is not offered. Typed-ahead input is
+  discarded before it, and end of input means `n`. Without a terminal, or in automatic mode, the
+  prompt is never offered and the item is kept, as before. The answer binds to F0, which includes
+  the store's files, so a new object before step 9 keeps the item. The record carries
+  `unnamed_uploaded` (the count and total bytes, no names or ids), and the summary counts such
+  items.
 - The answer binds to F0; any difference at step 9 keeps the item.
 - **Automatic** applies to the classes named by `--auto` or `[apply] auto`; default none. Automatic
   items are re-checked and skipped on any difference.
@@ -884,6 +1038,10 @@ Where they apply:
 - `nested_regenerable`: the paths of regenerable children archived and removed with a git item
   (6.3);
 - `secrets_uploaded`: the count of secret-like files archived under `--upload-secrets` (no names);
+- `unnamed_uploaded`: the count and total bytes of unnamed objects archived after the answer `u`
+  (11; no names or ids);
+- `discarded_changes`: the paths whose changes `quarantine finish --discard-changes` deleted
+  (10.1);
 - `restore`: the method (`archive` or `regenerable`) and the exact `disk-cleaner restore
   <record_id>` command.
 
@@ -894,7 +1052,10 @@ secret.
 
 - Locally: `<state>/manifest/<run_id>.<seq>.jsonl`, one **segment** per sync, never modified after
   it is written, ending with a trailer line holding the record count and the SHA-256 of the bytes
-  before it. `seq` comes from a `segment-reserved` journal line (10.1).
+  before it. `seq` comes from a `segment-reserved` journal line (10.1). A segment is written
+  atomically: to `<run_id>.<seq>.jsonl.tmp`, `fsync`ed, renamed to its name with no-replace
+  semantics, and the directory `fsync`ed, so a reader never sees a segment being written. A
+  leftover `.tmp` file is reported and ignored.
 - In storage: the same segment at `disk-cleaner/v1/<machine id>/manifest/<run_id>.<seq>.jsonl`,
   uploaded with rcat, read back and compared like a part. A name is never reused. `machine.json` is
   uploaded once; if one exists there with another id, apply stops.
@@ -945,7 +1106,11 @@ the second existence check passed. No remote fact is a condition.
 
 `disk-cleaner restore RECORD_ID [--to DIR]`:
 
-1. Finds the record (local manifest, or `--storage` alone on a new machine).
+1. Finds the record (local manifest, or `--storage` alone on a new machine). It uses a record only
+   from a segment whose trailer matches, locally or in storage. A record found only in a damaged
+   segment is refused (exit 1, naming the segment) unless `--accept-unverified` is given. The
+   output then says the record is unverified, and every part is still checked against that
+   record's digests.
 2. The target is the original path or `--to`. It must not exist. Free space on its volume must be
    at least the record's logical `bytes` plus 1 GiB, and extraction stops if the stream
    exceeds it. **The state volume**, which holds restore's own spool directory (9.6), is checked
@@ -1047,7 +1212,8 @@ No scan or plan safety rule changes.
 The text above follows the recommended option. D-4 changes what the user approved earlier and needs
 the user's own decision. D-1 departs from the user's stated requirement (section 2,
 TARGET_MISMATCH) and is reported to the user as such. D-15 and D-16 are the owner's assumptions,
-not the user's choices.
+not the user's choices, except D-16's handling of unnamed objects, which the user chose (option
+(i), sourced in D-16).
 
 - **D-1. Network access for git: none in this release.** ASSUMPTION: the coordinator's choice after
   the review of revision 4, not the user's. Removal rests on the verified whole-item archive alone;
@@ -1066,9 +1232,10 @@ not the user's choices.
   stash, a local-only commit or an unreachable object, with an unnamed object in the git store
   (D-16), with a store past the history limits, or with an untracked file the user's global
   excludes match, are not reclaimed until the user opts in; the summary counts them by rule. The
-  only way to opt in is the run-wide `--upload-secrets`. For an item kept only by an unnamed
-  object, opting in also uploads that item's real `.env` and key files, and those of every other
-  item in the run unless `--item` narrows it. The user must be told this when asked. Alternative: client-side
+  run-wide opt-in, `--upload-secrets`, uploads the real `.env` and key files of every item in the
+  run unless `--item` narrows it. For an item kept only by unnamed objects, ask mode also offers
+  the per-item answer `u` (11, D-16), which uploads only those objects. The user must be told this
+  when asked. Alternative: client-side
   encryption of secret-like files with a key kept in the OS keychain and shown once, which adds a crypto dependency, key loss as a new way to lose data, and a
   restore that needs the key. The user earlier approved a local vault for a private script; this
   drops it, so the user should confirm.
@@ -1133,31 +1300,37 @@ not the user's choices.
   `git add` or `git commit -a`; `git add -p`; GUI hunk staging. A repository with no remote and
   one harmless file staged twice is kept (NEG-46). Apply runs with `gc.auto=0`, and the user's own
   automatic `gc` rarely runs in small repositories, so those objects stay. For repositories
-  worked on by hand this is likely the common case. The only override is the run-wide
-  `--upload-secrets`, which also uploads real `.env` and key files (D-4), and ask mode has no
-  per-item answer for it. The reason text gives the remedy (9.2): inspect with
+  worked on by hand this is likely the common case. The overrides are the run-wide
+  `--upload-secrets`, which also uploads real `.env` and key files (D-4), and, in ask mode only,
+  the per-item answer `u` below. The reason text gives the remedy (9.2): inspect with
   `git fsck --lost-found`, and prune with `git gc --prune=now` only if the objects are not
   wanted. Pruning also destroys dropped stashes, which is why apply never prunes. A corpus
   replayed from public clones will understate the rate, because it does not reproduce those
   staging habits. Section 23 therefore requires them in the corpus.
 
-  **Options for the user (not decided; the text above follows (iii) until the user chooses):**
-  - (i) a per-item answer in ask mode, `u`, that uploads that item's unnamed objects after showing
-    their count, their sizes and the content rule's result for each. It is offered only when the
-    unnamed-object rule is the item's only reason. Other secret-like files still keep the item,
-    and automatic mode never gives it. Cost: a new answer and prompt, and an unnamed object of
-    1 MiB or more is uploaded unread, because the content rule reads only the first 64 KiB of
-    smaller blobs;
-  - (ii) keep the unnamed objects in a local vault and archive the rest of the item. Cost: the
-    archive is no longer whole, which breaks the invariant at the top of this document. Restore
-    must put them back from the vault, the vault is a same-disk copy that D-4 rejected, and when
-    the repository is removed, the vault is their only copy;
+  **Handling of unnamed objects: option (i), the user's choice.** The user chose the per-repository
+  answer in ask mode (Source: answer:4577b940-1ee7-4a57-a14c-89e1db1f9384/81b262d5-2447-43d9-9eff-6da6c414ca08
+  "Ask per repo (Recommended)"). Section 11 specifies it as the answer `u`. The options the user
+  was offered were:
+  - (i) **chosen**: a per-item answer in ask mode, `u`, that uploads that item's unnamed objects
+    after showing their count, their sizes and what the content rule saw for each;
+  - (ii) keep the unnamed objects in a local vault and archive the rest of the item;
   - (iii) leave it as it is: kept, counted, and the reason gives the remedy.
 
-  The owner's recommendation is (i), because it keeps the default safe and turns the common case
-  into one informed answer. If the corpus shows a low rate, (iii) is enough. Fallback (a) above,
-  with the residue disclosed, is a further option. The limits (10 million objects, 600 seconds)
-  are assumed values. Confidence medium.
+  The question the user saw said that objects of 1 MiB or more would be uploaded without being
+  scanned. It did not carry three further limits, which the acceptance review of revision 8
+  raised. The spec states them where the prompt is specified (11), and the prompt shows them to
+  the person answering:
+  - an object of 64 KiB to 1 MiB is read only for its first 64 KiB, and nothing is read after the
+    item's 64 MiB budget, so for an object of any size the result can be "not read";
+  - "no pattern matched" is not evidence that an object holds no secret: the case D-16 was built
+    for, a plaintext `.env` swept up by `git add .` and then unstaged, has no name and may match
+    no pattern, and `u` uploads it;
+  - the answer exists only in ask mode on a terminal: automatic runs never offer it, and without a
+    terminal the answer is no, so `--auto` runs reclaim none of these items.
+
+  The rest of D-16 (the examined set, the limits, the commit-graph setting) stays the owner's
+  ASSUMPTION. The limits (10 million objects, 600 seconds) are assumed values. Confidence medium.
 
 ## 17. Documented limits
 
@@ -1189,15 +1362,25 @@ not the user's choices.
   inside an `includeIf` block is not seen.
 - Repositories where a file version was staged and then replaced before a commit are kept by the
   unnamed-object rule, likely most repositories worked on by hand (D-16), until the user prunes
-  them or opts in with the run-wide `--upload-secrets`.
-- Resuming the deletion of an unarchived regenerable item rests on metadata (change time, 10.1).
-  Only a process that can set the system clock, or write to the raw device, can change a file and
-  leave its change time as it was.
+  them, answers `u` for them in ask mode (11), or opts in with the run-wide `--upload-secrets`.
+  After `u`, unnamed objects are uploaded as they are: those not read, or read only in part, and
+  those in which no pattern matched may hold a secret.
+- An interrupted deletion of an unarchived regenerable item never continues on its own (10.1); its
+  quarantine stays until the user runs `quarantine finish`.
 - A repository whose store has more than 10 million objects, or whose history check takes more
   than 600 seconds, is kept unless `--upload-secrets` is given (9.2, D-16).
-- ACLs, owners and groups are not archived; mode bits are restored on Unix only; access and change
-  times, system file flags and SELinux labels are not restored (13.3). Sparse files are restored
-  dense. A hard link to a file outside the item is restored as an independent file.
+- **Not preserved** (section 4): what the archive does not carry, or carries without restoring, is
+  lost with a removal, and a change to it made while a deletion was stopped is not seen by the
+  resume check (10.1): owners and groups; ACLs (`system.posix_acl_*`, macOS and Windows ACLs);
+  access, change and birth times; inode and device numbers and link counts; system file flags
+  (`SF_*`; an item with immutable flags is never removed, 7.4); `security.selinux` (recorded in
+  the index, not restored); sparseness (sparse files are restored dense); the harmless attributes
+  9.3 drops (`com.apple.quarantine`, `com.apple.provenance`, `com.apple.lastuseddate#PS`, an
+  all-zero `com.apple.FinderInfo`); and the link from a file inside the item to one outside it (a
+  hard link to outside is restored as an independent file). Mode bits are restored on Unix only.
+  The resume check also excuses, by name, the three changes the deletion itself makes (10.1). So a
+  change made while a deletion was stopped to a remaining directory's modification time or owner
+  write bit is lost. The archive keeps the values from before.
 - Sync-folder detection covers the providers and markers listed in 7.4; another sync client, or a
   Seafile library outside `~/Seafile`, is not recognised. macOS `~/Desktop` and `~/Documents` are
   always treated as synced.
@@ -1207,7 +1390,10 @@ not the user's choices.
 - Verification proves the stored object equalled what was sent at the time; `manifest verify` notices
   later loss, it cannot prevent it.
 - The lock does not cover two users, or two machines sharing a network home. On such a shared
-  home, the advisory locks that keep spool directories apart (9.6) may not hold either.
+  home, the advisory locks that keep spool directories apart (9.6) may not hold either, so no
+  spool there is ever cleaned up automatically. An rclone child that hangs after the tool died
+  keeps its spool on macOS and Linux until it exits (9.6); the tool reports it and does not kill
+  it.
 - Whether `rclone rcat --size` avoids a local spool is tested for the `local` backend only (9.4);
   for other backends the part size is bounded by the state volume's free space instead. The
   `local` backend never spools, so the tmpfs test cannot show that a spooling backend honours
@@ -1241,8 +1427,9 @@ not the user's choices.
   object limit about 210 MB for SHA-1 and 330 MB for SHA-256, one git directory at a time. git's
   own memory for `rev-list --objects` on such a store is not bounded by the tool. Only the time
   limit bounds it, and section 23 measures it.
-- A resumed deletion of an archived item reads the remaining files once more to compare their
-  digests (10.1): at most the item's bytes, with the same fixed buffers.
+- A resumed deletion of an archived item, and `quarantine finish`, read the remaining files and
+  attribute values once more to compute their preserved records (10.1): at most the item's bytes,
+  with the same fixed buffers. A stranded quarantine is not read again by later runs.
 - One item at a time; one rclone process at a time.
 - Bytes freed are measured as the change in free space, alongside the sum of sizes.
 
@@ -1257,6 +1444,10 @@ not the user's choices.
 - 2: completed, but at least one item was skipped, failed, vanished, or ended `backed-up-kept` for
   any reason other than a request.
 - 3: interrupted; the run id is printed for `--resume`.
+- `quarantine finish` (10.1): 0 when Q was deleted and its record written; 1 when refused (not a
+  stranded id, Windows, a lock held, a failed existence check); 2 when it ended with nothing
+  deleted (no terminal, a wrong id typed, differences without `--discard-changes`).
+  `quarantine list` exits 0, or 1 when the state directory cannot be read.
 
 The summary lists every item with its outcome and reason, bytes freed (measured and summed), bytes
 uploaded, whether the storage is encrypted, and where the manifest is. `--json` writes the same as
@@ -1307,7 +1498,8 @@ two steps; it exists only in test builds (AC-35).
 - **AC-9** No git command apply runs can reach the network: every invocation goes through core's
   hardened runner with `protocol.allow=never`, and its subcommand is within the set of 7.5. Every
   history command of 9.2 carries `-c disk-cleaner.phase=history`, `-c core.commitGraph=false` and
-  `--no-replace-objects`, and none carries `--use-bitmap-index`.
+  `--no-replace-objects`, and none carries `--use-bitmap-index`. A git older than 2.32 is refused
+  at start (7.5).
   Verify by: `offline.rs` puts a logging git shim first on `PATH` for full apply, resume and restore runs and asserts the subcommand set (found after the runner's `-c` pairs and `--no-replace-objects`) and `protocol.allow=never` on every call; for the calls marked `disk-cleaner.phase=history`, the other two overrides and no `--use-bitmap-index`, and that each of the six history command shapes of 7.5 appears marked at least once per git directory that has a network tip (the five other than `rev-list` without one); a local test server that counts connections sees none. The behavioural cases NEG-45 (graft) and NEG-47 (commit-graph) fail an implementation that omits an override on `rev-list`.
 - **AC-10** Removal of a git item depends only on the verified whole-item archive: both git actions
   run the same steps, the record shows the plan's `action` and `executed_as: whole-archive`, and
@@ -1359,15 +1551,19 @@ two steps; it exists only in test builds (AC-35).
   backup unless asked. Verify by: `regenerable.rs`.
 - **AC-21** Every transition is journaled before it takes effect; every row of the resume table in
   10.1 leads to its stated outcome; every apply first reconciles unfinished quarantines and unsynced
-  records; a resume refuses changed inputs. A resumed deletion continues only while Q passes the
-  subset check of 10.1 (digests for an archived item, the strict F0 rule for an unarchived
-  regenerable one). Verify by: `resume.rs` stops at each transition in turn, including between the last `unlinkat` and the `deleted` line, and resumes in a new instance; builds each O and Q combination of the table by hand; after `delete-started`, overwrites a remaining file in Q in place with different bytes of equal length and sets its modification time back, for an archived and for an unarchived regenerable item; starts a new apply instead of resuming; and kills the real binary during an rclone upload.
+  records; a resume refuses changed inputs. A resumed deletion of an archived item continues only
+  when every remaining entry's preserved record (section 4), recomputed by the archive writer's own
+  function, equals the index's apart from the three exceptions of 10.1. An unarchived regenerable
+  item's deletion never continues on its own. A failed check strands Q, which is final until
+  `quarantine finish`. Verify by: `resume.rs` stops at each transition in turn, including between the last `unlinkat` and the `deleted` line, and resumes in a new instance; builds each O and Q combination of the table by hand; after `delete-started`, changes a remaining entry while stopped, once per field of the preserved record (content of equal length with its modification time set back, mode, a `UF_*` flag on macOS, an extended attribute value replaced by one of equal length, a resource fork on macOS, a symlink target, a hard-link group split), on a file, on a directory and on a symlink where the platform allows; a unit test asserts that the resume check and the archive writer call one function, and that every field of the preserved record the archive writer emits is compared or is one of the three exceptions, and that a field outside the record (`security.selinux`) is never written to the archive stream; starts a new apply instead of resuming; and kills the real binary during an rclone upload.
 - **AC-22** Applying a finished plan again changes nothing and reports items as done. Verify by:
   `resume.rs`.
 - **AC-23** One apply per user per machine (10.2), the lock path independent of `HOME` and
-  `XDG_*`, no stale lock after a kill, root refused without `--allow-root`. Each apply and restore
-  owns its spool directory, and cleanup removes only the spool directories of dead operations
-  (9.6). Verify by: `lock.rs` with two processes under different environments and state directories, and a killed holder; and `spool.rs`, which runs a restore whose fake rclone stalls with a file in its `--temp-dir`, starts an apply meanwhile, and then lets the restore finish, plus a killed operation's leftover spool directory that the next apply removes.
+  `XDG_*`, no stale lock after a kill, root refused without `--allow-root`. Each operation owns
+  its spool directory, cleanup removes a spool only when neither the tool nor any child of it
+  can still write there (9.6), every lock is taken with the primitive 9.6 names and is
+  close-on-exec except the inherited spool lock, and a lock call that errors counts as held.
+  Verify by: `lock.rs` with two processes under different environments and state directories, a killed holder, and an injected lock error; and `spool.rs` on macOS, Linux and Windows in the CI matrix, which runs a restore whose fake rclone stalls with a file in its `--temp-dir`, starts an apply meanwhile, and then lets the restore finish; kills only the parent while its fake rclone child stays stalled; and checks a killed operation's leftover spool directory that the next operation removes.
 - **AC-24** Free space and budgets follow section 18 and 9.5: the floor is checked on the state
   volume (which holds the spool directories) before each item and part, the part size is
   derived from free space and journaled per attempt, the upload budget uses logical size, and
@@ -1426,6 +1622,15 @@ two steps; it exists only in test builds (AC-35).
   phrase list (section 15) appears and that no sentence pairs "apply" with `ls-remote`,
   "re-check" or "re-verif"; a control copy of `SCAN-FORMAT.md` with one phrase restored, wrapped
   across a line break, must fail it; meanwhile `output.rs` checks the header line.
+- **AC-38** The answer `u` follows 11. It is offered only in ask mode on a terminal, only when the
+  unnamed-object rule is the item's only reason, and only for that item. Its prompt shows the
+  count, each object's size and content result, and the three statements of 11 word for word.
+  After `u` the item is asked about again, and the record carries `unnamed_uploaded`.
+  Verify by: `ask.rs` through the library's prompt interface and the binary through a pseudo-terminal, comparing the prompt with the three statements of 11 and with each content result (read in full, first 64 KiB, 1 MiB or more, budget spent); and `secrets.rs`, which shows the unnamed values in the inflated archive after `u` and in no stored object after `n`.
+- **AC-39** `quarantine list` and `quarantine finish` follow 5 and 10.1: a stranded Q is never
+  deleted without that command; an archived Q is deleted only when the resume check holds or after
+  `--discard-changes` with a typed confirmation; an unarchived regenerable Q only after a typed
+  confirmation; never without a terminal. Verify by: `quarantine.rs` with stranded archived and unarchived items, through a pseudo-terminal and a pipe, checking the file system, the records and the printed restore-and-merge steps.
 
 ## 21. Negative cases
 
@@ -1484,12 +1689,21 @@ two steps; it exists only in test builds (AC-35).
   back or reported. A resume with a different plan, scan or flags: refused. Both O and Q absent
   before `delete-started`: a `vanished` record, not `removed` or `kept`. Q gained a new file after
   `delete-started`: Q is left as it is and reported, nothing at O touched. A new directory at O
-  after `delete-started`: untouched. After `delete-started`, a remaining file in Q overwritten in
-  place with different bytes of the same length and its modification time set back to F0's: for
-  an archived item, the digest differs; for an unarchived regenerable item, the change time
-  differs. Either way nothing more is deleted, the file keeps its new bytes, Q stays, the item is
-  `failed`, and the summary names the file. The same archived item with its local index copy
-  deleted: the index is read from storage and the result is the same.
+  after `delete-started`: untouched. Changes made while stopped after `delete-started`, each alone,
+  in an archived item: a remaining file overwritten in place with different bytes of the same
+  length and its modification time set back; an extended attribute value on a remaining file
+  replaced by a value of equal length (`user.test` on Linux; the resource fork on macOS); an
+  extended attribute added to, or changed on, a remaining directory; a file's mode bits; a
+  `UF_HIDDEN` flag on macOS; a symlink's target replaced with one of equal length. Each strands Q:
+  nothing more is deleted, the change survives, the item is `failed`, the summary names the entry
+  and the field, and a later `--remove` run reports it without reading Q again. Controls that must
+  not strand: a remaining directory whose modification time moved because its children were
+  deleted; a two-name hard-link group with one name already deleted. The same archived item with
+  its local index copy deleted: the index is read from storage and the result is the same. An
+  unarchived regenerable item stopped after `delete-started`, with nothing changed: stranded all
+  the same, and nothing more is deleted. A Q at `quarantined` (before deletion) whose item
+  directory had an extended attribute value replaced by one of equal length: renamed back and
+  `kept`.
 - **NEG-20 (AC-23)** Two applies at once with different `HOME`, `XDG_DATA_HOME` and `--state-dir`:
   the second exits 1. A killed holder: the next apply starts. Run as root without `--allow-root`:
   exit 1.
@@ -1603,8 +1817,13 @@ two steps; it exists only in test builds (AC-35).
   a sibling of T, so the forged edge makes no cycle). The test writes a commit-graph that
   holds T and L, then edits T's entry so that T's parent is L, and recomputes the file's trailing
   checksum. A control walk with the graph enabled must reach the `.env` blob from T, which proves
-  the graph is load-bearing. Apply keeps the item, naming `.env`. AC-12's search finds the value
-  in no stored object, and it does find it with `--upload-secrets`.
+  the graph is load-bearing. The library's history check keeps the item, naming `.env`, so this
+  case does not depend on what core's scan makes of it. Core's runner does not disable the graph,
+  so its scan may see L as pushed and its plan may give either a removing action or `ask`. End to
+  end, the item is not removed and the value is in no stored object in both cases: apply keeps it
+  under a removing action, and does not select it under `ask`. The test runs whichever case core
+  produces and states which. With `--upload-secrets` and a removing action, AC-12's search does
+  find the value.
 - **NEG-48 (AC-23)** A restore whose fake rclone writes a file into its `--temp-dir` and then
   stalls, and an apply started during the stall: the restore's spool directory and file are
   untouched, and the restore completes when the stall is released. A spool directory left by a
@@ -1620,33 +1839,86 @@ two steps; it exists only in test builds (AC-35).
 - **NEG-50 (AC-1)** A dry run over a repository whose `.env` was set aside with `git stash -u`
   and then dropped, and one kept by the unnamed-object rule: both are reported "would keep" with
   their reasons, the per-rule counts show them, and nothing is written.
+- **NEG-51 (AC-38)** The answer `u`, each alone: an item with an unnamed object and also a `.env`
+  (no `u` offered, kept); the same item as NEG-46 in automatic mode, and with no terminal (no `u`
+  offered, kept); `u` typed ahead before the prompt (discarded; end of input then means `n`); `u`
+  for the first of two such items followed by `a` (the second is asked again, not uploaded); `u`
+  then `n` at the item prompt (kept, nothing uploaded). The prompt for objects of 10 KiB, 200 KiB
+  and 2 MiB, read in that order, and a fourth of 10 KiB, with an injected budget of 74 KiB (what
+  the first two use), shows "read in full", "first 64 KiB read", "not read: 1 MiB or more" and
+  "not read: the item's 74 KiB content budget was spent" (the injected figure in place of
+  64 MiB), and the three statements of 11; the binary through a pseudo-terminal shows them with
+  64 MiB.
+- **NEG-52 (AC-38)** After `u` and `y`, a new loose object written into the store before step 9:
+  the item is kept, nothing removed.
+- **NEG-53 (AC-39)** pnpm-style strand: an unarchived regenerable `node_modules` whose files are
+  hard links into a store outside the item, deletion stopped after `delete-started`, and one more
+  link added from the store side. The next `--remove` run strands it and reports it. `quarantine
+  list` shows it. `quarantine finish` through a pipe deletes nothing (exit 2). Through a terminal,
+  it lists the moved change times and link counts and deletes after the item id is typed. An
+  archived stranded Q from NEG-19: `finish` prints the `restore --to` steps and deletes nothing.
+  With `--discard-changes` and a typed id, it deletes and records `discarded_changes`. A wrong id
+  typed: nothing deleted (exit 2). `finish` with an unknown id, and with the id of a quarantine
+  stopped after `delete-started` that no run has checked yet: exit 1, nothing read or deleted.
+- **NEG-54 (AC-23)** A non-blocking lock call made to fail with `ENOLCK`, through the library's
+  file-system interface, on another operation's spool lock: that spool is left. The same on the
+  apply lock: exit 1 before anything is done. A state directory on a file system outside the 7.4
+  allowlist (injected): leftover spools are reported and not removed.
+- **NEG-55 (AC-9)** A fake git reporting 2.31.0, and one printing an unparsable version: exit 1 at
+  start, naming the version, nothing done.
+- **NEG-56 (AC-23)** On each supported platform, during a restore whose fake rclone child stalls
+  in a transfer with a file in its spool, only the parent is killed (SIGKILL; `TerminateProcess`
+  on Windows), then a new apply starts at once. macOS and Linux: the child still holds the spool
+  lock, so the new apply starts and leaves that spool and file alone, reports the surviving
+  process, and the next operation after the child exits removes the spool. Windows: the job object
+  kills the child, and the spool is removed only once the child has exited (the test records that
+  the child's handle closed before any file in the spool was deleted). A Linux and macOS variant
+  where the child hangs forever: no later apply waits for it.
+- **NEG-57 (AC-16)** A crash while a manifest segment is written: only a `.tmp` file is left,
+  reported and ignored, and the segment is written under its name later. A restore whose record
+  appears only in a damaged segment: refused (exit 1) without `--accept-unverified`; with it, the
+  output says the record is unverified and a part altered to differ from the record's digest
+  still fails the restore.
+- **NEG-58 (AC-20)** A `remove-regenerable` `node_modules` holding, directly in it, a file whose
+  text has a PEM private-key header. Removed without a backup: the 9.2 checks do not run, and the
+  item is removed (nothing is uploaded). The same with `--backup-regenerable`: kept by the content
+  rule, nothing uploaded.
+- **NEG-59 (AC-12)** Network tips: a repository with remotes `origin` (a network URL) and `mirror`
+  whose `remote.mirror.fetch` writes into `refs/remotes/origin/*`, and a local-only commit holding
+  a fake `.env` that only `refs/remotes/origin/feature` reaches, set there through `mirror`'s
+  refspec: the ref is not a network tip, the commit is examined, and the item is kept. A control
+  where `refs/remotes/origin/feature` is set by hand with `git update-ref` and no other refspec
+  matches it: the commit is subtracted and the item is archived, the case section 17 discloses; the
+  test asserts this so a later change to the rule is seen.
 
 ## 22. Reviews: findings and changes
 
-Earlier reviews (revision 2 acceptance, revision 4 adversarial, revision 5 and 6 acceptance) and how
-revisions 5 to 7 answered them are in [APPLY-SPEC-REVIEWS.md](APPLY-SPEC-REVIEWS.md). This table
-answers the two reviews of revision 7: an adversarial plan review (F-ids) and an acceptance review
-(T-ids and its question 4 on the over-keeping cost).
+Earlier reviews (revision 2 acceptance, revision 4 adversarial, revisions 5 and 6 acceptance,
+revision 7 adversarial and acceptance) and how revisions 5 to 8 answered them are in
+[APPLY-SPEC-REVIEWS.md](APPLY-SPEC-REVIEWS.md). This table answers the two reviews of revision 8:
+an adversarial plan review (F-ids) and an acceptance review (R8-ids and S-13). The coordinator
+noted that several rounds in a row closed one instance and the next review found a sibling, so
+revision 9 closes classes: one complete record of what the archive preserves, and spool ownership
+over every process that can write there.
 
-| Finding | Change in revision 8 | Criteria and negative cases |
+| Finding | Change in revision 9 | Criteria and negative cases |
 |---|---|---|
-| F1 the history walk trusts the commit-graph, which can name a parent the commit does not have | Every history command runs with `-c core.commitGraph=false`; the repository cannot re-enable it (core's config allowlist). Audit of the other repository-controlled inputs: grafts and alternates refused by core's layout check, replace refs and refs at blobs refused by its ref rule, `--no-replace-objects` as a second guard, bitmaps unused, shallow and promisor only shrink the walk, ids of parsed trees and tags recomputed, pack-index substitution disclosed (9.2, 7.5, 17); measured in the safe configuration (23) | AC-9, AC-12; NEG-47 |
-| F2 a resumed deletion trusted metadata, so an equal-length overwrite with its modification time set back was deleted unarchived | Subset check before any resumed deletion: digests with `fstat` identity checks for an archived item; the strict F0 rule with change time for an unarchived regenerable item; a check before each `unlinkat` (10.1) | AC-21; NEG-19 |
-| F3 apply emptied the spool directory that a running restore used; restore checked no state-volume space | One spool directory per operation (apply, restore and the manifest commands that read data) under a held lock, created and cleaned up only under a fixed guard lock, so cleanup removes only dead operations' spools (9.6, 10.2); restore's state-volume floor (13.3, 18); 13.2 never chmods files | AC-23, AC-24, AC-33; NEG-48, NEG-49 |
-| T-1 does a dry run perform the history check | Yes, with the same reasons and per-rule counts (9.2) | AC-1; NEG-50 |
-| T-2 9.2 relies on core's private package evidence | C-5 exposes it, with a core equality test (15) | AC-12 |
-| T-3 AC-9 could not tell history commands apart; the replace case did not test the walk | `-c disk-cleaner.phase=history` marker; AC-9 asserts the three overrides on marked calls; graft case in NEG-45 with a control walk; the replace cases run through the library because core's layout check refuses replace refs first | AC-9; NEG-45 |
-| T-4 no SHA-256 fixture | NEG-43 case 6 | AC-12; NEG-43 |
-| T-5 network tips undefined for unconfigured remotes and custom refspecs | Defined as core's `--remotes=NAME` refs of configured network remotes; anything else only enlarges the examined set (9.2) | AC-12 |
-| T-6 when the history check runs | Inside step 2, between F0 and the end-of-step-2 comparison (9.2) | AC-8, AC-12 |
-| T-7 and question 4: the over-keeping cost was understated | Stated plainly in 9.2, D-4, D-16 and 17: likely the common case for repositories worked on by hand, the run-wide override also uploads real secrets, the reason gives the remedy, a replayed corpus understates it (23); three options left to the user (D-16) | AC-12; NEG-46 |
-| T-8 no case made the cost observable | NEG-46 | AC-12; NEG-46 |
-| Minor remarks of the acceptance review | 17 names nameless blobs of 1 MiB or more and content-only checks of git-directory files; the time limit kills the git process group (9.2); git's own memory is unbounded (18) | AC-12 |
+| F1 resumed deletion missed extended attributes, and checked directories by path and kind only | The **preserved record** (section 4): everything the archive carries and restore writes back, computed by the archive writer's own function and stored in the index (xattr value digests included); resume compares it for every entry, with exactly three deletion-caused exceptions named; what is not preserved is listed in 17; the item directory's attribute values join the fingerprint, since the rename moves its change time; unarchived regenerable items never resume deletion on their own (the simpler alternative, taken where nothing is archived; 10.1 says why not for archived items) | AC-21; NEG-19 |
+| F2 a killed parent released the spool lock while its rclone child still wrote | Two locks: a close-on-exec operation lock held by the tool, and a spool lock every rclone child inherits (`flock`, macOS and Linux); a job object with kill-on-close on Windows; cleanup needs both locks, only on allowlisted file systems; the hung-child case stated (9.6, 17) | AC-23; NEG-56 |
+| R8-1 no way out of a stranded quarantine; is a failed check final | `quarantine list` and `quarantine finish` (5, 10.1); a stranded state, final and not re-read (6.1) | AC-39; NEG-53 |
+| R8-2 lock semantics per platform | `flock` and `LockFileEx` named, never `fcntl`; close-on-exec except the spool lock; an erroring call counts as held; Windows share-delete and delete-on-close (9.6, 10.2) | AC-23; NEG-54 |
+| R8-3 minimum git | 2.32, checked at start, exit 1 (7.5; ASSUMPTION on the value) | AC-9; NEG-55 |
+| R8-4 and the user's decision on D-16 | Option (i) specified as the answer `u` (11), labelled the user's choice with its source; the three limits the question did not carry are stated in 11 and shown word for word in the prompt (D-16) | AC-38; NEG-51, NEG-52 |
+| S-13 network tips | The "only enlarges" sentence corrected; refs that match another remote's fetch refspec are excluded; hand-set refs under `refs/remotes/NAME/` disclosed (9.2) | AC-12; NEG-59 |
+| S-13 NEG-47 end to end | States both outcomes of core's plan | NEG-47 |
+| S-13 step-2 secret checks and regenerable items | They run only for items that will be uploaded (6.2) | AC-20; NEG-58 |
+| S-13 manifest segments | Written atomically; restore refuses a record only in a damaged segment without `--accept-unverified` (12.2, 13.3) | AC-16; NEG-57 |
+| S-13 lost metadata changes | 17 lists everything not preserved and the three excused changes | AC-21 |
 
 ### 22.1 Minor items left for a later revision
 
-These items of the revision 6 review are accepted and not yet changed. None of them lets a removal
-lose data; each is either a disclosure, a fidelity detail or a test addition.
+These items of earlier reviews are accepted and not yet changed. None of them lets a removal lose
+data; each is either a disclosure, a fidelity detail or a test addition.
 
 - **S-4** SCAN-FORMAT.md says `recover-backup-then-remove`'s "recovery step re-checks every fact";
   add it to the C-4 phrase list (core owner). The `plan.rs` doc comment about recovery refs or a
@@ -1660,11 +1932,11 @@ lose data; each is either a disclosure, a fidelity detail or a test addition.
   it in the summary and name it in D-4's cost.
 - **S-12** Relative `include.path` values; whether the `fixture_prone` database names (`*.db`,
   `*.sqlite`) are in the secret name list; F0's size per entry stated as a measured figure; pnpm's
-  hard links to a store outside the item change link counts (a safe skip, to disclose, and a NEG
-  so a comparator based on link counts does not fail every restore). The restore-lock and
-  restore free-space parts of S-12 are answered by F3.
+  hard links to a store outside the item change link counts, which makes the F0 comparison skip
+  such an item before deletion (a safe skip, to disclose with a NEG; the stranding after deletion
+  began is NEG-53).
 - **Review section 4** AC-28 has no negative case: a storage holding two machines' manifests and no
-  `--machine` should be refused, not guessed. AC-15, AC-16, AC-22 and AC-26 have none either.
+  `--machine` should be refused, not guessed. AC-15, AC-22 and AC-26 have none either.
 
 ## 23. Test and build plan
 
@@ -1674,7 +1946,9 @@ lose data; each is either a disclosure, a fidelity detail or a test addition.
 - Builds and tests run in GitHub Actions on ubuntu, macOS and Windows; extra jobs: Linux mounts and
   spool (tmpfs, directory and file bind mounts, a vfat loop mount, with `sudo`), real rclone (a
   pinned release whose published SHA-256 is checked before use, `local` remotes only), and a release build that checks the hook is absent
-  (AC-35).
+  (AC-35). The pseudo-terminal tests (the answer `u`, `quarantine finish`) and the killed-parent
+  spool test (NEG-56, with its Windows job-object variant) run in the ordinary test job of each
+  of the three runners.
 - No test touches any directory outside its own temporary directory, and no test uses a network
   remote, a network host or a real credential.
 - **Measurements before release** (claims to be checked, not assumed; run in CI or on the fleet,
@@ -1692,8 +1966,9 @@ lose data; each is either a disclosure, a fidelity detail or a test addition.
     objects (`git add`, edit, `git add` again; `git add` then `git commit -a`; `git add -p`;
     hunk staging as GUI clients do it), or the corpus must include repositories of users who
     consented. Never a user's own repositories without their consent. The thresholds for "too
-    many kept" are set before the run and reported with the result, and the result informs the
-    user's choice among D-16's options.
+    many kept" are set before the run and reported with the result. The user has chosen the
+    answer `u` (D-16); the result is reported to the user as the share of items `u` could reclaim
+    in ask mode and the share automatic runs keep.
 
 ## 24. Click-test plan
 
@@ -1711,7 +1986,9 @@ runs the real binary before the work is called ready.
   unpushed commit, a stash, uncommitted, untracked and ignored files
   (`recover-backup-then-remove`); a project with a `node_modules` (`remove-regenerable`); one
   repository with a fake `.env`, one with a fake `.env` set aside with `git stash -u`, and one
-  where that stash was then dropped with `git stash drop` (all three kept by default); a nested case with a hand-edited file in `node_modules`; a file with an extended
+  where that stash was then dropped with `git stash drop` (all three kept by default); one where a
+  plain text file matching no secret pattern was staged and then replaced before a commit (kept by
+  the unnamed-object rule alone, so `u` is offered); a nested case with a hand-edited file in `node_modules`; a file with an extended
   attribute; a long path on Windows. The script sets every modification time and every commit
   date 60 days in the past, beyond the default 7-day active window, so the plan gives the actions
   named. The tester runs `scan` and `plan` on DIR.
@@ -1726,8 +2003,24 @@ runs the real binary before the work is called ready.
   `manifest orphans` after the interrupted run; `--require-encrypted-remote` on a plain remote
   (refused); a `restore` from (b) started while a `--backup-only` run is uploading, both
   completing, with the tester checking that `<state>/rclone-tmp/` holds one spool directory for
-  each live operation and none after both end. After each flow the tester compares the restored trees with the fixture and searches
-  every output for the fake `.env` value.
+  each live operation and none after both end; `--remove` in ask mode on the staged-and-replaced
+  repository, answering `n` at the `u` prompt (kept, nothing uploaded), then on a new run `u` after
+  reading the three statements the prompt shows (11) and `y` (archived and removed, the record
+  counting the unnamed objects), and on the dropped-stash repository (no `u` offered, since the
+  fake `.env` matches a pattern); the tool killed (not Ctrl-C) during the deletion of a
+  `node_modules` item and of an archived item holding the file with an extended attribute, that
+  attribute's value replaced by one of equal length while stopped, then `apply --resume` (both
+  stranded), `quarantine list`, and `quarantine finish` for each, once through a pipe (exit 2,
+  nothing deleted) and once on a terminal, typing the item id (for the archived item with
+  `--discard-changes`, after following the printed `restore --to` steps); and a control kill of an
+  archived item with nothing changed, after which `apply --resume` completes the deletion. After
+  each flow the tester compares the restored trees with the fixture and searches every output for
+  the fake `.env` value.
+- **Killed parent, macOS and Linux, against (b).** During an upload the tester stops the rclone
+  child with `kill -STOP`, kills the tool with `kill -9`, starts a `--backup-only` run, and checks
+  that the stopped child's spool directory is still there and is reported with its pid; then sends
+  the child `kill -CONT` and `kill -TERM` (the tester's own processes, in the test directory only)
+  and checks that the next operation removes that spool.
 - **Spool observation, (b) only.** During every upload to the non-local remote, the tester samples
   once a second the size of `<state>/rclone-tmp` (all spool directories) and the free space of the
   state volume, and
