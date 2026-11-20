@@ -78,7 +78,9 @@ export class Treemap {
         const share = formatPercent(percentOf(p.tile.alloc, t.total_alloc));
         const what = p.tile.id === null ? "everything else" : p.tile.is_dir ? "folder" : "file";
         const tag = p.tile.tag ? `, ${p.tile.tag}` : "";
-        const label = `${p.tile.name}: ${formatBytes(p.tile.alloc)}, ${share}, ${what}${tag}`;
+        // The visible text (name, then size and tag) comes first and in the same order, so a
+        // speech user can name the tile by what it shows (axe label-content-name-mismatch).
+        const label = `${p.tile.name}: ${formatBytes(p.tile.alloc)}${tag}, ${share}, ${what}`;
         const drill = p.tile.is_dir && p.tile.id !== null;
         return h(
           "button",
@@ -94,6 +96,8 @@ export class Treemap {
             },
           },
           p.w > 60 && p.h > 24 ? h("span", { class: "tile-name" }, p.tile.name) : null,
+          // A space between the two lines, so their words do not run together.
+          p.w > 60 && p.h > 40 ? " " : null,
           p.w > 60 && p.h > 40 ? h("span", { class: "tile-size" }, `${formatBytes(p.tile.alloc)}${tag}`) : null,
         );
       }),
