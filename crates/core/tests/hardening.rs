@@ -61,7 +61,11 @@ fn f1_filter_clean_in_repo_config_is_never_executed() {
 fn a_maintenance_lock_in_the_object_directory_is_local_admin_content() {
     let (_tmp, root, remotes) = workspace();
     let repo = pushed_repo(&root, &remotes, "app");
-    fs::write(repo.join(".git").join("objects").join("maintenance.lock"), "").unwrap();
+    fs::write(
+        repo.join(".git").join("objects").join("maintenance.lock"),
+        "",
+    )
+    .unwrap();
     let res = scan_with(&root, network_everywhere());
     let f = facts_of(&res, &repo);
     let notes = &node(&res, &repo).repo.as_ref().unwrap().notes;
