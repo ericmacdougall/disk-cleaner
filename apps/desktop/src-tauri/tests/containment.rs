@@ -36,19 +36,59 @@ fn fake_git() -> PathBuf {
 /// wants HEAD, config, refs, objects, objects/info and objects/pack before it runs any git
 /// (a fixture without config never starts git; CI run 44608860767).
 fn repo_fixture(dir: &Path) -> PathBuf {
-    let root = dir.join("root");
-    let git = root.join("app").join(".git");
-    std::fs::create_dir_all(git.join("objects").join("info")).unwrap();
-    std::fs::create_dir_all(git.join("objects").join("pack")).unwrap();
-    std::fs::create_dir_all(git.join("refs").join("heads")).unwrap();
-    std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-    std::fs::write(
-        git.join("config"),
-        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
-    )
-    .unwrap();
-    std::fs::write(root.join("app").join("main.rs"), "fn main() {}\n").unwrap();
+    repos_fixture(dir, "root", 1)
+}
+
+/// `n` plain repositories under `dir/name` (app0 ... app<n-1>).
+fn repos_fixture(dir: &Path, name: &str, n: usize) -> PathBuf {
+    let root = dir.join(name);
+    for i in 0..n {
+        let app = root.join(if n == 1 {
+            "app".to_string()
+        } else {
+            format!("app{i}")
+        });
+        let git = app.join(".git");
+        std::fs::create_dir_all(git.join("objects").join("info")).unwrap();
+        std::fs::create_dir_all(git.join("objects").join("pack")).unwrap();
+        std::fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("main.rs"), "fn main() {}\n").unwrap();
+    }
     root
+}
+
+fn now_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Each fake git's pid and start time (ns since the Unix epoch).
+fn starts(file: &Path) -> Vec<(u32, u128)> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The time the worker says it stopped starting processes ("analysis worker: ending at <ns>"
+/// on its stderr), if it said so.
+fn ending_mark(stderr: &str) -> Option<u128> {
+    stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("analysis worker: ending at "))
+        .and_then(|t| t.trim().parse().ok())
 }
 
 /// Why no git started: end the worker and return its exit and stderr.
@@ -66,7 +106,7 @@ fn pids(file: &Path) -> Vec<u32> {
     std::fs::read_to_string(file)
         .unwrap_or_default()
         .lines()
-        .filter_map(|l| l.trim().parse().ok())
+        .filter_map(|l| l.split_whitespace().next()?.parse().ok())
         .collect()
 }
 
@@ -226,6 +266,94 @@ fn the_worker_and_every_git_it_started_end() {
         }
         no_git_left(&pid_file, worker, "the parent going away");
     }
+
+    // The parent goes away right after "go", and between two git commands (code inspection
+    // F1): no git may start once the worker is ending, and none may outlive it. A test-build
+    // pause after the worker's sweep holds open the window in which its analysis could start
+    // one more git before it exits. Core runs 4 git jobs at a time and a sweep makes at most
+    // 40 passes, so it kills at most about 160 gits: with 200 repositories core always has git
+    // work left when a sweep stops, and without a block on new processes it starts another
+    // git in that window whatever the timing (not vacuous).
+    std::env::set_var("PRUNEDISK_TEST_END_PAUSE_MS", "3000");
+    let many = repos_fixture(tmp.path(), "many", 200);
+    for between in [false, true] {
+        let step = if between {
+            "the parent going away between two git commands"
+        } else {
+            "the parent going away right after go"
+        };
+        let file = tmp.path().join(if between {
+            "pids-between.txt"
+        } else {
+            "pids-after-go.txt"
+        });
+        std::fs::write(&file, "").unwrap();
+        std::env::set_var("PRUNEDISK_FAKE_GIT_PIDS", &file);
+        if between {
+            std::env::set_var("PRUNEDISK_FAKE_GIT_FIRST_EXITS", "1");
+        }
+        let mut w = spawn_worker(&app_exe(), &args(&many)).expect("spawn the worker");
+        let worker = w.handle.pid();
+        {
+            let stdin = w.stdin.as_mut().unwrap();
+            stdin.write_all(&[GO]).unwrap();
+            stdin.flush().unwrap();
+        }
+        if between {
+            // The first git ran and ended: the worker is between two git commands.
+            let first_done = || {
+                let p = pids(&file);
+                !p.is_empty() && alive(&p[..1]).is_empty()
+            };
+            if !wait_for(first_done, Duration::from_secs(60)) {
+                let report = worker_report(&mut w);
+                panic!("the fake git never started for {step}; {report}");
+            }
+        }
+        let closed_at = now_ns();
+        drop(w.stdin.take());
+        #[cfg(windows)]
+        let stderr = {
+            // The parent's death closes the job handle too.
+            drop(w);
+            String::new()
+        };
+        #[cfg(unix)]
+        let stderr = {
+            assert!(
+                wait_for(|| alive(&[worker]).is_empty(), Duration::from_secs(20)),
+                "the worker is still running 20 s after {step}"
+            );
+            w.handle.wait();
+            let mut err = String::new();
+            if let Some(mut s) = w.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut s, &mut err);
+            }
+            err
+        };
+        assert!(
+            wait_for(|| alive(&[worker]).is_empty(), Duration::from_secs(20)),
+            "the worker is still running after {step}"
+        );
+        // A fake git records its start after exec, so one forked just before the mark may
+        // record a later time: 250 ms of slack. Any git that starts later is a new start (and
+        // `no_git_left` below catches every survivor, whenever it started).
+        let mark = closed_at.max(ending_mark(&stderr).unwrap_or(0));
+        let late: Vec<(u32, u128)> = starts(&file)
+            .into_iter()
+            .filter(|(_, t)| *t > mark + 250_000_000)
+            .collect();
+        assert!(
+            late.is_empty(),
+            "a git started after {step}: {} of {} fake gits started after the worker was \
+             ending ({late:?}); worker stderr {stderr:?}",
+            late.len(),
+            starts(&file).len()
+        );
+        no_git_left(&file, worker, step);
+    }
+    std::env::remove_var("PRUNEDISK_FAKE_GIT_FIRST_EXITS");
+    std::env::remove_var("PRUNEDISK_TEST_END_PAUSE_MS");
 }
 
 /// Every git the worker started, including one started after the pids were first read (core

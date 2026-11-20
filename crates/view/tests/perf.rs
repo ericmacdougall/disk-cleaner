@@ -144,21 +144,29 @@ fn real_walk_over_a_million_empty_files() {
     let mut runs = Vec::new();
     for _ in 0..2 {
         let cancel = AtomicBool::new(false);
-        let mut events = 0u64;
+        let mut at: Vec<Instant> = Vec::new();
         let start = Instant::now();
         let tree = walk(&WalkOptions::new(vec![root.clone()]), &cancel, &mut |_| {
-            events += 1
+            at.push(Instant::now())
         })
         .unwrap();
         let t = ms(start.elapsed());
+        let events = at.len() as u64;
+        let closest = at
+            .windows(2)
+            .map(|w| ms(w[1].duration_since(w[0])))
+            .fold(f64::INFINITY, f64::min);
         assert_eq!(tree.stats.files, 1_000_000);
         let per_s = events as f64 / (t / 1000.0).max(0.001);
         println!(
-            "PERF real_walk_1m_files ms={t:.0} progress_events={events} per_second={per_s:.2} threads={}",
+            "PERF real_walk_1m_files ms={t:.0} progress_events={events} per_second={per_s:.2} closest_gap_ms={closest:.1} threads={}",
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
         );
-        // At most one per 100 ms plus the first and the last.
-        assert!(events as f64 <= t / 100.0 + 2.0);
+        // Spec: at most 10 progress events per second, the last one included.
+        assert!(
+            per_s <= 10.0 && closest >= 100.0,
+            "{events} progress events in {t:.0} ms ({per_s:.2} a second), closest two {closest:.1} ms apart"
+        );
         runs.push(t);
     }
     report("real_walk_1m_files", &runs, f64::INFINITY);

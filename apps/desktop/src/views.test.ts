@@ -339,6 +339,45 @@ describe("developer view paging (spec AC-4)", () => {
     expect(Math.max(...b.calls.filter((c) => c.name === "devPage").map((c) => c.args[2] as number))).toBe(300);
   });
 
+  it("keyboard focus stays on the class chosen and on the pager button pressed (spec AC-7)", async () => {
+    const b = mockBackend({
+      devSummary: async () => ({ ...SUMMARY, imported: false, groups }),
+      devPage: async (_v, cls, offset, limit) => {
+        const count = cls === "repo" ? 350 : 3;
+        const n = Math.max(0, Math.min(limit, count - offset));
+        return Array.from({ length: n }, (_, i) => item(cls, offset + i));
+      },
+    });
+    const v = new DevView(b, 1, () => undefined);
+    document.body.replaceChildren(v.el);
+    await v.load();
+    const caches = button(v.el, "Caches");
+    caches.focus();
+    caches.click();
+    await flush();
+    expect(button(v.el, "Caches").getAttribute("aria-pressed")).toBe("true");
+    expect(document.activeElement).toBe(button(v.el, "Caches"));
+    const repos = button(v.el, "Repositories");
+    repos.focus();
+    repos.click();
+    await flush();
+    expect(document.activeElement).toBe(button(v.el, "Repositories"));
+    const next = button(v.el, "Next");
+    next.focus();
+    next.click();
+    await flush();
+    expect(v.el.textContent).toContain("101 to 200 of 350");
+    expect(document.activeElement).toBe(button(v.el, "Next"));
+    for (let i = 0; i < 2; i++) {
+      button(v.el, "Next").click();
+      await flush();
+    }
+    // On the last page Next is disabled: focus moves to Previous instead of being lost.
+    expect(v.el.textContent).toContain("301 to 350 of 350");
+    expect(button(v.el, "Next").disabled).toBe(true);
+    expect(document.activeElement).toBe(button(v.el, "Previous"));
+  });
+
   it("a failed page keeps the page shown, says so, and Next asks for that page again", async () => {
     let failNext = true;
     const statuses: string[] = [];
@@ -397,9 +436,14 @@ describe("developer view paging (spec AC-4)", () => {
     expect(button(v.el, "Caches").getAttribute("aria-pressed")).toBe("false");
     expect(v.el.querySelector(".dev-items")?.textContent).toContain("/syn/repo/item-0");
     expect(v.el.querySelector('[role="alert"]')?.textContent).toContain("Could not load Caches 1 to 3");
-    button(v.el, "Try again").click();
+    const retry = button(v.el, "Try again");
+    retry.focus();
+    retry.click();
     await flush();
     expect(button(v.el, "Caches").getAttribute("aria-pressed")).toBe("true");
+    // The Try again button is gone; focus moves to the heading of the page now shown.
+    expect(document.activeElement?.tagName).toBe("H3");
+    expect(document.activeElement?.textContent).toBe("Caches");
     const items = v.el.querySelector(".dev-items")?.textContent ?? "";
     expect(items).toContain("/syn/cache/item-0");
     expect(items).toContain("1 to 3 of 3");

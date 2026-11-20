@@ -330,7 +330,23 @@ fn watchdog(go: std::sync::mpsc::Sender<()>) {
         }
     }
     end_own_session();
+    test_pause_before_exit();
     std::process::exit(5);
+}
+
+/// Test builds only: stay alive for `PRUNEDISK_TEST_END_PAUSE_MS` (at most 10 s) after the
+/// parent-death sweep, which holds open the window in which the analysis could start one more
+/// git before the worker exits (tests/containment.rs). Release builds never read it.
+fn test_pause_before_exit() {
+    #[cfg(debug_assertions)]
+    {
+        if let Some(ms) = std::env::var("PRUNEDISK_TEST_END_PAUSE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            std::thread::sleep(Duration::from_millis(ms.min(10_000)));
+        }
+    }
 }
 
 /// The parent is gone: end everything this worker started.

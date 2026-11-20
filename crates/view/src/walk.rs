@@ -485,6 +485,38 @@ mod tests {
         assert_eq!(sent, 10);
     }
 
+    /// Spec: at most 10 progress events per second. No two reports may be closer than the
+    /// interval, the one at the end included (a walk that ended just after a report used to
+    /// send its last report at once: 11 to 12 a second in CI run 44641016582).
+    #[test]
+    fn progress_reports_are_one_interval_apart_the_last_included() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in 0..3 {
+            std::fs::write(dir.path().join(format!("f{f}")), "x").unwrap();
+        }
+        let mut opts = WalkOptions::new(vec![dir.path().to_path_buf()]);
+        opts.progress_interval = Duration::from_millis(200);
+        let cancel = AtomicBool::new(false);
+        let mut at = Vec::new();
+        let mut last_files = 0;
+        let tree = walk(&opts, &cancel, &mut |p| {
+            at.push(Instant::now());
+            last_files = p.files;
+        })
+        .unwrap();
+        assert!(!at.is_empty(), "no progress report at all");
+        assert_eq!(last_files, tree.stats.files, "the last report holds the final count");
+        for w in at.windows(2) {
+            let gap = w[1].duration_since(w[0]);
+            assert!(
+                gap >= opts.progress_interval,
+                "two progress reports {gap:?} apart (interval {:?}, {} reports)",
+                opts.progress_interval,
+                at.len()
+            );
+        }
+    }
+
     #[test]
     fn nested_and_duplicate_roots_collapse() {
         let r = distinct_roots(&[
