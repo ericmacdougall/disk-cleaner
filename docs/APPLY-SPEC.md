@@ -49,9 +49,10 @@ In scope:
   `disk-cleaner restore`.
 - Ask mode (per item, the default) and automatic mode (per class, opt-in).
 - **Platforms.** macOS and Linux: dry run, backup, removal and restore. On Windows `apply` in
-  every mode, `restore`, `quarantine list` and every rclone-running command refuse (exit 4; 5, D-13).
+  every mode, `restore`, `quarantine list` and every rclone-running command refuse (exit 4; 5;
+  D-13, ASSUMPTION).
 - **Interrupted deletions are never finished by the tool.** A deletion that stops part-way leaves
-  a **leftover** quarantine that no later run deletes from or reads (10.1, D-17).
+  a **leftover** quarantine that no later run deletes from or reads (10.1; D-17, ASSUMPTION).
 
 Out of scope for this release. **Against the original requirements this release is partial; each
 item marked TARGET_MISMATCH is deferred, not met:**
@@ -61,7 +62,7 @@ item marked TARGET_MISMATCH is deferred, not met:**
   that work instead. Section 8 lists the entry conditions for the later release.
 - **TARGET_MISMATCH: Windows.** The requirement asked for Windows, macOS and Linux. In this
   release a Windows machine cannot back up, remove or restore, not even an archive made on macOS
-  or Linux (5, D-13, 8.2).
+  or Linux (5, 8.2). ASSUMPTION: the coordinator's choice, not the user's (D-13).
 - **TARGET_MISMATCH: outputs, agent sessions and logs, loose code.** The plan has no removing
   action for them yet. Backing up outputs and agent sessions to cold storage, and loose-code
   handling (connect an origin, back up raw, remove or leave), are deferred. The archive and manifest
@@ -134,10 +135,9 @@ and restore detect it, they cannot undo it); memory corruption.
   directory alone, whose change time the rename moves, it also holds the SHA-256 of each extended
   attribute's value, so that a change to them is still seen. Every other entry's change time moves
   on any write, chmod, flag or attribute change, which is what makes the fingerprint sufficient
-  before deletion begins. Any other kind
-  of entry (fifo, socket, device) makes the item unsupported, except the socket
-  `.git/fsmonitor--daemon.ipc`, which SCAN-FORMAT.md allows in a plain git directory: it is
-  recorded by name, not archived, and not recreated by restore.
+  before deletion begins. Any other kind of entry (fifo, socket, device) makes the item
+  unsupported, except the socket `.git/fsmonitor--daemon.ipc`, which SCAN-FORMAT.md allows in a
+  plain git directory: it is recorded by name, not archived, and not recreated by restore.
 - **Preserved record**: for one entry, everything the archive carries for it **and restore writes
   back** (9.3, 13.3), and nothing else:
   - relative path (bytes) and kind;
@@ -190,7 +190,8 @@ disk-cleaner manifest orphans --storage REMOTE:PATH [--machine ID] [--json]
 disk-cleaner quarantine list [--state-dir DIR] [--json]
 ```
 
-- `quarantine list` prints, for every leftover quarantine a journal names (10.1): its path, the
+- `quarantine list` prints, for every leftover quarantine a journal names, and every quarantine
+  not renamed back because a directory occupies its original path (10.1): its path, the
   item and run it came from, the record and archive that hold the verified copy of the item (none
   for an unarchived regenerable item), the exact `disk-cleaner restore RECORD_ID --to DIR` command
   with an absolute DIR outside the quarantine's parent, and this statement: "disk-cleaner will not
@@ -230,9 +231,9 @@ lock (10.2) and reconciles what earlier runs left behind, according to its mode:
 - **`--backup-only` and `--remove`:** in addition, records written but not yet in a synced
   segment are synced to the storage named in **that run's journal** (not the current `--storage`,
   if it differs).
-- **`--remove`:** in addition, a quarantine whose deletion never started (`quarantine-intent` or
-  `quarantined`, 10.1) is renamed back to its original path when that path is free, and its item
-  is recorded `kept`. That rename reads nothing inside it.
+- **`--remove` and a resume:** in addition, a quarantine whose deletion never started
+  (`quarantine-intent` or `quarantined`, 10.1) is renamed back to its original path when that path
+  is free, and its item is recorded `kept`. That rename reads nothing inside it.
 
 No mode reads, deletes or renames anything inside a leftover.
 
@@ -261,8 +262,8 @@ and the run continues with the next item; nothing that failed a check is ever re
 8. **Process check again.**
 9. **Quarantine**: rename with no-replace semantics; take the fingerprint of the renamed directory
    through the handle opened on it, and compare with F0 (the item directory's attribute values
-   included, section 4). Any difference: rename it back and end as
-   `backed-up-kept` (the archive stays, the manifest says why). If the rename back fails because
+   included, section 4). Any difference: rename it back and end as `backed-up-kept` (the archive
+   stays, the manifest says why). If the rename back fails because
    the original path was recreated, the quarantine stays, the record says where, and the summary
    names both paths.
 10. **Delete** the quarantined directory (section 13.2).
@@ -498,8 +499,9 @@ revisions 2 and 4, each answered in a spec with its own criteria:
 Revision 9 (commit `fbf25f3`) holds the Windows design (handle-based backup and restore, job
 objects, locks, placeholders, alternate data streams, long paths). Entry conditions: **r9
 adversarial F1**, an observable barrier proving every writer of a dead operation's spool exited
-before cleanup; **r9 adversarial F2**, a fail-closed Windows file-system allowlist for the state
-directory's locks; tests of a failed `AssignProcessToJobObject` and of breakaway under a job.
+before cleanup (until then the spool is kept); **r9 adversarial F2**, a fail-closed Windows
+file-system allowlist for the state directory's locks; tests of a failed
+`AssignProcessToJobObject` and of breakaway under a job; handle-based removal, if wanted.
 
 ### 8.3 Finishing interrupted deletions (D-17)
 
@@ -565,9 +567,9 @@ always to the user's own storage):
   enlarge the examined set. The opposite is not prevented: a ref under `refs/remotes/NAME/` set by
   hand (`git update-ref`) to a local-only commit, including one at a deeper name such as
   `refs/remotes/NAME/sub/x`, is subtracted. This is the stale or hand-set tracking-ref case
-  section 17 discloses. The examined set holds what unpushed
-  commits, stashes (live or dropped), reflogs, the index and unreachable objects hold (a dropped
-  stash, a file staged and then unstaged, a deleted branch). It is computed with the history
+  section 17 discloses. The examined set holds what unpushed commits, stashes (live or dropped),
+  reflogs, the index and unreachable objects hold (a dropped stash, a file staged and then
+  unstaged, a deleted branch). It is computed with the history
   commands of 7.5 only, and they run inside step 2, after F0 and before step 2 takes the
   fingerprint again. A change to the store after the check (a new loose object or pack, a moved
   ref) changes an entry of the git directory. The end-of-step-2 and end-of-archive comparisons
@@ -844,8 +846,8 @@ length).
     `ID.spool` locked. Its spool then stays: every later operation reports it ("a process of dead
     operation ID still holds its spool; last known rclone pid N"; the pid is recorded in `ID.pids`
     for this message only, is never trusted as a lock, and may already be gone when a subprocess
-    of rclone is the holder) and counts its bytes against
-    the state volume's floor. No later operation waits for it, because the operation lock and the
+    of rclone is the holder) and counts its bytes against the state volume's floor. No later
+    operation waits for it, because the operation lock and the
     apply locks are close-on-exec, and the tool never kills a process it did not start in the
     current operation. When the child exits, the next operation removes the spool.
   - **End.** The operation waits for its children, then removes `OP/`, `OP.spool` and `OP.lock`
@@ -886,11 +888,11 @@ length).
   resumed `--backup-only` run never deletes. **A deletion that began is never continued.**
 
 **Leftovers.** When the deletion pass of 13.2 stops before emptying Q (a kill, a machine stop, or
-a difference the pass found), Q is a leftover: no run or mode ever deletes from it, renames it or
-reads inside it again. A difference journals `left` with the entry and field; the item is
-`failed`. A run that finds `delete-started` with Q present journals `left` without looking inside
-Q. Every later run reports the leftover (6.1); `quarantine list` (5) shows how to restore the item
-and that removing the folder is the user's own action (D-17, 8.3).
+a difference it found), Q is a leftover: no run ever deletes from it, renames it or reads inside
+it again. A difference journals `left` with the entry and field; the item is `failed`. Every run
+reports a leftover (6.1), but only a `--remove` run or a resume writes for one: `left` on finding
+`delete-started` with Q present (without looking inside), and the table's records. `quarantine
+list` (5) shows how to restore the item and that removing the folder is up to the user (D-17).
 
 In the table, **O** is the original path and **Q** the quarantine path. "Present" for O means a
 directory is there; a resume never touches a directory at O that is not the item (same device,
@@ -1193,8 +1195,8 @@ Process checks use `sysinfo`. **Windows**: the commands section 5 lists (`apply`
     re-checks them").
 
   The quoted phrases above are the **C-4 phrase list**. Tests that compare these strings change with
-  them. C-4 belongs to the core owner; until it lands,
-  apply prints the correction in the header of every run that selects a git item.
+  them. C-4 belongs to the core owner; until it lands, apply prints the correction in the header
+  of every run that selects a git item.
 - **C-5** Package evidence per file: core makes its `has_package_evidence` (`crates/core/src/scan.rs`)
   public, or `rescan_item` reports for each file below a `regenerable` or `cache` node whether that
   evidence holds. Apply's package exemption (9.2) uses this and nothing of its own. A core test
@@ -1289,9 +1291,8 @@ sourced in D-16).
   `git add` or `git commit -a`; `git add -p`; GUI hunk staging. A repository with no remote and
   one harmless file staged twice is kept (NEG-46). Apply runs with `gc.auto=0` and automatic `gc`
   rarely runs in small repositories, so for hand-worked repositories this is likely the common
-  case. The overrides are the run-wide
-  `--upload-secrets`, which also uploads real `.env` and key files (D-4), and, in ask mode only,
-  the per-item answer `u` below. The reason text gives the remedy (9.2): inspect with
+  case. The overrides are the run-wide `--upload-secrets`, which also uploads real `.env` and key
+  files (D-4), and, in ask mode only, the per-item answer `u` below. The remedy (9.2): inspect with
   `git fsck --lost-found`, and prune with `git gc --prune=now` only if the objects are not
   wanted. Pruning also destroys dropped stashes, which is why apply never prunes. A corpus
   replayed from public clones understates the rate, so section 23 requires those habits in it.
@@ -1388,8 +1389,8 @@ sourced in D-16).
 - Archives are streamed; local disk use is the journal, the manifest segments and the index copies.
 - **Floor.** Before each item, and before each part, apply checks free space on the state
   directory's volume, which also holds the spool directories (9.6). Restore checks the same floor
-  before each part (13.3). `--min-free` (default
-  1 GiB, a fixed amount, not a share of the volume) must remain free there.
+  before each part (13.3). `--min-free` (default 1 GiB, a fixed amount, not a share of the
+  volume) must remain free there.
 - **Part size.** At the start of each attempt the part size is
   `min(--part-size, (free on the state volume - min-free) / 2)`, rounded down to a MiB, with
   `--part-size` defaulting to 1 GiB. Below 64 MiB the item is not started ("not enough free space
@@ -1402,8 +1403,8 @@ sourced in D-16).
   structures grow with the item: the fingerprint F0, about 200 bytes per entry (half a million
   entries in a `node_modules` archived with its repository, D-15, is about 100 MB), and the history
   rule's object table (9.2), one object id plus one byte (type and mark) per object, kept sorted in
-  the order `--batch-all-objects` prints: at the 10 million
-  object limit about 210 MB for SHA-1 and 330 MB for SHA-256, one git directory at a time. git's
+  the order `--batch-all-objects` prints: at the 10 million object limit about 210 MB for SHA-1
+  and 330 MB for SHA-256, one git directory at a time. git's
   own memory for `rev-list --objects` on such a store is not bounded by the tool. Only the time
   limit bounds it, and section 23 measures it.
 - One item at a time; one rclone process at a time.
@@ -1412,8 +1413,8 @@ sourced in D-16).
 ## 19. Exit codes and output
 
 - 0: dry run completed, or every selected item ended removed (alone or `removed-with` its
-  enclosing item), `backed-up-kept` by request
-  (`--backup-only`, answer `s`), answered `n`, or was already done.
+  enclosing item), `backed-up-kept` by request (`--backup-only`, answer `s`), answered `n`, or was
+  already done.
 - 1: refused before acting (usage, inputs not bound, plan too old, lock held, root without
   `--allow-root`, rclone or git missing or too old, an encrypted rclone
   configuration, storage unusable, `--require-encrypted-remote` with a plain remote).
@@ -1430,8 +1431,8 @@ JSON. No output, journal line or record holds a secret value or a credential URL
 ## 20. Acceptance criteria
 
 Tests live in `crates/apply/tests/` and run in CI on ubuntu and macOS; the Windows runner runs the
-refusal test of AC-30 and core's own tests. Unless stated, they
-use temporary directories, the in-process `LocalDirStore` or `FaultStore` (a wrapper that injects
+refusal test of AC-30 and core's own tests. Unless stated, they use temporary directories, the
+in-process `LocalDirStore` or `FaultStore` (a wrapper that injects
 partial writes, flipped bytes on read, success reported as failure, objects deleted after
 verification, stalls), and local git repositories. No test contacts a network host. A separate job
 runs the flows through the real `rclone` binary against an rclone `local` remote defined in a
@@ -1614,17 +1615,17 @@ two steps; it exists only in test builds (AC-35).
   unnamed-object rule is the item's only reason, and only for that item. Its prompt shows the
   count, each object's size and content result, and the three statements of 11 word for word.
   After `u` the item is asked about again, and the record carries `unnamed_uploaded`. No answer is
-  reused after F0 is taken again (11).
-  Verify by: `ask.rs` through the library's prompt interface and the binary through a pseudo-terminal, comparing the prompt with the three statements of 11 and with each content result (read in full, first 64 KiB, 1 MiB or more, budget spent); and `secrets.rs`, which shows the unnamed values in the inflated archive after `u` and in no stored object after `n`.
+  reused after F0 is taken again (11). Verify by: `ask.rs` through the library's prompt interface and the binary through a pseudo-terminal, comparing the prompt with the three statements of 11 and with each content result (read in full, first 64 KiB, 1 MiB or more, budget spent); and `secrets.rs`, which shows the unnamed values in the inflated archive after `u` and in no stored object after `n`.
 - **AC-39** Leftovers follow 5, 7.4, 10.1 and 13.3: `quarantine list` prints, for each, the path,
   item, run, record, archive, the exact restore command with an absolute target outside the
   quarantine's parent, and the statement of 5; no command deletes a leftover; restore refuses a
   target or staging directory inside a quarantine; an item that holds or lies inside a quarantine
   or a restore staging directory is kept, by apply and by core's plan (C-6). Verify by:
-  `quarantine.rs` with archived and unarchived leftovers, comparing the printed text and the JSON
-  with the journal and records, and the file system before and after; `restore.rs` with `--to`
-  inside a leftover (relative and absolute); `nested.rs` with a leftover inside a repository and
-  inside a `node_modules`; and the core test of C-6.
+  `quarantine.rs` with archived and unarchived leftovers and a quarantine whose original path is
+  occupied, comparing the printed text and the JSON with the journal and records, and the file
+  system before and after; `restore.rs` with `--to` inside a leftover (relative and absolute);
+  `nested.rs` with a leftover inside a repository and inside a `node_modules`; and the core test
+  of C-6.
 
 ## 21. Negative cases
 
@@ -1686,9 +1687,10 @@ two steps; it exists only in test builds (AC-35).
   unarchived regenerable items), with nothing changed, and again with a file rewritten with equal
   length and its time set back, a new file, and a FIFO with no writer planted in Q: a resume, a
   new `--remove` run, a `--backup-only` run and a dry run each report the leftover, delete
-  nothing, never hang, and make no call naming a path inside Q (so an implementation that
-  compares or finishes Q fails). Q then removed by hand: the next run writes `deleted` and the
-  record with `completed_by: "unknown"` once. A new directory at O: untouched.
+  nothing, never hang, and make no call naming a path inside Q (failing any implementation that
+  compares or finishes Q); only the `--remove` run and the resume journal `left`. Q removed by
+  hand: the next `--remove` run, not a `--backup-only` or dry run, writes `deleted` and the record
+  with `completed_by: "unknown"` once; `quarantine list` omits Q; a new directory at O: untouched.
 - **NEG-20 (AC-23)** Two applies at once with different `HOME`, `XDG_DATA_HOME` and `--state-dir`:
   the second exits 1. A killed holder: the next apply starts. Run as root without `--allow-root`:
   exit 1.
@@ -1978,18 +1980,17 @@ runs the real binary before the work is called ready.
 - **Fixtures.** `scripts/make-click-fixtures DIR` (part of the PR) creates, inside DIR only: a
   repository whose remote is an https URL on a reserved `.invalid` host and whose remote-tracking
   refs are set locally to its tips, so the scan reports it saved (`backup-then-remove`; apply never
-  contacts that host); one with an
-  unpushed commit, a stash, uncommitted, untracked and ignored files
-  (`recover-backup-then-remove`); a project with a `node_modules` (`remove-regenerable`); one
+  contacts that host); one with an unpushed commit, a stash, uncommitted, untracked and ignored
+  files (`recover-backup-then-remove`); a project with a `node_modules` (`remove-regenerable`); one
   repository with a fake `.env`, one with a fake `.env` set aside with `git stash -u`, and one
   where that stash was then dropped with `git stash drop` (all three kept by default); one where a
   plain text file matching no secret pattern was staged and then replaced before a commit (kept by
-  the unnamed-object rule alone, so `u` is offered); a nested case with a hand-edited file in `node_modules`; a file with an extended
-  attribute; a `node_modules` large enough (a few hundred MiB in many files) that its deletion
-  takes several seconds, so the tester can stop the tool during it. The script sets every
-  modification time and every commit
-  date 60 days in the past, beyond the default 7-day active window, so the plan gives the actions
-  named. The tester runs `scan` and `plan` on DIR.
+  the unnamed-object rule alone, so `u` is offered); a nested case with a hand-edited file in
+  `node_modules`; a file with an extended attribute; a `node_modules` large enough (a few hundred
+  MiB in many files) that its deletion takes several seconds, so the tester can stop the tool
+  during it. The script sets every modification time and every commit date 60 days in the past,
+  beyond the default 7-day active window, so the plan gives the actions named. The tester runs
+  `scan` and `plan` on DIR.
 - **Storage.** (a) A local-directory rclone remote in a temporary rclone config. (b) One real
   non-local remote in a disposable bucket or folder that the coordinator provides at test time. The
   tester configures it in their own rclone config; no credential appears in the repository, the
@@ -2021,10 +2022,9 @@ runs the real binary before the work is called ready.
   and checks that the next operation removes that spool.
 - **Spool observation, (b) only.** During every upload to the non-local remote, the tester samples
   once a second the size of `<state>/rclone-tmp` (all spool directories) and the free space of the
-  state volume, and
-  records the peak size, the lowest free space and the part size the journal shows. The flow
-  fails if the peak exceeds the part size or the free space falls below `--min-free`. This is the
-  check section 17 defers to the click-test.
+  state volume, and records the peak size, the lowest free space and the part size the journal
+  shows. The flow fails if the peak exceeds the part size or the free space falls below
+  `--min-free`. This is the check section 17 defers to the click-test.
 - **Flows on Windows:** `scan` and `plan` on DIR; each command of NEG-60 exits 4 with the
   message and creates no state directory (checked in local application data and a given
   `--state-dir`).
