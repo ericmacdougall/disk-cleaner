@@ -1,10 +1,43 @@
 # Apply spec: earlier reviews
 
-How revisions 5 to 12 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
+How revisions 5 to 13 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
 from section 22 (revision 5's answers in revision 6, revision 6's in revision 7, revision 7's in
 revision 8, revision 8's in revision 9, revision 9's in revision 10, revision 10's in revision
-11, revision 11's in revision 12, revision 12's in revision 13). Criterion and negative-case ids are those of revision 5 and later; section numbers are
+11, revision 11's in revision 12, revision 12's in revision 13, revision 13's in revision 14). Criterion and negative-case ids are those of revision 5 and later; section numbers are
 those of APPLY-SPEC.md. Later changes to the same areas are listed in APPLY-SPEC.md section 22.
+
+## Reviews of revision 12 (adversarial and acceptance)
+
+F-ids are the adversarial plan review's and S-ids the acceptance review's, prefixed `r12`
+(S-7 unused). Revision 14 changed two of the answers below: the writer's guarantee depends on
+the kind of rule (row r12 F1), and the resume row for `recorded` reconciles the remote segment
+before writing (row r12 S-3).
+
+| Finding | Change in revision 13 | Criteria and negative cases |
+|---|---|---|
+| r12 F1 the writer repeated the content rule only for working-tree statuses, and the credential-URL rule alone for git directory files | One rule table (9.2) and one function used by step 2 and the writer; the writer applies every rule the table gives each kind of file to the bytes it sends, whatever its status; a test enumerates rows and kinds (9.2, 9.4) | AC-43, AC-46; NEG-70, NEG-80 |
+| r12 F2 the first inventory came after the history commands | The inventory chain: I0 before the history commands, I1 before the git directory's first byte and equal to I0, each file's digest as sent equal to I0; what a mismatch does at each point; the cost stated (9.4, 17, 18, 23) | AC-43; NEG-72, NEG-85 |
+| r12 F3 NEG-75 required outcomes the sequence cannot give | Split by first detection: step 2 (a readability probe, before any prompt) and upload (the attempt stops, objects removed, absence asserted only for the failing file and what follows it in archive order); every negative case added in revisions 11 and 12 reread (NEG-70, 72, 74 changed) | AC-44; NEG-75, NEG-81 |
+| Coordinator: cost where the chain protects nothing | The history check and the chain are not run under `upload-all`, and I1 and the emitted comparison are skipped after `u`; the record says which checks ran (`checks_run`) (9.2, 12.1, 18, D-4) | AC-42, AC-47; NEG-69, NEG-83 |
+| r12 S-1 NEG-74 could pass vacuously | Each damage fixture is shown to reach the prompt and fails the test, never skips; core's layout check judges names only (`gitshape.rs`), so a lone pack and a named loose object are accepted | AC-44; NEG-74 |
+| r12 S-2 an unreadable entry surfaced after the prompt and the upload | The readability probe in step 2; an unreadable entry found only by a read is not retried (9.2, 9.4) | AC-44; NEG-75, NEG-81 |
+| r12 S-3 where `recorded` sits | Journaled and synced before the record is written and the segment uploaded (6.2, 9.4, 10.1) | AC-14; NEG-14 |
+| r12 S-4 three levels of nesting, "decision" | The digest is over the item's own entries; a decision is the latest `answered` line of this run; an earlier run's does not count (6.3, 9.2) | AC-45; NEG-82 |
+| r12 S-5 a resume cannot tighten | `--resume RUN_ID --secrets keep` narrows (5, 10.1) | AC-21; NEG-79 |
+| r12 S-6 late-arriving objects | The next non-dry run lists attempts removed in the last 7 days once and removes again (9.4) | AC-14; NEG-14 |
+| r12 S-8 wording | Upload race: before or after the read; deletion race: write or replacement; the clock tick of F0; the name rule applies where 9.2's does (9.4, 17) | AC-43; NEG-86 |
+| r12 S-9 hygiene | AC-44's `Verify by:` on one line; the rename-over case; AC-9's citations as cases of AC-12 | AC-9, AC-44; NEG-86 |
+| r12 S-10 inventory proportion | Kept where it protects the decision, not run where it protects nothing (above) | AC-47; NEG-83 |
+| r12 S-11 deletion-pass platform rules | `UF_COMPRESSED` and `UF_TRACKED` excluded on macOS with the reason; the setgid exemption on macOS stated as an unverified hypothesis with an injected control (13.2) | AC-19; NEG-61 |
+| r12 S-12 names that attack the terminal | One printing function for every name, escaping control and bidirectional characters, citing core's `esc` and `diag` (5, 11) | AC-38; NEG-84 |
+| r12 S-13 memory | Inventories and index records named in 18 | none |
+| r12 S-14 nested costs | D-4 states the re-walk and shared budget, the double storage, the earlier-run rule and the mixed-handling mismatch | none |
+| r12 S-15 `history_damage` labelling | Only damage the tool can name from structured output or its listing gets a label; a permission error is "could not run" (9.2) | AC-44; NEG-74 |
+| Found while writing revision 13 (not a reviewer's finding) | Under `upload-all` an enclosing item with an undecided nested repository is kept, since its history is unexamined (6.3, NEG-76); I0 is under the history check's timer and count (9.2); a resume finishes a segment from the `recorded` line (10.1, NEG-14); the damage note is absent under `upload-all` (D-4, NEG-74) | AC-45; NEG-14, NEG-74, NEG-76 |
+| r12 packet note | The packet's Source for AC-45 is an inferred source naming the acceptance report, not the user's D-4 answer (a rule that refuses uploads is not supported by words that ask for them) | none |
+
+Rewritten in place: AC-9, 21, 38, 42, 43, 44, 45 and NEG-14, 61, 69, 70, 72, 74, 75, 76, 79. Added:
+AC-46, 47 and NEG-80 to 86. None was withdrawn.
 
 ## Reviews of revision 11 (adversarial and acceptance)
 

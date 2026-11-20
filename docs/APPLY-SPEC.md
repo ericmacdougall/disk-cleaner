@@ -1,6 +1,6 @@
 # Apply phase specification
 
-Status: **draft for review, revision 13**. Nothing in this document is implemented yet. It defines
+Status: **draft for review, revision 14**. Nothing in this document is implemented yet. It defines
 what `disk-cleaner apply`, `disk-cleaner restore` and `disk-cleaner manifest` must do before any
 code is written, and it is the contract the tests are written against. Section 16 lists the
 decisions that are still open; text that depends on one of them says so. Section 22 maps the latest
@@ -19,8 +19,10 @@ writer share one rule table and one function (9.2, 9.4), binds the history check
 sent with an inventory chain that is not run where the check cannot change a decision
 (`upload-all`, after `u`; 9.2, 9.4), probes every entry's readability before any prompt (9.2),
 defines nesting at several levels (6.3), escapes every printed name (5), and tightens the
-negative cases that promised more than the sequence can give (21). Criteria are rewritten in place
-under the same numbers (section 22).
+negative cases that promised more than the sequence can give (21). Revision 14 gives each rule of
+the table a kind and states what each kind withholds (9.2), reconciles a remote segment before
+writing it again after a crash (12.2), and builds every command the tool prints for pasting with
+shell quoting (5). Criteria are rewritten in place under the same numbers (section 22).
 
 Read with [DESIGN.md](DESIGN.md) and [SCAN-FORMAT.md](SCAN-FORMAT.md). Where this document and
 SCAN-FORMAT.md disagree about the plan format, SCAN-FORMAT.md wins and this document is wrong. The
@@ -230,15 +232,18 @@ disk-cleaner quarantine list [--state-dir DIR] [--json]
   No command deletes a quarantine.
   - **Not started** (`quarantine-intent` or `quarantined`): "This folder is the complete item;
     nothing was deleted." Then the commands that put it back: `disk-cleaner apply --resume RUN_ID`
-    and, **only when nothing is at the original path**, the manual `mv -n Q O` (on Linux
-    `mv -nT Q O`, which never moves Q into a directory that appears at O meanwhile). When something
+    and, **only when nothing is at the original path**, the manual `mv -n -- Q O` (on Linux
+    `mv -nT -- Q O`, which never moves Q into a directory that appears at O meanwhile), with Q and
+    O quoted by the function of "Printed commands" below, and no command at all when either path
+    holds a control character or bytes that are not valid UTF-8. When something
     occupies the original path, it prints no `mv` command (with a directory at O, `mv -n Q O`
     would move Q inside it): it names what is there and says "first move or rename what is at O,
     then run `disk-cleaner apply --resume RUN_ID`".
   - **Leftover** (`delete-started` or `left`): the record and archive that hold the verified copy
     (none for an unarchived regenerable item, which says "never archived; rebuildable"), the exact
     `disk-cleaner restore RECORD_ID --to DIR` command with an absolute DIR outside the
-    quarantine's parent, and these statements: "It is incomplete: some of its files were already
+    quarantine's parent (DIR quoted by the same function, and no command when DIR cannot be
+    quoted safely), and these statements: "It is incomplete: some of its files were already
     deleted. Do not use it as a working copy; the restore command gives the complete item." and
     "disk-cleaner will not delete this folder. Removing it is your own action, after you have
     checked it."
@@ -281,13 +286,31 @@ disk-cleaner quarantine list [--state-dir DIR] [--json]
 - **Printing names.** Every file name, path, symlink target, ref or other text that came from the
   file system or a repository and is printed (an item prompt, the secrets prompt, a reason such as
   "holds NAME", `quarantine list`, the summary, `--json` string values) passes through one
-  function that shows each control character as `\u{..}`, as core's report code already does
-  (`esc` in `crates/cli/src/report.rs`; core's `diag` in `crates/core/src/redact.rs` replaces
-  control characters in stored notes), and in addition shows the bidirectional controls
+  **display function** that shows each control character as `\u{..}`, as core's report code
+  already does (`esc` in `crates/cli/src/report.rs`; core's `diag` in `crates/core/src/redact.rs`
+  replaces control characters in stored notes), and in addition shows the bidirectional controls
   (U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069) and bytes that are not valid UTF-8 the
-  same way (`\u{..}`, `\xNN`). A name is also cut to 200 characters in a prompt, with its length
-  shown. No name can therefore end a line, move the cursor, or overwrite the prompt's own lines
-  such as "these files will be stored unencrypted in REMOTE".
+  same way (`\u{..}`, `\xNN`). In a prompt a name longer than 200 characters is shown as its first
+  100 characters, an ellipsis with the number of characters left out, and its last 80 characters
+  (ASSUMPTION, the owner's), so that the end of a name, which is often what tells two names apart,
+  is not hidden. No name can therefore end a line, move the cursor, or overwrite the prompt's own
+  lines such as "these files will be stored unencrypted in REMOTE". In `--json` output, string
+  values use **JSON escaping** (`\uXXXX`), not the display form; a path that is not valid UTF-8 is
+  carried as a separate field holding its bytes in base64, next to a lossy display string.
+- **Printed commands.** Display escaping is for reading. A command the tool prints for the user to
+  paste (the `mv` of `quarantine list`, the `disk-cleaner restore RECORD_ID --to DIR` of
+  `quarantine list`, of records and of summaries, the instruction to put a not-started quarantine
+  back, any hint that names a path, and every command in the flows of section 24) is built by a
+  **second function that shares no code with the display function** and is the only way such a
+  line is made. Each argument that came from the file system (Q, O, DIR, a path) is quoted for a
+  POSIX shell in single quotes, with `'` written `'\''`; every path argument follows `--` (a
+  directory named `-x` must not become an option); the words of the command, the run id and the
+  record id are the tool's own and are not quoted. **If a path holds a newline, any other control
+  character or bytes that are not valid UTF-8, no command is printed for it**: the output says
+  which action is meant, shows the path through the display function and says "use the name
+  as it is on disk; no command can be pasted safely". The same function is used wherever the same
+  command appears (a record's `restore` field holds the command with RECORD_ID only, which needs
+  no quoting, and `--to DIR` is added only by this function). AC-48 and NEG-88 test it.
 - Running as root (uid 0) is refused unless `--allow-root`.
 - Configuration lives in the same `config.toml` as the plan settings, under `[apply]` (`auto`,
   `secrets`, `require_encrypted_remote`, `min_free`, `part_size`, `max_upload_bytes`,
@@ -867,7 +890,11 @@ always to the user's own storage):
 
 A URL **carries a credential** when its userinfo has a password, or its user name matches a token
 pattern, is 40 or more hexadecimal characters, or is longer than 30 characters. A short plain user
-name (as in a default Azure DevOps clone URL) is not a credential.
+name (as in a default Azure DevOps clone URL) is not a credential. A **candidate** is a scheme,
+`://`, and the characters up to the first terminator (white space, a quote, `<`, `>` or the end of
+the file). A candidate that has **not terminated within one 64 KiB window** is treated as a match
+(ASSUMPTION, the owner's: no real URL is that long, and a longer run is more likely a payload
+that hides one), in step 2 and in the writer alike, since both call one function.
 
 **The rule table.** The rules above, by the kind of file they judge. Step 2 and the archive writer
 (9.4) both read this table, and the implementation has **one function** for it, called with the
@@ -884,13 +911,40 @@ that step 2 applied.
 | File below `objects/` of a git directory | the history rules, through git, on the examined set; no rule on the file as a file | the object inventory I0 (9.4) |
 | Symlink, directory or any other entry | no content rule; a name the name rule lists is judged as for a regular file | the name verdict |
 
+**Two kinds of rule, and the one guarantee each gives.** The column that matters to the writer is
+the **kind** of each rule, and every sentence of 9.4, 17, D-4 and the criteria about what is
+withheld derives from it:
+
+| Rule | What it examines | Kind |
+|---|---|---|
+| name rule, global-excludes rule | the path and the status from step 2 | **first-chunk** |
+| content rule | the first 64 KiB of a file smaller than 1 MiB | **first-chunk** |
+| credential-URL rule (git directory files) | the whole file, through a 64 KiB window | **streaming** |
+
+- **First-chunk rule:** its verdict is known before any byte of the file is emitted (a name
+  rule needs no bytes; the content rule needs the first 64 KiB, which the writer reads into
+  memory first). A changed verdict therefore sends **nothing of that file**, its tar header
+  included.
+- **Streaming rule:** the writer emits a chunk only after the window has moved past it, so a
+  matching region is **withheld**; but clean bytes of the same file **before** the match, and its
+  header, may already have been sent. A changed verdict fails the attempt, and the attempt's objects
+  are removed (9.4). **No sentence of this document promises "nothing of the file" for a file
+  that a streaming rule judges.**
+
+The implementation holds the table as data in the code (rule, what it examines, kind), and step 2,
+the writer and the test of AC-46 all read that one table. This document's tables are checked
+against it by a separate, clearly named documentation test (`doc_table_matches_code`), or not at
+all; the test of AC-46 does not parse this document.
+
 **Readability probe** (ASSUMPTION, the owner's). Before any history command, step 2 probes every
 entry of an item that **will be archived** (an unarchived `remove-regenerable` item uploads
 nothing, so a mode 000 file in its `node_modules` does not block it) so that a
 failure of the second kind below shows before any prompt or upload: it opens every regular file
 under the open rule of 13.2 (non-blocking, no-follow; a successful `open` shows read permission),
 lists every directory and every entry's extended attribute names, and applies the kind and
-attribute limits of 9.3. The probe reads no content. A failure keeps the item as one of the second
+attribute limits of 9.3. The probe reads no content, and it is **best effort** for what only a
+read can show: an I/O error, or an attribute value that cannot be read (it lists attribute names
+only). A failure keeps the item as one of the second
 kind, in every mode. A read error that only a read can show (an I/O error) first appears during
 the upload, is of the second kind too, and is **not retried**: the attempt fails, its objects are
 removed (9.4) and the item is kept, once, not three times.
@@ -959,8 +1013,11 @@ directory rule), secret-like names in history the network remotes do not hold, u
 and every check **not examined** (a limit reached or a check that could not run, above). Its
 **set digest** is the SHA-256 of its canonical list: for each entry its rule, its path relative to
 the item the set belongs to (for history, the git directory's relative path and the object id)
-and, for a file, its content digest, sorted, followed by which of the two checks that find entries ran (`file-rules`, `history`, from
-`checks_run`), so a set found without the history check never equals one found with it. The
+and, for a file, its content digest, sorted, followed by which of the two checks that find entries ran (`file-rules`, and `history` **only for
+an item that has a git directory**: for an item without one `history` is trivially empty and is
+left out, so a non-git nested item decided under `upload` still matches an enclosing item run by
+`upload-all`, from `checks_run`), so a set found without the history check never equals one found
+with it. The
 digest is taken over the item's **own entries**: those that belong to no item nested inside it
 (6.3). The journal holds the digest, never the list. Paths are relative to the owning item, so a
 nested item's part computed inside its enclosing item has the digest of the nested item's own
@@ -1096,20 +1153,23 @@ such a remote (exit 1). The tool does no encryption of its own in this release (
   - **one sentence governs the rest: for every file of every kind in the item, each rule that the
     rule table of 9.2 applies to that file at step 2 is applied again by the writer to the bytes
     it is about to send, with the same inputs (the status, the exempt flag and the name from
-    step 2), and a verdict that differs from the one step 2 recorded stops the item before any
-    byte of that file leaves the process.** The writer calls the one function of 9.2 and has no
-    list of its own, so a rule added to the table is applied at both places or the test of AC-46
-    fails. In particular, for the first chunk of a file the table gives a content rule, the rule
-    runs on that chunk's first 64 KiB, in memory; for a file of a git directory outside
-    `objects/` the credential-URL rule runs over the whole file through a window of the chunk
-    plus the previous chunk's last 64 KiB, and the content rule on its first 64 KiB. The writer
+    step 2), and a verdict that differs from the one step 2 recorded stops the item.** What that
+    withholds depends on the **kind** of the rule (9.2): a **first-chunk** rule (the name rules
+    and the content rule) is judged on the first 64 KiB, read into memory, before any byte of the
+    file is emitted, so a changed verdict sends nothing of that file, its tar header included; a
+    **streaming** rule (the credential-URL rule on a file of a git directory outside `objects/`)
+    is judged through a window of the chunk plus the previous chunk's last 64 KiB, and the writer
     holds back each chunk's last 64 KiB until the next window is judged, so a URL of up to 64 KiB
-    is judged whole before any byte of it is sent. A file the table lists no rule for (tracked and
-    unmodified, below `objects/`) is guarded by the other bullets of this section.
+    is withheld whole, but clean bytes of the same file before it, and its header, may already
+    have been sent. A candidate that has not terminated within the window is a match and stops the
+    item (9.2). The writer calls the one function of 9.2 and has no list of its own, so a rule
+    added to the table is applied at both places or the test of AC-46 fails. A file the table
+    lists no rule for (tracked and unmodified, below `objects/`) is guarded by the other bullets
+    of this section.
 
-  Any difference, or a failed read, fails the item before that chunk is emitted; in the first
-  chunk, before any byte of the file, its header included, is sent. The bytes judged are the
-  buffer that is emitted, so nothing written between the judgement and the emission is sent. The
+  Any difference, or a failed read, fails the item before that chunk is emitted. The bytes judged
+  are the buffer that is emitted, so nothing written between the judgement and the emission is
+  sent. The
   name-based rules are functions of F0's path and step 2's status, so the writer evaluates them on
   the path it opened: the name rule applies exactly where 9.2's name rule does (a tracked and
   unmodified `.env.example` is not stopped), and the global-excludes rule is looked up in the set
@@ -1137,7 +1197,10 @@ such a remote (exit 1). The tool does no encryption of its own in this release (
   step 2 with attempt + 1, which takes a new F0, runs the history check again from a new I0 and,
   in ask mode, asks again (no answer is reused after a new F0, 11); after three attempts the item
   is kept with the reason "the object store changed while its history was being checked: its
-  history was not examined". An I0, I1 and emitted check is a **secrecy** check: it is not run
+  history was not examined". **A cost:** the files that sort before `.git` in archive order are
+  sent before I1 is taken, so an I1 mismatch voids the decision after those files, which the
+  decision covered, have gone to storage; under an automatic handling the same covered files are
+  uploaded and removed again in each of up to three attempts (17, D-4). An I0, I1 and emitted check is a **secrecy** check: it is not run
   where 9.2's table of handlings says the history check is not run (`upload-all`), and I1 and the
   emitted comparison are skipped after the answer `u`. What stays under every handling, because it
   protects the archive's integrity and not its secrecy, is the per-chunk `fstat`, the digest of
@@ -1309,7 +1372,7 @@ length).
 - `<state>/journal/<run_id>.jsonl` is append-only. Each line is one transition of one item
   (`selected`, `rechecked`, `answered`, `attempt-started`, `part-uploaded`, `part-verified`,
   `index-verified`, `attempt-removing`, `attempt-removed`, `segment-reserved`, `recorded`,
-  `segment-synced`, `checked-again`, `quarantine-intent`, `quarantined`, `delete-started`,
+  `segment-superseded`, `segment-synced`, `checked-again`, `quarantine-intent`, `quarantined`, `delete-started`,
   `deleted`, `removed-recorded`, `skipped`, `failed`, `kept`, `vanished`, `left`, `moved-back`)
   with the attempt, object names, sizes and digests; `rechecked` and `answered` also hold the
   item's secrets set digest and how its secrets were decided (9.2, 6.3), and `quarantine-intent`
@@ -1329,7 +1392,9 @@ length).
   and goes on with the journaled value. To change a setting, the user starts a new run, with one
   exception that only narrows: `apply --resume RUN_ID --secrets keep` is accepted, journals the
   override with its source (ASSUMPTION, the owner's), and stops every further upload of a secrets set in that run (an
-  interrupted `upload-all` run the user no longer wants to continue). A resume under `upload-all`
+  interrupted `upload-all` run the user no longer wants to continue); items of that run already
+  decided under `upload-all` stay recorded as such, their archives are not touched, and an
+  enclosing item that holds one of them is kept for the mixed-handling rule (6.3). A resume under `upload-all`
   prints the notice again before its first upload (9.2).
 - `apply --resume RUN_ID` continues each unfinished item from its last durable state, but only
   work before deletion (re-checks, uploads, verification, records, items not yet quarantined). A
@@ -1353,7 +1418,7 @@ is not the item.
 | Last state | O | Q | On resume |
 |---|---|---|---|
 | Archived item: before `recorded`. Unarchived regenerable item: any state before `quarantine-intent` | any | absent | Remove the objects of every attempt without `recorded` (9.4), then start the item again from step 2 with the next attempt. O absent: skipped `gone`. |
-| Archived item: `recorded` but not `segment-synced` | any | absent | The `recorded` line holds the record, so the attempt it names is **kept** (a stored record may already reference it; 9.4): write the record to the reserved segment again if it is not there, upload the segment, read it back and journal `segment-synced`; then continue as in the next row, or, with O absent, skip `gone`. The item is not started again from step 2, which would leave that attempt's objects unreferenced and, once recorded, undeletable. |
+| Archived item: `recorded` but not `segment-synced` | any | absent | The `recorded` line holds the record, so the attempt it names is **kept** (a stored record may already reference it; 9.4). **Reconcile the segment before writing** (12.2): list the reserved name; absent, write it; present and equal to the expected bytes, journal `segment-synced` without writing (the case of a successful upload whose response was lost); present and incomplete or different, never overwrite: reserve a new segment, write the records there with `supersedes`, and journal `segment-superseded`. Then continue as in the next row, or, with O absent, skip `gone`. The item is not started again from step 2, which would leave that attempt's objects unreferenced and, once recorded, undeletable. |
 | Archived item: `segment-synced` or `checked-again` | present | absent | Step 2 again (F0 must equal the index), then steps 7 to 11. |
 | Archived item: `segment-synced` or `checked-again` | absent | absent | Skipped `gone`; the `backed-up` record stays valid for restore. |
 | `quarantine-intent` | present | absent | The rename never happened: as `segment-synced`. |
@@ -1466,6 +1531,9 @@ its re-check.
        uploads them as they are.";
     3. "In ask mode, unnamed objects are uploaded only by this answer. Automatic runs upload them
        only under --secrets upload-all, and without a terminal the answer is no.";
+  - for an item with a git directory, this statement, word for word: "After u the object store is
+    not checked again: files below objects/ that change after this check are uploaded as they
+    are." (9.2, 9.4);
   - the answers `u`, upload this item's whole secrets set with the rest of the item, and `n`, keep
     the item.
 
@@ -1544,8 +1612,8 @@ secret.
 ### 12.2 Where it lives
 
 - Locally: `<state>/manifest/<run_id>.<seq>.jsonl`, one **segment** per sync, never modified after
-  it is written, ending with a trailer line holding the record count and the SHA-256 of the bytes
-  before it. `seq` comes from a `segment-reserved` journal line (10.1). A segment is written
+  it is written, ending with a trailer line holding the record count, the SHA-256 of the bytes
+  before it and, for a segment that replaces an incomplete one, `supersedes` (12.2, below). `seq` comes from a `segment-reserved` journal line (10.1). A segment is written
   atomically: to `<run_id>.<seq>.jsonl.tmp`, `fsync`ed, renamed to its name with no-replace
   semantics, and the directory `fsync`ed, so a reader never sees a segment being written. A
   leftover `.tmp` file is reported and ignored.
@@ -1553,6 +1621,28 @@ secret.
   uploaded with rcat, read back and compared like a part. A name is never reused. `machine.json` is
   uploaded once; if one exists there with another id, apply stops.
 - **No item is removed until a verified copy of its `backed-up` record is in storage.**
+- **Reconcile before writing.** After a crash or a lost response the tool may be asked to write
+  an object it already wrote. It never overwrites and never asks the store to refuse: before any
+  write of a name that an earlier process may have written, it lists that name (`lsjson`) and
+  decides by the table below, so that a store call is made only for a name just listed absent
+  (the lock of 10.2 means no other process writes this machine's names). This makes AC-34's
+  "zero refused writes" true by construction.
+
+  | Object | Can a crash make the tool write it twice? | Rule |
+  |---|---|---|
+  | An archive part or the index of an attempt (`<item>.a<attempt>...`) | No: an attempt is never resumed. An attempt without `recorded` is removed (9.4) and the item restarts with attempt + 1 and new names; an attempt with `recorded` is kept and never rewritten | no rewrite; new names |
+  | A manifest segment in storage (`<run_id>.<seq>.jsonl`) | Yes, from `recorded` until `segment-synced` | list the name; **absent**: write it; **present and equal** to the expected bytes (size and SHA-256 derived from the journal, read back with `rclone cat`): journal `segment-synced` without writing; **present and incomplete or different**: never overwrite, reserve a new `seq` (`segment-reserved`), write the same records there with a `supersedes` list naming the old `seq` in its trailer, and journal `segment-superseded` (old `seq`, observed size); the archive the records reference is kept |
+  | The local copy of a segment (`<state>/manifest/...`) | Yes | written to `.tmp`, `fsync`ed and renamed no-replace; an existing file with a valid trailer is used as it is; a `.tmp` is reported and ignored; the expected bytes are rebuilt from the `recorded` lines since the `segment-reserved` line when the file is missing |
+  | The local index copy (`<state>/index/`) | Yes | the same: no-replace, an existing file is used only when its SHA-256 equals the record's `index` digest |
+  | `machine.json` in storage | Yes, on the first run | list it: **absent**: write it; **present with this machine's id**: nothing; **present with another id, or not parsable**: apply stops (exit 1), naming it, and overwrites nothing |
+  | The journal | Never rewritten: append-only | none |
+
+  **What later readers do with a superseded or partial segment.** A segment is **ignored** for its
+  records when it fails its trailer check (incomplete) or when a later segment of the same run
+  names its `seq` in `supersedes`. Restore, `manifest list`, `find` and `verify` ignore it and
+  report it **once** ("segment RUN.SEQ is superseded" or "is incomplete"); `verify` does not count
+  it as damage, since its records are in the segment that supersedes it. The tool never deletes a
+  segment (the only deletions are of a failed attempt's objects, 9.4).
 
 ### 12.3 Commands
 
@@ -1871,12 +1961,19 @@ which the user chose (option (i), sourced in D-16).
   git directories again and shares one 600 second budget across them, so spurious "limit
   reached" entries can keep it; under `--backup-only` a nested item's secrets chosen for upload
   sit in storage twice (its own archive and the enclosing one); a nested decision from an
-  earlier run does not count; and a nested item decided in ask mode (history checked) under an
-  enclosing item run by `upload-all` (history not checked) never matches, so the enclosing item
-  is kept. The writer's own checks (9.4) can fail an item whose files are being written during
-  the upload; it is retried, and kept after three attempts (an unreadable entry is not retried).
-  An interrupted `upload-all` run can be resumed only under `upload-all` or narrowed with
-  `--resume RUN_ID --secrets keep` (10.1). The user was shown three options and gets two in this release (the vault is
+  earlier run does not count; and **mixed handlings never match, in both directions**: a nested
+  git item decided in ask mode or under `upload` (history checked) under an enclosing item run by
+  `upload-all` (history not checked), and a nested git item decided under `upload-all` under an
+  enclosing item in ask mode or under `upload`, so the enclosing item is kept either way (a nested
+  item with no git directory is not affected). The writer's own checks (9.4) can fail an item
+  whose files are being written during the upload; it is retried, and kept after three attempts
+  (an unreadable entry is not retried); and an I1 mismatch voids a decision after the files that
+  sort before `.git`, which the decision covered, were already sent, so under an automatic
+  handling those files can be uploaded and removed up to three times (9.4, 17). An interrupted
+  `upload-all` run can be resumed only under `upload-all` or narrowed with
+  `--resume RUN_ID --secrets keep` (10.1); items of the same run already decided under `upload-all`
+  stay recorded as such, and an enclosing item that holds one of them is then kept for the
+  mixed-handling rule, which is correct but surprising. The user was shown three options and gets two in this release (the vault is
   deferred); the coordinator reports that to the user.
 - **D-5. Recovery refs.** Moot in this release: nothing is pushed (D-1, section 8).
 - **D-6. rclone command line**, not the rc API that DESIGN.md named: `rcat --size`, `cat`, `lsjson`
@@ -2003,6 +2100,13 @@ which the user chose (option (i), sourced in D-16).
   (9.2), because you asked for the whole item to be uploaded. **What to do:** stop programs that write into the
   folders you select (editors, builds, sync clients, coding agents) while apply runs, and use an
   rclone `crypt` remote if the provider must never see such bytes.
+- **What is withheld depends on the rule** (9.2). A name rule or the content rule is decided
+  before any byte of the file leaves, so a file that fails it is not sent at all. The
+  credential-URL rule examines a git directory file through a 64 KiB window: a URL found late in a
+  large file is withheld, but the clean bytes of that file before it may already be in storage
+  (and are removed with the failed attempt's objects). An I1 mismatch (9.4) can void your answer
+  or setting after the files that sort before `.git` were sent; under an automatic handling those
+  files can be uploaded and removed up to three times.
 - **Deleting a failed attempt's objects** (9.4) removes them from the listing. On a provider that
   keeps object versions or hides deleted files (an S3 bucket with versioning, B2 by default), an
   old version can remain until the provider's own cleanup removes it; the tool does not purge
@@ -2342,9 +2446,14 @@ two steps; it exists only in test builds (AC-35).
   encrypted-configuration marker over random bytes (no password exists for it).
 - **AC-34** The attempt number, part size and object names (`attempt-started`) and the manifest
   segment number (`segment-reserved`) are durable in the journal before any name is used, so no
-  object or segment name is ever written twice. Verify by: `resume.rs` stops between each of those
-  lines and the first store write, resumes, and `LocalDirStore` (which fails any write to an
-  existing name) records zero refused writes; a lost response then a crash uses the next attempt.
+  object or segment name is ever written twice, and every object a crash could make the tool write
+  again is **reconciled before it is written** (12.2): the name is listed, a segment that is
+  present and equal is marked synced without a write, one that is incomplete or different is never
+  overwritten (a new segment supersedes it), so zero writes are refused by construction. Verify
+  by: `resume.rs` stops between each of those lines and the first store write, resumes, and
+  `LocalDirStore` (which fails any write to an existing name) records zero refused writes; a lost
+  response then a crash uses the next attempt; and with the remote segment absent, exactly equal
+  (the upload succeeded and the response was lost), partial and conflicting (NEG-89).
 - **AC-35** The step hook is compiled out of release builds. Verify by: the hook exists only under
   a test-only cargo feature; the release CI job builds without it, asserts that `cargo tree -e
   features` for the release binary does not include it, and checks that the hook's marker string is
@@ -2419,8 +2528,10 @@ two steps; it exists only in test builds (AC-35).
 - **AC-43** What is checked is what is sent (9.4): every chunk of a regular file is emitted only
   after an `fstat` that equals F0; for every file of every kind, each rule the table of 9.2 gives
   it is applied again, in memory, to the buffer that is emitted, and any difference from step 2's
-  verdict stops the item before any byte of that file is sent; git directory files are judged for
-  credential URLs over a held-back window and for the content rule; the inventory chain holds:
+  verdict stops the item, with the guarantee of the rule's kind (9.2): for a first-chunk rule
+  nothing of the file is sent, and for the streaming credential-URL rule the matching region is
+  withheld while clean earlier bytes of the file may have been sent (NEG-70, NEG-87); a URL
+  candidate not terminated within the window is a match; the inventory chain holds:
   I0 before the history commands, I1 after them and before the first byte of the git directory
   (equal to I0), and each file's digest as sent equal to I0's; a mismatch at either point voids the
   decision and stops the item before (I1) or at (emitted) that file. Verify by: `upload_race.rs`
@@ -2451,15 +2562,28 @@ two steps; it exists only in test builds (AC-35).
   file kind (regular files of the three working-tree statuses, files of a git directory outside
   `objects/`, files below `objects/`, symlinks, directories) and shows for each that step 2
   applies the rules the table lists and the writer applies the same rules to the bytes it is
-  about to send and stops the item on a different verdict. Verify by: `rule_table.rs`, which
-  parses the table of the spec, builds one fixture per row with a different verdict planted after
-  step 2 under hidden times, and a broken variant of the writer that omits one row at a time, each
-  of which must fail the test (NEG-70, NEG-80).
+  about to send and stops the item on a different verdict, with the guarantee of the rule's kind.
+  The implementation's table (rule, what it examines, kind) is data in the code and the single
+  source. Verify by: `rule_table.rs`, which reads that table from the code (not from this
+  document), builds one fixture per row with a different verdict planted after step 2 under hidden
+  times, and a broken variant of the writer that omits one row at a time, each of which must fail
+  the test; and, separately, the documentation test `doc_table_matches_code`, which compares this
+  document's tables with the code's table and is named so that its failure is read as a stale
+  document, not a broken writer (NEG-70, NEG-80, NEG-87).
 - **AC-47** Which checks run (9.2): under `upload-all` no history command runs and no object
   inventory beyond F0's is read, in a dry run too, and the record's `checks_run` says so; for
   `keep` and `upload` the whole chain runs; in ask mode the history check runs before the prompt
   and, after the answer `u`, I1 and the emitted comparison are skipped. Verify by: `chain.rs` with
   a git shim that logs every call and a file-system shim that counts reads of `objects/` (NEG-83).
+- **AC-48** Every command the tool prints for pasting is built by one function that shares no code
+  with display escaping (5, "Printed commands"): each path argument is POSIX single-quoted with
+  `'\''` for a quote and follows `--`; a path with a newline, another control character or bytes
+  that are not valid UTF-8 gets no command, only a statement and the display form; `--json` uses
+  JSON escaping. Verify by: `printed_commands.rs`, which collects every printed command from
+  `quarantine list` (each state), the summary and the records, feeds each to `sh -c` with a
+  recording stub in place of the real programs, and compares the argument vector the stub saw with
+  the intended one, over the hostile names of NEG-88; a broken variant that quotes with the display
+  function, or omits `--`, must fail (NEG-88).
 
 ## 21. Negative cases
 
@@ -2510,7 +2634,7 @@ two steps; it exists only in test builds (AC-35).
   `recorded` was journaled and before, during and after the segment upload, each alone, then a
   resume: no delete call names that attempt's objects, and `manifest verify` finds no dangling
   record, and a resume completes the segment from the journaled record instead of starting the
-  item again (the 10.1 row for `recorded`). No delete call names an object outside an `attempt-started` line or of an attempt with
+  item again, reconciling the remote segment first (the 10.1 row for `recorded`, NEG-89). No delete call names an object outside an `attempt-started` line or of an attempt with
   `recorded`. An object of an `attempt-removed` attempt made to reappear in the listing (a late
   arrival): the next non-dry run removes it again.
 - **NEG-15 (AC-17)** The segment upload fails: backed up and kept. A part deleted from storage
@@ -2779,8 +2903,8 @@ two steps; it exists only in test builds (AC-35).
   O, the quarantine as not started with `apply --resume RUN_ID`, what occupies O and "first move
   or rename what is at O", and **no** `mv` command; for a replaced Q, the replaced state of 5
   ("cannot confirm this is its quarantine") with the restore command. A control with O free and
-  Q intact: `quarantine list` prints `mv -n Q O` (`mv -nT Q O` on Linux), and `--resume` renames Q
-  back and records `kept`.
+  Q intact: `quarantine list` prints `mv -n -- 'Q' 'O'` (`mv -nT -- 'Q' 'O'` on Linux, quoted as
+  in "Printed commands", 5), and `--resume` renames Q back and records `kept`.
 - **NEG-66 (AC-19)** Through the step hook during the deletion pass: the fsmonitor socket replaced
   by a regular file of the same name, and by a socket with another inode: the pass stops before
   it and the replacement survives; a control with the original socket: removed. In an unarchived
@@ -2845,11 +2969,9 @@ two steps; it exists only in test builds (AC-35).
   mapping would leave them. In both the attempt fails (the next attempt's step 2 then sees the
   token and keeps the item) and no byte of `notes.txt`, its tar header included, is in any stored
   object or in `FaultStore`'s log of received bytes. A broken variant that runs the content rule
-  only in step 2 must fail (b). A `.git/config` of 2 MiB with a fake credential URL straddling the
-  boundary of its first and second 1 MiB chunks, written with hidden times after the writer's open
-  and **before its first read of that file** (a write between the two chunk reads is the upload
-  race of 17, which the test does not assert): no byte of the URL is received; a broken variant
-  without the held-back window must fail.
+  only in step 2 must fail (b). (The content rule is a first-chunk rule: nothing of the file is
+  sent.) The streaming credential-URL rule has its own case, NEG-87, because its guarantee is the
+  weaker one.
 - **NEG-71 (AC-43)** The unexamined remainder rewritten. A tracked, unmodified 3 MiB file has a
   fake value written into its last MiB through the step hook after its first chunk was emitted:
   by an ordinary write, the item fails before the changed chunk, the attempt's objects are
@@ -2976,10 +3098,14 @@ two steps; it exists only in test builds (AC-35).
   automatic under `--secrets upload`: `mono` is archived, its record lists `a` and `b` in
   `nested_secrets`, and `a`'s journaled digest equals `mono`'s digest of `a`'s part with `b`'s
   entries excluded. A control that fails under a digest taken over `a`'s entries including `b`'s.
-  `b` answered `n`: `a` and `mono` are kept. `b` answered `u`, then a new stash dropped in `b`
-  before `a`'s step 2: `a` and `mono` kept. A decision for `b` made in an earlier run and not this
-  one: `mono` kept with the reason, and archived once `b` is answered in the new run. No value of
-  `a` or `b` is in any stored object in the kept cases.
+  `b` answered `n`: `a` and `mono` are kept, and no value of `b` is in any stored object, since
+  `b` itself was not uploaded. `b` answered `u` (its own archive is uploaded then, under that
+  authorised answer), then a new stash dropped in `b` before `a`'s step 2: `a` and `mono` kept; the
+  assertion is that **no object of `a` or `mono` holds a value from the changed part of `b`**, and
+  `b`'s own archive, uploaded under its earlier answer, is allowed to remain and is not asserted
+  absent. A decision for `b` made in an earlier run and not this one: `mono` kept with the reason,
+  no object of `a` or `mono` holds a value of `b`, and `mono` is archived once `b` is answered in
+  the new run.
 - **NEG-83 (AC-47)** A repository with a dropped stash holding a fake `.env` and an unnamed
   object, a git shim that logs every command and a counter of reads below `objects/`. Under
   `--secrets upload-all`, automatic and a dry run: **no history command in the log** (not
@@ -2988,9 +3114,9 @@ two steps; it exists only in test builds (AC-35).
   record's `checks_run` lists neither `history`, `inventory-chain` nor `writer-repeat`. Under
   `keep` and `upload`, on a **second repository with an empty secrets set** (no stash, no unnamed
   object, so that it is uploaded and not kept): the history commands, one inventory read before
-  them (I0) and one before the git directory's first byte (I1), and the emitted comparison; on
-  the first repository, kept under both, the same commands and the two inventory reads occur and
-  nothing is uploaded. Ask mode: the history commands
+  them (I0) and one before the git directory's first byte (I1, taken in step 4), and the emitted
+  comparison; on the first repository, kept under both before step 4, the history commands and
+  **one** inventory read (I0, taken in step 2) occur, no I1, and nothing is uploaded. Ask mode: the history commands
   appear in the log before the prompt text; after `u` the counter shows I0 and the upload's read
   only, `checks_run` lists `inventory-chain` for I0 only; after `n` nothing is uploaded. A broken
   variant that runs a history command under `upload-all`, and one that skips I1 under `keep`, each
@@ -3001,9 +3127,11 @@ two steps; it exists only in test builds (AC-35).
   whose target holds ESC and a newline (in `quarantine list` of a leftover); a ref name with a
   control character in the history reason. The captured raw output holds no ESC, carriage return,
   backspace or bidirectional control from any name; the names show as `\u{1b}`, `\u{d}`,
-  `\u{202e}` and `\xNN`; the long name is cut at 200 characters with its length shown; the
-  statements of the prompt appear intact and last; the same strings in `--json` output are
-  escaped. A broken variant that prints a name raw must fail.
+  `\u{202e}` and `\xNN`; the long name is shown as its first 100 characters, the number left out
+  and its last 80 (two 5000-character names that differ only at their ends are told apart); the
+  statements of the prompt appear intact and last; the same strings in `--json` output use JSON
+  escaping (`\uXXXX`, not the display form) and the name that is not valid UTF-8 is carried in the
+  base64 field. A broken variant that prints a name raw must fail.
 - **NEG-85 (AC-43)** The first adversarial case of revision 12: a pack rewritten with equal length
   and its times hidden **between a history read and I1**, injected through the step hook right
   after the history command that read it returns. The attempt fails at I1 before any byte of that
@@ -3016,39 +3144,65 @@ two steps; it exists only in test builds (AC-35).
   it) is received; the attempt either fails, because the old inode's change time moved, or sends
   the old inode's bytes, which are what F0 describes, and the test accepts both and asserts the
   marker's absence and that an item removed afterwards equals its index.
+- **NEG-87 (AC-43)** The streaming rule's weaker guarantee, tested as that and no more. A
+  `.git/config` (and separately an `rr-cache` file) of 5 MiB, clean in step 2 and with no credential
+  URL, has a fake credential URL (userinfo with a password) written into its last MiB with equal
+  length and the times hidden, through the step hook after the writer's open and **before the
+  writer's first read of that file** (so the writer reads the new bytes). `FaultStore` records every
+  byte it receives, including failed attempts'. Expected: the attempt fails; **the URL's bytes are
+  absent** from every received byte and every stored object; **clean bytes of the same file before
+  the URL's region, and its tar header, may be present**, which the test states by asserting only
+  the absence of the URL and the removal of the attempt's objects, never the absence of the file's
+  earlier bytes. A URL that has not terminated within the 64 KiB window (a run of 100 KiB with no
+  terminator after `https://user:pass@`): treated as a match, the attempt fails, no byte of the run
+  is received. A broken variant that emits a chunk before the window has moved past it must fail.
+- **NEG-88 (AC-48)** Hostile names through the printed commands. Directories named
+  `a b`, `a'b`, `a;b`, `$(touch pwned)`, a backtick command, `-rf`, `*`, `x\n` (a trailing
+  newline), a name with a tab, and a name that is not valid UTF-8, each as the original path O of a
+  not-started quarantine, the item of a leftover and the target of a moved-back leftover, with the
+  quarantine path Q built from the same directory. For each state `quarantine list` is run; every
+  printed command is fed to `sh -c` with a recording stub for `mv` and `disk-cleaner` first in
+  `PATH`: the argument vector the stub records equals the intended one (`-nT`, `--`, Q, O exact),
+  nothing else runs (no file `pwned` appears in the shell's working directory), and for the names with a newline, a tab or
+  invalid UTF-8 **no command is printed**, the line says no command can be pasted safely and shows
+  the path through the display function. The same names in the summary and in a record's `restore`
+  hint. A broken variant that prints the display form, or leaves `--` out, must fail.
+- **NEG-89 (AC-34)** Segment reconciliation, with the journal stopped after `recorded` and the
+  remote segment, each alone: absent (the tool writes it, once); **exactly equal** to the expected
+  bytes, as when the upload succeeded and the response was lost (no write is made, `segment-synced`
+  is journaled); **truncated** (the tool never overwrites it: a new segment is reserved and
+  written with `supersedes`, `segment-superseded` is journaled, the archive the record references is
+  kept and not removed); **different but complete** (the same as truncated). `LocalDirStore`
+  records zero refused writes in all four. After the superseding case, `manifest list`,
+  `find`, `verify` and `restore` ignore the old segment and report it once, `verify` counts no
+  damage for it and finds the records in the new one, and no segment is deleted. `machine.json`
+  in storage absent, present with this id, present with another id, and truncated: written, left
+  alone, apply stops, apply stops, in each case with nothing overwritten.
 
 ## 22. Reviews: findings and changes
 
-Earlier reviews and how revisions 5 to 12 answered them are in
-[APPLY-SPEC-REVIEWS.md](APPLY-SPEC-REVIEWS.md). This table answers the revision 12 adversarial
-review (F-ids) and acceptance review (S-ids, S-7 unused), prefixed `r12` to avoid clashes with core
-changes and earlier findings.
+Earlier reviews and how revisions 5 to 13 answered them are in
+[APPLY-SPEC-REVIEWS.md](APPLY-SPEC-REVIEWS.md). This table answers the revision 13 adversarial
+review (F-ids) and acceptance review (M- and S-ids with a letter, S-a to S-h), prefixed `r13` to
+avoid clashes with core changes and earlier findings.
 
-| Finding | Change in revision 13 | Criteria and negative cases |
+| Finding | Change in revision 14 | Criteria and negative cases |
 |---|---|---|
-| r12 F1 the writer repeated the content rule only for working-tree statuses, and the credential-URL rule alone for git directory files | One rule table (9.2) and one function used by step 2 and the writer; the writer applies every rule the table gives each kind of file to the bytes it sends, whatever its status; a test enumerates rows and kinds (9.2, 9.4) | AC-43, AC-46; NEG-70, NEG-80 |
-| r12 F2 the first inventory came after the history commands | The inventory chain: I0 before the history commands, I1 before the git directory's first byte and equal to I0, each file's digest as sent equal to I0; what a mismatch does at each point; the cost stated (9.4, 17, 18, 23) | AC-43; NEG-72, NEG-85 |
-| r12 F3 NEG-75 required outcomes the sequence cannot give | Split by first detection: step 2 (a readability probe, before any prompt) and upload (the attempt stops, objects removed, absence asserted only for the failing file and what follows it in archive order); every negative case added in revisions 11 and 12 reread (NEG-70, 72, 74 changed) | AC-44; NEG-75, NEG-81 |
-| Coordinator: cost where the chain protects nothing | The history check and the chain are not run under `upload-all`, and I1 and the emitted comparison are skipped after `u`; the record says which checks ran (`checks_run`) (9.2, 12.1, 18, D-4) | AC-42, AC-47; NEG-69, NEG-83 |
-| r12 S-1 NEG-74 could pass vacuously | Each damage fixture is shown to reach the prompt and fails the test, never skips; core's layout check judges names only (`gitshape.rs`), so a lone pack and a named loose object are accepted | AC-44; NEG-74 |
-| r12 S-2 an unreadable entry surfaced after the prompt and the upload | The readability probe in step 2; an unreadable entry found only by a read is not retried (9.2, 9.4) | AC-44; NEG-75, NEG-81 |
-| r12 S-3 where `recorded` sits | Journaled and synced before the record is written and the segment uploaded (6.2, 9.4, 10.1) | AC-14; NEG-14 |
-| r12 S-4 three levels of nesting, "decision" | The digest is over the item's own entries; a decision is the latest `answered` line of this run; an earlier run's does not count (6.3, 9.2) | AC-45; NEG-82 |
-| r12 S-5 a resume cannot tighten | `--resume RUN_ID --secrets keep` narrows (5, 10.1) | AC-21; NEG-79 |
-| r12 S-6 late-arriving objects | The next non-dry run lists attempts removed in the last 7 days once and removes again (9.4) | AC-14; NEG-14 |
-| r12 S-8 wording | Upload race: before or after the read; deletion race: write or replacement; the clock tick of F0; the name rule applies where 9.2's does (9.4, 17) | AC-43; NEG-86 |
-| r12 S-9 hygiene | AC-44's `Verify by:` on one line; the rename-over case; AC-9's citations as cases of AC-12 | AC-9, AC-44; NEG-86 |
-| r12 S-10 inventory proportion | Kept where it protects the decision, not run where it protects nothing (above) | AC-47; NEG-83 |
-| r12 S-11 deletion-pass platform rules | `UF_COMPRESSED` and `UF_TRACKED` excluded on macOS with the reason; the setgid exemption on macOS stated as an unverified hypothesis with an injected control (13.2) | AC-19; NEG-61 |
-| r12 S-12 names that attack the terminal | One printing function for every name, escaping control and bidirectional characters, citing core's `esc` and `diag` (5, 11) | AC-38; NEG-84 |
-| r12 S-13 memory | Inventories and index records named in 18 | none |
-| r12 S-14 nested costs | D-4 states the re-walk and shared budget, the double storage, the earlier-run rule and the mixed-handling mismatch | none |
-| r12 S-15 `history_damage` labelling | Only damage the tool can name from structured output or its listing gets a label; a permission error is "could not run" (9.2) | AC-44; NEG-74 |
-| Found while writing revision 13 (not a reviewer's finding) | Under `upload-all` an enclosing item with an undecided nested repository is kept, since its history is unexamined (6.3, NEG-76); I0 is under the history check's timer and count (9.2); a resume finishes a segment from the `recorded` line (10.1, NEG-14); the damage note is absent under `upload-all` (D-4, NEG-74) | AC-45; NEG-14, NEG-74, NEG-76 |
-| r12 packet note | The packet's Source for AC-45 is an inferred source naming the acceptance report, not the user's D-4 answer (a rule that refuses uploads is not supported by words that ask for them) | none |
+| r13 F1 the whole-file withholding promise cannot hold for the streaming URL rule | Each rule carries a kind in the rule table: first-chunk (nothing of the file is sent) or streaming (the matching region is withheld; clean earlier bytes may have been sent, and are removed with the attempt); a candidate not terminated within the window is a match; AC-43, AC-46, 9.4, 17 and D-4 derive from the column; every "before any byte" sentence was checked against it (9.2, 9.4, 17) | AC-43, AC-46; NEG-70, NEG-87 |
+| r13 F2 the resume row for `recorded` writes a segment name that may exist | Reconcile before writing: list the name; absent, write; present and equal, mark synced without writing; incomplete or different, never overwrite, reserve a new segment with `supersedes` and journal `segment-superseded`; later readers ignore and report once; one table lists every object a crash could make the tool write again (12.2, 10.1) | AC-34; NEG-14, NEG-89 |
+| r13 F3 two negative cases contradicted the step order | NEG-83 requires I0 only for an item kept before step 4; NEG-82 allows the nested item's own authorised archive to remain and asserts only that no enclosing object holds the changed part; every negative case added in revision 13 reread against the step order (NEG-84 also changed) | AC-45, AC-47; NEG-82, NEG-83 |
+| r13 M-1 printed commands are not shell-safe | A second function, sharing no code with display escaping, builds every printed command: POSIX single quotes, `--` before paths, no command for a path with a control character or invalid UTF-8; `--json` uses JSON escaping (5) | AC-48; NEG-88, NEG-65 |
+| r13 S-a the prompt did not say the object store is not rechecked after `u` | A fixed sentence in the secrets prompt for an item with a git directory (11) | AC-38 |
+| r13 S-b the digest suffix and the mixed-handling cost | `history` joins the suffix only for an item with a git directory; the mismatch is stated in both directions (9.2, D-4) | AC-45; NEG-82 |
+| r13 S-c `--json` strings | JSON escaping, and a base64 field for a path that is not valid UTF-8 (5) | AC-38; NEG-84 |
+| r13 S-d the 200-character cut | The first 100 and the last 80 characters with the count left out (5) | AC-38; NEG-84 |
+| r13 S-e the probe's reach | Stated as best effort for I/O errors and attribute values (9.2) | AC-44; NEG-81 |
+| r13 S-f an I1 mismatch after covered files were sent | Stated in 9.4, 17 and D-4, with the three-attempt repeat under an automatic handling | AC-43; NEG-72 |
+| r13 S-g `--resume --secrets keep` and items decided under `upload-all` | They stay recorded as such, their archives are untouched, and an enclosing item then keeps for the mixed-handling rule (10.1, D-4) | AC-21; NEG-79 |
+| r13 S-h the test parsed the spec's prose table | The table is data in the code and the single source; a separate documentation test `doc_table_matches_code` checks this document against it (9.2) | AC-46 |
 
-Rewritten in place: AC-9, 21, 38, 42, 43, 44, 45 and NEG-14, 61, 69, 70, 72, 74, 75, 76, 79. Added:
-AC-46, 47 and NEG-80 to 86. None was withdrawn.
+Rewritten in place: AC-34, 43, 46 and NEG-14, 65, 70, 82, 83, 84. Added: AC-48 and NEG-87 to 89.
+None was withdrawn.
 
 ### 22.1 Minor items left for a later revision
 
