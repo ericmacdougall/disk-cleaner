@@ -10,7 +10,6 @@ use common::*;
 use disk_cleaner_core::Action;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// One fact by its JSON name, `"missing"` when the model has no such fact.
 fn fact(res: &disk_cleaner_core::ScanResult, repo: &Path, name: &str) -> String {
@@ -398,7 +397,7 @@ fn sibling_a_paused_rebase_is_not_removable() {
         commit_file(repo, "second.txt", "x\n");
         git(repo, &["push", "-q", "origin", "main"]);
         // Stops at an `edit` step with the tree clean and the rebase unfinished.
-        let status = Command::new("git")
+        let status = git_command()
             .args(["-c", "core.autocrlf=false", "rebase", "-q", "-i", "HEAD~1"])
             .current_dir(repo)
             .env("GIT_SEQUENCE_EDITOR", "sed -i.bak s/^pick/edit/")

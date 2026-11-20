@@ -81,8 +81,10 @@ Inside a regenerable or cache directory it gives that directory an `ask_reason`;
 directory becomes a `repo` node whose facts are all `unknown` (note: the `.git` entry was not
 followed), so it and the artifacts under it ask and are not classified as plain loose code.
 
-Every file the tool reads itself (a `.git` file, `alternates`, pseudorefs, `info/` entries, ref
-files) is read only after `lstat` shows a regular file, and the open checks again: on unix it does
+Every file in a scanned tree that the scan reads itself (a `.git` file, `alternates`, pseudorefs,
+`info/` entries, ref files) is read only after `lstat` shows a regular file, and the open checks
+again (the tool's own config file, from `--config` or its default location, and the scan file
+`plan` reads are not in a scanned tree and are read as ordinary files): on unix it does
 not follow a symlink (`O_NOFOLLOW`) or wait for a writer (`O_NONBLOCK`), and the open file must
 still be a regular file, so a symlink or FIFO put there in between is refused, not followed or
 waited on. Windows has no FIFOs in the file system (opening a named pipe never waits); there the
@@ -509,7 +511,11 @@ is not a ref, a symlink): it makes `no_local_admin_content` `no` and is named wi
 findings (`objects/pack/backup.tar`), so the plan asks. A ref file that cannot be read makes the
 fact `unknown`. git's own leftovers of an interrupted operation (`tmp_pack_*`, `tmp_obj_*`,
 `.tmp-*-pack-*`, a stale `*.lock`) are not in the shape either: they mean an operation was cut
-short, and a person looks before anything is removed. The fact is used rather than
+short, and a person looks before anything is removed. The same holds for an operation still
+running: after commands such as commit, merge or fetch git starts its automatic maintenance in
+the background by default, and it holds `objects/maintenance.lock` until it ends. A repository
+scanned in that moment asks; a later scan judges it without the lock, so two scans can differ
+only by the earlier one asking. The fact is used rather than
 `plain_layout` because git itself does not depend on these entries (the layout is still one git
 reads correctly); what is at stake is content of the repository's own that recovery does not
 save. `annex/` (check 3), `reftable/`, `lost-found/` and any other unknown top-level entry
