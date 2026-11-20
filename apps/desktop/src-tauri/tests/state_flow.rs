@@ -6,6 +6,9 @@
 //!   (WAL, round 6): with 20,000 planned sibling folders in a debug build on a CI runner,
 //!   installation takes at most 5 s, and no page request waits more than 250 ms; while tag
 //!   preparation is held for 300 ms, a page request and Cancel are each answered within 250 ms.
+//!   The same 250 ms applies to Cancel pressed during the 20,000-folder install (round 7, same
+//!   threshold, registered before that test's first run).
+//! - F3, F4: the plan as Export writes it carries the new window too.
 //! - F3: a Save whose plan settings were written but whose scan settings were not says so and
 //!   still replans.
 //! - F4: a Save that finds its values already on disk (another window wrote them), and a reload
@@ -16,6 +19,7 @@
 // The tests write their own fixtures (scan files, config files) in temporary folders.
 #![allow(clippy::disallowed_methods)]
 
+use disk_cleaner_view::export::write_plan_new;
 use disk_cleaner_view::settings::{AppSettings, CoreChanges};
 use disk_cleaner_view::synth::{synthetic_scan, wide_dir_scan, SEED};
 use prunedisk_desktop_lib::state::{Emit, Inner, ScanSettings};
@@ -57,6 +61,18 @@ fn scan_file(dir: &Path, name: &str, nodes: usize) -> PathBuf {
 fn shown_window(inner: &Inner) -> u64 {
     let s = inner.session();
     s.analysis.as_ref().expect("an analysis is shown").plan.active_window_days
+}
+
+/// The window of the plan as Export writes it: the shown plan, through export_plan's writer.
+fn exported_window(inner: &Inner, dir: &Path, name: &str) -> u64 {
+    let plan = {
+        let s = inner.session();
+        Arc::clone(&s.analysis.as_ref().expect("an analysis is shown").plan)
+    };
+    let path = dir.join(name);
+    write_plan_new(&path, &plan).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    v["active_window_days"].as_u64().expect("the exported plan has a window")
 }
 
 fn max_ms(d: &AtomicU64) -> f64 {
@@ -121,6 +137,59 @@ fn installing_a_wide_analysis_stays_fast_and_leaves_pages_answered() {
         "a page request waited {:.1} ms while the analysis was installed",
         max_ms(&longest)
     );
+}
+
+/// The wide install again, with Cancel pressed while it runs (once the analysis is being
+/// marked) and a pager running throughout: Cancel and every page are answered within 250 ms,
+/// and the cancelled analysis is not shown.
+#[test]
+fn cancel_during_a_wide_install_is_answered_promptly() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let inner = inner_in(tmp.path());
+    let (tree, scan) = wide_dir_scan(WIDE_DIRS, SEED);
+    let ticket = inner.jobs.start().unwrap();
+    let id = ticket.id;
+    let view = inner.show_walk(id, tree, &[PathBuf::from("/wide")]).expect("walk shown");
+
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let entered_tx = Mutex::new(entered_tx);
+    inner.set_prepare_hook(Some(Arc::new(move || {
+        let _ = entered_tx.lock().unwrap().send(());
+    })));
+    let stop = Arc::new(AtomicBool::new(false));
+    let longest = Arc::new(AtomicU64::new(0));
+    let pages = pager(Arc::clone(&inner), view, Arc::clone(&stop), Arc::clone(&longest));
+    let installer = {
+        let inner = Arc::clone(&inner);
+        std::thread::spawn(move || inner.show_scan(id, view, Arc::new(scan)))
+    };
+    entered_rx.recv_timeout(Duration::from_secs(60)).expect("the analysis was marked");
+    let t = Instant::now();
+    let cancelled = inner.cancel(id, &no_emit());
+    let cancel_wait = t.elapsed();
+    let shown = installer.join().unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    stop.store(true, Ordering::SeqCst);
+    let answered = pages.join().unwrap();
+    inner.set_prepare_hook(None);
+
+    eprintln!(
+        "PERF cancel_wide dirs={WIDE_DIRS} cancel_wait_ms={:.3} longest_page_wait_ms={:.1} pages={answered} limits: {} ms, {} ms",
+        cancel_wait.as_secs_f64() * 1e3,
+        max_ms(&longest),
+        MAX_WAIT.as_millis(),
+        MAX_WAIT.as_millis()
+    );
+    assert!(cancel_wait <= MAX_WAIT, "Cancel waited {cancel_wait:?} during a wide install");
+    assert!(cancelled, "Cancel did not take");
+    assert!(
+        max_ms(&longest) <= MAX_WAIT.as_secs_f64() * 1e3,
+        "a page request waited {:.1} ms during a wide install",
+        max_ms(&longest)
+    );
+    assert!(!shown, "a cancelled job's analysis was installed");
+    assert!(inner.session().analysis.is_none(), "a cancelled job's analysis is on screen");
 }
 
 #[test]
@@ -204,7 +273,12 @@ fn a_save_that_writes_only_the_plan_settings_says_so_and_replans() {
     let note = report.note.clone().unwrap_or_default();
     assert!(note.contains("scan settings were not saved"), "{note}");
     assert!(report.replanned, "the plan was not recomputed: {report:?}");
-    assert_eq!(shown_window(&inner), want, "the plan shown (and exported) keeps the old window");
+    assert_eq!(shown_window(&inner), want, "the plan shown keeps the old window");
+    assert_eq!(
+        exported_window(&inner, tmp.path(), "plan.json"),
+        want,
+        "the exported plan keeps the old window"
+    );
     assert_eq!(inner.app_settings(), AppSettings::default(), "unsaved scan settings were adopted");
 
     // A retry is not refused as "changed since loaded": the saved text is the loaded text now.
@@ -243,7 +317,12 @@ fn values_another_window_saved_are_adopted_and_replanned() {
         .unwrap();
     assert_eq!(report.outcome, "unchanged", "{report:?}");
     assert!(report.replanned, "the adopted values did not replan: {report:?}");
-    assert_eq!(shown_window(&inner), want, "the plan shown (and exported) keeps the old window");
+    assert_eq!(shown_window(&inner), want, "the plan shown keeps the old window");
+    assert_eq!(
+        exported_window(&inner, tmp.path(), "plan.json"),
+        want,
+        "the exported plan keeps the old window"
+    );
 }
 
 #[test]
@@ -263,6 +342,7 @@ fn reloading_a_changed_config_replans() {
     inner.load_settings().unwrap();
     assert!(inner.replan().unwrap(), "a changed config file did not replan");
     assert_eq!(shown_window(&inner), want);
+    assert_eq!(exported_window(&inner, tmp.path(), "plan.json"), want);
 }
 
 #[test]
