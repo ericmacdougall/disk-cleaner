@@ -13,6 +13,8 @@
 //! - F5: imports and scans share one admission: a second import, or a scan, is refused while an
 //!   import runs, and a failed import frees the slot.
 #![cfg(debug_assertions)]
+// The tests write their own fixtures (scan files, config files) in temporary folders.
+#![allow(clippy::disallowed_methods)]
 
 use disk_cleaner_view::settings::{AppSettings, CoreChanges};
 use disk_cleaner_view::synth::{synthetic_scan, wide_dir_scan, SEED};
@@ -194,7 +196,7 @@ fn a_save_that_writes_only_the_plan_settings_says_so_and_replans() {
         max_git_admin_bytes: None,
     };
     let report = inner
-        .save_settings(changes.clone(), Some(other_app_settings()), false)
+        .save_settings(changes, Some(other_app_settings()), false)
         .expect("a partial save is reported, not refused");
     let text = std::fs::read_to_string(tmp.path().join("cfg").join("config.toml")).unwrap();
     assert!(text.contains(&format!("active_window_days = {want}")), "config.toml: {text}");

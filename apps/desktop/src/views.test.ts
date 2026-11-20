@@ -4,7 +4,7 @@ import { App } from "./app";
 import { flush, mockBackend, syntheticPage, SETTINGS } from "./testing";
 import { changesFrom, parseWhole, SettingsForm } from "./views/settings";
 import { allocatedLabel, MAX_DOM_ROWS, TreeGrid } from "./views/tree";
-import type { DevItem, DevSummary, SaveResult } from "./api";
+import type { DevItem, DevSummary, SaveResult, SettingsPayload } from "./api";
 import { DEV_PAGE, DevView, summaryLines } from "./views/dev";
 import { layout } from "./views/treemap";
 
@@ -277,6 +277,36 @@ describe("settings (spec AC-5, NEG-5)", () => {
     expect(saves[1]?.args[0]).toMatchObject({ active_window_days: 7 });
     expect(saves[1]?.args[2]).toBe(true);
     expect(f.el.querySelector("fieldset")?.disabled).toBe(false);
+  });
+
+  it("a save that wrote the plan settings but not the scan settings says which, and the plan is recomputed (PR gate F3)", async () => {
+    const replans: boolean[] = [];
+    const partial = {
+      report: { outcome: "partial", note: "scan settings were not saved: cannot replace prunedisk-app.json", replanned: true },
+      settings: structuredClone(SETTINGS),
+    } as unknown as SaveResult;
+    const b = mockBackend({ saveSettings: async () => partial });
+    const f = new SettingsForm(b, (r) => replans.push(r));
+    document.body.replaceChildren(f.el);
+    await f.load();
+    (f.el.querySelector("#set-window") as HTMLInputElement).value = "60";
+    await f.save(false);
+    const text = f.el.querySelector('[role="status"]')?.textContent ?? "";
+    expect(text).toMatch(/^Plan settings saved\./);
+    expect(text).toContain("scan settings were not saved");
+    expect(text).toContain("The plan was recomputed.");
+    expect(text).not.toContain("Not saved");
+    expect(replans).toEqual([true]);
+  });
+
+  it("opening Settings after another program changed the file recomputes the plan and says so (PR gate F4)", async () => {
+    const replans: boolean[] = [];
+    const b = mockBackend({ getSettings: async () => ({ ...structuredClone(SETTINGS), replanned: true }) as SettingsPayload });
+    const f = new SettingsForm(b, (r) => replans.push(r));
+    document.body.replaceChildren(f.el);
+    await f.load();
+    expect(f.el.querySelector('[role="status"]')?.textContent).toContain("The config file changed; the plan was recomputed.");
+    expect(replans).toEqual([true]);
   });
 });
 

@@ -238,7 +238,10 @@ pub fn wide_dir_scan(dirs: usize, seed: u64) -> (Tree, ScanResult) {
         out.push(node);
     }
     let tree = b.finish(Vec::new(), WalkStats::default());
-    (tree, scan_document("/wide", out, by_class, total, dirs as u64))
+    (
+        tree,
+        scan_document("/wide", out, by_class, total, dirs as u64),
+    )
 }
 
 fn scan_document(
