@@ -6,7 +6,7 @@ import { changesFrom, parseWhole, SettingsForm } from "./views/settings";
 import { allocatedLabel, MAX_DOM_ROWS, TreeGrid } from "./views/tree";
 import type { DevItem, DevSummary, SaveResult, SettingsPayload } from "./api";
 import { DEV_PAGE, DevView, summaryLines } from "./views/dev";
-import { layout } from "./views/treemap";
+import { layout, Treemap } from "./views/treemap";
 
 const HOSTILE = '<img src=x onerror="window.__xss=1">';
 
@@ -180,6 +180,32 @@ describe("treemap (spec NEG-11)", () => {
     expect(placed).toHaveLength(2);
     const area = (p: (typeof placed)[number]) => p.w * p.h;
     expect(area(placed[0]!) / area(placed[1]!)).toBeGreaterThan(2);
+  });
+
+  it("each tile's name for assistive technology contains its visible text, in order (axe label-content-name-mismatch, PR gate F1)", async () => {
+    const b = mockBackend({
+      treeTiles: async (_v, node) => ({
+        node,
+        breadcrumb: [],
+        total_alloc: 4000,
+        tiles: [
+          { id: 1, name: "node_modules", alloc: 3000, is_dir: true, tag: "regenerable" },
+          { id: 2, name: "notes.txt", alloc: 1000, is_dir: false, tag: null },
+        ],
+      }),
+    });
+    const t = new Treemap(b, 1, () => undefined);
+    document.body.replaceChildren(t.el);
+    await t.load(null);
+    // As axe compares them: case, punctuation and runs of space do not count.
+    const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const tiles = [...t.el.querySelectorAll<HTMLElement>(".tile")];
+    expect(tiles).toHaveLength(2);
+    for (const tile of tiles) {
+      const visible = norm(tile.textContent ?? "");
+      expect(visible.length, tile.outerHTML).toBeGreaterThan(0);
+      expect(norm(tile.getAttribute("aria-label") ?? ""), tile.outerHTML).toContain(visible);
+    }
   });
 });
 
