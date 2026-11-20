@@ -357,7 +357,7 @@ fn a_folder_the_window_did_not_offer_is_refused() {
     let settings = ScanSettings {
         collect_git_facts: false,
     };
-    let r = inner.start_scan(&[root.clone()], settings, no_emit());
+    let r = inner.start_scan(std::slice::from_ref(&root), settings, no_emit());
     if let Ok(id) = &r {
         inner.cancel(*id, &no_emit());
     }
