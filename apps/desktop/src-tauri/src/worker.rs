@@ -12,9 +12,18 @@
 //! containment is in place; when the parent dies, stdin closes and the worker's watchdog ends
 //! its own session (Unix) or the job closes (Windows).
 //!
-//! Residual (disclosed): if the parent dies after killing the worker but before its sweep has
-//! finished, a git command still running finishes on its own. Core runs only local, read-only
-//! git commands.
+//! Parent death on Unix: the analysis keeps running while the watchdog sweeps, so the watchdog
+//! first stops this process from starting any other (the soft RLIMIT_NPROC limit becomes 0:
+//! fork and posix_spawn then fail with EAGAIN, which core reports as a git error, a fact
+//! "unknown"), then sweeps the session twice, 50 ms apart, then exits. From the moment the
+//! worker is ending, the analysis cannot end the process (its exits and panics wait for the
+//! watchdog), so the sweep always finishes (code inspection F1).
+//!
+//! Residual (disclosed): the process limit does not bind root, nor on Linux a process with
+//! CAP_SYS_RESOURCE or CAP_SYS_ADMIN; an app run that way can, when its parent dies, have one
+//! more git start between the sweep and the worker's exit, which then runs to its end. If the
+//! parent dies after killing the worker but before its own sweep has finished, a git command
+//! still running finishes on its own. Core runs only local, read-only git commands.
 
 use disk_cleaner_core::{scan, FactsConfig, Git, ScanOptions, ScanResult};
 use std::ffi::{OsStr, OsString};
@@ -349,13 +358,78 @@ fn test_pause_before_exit() {
     }
 }
 
-/// The parent is gone: end everything this worker started.
+/// True once the worker is ending because its parent is gone. Held while the watchdog sweeps;
+/// the analysis checks it before it may exit (see [`finish`]).
+static ENDING: Mutex<bool> = Mutex::new(false);
+
+/// The parent is gone: stop starting processes, then end everything this worker started.
 fn end_own_session() {
+    let mut ending = lock(&ENDING);
+    *ending = true;
     #[cfg(unix)]
     {
+        match stop_new_processes() {
+            Ok(()) => eprintln!("analysis worker: ending at {}", unix_ns()),
+            Err(e) => eprintln!("analysis worker: cannot stop new processes ({e})"),
+        }
         // The worker is its session's leader, so its pid is the session id; it exits next.
-        let _ = sweep_session(std::process::id(), None, false);
+        // A second sweep a moment later catches a process whose fork was already under way
+        // when the limit was set.
+        let sid = std::process::id();
+        let _ = sweep_session(sid, None, false);
+        std::thread::sleep(SWEEP_PAUSE);
+        let _ = sweep_session(sid, None, false);
     }
+    drop(ending);
+}
+
+/// From now on this process cannot start another (spec AC-3, code inspection F1): its soft
+/// limit on processes becomes 0, which fork and posix_spawn check (Linux counts every task of
+/// the real user id against it, threads too; macOS counts the user's processes; either way the
+/// count is at least 1). The hard limit is kept. Root, and on Linux CAP_SYS_RESOURCE or
+/// CAP_SYS_ADMIN, are not bound by it (disclosed in the module docs).
+#[cfg(unix)]
+fn stop_new_processes() -> std::io::Result<()> {
+    let (_, hard) = rlimit::getrlimit(rlimit::Resource::NPROC)?;
+    rlimit::setrlimit(rlimit::Resource::NPROC, 0, hard)
+}
+
+#[cfg(unix)]
+fn unix_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// End the worker with `code`, unless it is ending because its parent is gone: then wait for
+/// the watchdog, which exits once its sweep is done.
+fn finish(code: i32) -> ! {
+    let ending = lock(&ENDING);
+    if *ending {
+        drop(ending);
+        wait_for_the_watchdog();
+    }
+    std::process::exit(code)
+}
+
+fn wait_for_the_watchdog() -> ! {
+    loop {
+        std::thread::park();
+    }
+}
+
+/// While the worker is ending, a panic (core cannot start a thread once new processes are
+/// stopped on Linux) waits for the watchdog instead of unwinding out of the analysis and
+/// ending the process mid-sweep. Otherwise the default report and unwinding apply.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if *lock(&ENDING) {
+            wait_for_the_watchdog();
+        }
+        default(info);
+    }));
 }
 
 /// The worker's main. Never returns.
@@ -367,23 +441,24 @@ pub fn worker_main(args: &[OsString]) -> ! {
             std::process::exit(2);
         }
     };
+    install_panic_hook();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || watchdog(tx));
     if rx.recv_timeout(GO_TIMEOUT).is_err() {
         eprintln!("analysis worker: not started");
-        std::process::exit(4);
+        finish(4);
     }
     match analyse(&parsed) {
         Ok(scan) => {
             let mut out = std::io::BufWriter::new(std::io::stdout().lock());
             if serde_json::to_writer(&mut out, &scan).is_err() || out.flush().is_err() {
-                std::process::exit(1);
+                finish(1);
             }
-            std::process::exit(0);
+            finish(0);
         }
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(1);
+            finish(1);
         }
     }
 }

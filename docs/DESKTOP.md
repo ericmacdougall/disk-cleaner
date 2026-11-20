@@ -51,8 +51,14 @@ Disclosed limits:
   share that does not answer).
 - The analysis runs in a worker process. Cancel and quitting end it and every git command it
   started (a session sweep on macOS and Linux, a job object on Windows). If the app dies
-  after it has killed the worker but before its sweep finished, a git command still running
-  finishes on its own; core runs only local, read-only git commands.
+  outright, the worker notices its input closing; on macOS and Linux it first stops itself
+  from starting any further process (its process limit becomes 0), then sweeps, then exits,
+  and on Windows the job object ends it and everything it started. Residual: the process
+  limit does not bind an app run as root (or, on Linux, with CAP_SYS_RESOURCE or
+  CAP_SYS_ADMIN); there, one more git can start between the sweep and the worker's exit and
+  runs to its end. If the app dies after it has killed the worker but before its own sweep
+  finished, a git command still running finishes on its own. Core runs only local, read-only
+  git commands.
 - Saving settings: another program that writes core's config file at the moment of saving
   can lose that write; `config.toml.bak` holds the text Settings loaded.
 - An imported scan shows no agent session folders (they come from the size walk).

@@ -49,6 +49,7 @@ export class DevView {
   /** Each item request gets a number; only the latest one is shown. */
   private itemsGen = 0;
   private pagePending = false;
+  private groupButtons = new Map<string, HTMLButtonElement>();
 
   constructor(
     private backend: Backend,
@@ -93,29 +94,43 @@ export class DevView {
     }
   }
 
+  /** Build the class buttons (once per summary). A class button that had keyboard focus is
+   * focused again. Choosing a class only marks the buttons (spec AC-7: focus stays). */
   private renderGroups(): void {
     const s = this.data;
     if (!s) return;
+    const active = document.activeElement;
+    const focused = [...this.groupButtons].find(([, b]) => b === active)?.[0];
+    this.groupButtons.clear();
     replace(
       this.groups,
-      ...s.groups.map((g) =>
-        h(
+      ...s.groups.map((g) => {
+        const b = h(
           "button",
           {
             type: "button",
             class: "group",
-            "aria-pressed": String(g.class === this.cls),
+            "aria-pressed": "false",
             onclick: () => {
               this.cls = g.class;
               this.offset = 0;
-              this.renderGroups();
+              this.markGroups();
               void this.loadItems();
             },
           },
           `${g.label}: ${formatCount(g.count)} (${formatBytes(g.class_bytes)})`,
-        ),
-      ),
+        );
+        this.groupButtons.set(g.class, b);
+        return b;
+      }),
     );
+    this.markGroups();
+    if (focused !== undefined) this.groupButtons.get(focused)?.focus();
+  }
+
+  /** Mark the class asked for as pressed, keeping the buttons (and focus) in place. */
+  private markGroups(): void {
+    for (const [cls, b] of this.groupButtons) b.setAttribute("aria-pressed", String(cls === this.cls));
   }
 
   /** Load the current class and offset. Only the latest request is shown (a late reply of
@@ -140,44 +155,58 @@ export class DevView {
       if (this.shown) {
         this.cls = this.shown.cls;
         this.offset = this.shown.offset;
-        this.renderGroups();
+        this.markGroups();
       }
+      const hadRetryFocus = this.itemsError.contains(document.activeElement);
+      const retry = h(
+        "button",
+        {
+          type: "button",
+          onclick: () => {
+            this.cls = cls;
+            this.offset = offset;
+            this.markGroups();
+            void this.loadItems();
+          },
+        },
+        "Try again",
+      );
       replace(
         this.itemsError,
         h("p", { role: "alert" }, `Could not load ${g.label} ${rangeText(offset, g.count)}: ${message}`),
-        h(
-          "button",
-          {
-            type: "button",
-            onclick: () => {
-              this.cls = cls;
-              this.offset = offset;
-              this.renderGroups();
-              void this.loadItems();
-            },
-          },
-          "Try again",
-        ),
+        retry,
       );
+      if (hadRetryFocus) retry.focus();
       return;
     }
     if (gen !== this.itemsGen) return;
     this.pagePending = false;
     this.shown = { cls, offset };
+    // Where keyboard focus was (spec AC-7): on a pager button, or on Try again.
+    const active = document.activeElement;
+    const pagerFocus = active instanceof HTMLElement && this.items.contains(active) ? active.dataset.pager : undefined;
+    const retryFocus = this.itemsError.contains(active);
     replace(this.itemsError);
-    const pager = h(
-      "div",
-      { class: "pager" },
-      h("button", { type: "button", disabled: offset === 0, onclick: () => void this.pageBy(-DEV_PAGE) }, "Previous"),
-      ` ${rangeText(offset, g.count)} of ${formatCount(g.count)} `,
-      h("button", { type: "button", disabled: offset + DEV_PAGE >= g.count, onclick: () => void this.pageBy(DEV_PAGE) }, "Next"),
+    const prev = h(
+      "button",
+      { type: "button", "data-pager": "prev", disabled: offset === 0, onclick: () => void this.pageBy(-DEV_PAGE) },
+      "Previous",
     );
-    replace(
-      this.items,
-      h("h3", {}, g.label),
-      list.length === 0 ? h("p", {}, "None.") : this.table(list),
-      pager,
+    const next = h(
+      "button",
+      { type: "button", "data-pager": "next", disabled: offset + DEV_PAGE >= g.count, onclick: () => void this.pageBy(DEV_PAGE) },
+      "Next",
     );
+    const heading = h("h3", { tabindex: -1 }, g.label);
+    const pager = h("div", { class: "pager" }, prev, ` ${rangeText(offset, g.count)} of ${formatCount(g.count)} `, next);
+    replace(this.items, heading, list.length === 0 ? h("p", {}, "None.") : this.table(list), pager);
+    if (pagerFocus) {
+      // The same button, or the other one when it is now disabled (first or last page).
+      const [same, other]: [HTMLButtonElement, HTMLButtonElement] = pagerFocus === "prev" ? [prev, next] : [next, prev];
+      (!same.disabled ? same : !other.disabled ? other : heading).focus();
+    } else if (retryFocus) {
+      heading.focus();
+    }
   }
 
   private table(list: DevItem[]): HTMLElement {

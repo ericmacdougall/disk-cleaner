@@ -34,6 +34,9 @@ tauri-plugin-dialog = "2"
 [target.'cfg(unix)'.dependencies]
 # setsid for the analysis worker (worker::spawn_worker only).
 libc = "0.2"
+# A safe setrlimit: when its parent dies the worker stops starting processes before its
+# sweep (worker::stop_new_processes). MIT, depends only on libc.
+rlimit = "0.10.2"
 
 [target.'cfg(windows)'.dependencies]
 # A job object for the analysis worker (worker::spawn_worker only).

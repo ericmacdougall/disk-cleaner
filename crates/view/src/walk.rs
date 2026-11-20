@@ -87,30 +87,56 @@ impl std::fmt::Display for WalkError {
 
 impl std::error::Error for WalkError {}
 
-/// Lets a report through at most once per interval, plus the final one.
+/// Lets a report through at most once per interval, the last one included.
 #[derive(Debug)]
 pub struct Throttle {
     interval: Duration,
+    /// No report before one interval after this.
+    start: Option<Instant>,
     last: Option<Instant>,
 }
 
 impl Throttle {
+    /// The first report may go at once.
     pub fn new(interval: Duration) -> Throttle {
         Throttle {
             interval,
+            start: None,
+            last: None,
+        }
+    }
+
+    /// The first report is due one interval after `start`.
+    pub fn starting_at(interval: Duration, start: Instant) -> Throttle {
+        Throttle {
+            interval,
+            start: Some(start),
             last: None,
         }
     }
 
     /// True when a report may be sent at `now`; records it.
     pub fn ready(&mut self, now: Instant) -> bool {
-        match self.last {
+        match self.last.or(self.start) {
             Some(t) if now.duration_since(t) < self.interval => false,
             _ => {
                 self.last = Some(now);
                 true
             }
         }
+    }
+
+    /// Before the last report, which must go: wait out the interval since the previous
+    /// report (at once when none was sent), then record it. Waits less than one interval.
+    pub fn wait_for_last(&mut self) {
+        if let Some(t) = self.last {
+            let due = t + self.interval;
+            let now = Instant::now();
+            if now < due {
+                std::thread::sleep(due - now);
+            }
+        }
+        self.last = Some(Instant::now());
     }
 }
 
@@ -239,8 +265,8 @@ impl Accum {
     }
 }
 
-/// Walk the roots. `progress` is called at most once per `progress_interval` and once at the
-/// end. Setting `cancel` stops the walk: no further folder is entered and `Cancelled` is
+/// Walk the roots. `progress` is called at most once per `progress_interval`, the call at the
+/// end included (the first is due one interval in; the last waits out the interval). Setting `cancel` stops the walk: no further folder is entered and `Cancelled` is
 /// returned.
 pub fn walk(
     opts: &WalkOptions,
@@ -262,7 +288,9 @@ pub fn walk(
         heap: BinaryHeap::new(),
         top_n: opts.top_files,
     };
-    let mut throttle = Throttle::new(opts.progress_interval);
+    // Spec: at most 10 progress events a second (one per 100 ms by default), the last one
+    // included, so the first is due one interval in and the last waits out the interval.
+    let mut throttle = Throttle::starting_at(opts.progress_interval, started);
     let one_fs = opts.one_file_system && cfg!(unix);
     let cancelled = Arc::new(AtomicBool::new(false));
 
@@ -427,6 +455,7 @@ pub fn walk(
             return Err(WalkError::Cancelled);
         }
     }
+    throttle.wait_for_last();
     acc.stats.elapsed_ms = started.elapsed().as_millis() as u64;
     progress(&Progress {
         files: acc.stats.files,
@@ -505,7 +534,10 @@ mod tests {
         })
         .unwrap();
         assert!(!at.is_empty(), "no progress report at all");
-        assert_eq!(last_files, tree.stats.files, "the last report holds the final count");
+        assert_eq!(
+            last_files, tree.stats.files,
+            "the last report holds the final count"
+        );
         for w in at.windows(2) {
             let gap = w[1].duration_since(w[0]);
             assert!(
