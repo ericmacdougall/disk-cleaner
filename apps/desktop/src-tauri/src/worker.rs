@@ -42,6 +42,10 @@ pub const SWEEP_PASSES: usize = 40;
 pub const SWEEP_PAUSE: Duration = Duration::from_millis(50);
 /// How long the worker waits for "go" before giving up.
 const GO_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long after ending begins the worker exits, whatever its other threads are doing.
+pub const END_DEADLINE: Duration = Duration::from_secs(10);
+/// Core's limit on one git command (`--git-timeout-ms`).
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the worker is asked to do. Passed as an argument list, never through a shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +57,8 @@ pub struct WorkerArgs {
     pub min_output_bytes: u64,
     /// The git program (`git`; tests use a fake one).
     pub git: OsString,
+    /// Core's limit on one git command ([`GIT_TIMEOUT`]; tests use a short one).
+    pub git_timeout: Duration,
 }
 
 impl WorkerArgs {
@@ -71,6 +77,8 @@ impl WorkerArgs {
         a.push(self.min_output_bytes.to_string().into());
         a.push("--git".into());
         a.push(self.git.clone());
+        a.push("--git-timeout-ms".into());
+        a.push(self.git_timeout.as_millis().to_string().into());
         a.push("--".into());
         a.extend(self.roots.iter().map(|r| r.as_os_str().to_os_string()));
         a
@@ -85,6 +93,7 @@ impl WorkerArgs {
             top_files: 200,
             min_output_bytes: 100 << 20,
             git: "git".into(),
+            git_timeout: GIT_TIMEOUT,
         };
         let mut it = args.iter();
         let number = |v: Option<&OsString>, name: &str| -> Result<u64, String> {
@@ -101,6 +110,10 @@ impl WorkerArgs {
                     out.min_output_bytes = number(it.next(), "--min-output-bytes")?
                 }
                 Some("--git") => out.git = it.next().cloned().ok_or("--git needs a program")?,
+                Some("--git-timeout-ms") => {
+                    let ms = number(it.next(), "--git-timeout-ms")?;
+                    out.git_timeout = Duration::from_millis(ms.max(1));
+                }
                 Some("--") => {
                     out.roots.extend(it.by_ref().map(PathBuf::from));
                     break;
@@ -189,6 +202,11 @@ impl WorkerHandle {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The worker's output has ended: wait for it to exit and reap it.
+    pub fn reap(&self) -> Option<ExitStatus> {
+        self.wait()
     }
 }
 
@@ -316,7 +334,7 @@ pub fn analyse(args: &WorkerArgs) -> Result<ScanResult, String> {
     opts.top_files = args.top_files;
     opts.min_output_bytes = args.min_output_bytes;
     opts.collect_facts = args.collect_facts;
-    let git = Git::new(args.git.clone(), Duration::from_secs(30));
+    let git = Git::new(args.git.clone(), args.git_timeout);
     opts.facts = FactsConfig::default().with_git(git);
     scan(&opts).map_err(|e| e.to_string())
 }
@@ -358,6 +376,21 @@ fn test_pause_before_exit() {
     }
 }
 
+/// Test builds only: with `PRUNEDISK_TEST_STALL_END` set, the watchdog stops for good once new
+/// processes are stopped, before its sweep: a stuck ending, which only the deadline can end
+/// (tests/containment.rs). Release builds never read it.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn test_stall_ending() {
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os("PRUNEDISK_TEST_STALL_END").is_some() {
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+}
+
 /// True once the worker is ending because its parent is gone. Held while the watchdog sweeps;
 /// the analysis checks it before it may exit (see [`finish`]).
 static ENDING: Mutex<bool> = Mutex::new(false);
@@ -372,6 +405,7 @@ fn end_own_session() {
             Ok(()) => eprintln!("analysis worker: ending at {}", unix_ns()),
             Err(e) => eprintln!("analysis worker: cannot stop new processes ({e})"),
         }
+        test_stall_ending();
         // The worker is its session's leader, so its pid is the session id; it exits next.
         // A second sweep a moment later catches a process whose fork was already under way
         // when the limit was set.
@@ -487,6 +521,7 @@ mod tests {
             top_files: 50,
             min_output_bytes: 7,
             git: "fake-git".into(),
+            git_timeout: Duration::from_millis(1500),
         };
         assert_eq!(WorkerArgs::parse(&a.to_args()).unwrap(), a);
     }

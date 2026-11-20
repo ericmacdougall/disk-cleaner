@@ -7,7 +7,7 @@
 //!   is swapped in under it after the job id and the settings generation are checked.
 //! - The view commands name a view id; a stale id is refused, never answered from newer data.
 
-use crate::worker::{spawn_worker, worker_exe, WorkerArgs, WorkerHandle, GO};
+use crate::worker::{spawn_worker, worker_exe, WorkerArgs, WorkerHandle, GIT_TIMEOUT, GO};
 use disk_cleaner_core::{running_cwds, Plan, ScanResult};
 use disk_cleaner_view::dev::{make_plan, DevView, PlanInputs};
 use disk_cleaner_view::import::{self, Limits, MAX_IMPORT_BYTES};
@@ -529,6 +529,7 @@ impl Inner {
             top_files: app.top_files,
             min_output_bytes: app.min_output_mib << 20,
             git: lock(&self.git_program).clone(),
+            git_timeout: GIT_TIMEOUT,
         };
         let mut proc = spawn_worker(&exe, &args)
             .map_err(|e| format!("cannot start the analysis process: {e}"))?;
@@ -602,7 +603,7 @@ impl Inner {
                 return Err(e.to_string());
             }
         };
-        let status = handle.wait();
+        let status = handle.reap();
         let messages = err_reader.join().unwrap_or_default();
         if !self.jobs.is_current(id) {
             return Ok(None);

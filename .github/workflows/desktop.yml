@@ -232,7 +232,7 @@ jobs:
       - name: Test (desktop; includes the worker containment test)
         working-directory: apps/desktop/src-tauri
         run: |
-          cargo build --locked --example fake_git
+          cargo build --locked --examples
           cargo test --locked --no-fail-fast -- --nocapture
       - name: Containment test repeated (10 runs, no failure allowed)
         if: ${{ !cancelled() }}
@@ -270,7 +270,7 @@ jobs:
         working-directory: apps/desktop/src-tauri
         shell: bash
         run: |
-          cargo build --locked --example fake_git
+          cargo build --locked --examples
           cargo test --locked --no-fail-fast -- --nocapture
       - name: Containment test repeated (10 runs, no failure allowed)
         if: ${{ !cancelled() }}
