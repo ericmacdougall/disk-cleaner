@@ -8,7 +8,7 @@ $id = 'io.github.ericmacdougall.prunedisk'
 $local = [Environment]::GetFolderPath('LocalApplicationData')
 
 function Show-Webviews($what) {
-  "--- $what: webview processes"
+  "--- ${what}: webview processes"
   Get-CimInstance Win32_Process -Filter "Name = 'msedgewebview2.exe'" |
     ForEach-Object { "  pid $($_.ProcessId) parent $($_.ParentProcessId): $($_.CommandLine)" } | Select-Object -First 6
 }
