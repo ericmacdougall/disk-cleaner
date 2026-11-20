@@ -3,6 +3,13 @@
 
 const ELEMENT = "element-6066-11e4-a52f-4a6a43c3c0d1";
 
+/** An element reference from a WebDriver reply (the W3C key, or the legacy one). */
+function ref(v, what) {
+  const id = v?.[ELEMENT] ?? v?.ELEMENT;
+  if (!id) throw new Error(`${what}: no element reference in ${JSON.stringify(v)}`);
+  return id;
+}
+
 export class WebDriverError extends Error {
   constructor(what, value) {
     super(`${what}: ${value?.error ?? "error"}: ${value?.message ?? JSON.stringify(value)}`);
@@ -14,6 +21,7 @@ export class Session {
   constructor(base, id) {
     this.base = base;
     this.id = id;
+    this.tagged = 0;
   }
 
   static async start(base, capabilities, timeoutMs = 120_000) {
@@ -61,29 +69,37 @@ export class Session {
 
   async find(css) {
     const v = await this.cmd("POST", "/element", { using: "css selector", value: css });
-    return v[ELEMENT];
+    return ref(v, css);
   }
 
   async findAll(css) {
     const v = await this.cmd("POST", "/elements", { using: "css selector", value: css });
-    return v.map((e) => e[ELEMENT]);
+    return v.map((e) => ref(e, css));
   }
 
   /** The first element matching `css` whose trimmed text is `text` (or starts with it, when
    * `prefix`); waits up to `timeoutMs`. */
   async findText(css, text, { prefix = false, timeoutMs = 30_000 } = {}) {
-    const v = await this.until(
-      `const [css, text, prefix] = arguments;
-       return [...document.querySelectorAll(css)].find((e) => {
+    // The match is tagged and then found with /element, rather than returned from the script:
+    // WebKitWebDriver did not hand back a usable reference for a returned element (probe run
+    // 44682996385).
+    const token = String(++this.tagged);
+    await this.until(
+      `const [css, text, prefix, token] = arguments;
+       const e = [...document.querySelectorAll(css)].find((e) => {
          const t = e.textContent.trim();
          return prefix ? t.startsWith(text) : t === text;
-       }) ?? null;`,
+       });
+       if (!e) return false;
+       e.setAttribute("data-e2e-find", token);
+       return true;`,
       timeoutMs,
       css,
       text,
       prefix,
+      token,
     );
-    return v[ELEMENT];
+    return this.find(`[data-e2e-find="${token}"]`);
   }
 
   click(el) {

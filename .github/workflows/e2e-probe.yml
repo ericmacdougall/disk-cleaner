@@ -20,15 +20,25 @@ env:
 
 jobs:
   probe:
-    name: probe (${{ matrix.os }})
+    name: probe (${{ matrix.os }}, ${{ matrix.variant }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 70
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest]
+        include:
+          - { os: ubuntu-22.04, variant: none }
+          - { os: windows-latest, variant: none }
+          # Broken variants (e2e/variants/*.patch): each must be caught by its own check.
+          - { os: ubuntu-22.04, variant: planted-write }
+          - { os: ubuntu-22.04, variant: offered-check-removed }
+          - { os: ubuntu-22.04, variant: capability-broadened }
+          - { os: ubuntu-22.04, variant: focus-broken }
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Apply the broken variant
+        if: matrix.variant != 'none'
+        run: git apply --verbose "apps/desktop/e2e/variants/${{ matrix.variant }}.patch"
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
@@ -77,6 +87,7 @@ jobs:
           npm ci --no-audit --no-fund
           npx tauri icon app-icon.svg
       - name: Build the release binary (production config, no e2e feature)
+        if: matrix.variant == 'none'
         working-directory: apps/desktop
         shell: bash
         run: |
@@ -99,15 +110,27 @@ jobs:
       - name: End-to-end checks
         working-directory: apps/desktop
         shell: bash
+        env:
+          VARIANT: ${{ matrix.variant }}
         run: |
           ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
           export RELEASE_BIN="$RUNNER_TEMP/bin/release$ext" E2E_BIN="$RUNNER_TEMP/bin/e2e$ext"
+          [ "$VARIANT" = none ] || RELEASE_BIN=none
           export CLI_BIN="$GITHUB_WORKSPACE/target/release/disk-cleaner$ext" OUT="$RUNNER_TEMP/e2e"
-          if [ "$RUNNER_OS" = Linux ]; then xvfb-run -a -s "-screen 0 1280x1024x24" bash e2e/check.sh; else bash e2e/check.sh; fi
+          status=0
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a -s "-screen 0 1280x1024x24" bash e2e/check.sh || status=$?
+          else
+            bash e2e/check.sh || status=$?
+          fi
+          if [ "$VARIANT" = none ]; then exit "$status"; fi
+          # A broken variant must make its own check fail.
+          [ "$status" != 0 ] || { echo "::error::variant $VARIANT passed every check"; exit 1; }
+          python3 e2e/expect_variant.py "$VARIANT" "$OUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: e2e-${{ matrix.os }}
+          name: e2e-${{ matrix.os }}-${{ matrix.variant }}
           path: |
             ${{ runner.temp }}/e2e/*.json
             ${{ runner.temp }}/e2e/*.txt

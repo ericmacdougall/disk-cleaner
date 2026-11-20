@@ -1,0 +1,11 @@
+diff --git a/apps/desktop/src/views/settings.ts b/apps/desktop/src/views/settings.ts
+index b7dae95..474229b 100644
+--- a/apps/desktop/src/views/settings.ts
++++ b/apps/desktop/src/views/settings.ts
+@@ -234,6 +234,5 @@ export class SettingsForm {
+       ),
+     );
+     this.dialog.hidden = false;
+-    keep.focus();
+   }
+ }

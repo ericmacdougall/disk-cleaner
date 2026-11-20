@@ -28,7 +28,8 @@ if $win; then PY=python; fi
 native() { if $win; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
 
 echo "== binaries: the release binary holds no e2e hook names; the e2e binary does"
-if grep -a -q PRUNEDISK_E2E_ "$RELEASE_BIN"; then
+# RELEASE_BIN=none: a broken-variant run (e2e/variants), which builds only the e2e binary.
+if [ "$RELEASE_BIN" != none ] && grep -a -q PRUNEDISK_E2E_ "$RELEASE_BIN"; then
   echo "::error::the release binary contains PRUNEDISK_E2E_ strings"; exit 1
 fi
 grep -a -q PRUNEDISK_E2E_FOLDERS "$E2E_BIN" || { echo "::error::the e2e binary lacks its hooks (control)"; exit 1; }
@@ -38,8 +39,10 @@ echo "== fixture (seed 16452)"
 "$CLI_BIN" scan --no-git --out "$(native "$INPUTS/valid-scan.json")" "$(native "$FIX")" > /dev/null
 printf '{"version": 1, "roots": ["unterminated' > "$INPUTS/malformed-scan.json"
 
-echo "== probe: the release binary as shipped"
-node e2e/probe.mjs --app "$(native "$RELEASE_BIN")" --out "$OUT/probe-release.json" || echo "probe of the release binary failed (see $OUT/probe-release.json)"
+if [ "$RELEASE_BIN" != none ]; then
+  echo "== probe: the release binary as shipped"
+  node e2e/probe.mjs --app "$(native "$RELEASE_BIN")" --out "$OUT/probe-release.json" || echo "probe of the release binary failed (see $OUT/probe-release.json)"
+fi
 
 if $win; then
   folder() { cygpath -u "$(powershell -NoProfile -Command "[Environment]::GetFolderPath('$1')" | tr -d '\r')"; }
@@ -54,8 +57,10 @@ else
   ROOTS=("$FIX" "$SB")
   # Linux runs the e2e binary with incognito off (WebKitWebDriver cannot drive an ephemeral
   # webkit2gtk context), so the webview keeps its data in the sandbox's data and cache folders.
+  # The graphics driver (Mesa) keeps its shader cache in XDG_CACHE_HOME for any program that
+  # draws with it, the shipped app included (docs/DESKTOP.md).
   DECLARED=(--declared "$SB/config/disk-cleaner" --declared "$SB/home/exports/plan.json"
-    --declared "$SB/data/$ID" --declared "$SB/cache/$ID")
+    --declared "$SB/data/$ID" --declared "$SB/cache/$ID" --declared "$SB/cache/mesa_shader_cache")
   BIG=/usr
   APP="$OUT/app-traced.sh"
   mkdir -p "$OUT/trace"
@@ -92,8 +97,8 @@ nowrite=0
 if ! $win; then
   echo "== trace (report only)"
   "$PY" e2e/trace_report.py "$OUT/trace/strace.log" "${DECLARED[@]}" \
-    --ignore /dev/ --ignore /proc/ --ignore /sys/ > "$OUT/trace.txt" || true
-  grep -E '^(OTHER|trace:)' "$OUT/trace.txt" | head -80 || true
+    --ignore /dev/ --ignore /proc/ --ignore /sys/ --ignore /run/user/ > "$OUT/trace.txt" || true
+  grep -E '^(OTHER|trace:)' "$OUT/trace.txt" || true
 fi
 
 echo "suite exit $status, no-write exit $nowrite"

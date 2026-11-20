@@ -42,9 +42,10 @@ def git(repo: Path, *args: str, when: int | None = None) -> None:
 
 def age(root: Path, seconds: int) -> None:
     t = time.time() - seconds
+    nofollow = os.utime in os.supports_follow_symlinks  # not on Windows; the fixture has no links
     for dirpath, dirnames, filenames in os.walk(root):
         for n in filenames + dirnames:
-            os.utime(Path(dirpath) / n, (t, t), follow_symlinks=False)
+            os.utime(Path(dirpath) / n, (t, t), **({"follow_symlinks": False} if nofollow else {}))
     os.utime(root, (t, t))
 
 
