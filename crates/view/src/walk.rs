@@ -61,6 +61,17 @@ pub struct Progress {
     pub elapsed_ms: u64,
     /// The folder being read (display-safe).
     pub current: String,
+    /// When the walk let this report through, in nanoseconds since the walk started: the
+    /// instant its throttle compared, so two reports are at least `progress_interval` apart
+    /// by this clock exactly, however late the callback runs. Not sent to the app's frontend.
+    #[serde(skip)]
+    pub reported_ns: u64,
+}
+
+/// Nanoseconds from `start` to `t` (0 if `t` is earlier).
+fn nanos_since(start: Instant, t: Instant) -> u64 {
+    let ns = t.saturating_duration_since(start).as_nanos();
+    u64::try_from(ns).unwrap_or(u64::MAX)
 }
 
 /// Why a walk produced no tree.
@@ -127,16 +138,20 @@ impl Throttle {
     }
 
     /// Before the last report, which must go: wait out the interval since the previous
-    /// report (at once when none was sent), then record it. Waits less than one interval.
-    pub fn wait_for_last(&mut self) {
+    /// report (at once when none was sent), then record it and return the instant recorded.
+    /// Waits less than one interval.
+    pub fn wait_for_last(&mut self) -> Instant {
+        let mut now = Instant::now();
         if let Some(t) = self.last {
-            let due = t + self.interval;
-            let now = Instant::now();
-            if now < due {
-                std::thread::sleep(due - now);
+            // Checked against the clock after each sleep, so the instant recorded is never
+            // short of the interval.
+            while now.duration_since(t) < self.interval {
+                std::thread::sleep(self.interval - now.duration_since(t));
+                now = Instant::now();
             }
         }
-        self.last = Some(Instant::now());
+        self.last = Some(now);
+        now
     }
 }
 
@@ -440,13 +455,15 @@ pub fn walk(
                     acc.note_file(id, alloc);
                 }
             }
-            if throttle.ready(Instant::now()) {
+            let now = Instant::now();
+            if throttle.ready(now) {
                 progress(&Progress {
                     files: acc.stats.files,
                     dirs: acc.stats.dirs,
                     bytes: acc.stats.allocated_bytes,
-                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    elapsed_ms: now.duration_since(started).as_millis() as u64,
                     current: current_path(&stack, root),
+                    reported_ns: nanos_since(started, now),
                 });
             }
         }
@@ -455,14 +472,15 @@ pub fn walk(
             return Err(WalkError::Cancelled);
         }
     }
-    throttle.wait_for_last();
-    acc.stats.elapsed_ms = started.elapsed().as_millis() as u64;
+    let last = throttle.wait_for_last();
+    acc.stats.elapsed_ms = last.duration_since(started).as_millis() as u64;
     progress(&Progress {
         files: acc.stats.files,
         dirs: acc.stats.dirs,
         bytes: acc.stats.allocated_bytes,
         elapsed_ms: acc.stats.elapsed_ms,
         current: String::new(),
+        reported_ns: nanos_since(started, last),
     });
     // Largest first. (The heap holds `Reverse` entries, so sort the unwrapped pairs.)
     let mut ids: Vec<(u64, NodeId)> = acc.heap.into_iter().map(|Reverse(x)| x).collect();
@@ -528,8 +546,9 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let mut at = Vec::new();
         let mut last_files = 0;
+        // The walk's own report times, which do not depend on when this callback runs.
         let tree = walk(&opts, &cancel, &mut |p| {
-            at.push(Instant::now());
+            at.push(p.reported_ns);
             last_files = p.files;
         })
         .unwrap();
@@ -539,7 +558,7 @@ mod tests {
             "the last report holds the final count"
         );
         for w in at.windows(2) {
-            let gap = w[1].duration_since(w[0]);
+            let gap = Duration::from_nanos(w[1].saturating_sub(w[0]));
             assert!(
                 gap >= opts.progress_interval,
                 "two progress reports {gap:?} apart (interval {:?}, {} reports)",
