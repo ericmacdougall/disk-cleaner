@@ -88,9 +88,13 @@ account's home folder. The app runs the webview in incognito mode (`"incognito":
   `~/Library/WebKit/<bundle id>/WebsiteData/` (520 KiB in CI and 584 KiB in the click-test,
   with a `ResourceLoadStatistics` database still being written while idle) and
   `~/Library/Caches/<bundle id>/WebKit/` (8 KiB). CI (job "bundle (macos-arm64)") launches
-  the app idle for 20 s, lists what it wrote and fails if the statistics database is written.
-  With incognito, CI saw an idle launch create neither folder. Folders that an older build
-  created are not removed; delete them by hand if wanted.
+  the app idle for 20 s, quits it, lists anything under `~/Library/WebKit/<bundle id>`,
+  `~/Library/Caches/<bundle id>`, `~/Library/HTTPStorages/<bundle id>` (and its
+  `.binarycookies` file) and `~/Library/Saved Application State/<bundle id>.savedState`, and
+  fails if any of them exists. With incognito, CI saw an idle launch create neither of the
+  first two (run 44655472337); the check of all five runs on every push. It shows that the
+  app stayed running, not that the page loaded. Folders that an older build created are not
+  removed; delete them by hand if wanted.
 - Windows (not observed here): WebView2 keeps a user data folder,
   `%LOCALAPPDATA%\io.github.ericmacdougall.prunedisk\EBWebView\`; incognito runs it InPrivate,
   which keeps browsing data out of it, but the runtime still creates the folder.
@@ -110,8 +114,13 @@ Disclosed limits:
 - The analysis runs in a worker process. Cancel and quitting end it and every git command it
   started (a session sweep on macOS and Linux, a job object on Windows). If the app dies
   outright, the worker notices its input closing; on macOS and Linux it first stops itself
-  from starting any further process (its process limit becomes 0), then sweeps, then exits,
-  and on Windows the job object ends it and everything it started. Residual: the process
+  from starting any further process (its soft process limit becomes 0; macOS may also lower
+  the hard limit to its per-user maximum, which does not matter as the worker exits next),
+  then sweeps, then exits, and on Windows the job object ends it and everything it started.
+  Its output then has no reader, so nothing on the way out depends on writing it; and ten
+  seconds after the worker began ending, a separate thread sweeps once more and exits it
+  whatever else is happening. When the worker dies on its own (a crash, the out-of-memory
+  killer), the app sweeps what it started before reaping it. Residual: the process
   limit does not bind an app run as root (or, on Linux, with CAP_SYS_RESOURCE or
   CAP_SYS_ADMIN); there, one more git can start between the sweep and the worker's exit and
   runs to its end. If the app dies after it has killed the worker but before its own sweep
@@ -130,6 +139,6 @@ All in CI; nothing is built on a developer machine by default.
 | view and tui crates, three OSes | job "view and tui" (`cargo test -p disk-cleaner-view -p disk-cleaner-tui`) |
 | read-only guard and its planted-violation controls | job "read-only guard" (`scripts/check-readonly.sh`, `--controls`) |
 | frontend unit tests (vitest, jsdom, mocked backend) | job "frontend unit tests" (`npm test` in `apps/desktop`) |
-| desktop backend, worker and containment | jobs "desktop backend (linux)", "worker containment" (`cargo test` in `apps/desktop/src-tauri`, then `scripts/repeat-containment.sh 10`) |
+| desktop backend, worker and containment (Cancel; the parent's input closing; the parent dying with every pipe; a real parent process killed; a stuck ending cut short by the deadline; a worker that dies on its own) | jobs "desktop backend (linux)", "worker containment" (`cargo build --examples`, then `cargo test` in `apps/desktop/src-tauri`, then `scripts/repeat-containment.sh 10`) |
 | one million nodes | job "performance at one million nodes" (results in the job summary and the `perf-results` artifact) |
-| licences and advisories of the desktop lockfile | job "cargo deny (desktop workspace)" (`apps/desktop/src-tauri/deny.toml`; each advisory ignore gives its reason). ci.yml's "cargo deny licenses" covers the root lockfile, licences only |
+| licences, advisories, bans and sources of the desktop lockfile | job "cargo deny (desktop workspace)" (`apps/desktop/src-tauri/deny.toml`, `--locked`; crates only from crates.io, no git sources; duplicate versions warn; the cargo-deny version is printed first; each advisory ignore gives its reason). ci.yml's "cargo deny licenses" covers the root lockfile, licences only |

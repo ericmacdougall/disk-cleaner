@@ -26,3 +26,16 @@ confidence-threshold = 0.8
 # (proc-macro-error unmaintained, build-time, via glib-macros and gtk3-macros) and
 # RUSTSEC-2026-0543 (chrono unmaintained, via serde_with in tauri-utils).
 ignore = []
+
+[bans]
+# Tauri's tree has crates at several versions that this repository cannot unify: they warn,
+# so the job's log shows them, without failing it. No crate is banned.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# Crates come from crates.io only: another registry or a git source fails the job.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -58,21 +58,27 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: cargo-deny version
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          manifest-path: apps/desktop/src-tauri/Cargo.toml
+          arguments: --locked
+          command: --version
       - name: Every crate of the desktop lockfile with its licence
         uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         with:
           manifest-path: apps/desktop/src-tauri/Cargo.toml
-          # --config is a global option, so it goes before the subcommand.
-          arguments: --all-features --config apps/desktop/src-tauri/deny.toml
+          # --config and --locked are global options, so they go before the subcommand.
+          arguments: --all-features --locked --config apps/desktop/src-tauri/deny.toml
           command: list
           command-arguments: --layout crate
-      - name: Licences and advisories
+      - name: Licences, advisories, bans and sources
         if: ${{ !cancelled() }}
         uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         with:
           manifest-path: apps/desktop/src-tauri/Cargo.toml
-          arguments: --all-features --config apps/desktop/src-tauri/deny.toml
-          command: check licenses advisories
+          arguments: --all-features --locked --config apps/desktop/src-tauri/deny.toml
+          command: check licenses advisories bans sources
 
   readonly-guard:
     name: read-only guard
@@ -358,11 +364,14 @@ jobs:
         run: |
           set -uo pipefail
           id=io.github.ericmacdougall.prunedisk
-          data="$HOME/Library/WebKit/$id"
-          cache="$HOME/Library/Caches/$id"
-          if [ -e "$data" ] || [ -e "$cache" ]; then
-            echo "::error::webview folders exist before the launch"; exit 1
-          fi
+          # Every folder an idle launch could write under the bundle id (docs/DESKTOP.md says
+          # it writes none of them).
+          places=("$HOME/Library/WebKit/$id" "$HOME/Library/Caches/$id"
+            "$HOME/Library/HTTPStorages/$id" "$HOME/Library/HTTPStorages/$id.binarycookies"
+            "$HOME/Library/Saved Application State/$id.savedState")
+          for p in "${places[@]}"; do
+            if [ -e "$p" ]; then echo "::error::$p exists before the launch"; exit 1; fi
+          done
           app=$(ls -d apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app | head -1)
           exe="$app/Contents/MacOS/$(ls "$app/Contents/MacOS" | head -1)"
           "$exe" > launch.log 2>&1 &
@@ -372,12 +381,12 @@ jobs:
             echo "::error::the app exited during the idle launch"; cat launch.log; exit 1
           fi
           kill "$pid"; wait "$pid" 2>/dev/null || true
-          echo "Written by a 20 s idle launch:"
+          echo "Written by a 20 s idle launch and its quit:"
           # find fails on a folder that does not exist, which is the good case.
-          listing=$(find "$data" "$cache" -maxdepth 4 2>/dev/null | sed "s|^$HOME|~|" || true)
-          echo "${listing:-nothing under ~/Library/WebKit/$id or ~/Library/Caches/$id}"
-          du -sk "$data" "$cache" 2>/dev/null || true
-          if [ -e "$data/WebsiteData/ResourceLoadStatistics" ]; then
-            echo "::error::the webview keeps a persistent ResourceLoadStatistics store"; exit 1
+          listing=$(find "${places[@]}" -maxdepth 4 2>/dev/null | sed "s|^$HOME|~|" || true)
+          echo "${listing:-nothing under any of: ${places[*]}}"
+          du -sk "${places[@]}" 2>/dev/null || true
+          if [ -n "$listing" ]; then
+            echo "::error::an idle launch wrote webview or app-state data (listed above)"; exit 1
           fi
-          echo "No persistent ResourceLoadStatistics store."
+          echo "Nothing written under any of the five places."
