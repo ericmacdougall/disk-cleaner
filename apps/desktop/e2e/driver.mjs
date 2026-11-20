@@ -1,7 +1,7 @@
 // Start tauri-driver, open the app under test in a WebDriver session, and give checks a small
 // API: page scripts, IPC through the page's own bridge, axe, and named results.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -44,6 +44,17 @@ export async function startDriver({ driver = "tauri-driver", port = 4444, native
   }
   proc.kill();
   throw new Error("tauri-driver did not start");
+}
+
+/** Stop tauri-driver and everything it started (the native driver, the app, its webview):
+ * on Windows a plain kill ends tauri-driver alone, and a survivor holding the webview's data
+ * folder can make the next launch fail. */
+export function stopDriver(proc) {
+  if (process.platform === "win32" && proc.pid) {
+    spawnSync("taskkill", ["/F", "/T", "/PID", String(proc.pid)], { stdio: "ignore" });
+  } else {
+    proc.kill();
+  }
 }
 
 export class Run {

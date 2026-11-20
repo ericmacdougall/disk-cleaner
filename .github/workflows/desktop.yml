@@ -352,12 +352,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/bin"
           ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
           cp "src-tauri/target/release/prunedisk-desktop$ext" "$RUNNER_TEMP/bin/release$ext"
-      - name: Build the e2e binary (--features e2e; Linux also turns incognito off)
+      - name: Build the e2e binary (--features e2e; on Linux incognito off, docs/DESKTOP.md)
         working-directory: apps/desktop
         shell: bash
         run: |
           extra=()
-          [ "$RUNNER_OS" = Linux ] && extra=(--config e2e/linux-automation.conf.json)
+          [ "$RUNNER_OS" = Linux ] && extra=(--config e2e/automation.conf.json)
           npx tauri build --ci --no-bundle --features e2e "${extra[@]}"
           mkdir -p "$RUNNER_TEMP/bin"
           ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe

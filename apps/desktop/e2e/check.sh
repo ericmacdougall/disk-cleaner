@@ -2,8 +2,9 @@
 # End-to-end checks on the packaged app (PR gate F1), Linux and Windows (Git Bash).
 # Run from apps/desktop after building:
 #   RELEASE_BIN  the release binary (production config, no e2e feature)
-#   E2E_BIN      the same app built with --features e2e (on Linux also with
-#                e2e/linux-automation.conf.json: see docs/DESKTOP.md)
+#   E2E_BIN      the same app built with --features e2e; on Linux also with
+#                --config e2e/automation.conf.json (incognito off: WebKitWebDriver cannot drive
+#                an incognito webkit2gtk webview; see docs/DESKTOP.md)
 #   CLI_BIN      the disk-cleaner CLI (writes the valid scan file the app opens)
 #   OUT          a new folder for results, logs and the sandbox
 # Steps: string check of both binaries, fixture, probe of the release binary, snapshot,
@@ -55,8 +56,8 @@ if $win; then
   APP="$E2E_BIN"
 else
   ROOTS=("$FIX" "$SB")
-  # Linux runs the e2e binary with incognito off (WebKitWebDriver cannot drive an ephemeral
-  # webkit2gtk context), so the webview keeps its data in the sandbox's data and cache folders.
+  # On Linux the e2e binary runs with incognito off, so the webview keeps its data in the
+  # sandbox's data and cache folders.
   # The graphics driver (Mesa) keeps its shader cache in XDG_CACHE_HOME for any program that
   # draws with it, the shipped app included (docs/DESKTOP.md).
   DECLARED=(--declared "$SB/config/disk-cleaner" --declared "$SB/home/exports/plan.json"

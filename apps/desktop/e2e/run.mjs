@@ -13,7 +13,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { App, Run, args, startDriver } from "./driver.mjs";
+import { App, Run, args, startDriver, stopDriver } from "./driver.mjs";
 import { KEY } from "./webdriver.mjs";
 
 // Registered before the first measurement (WAL w0ce4fd7355e): p95 by nearest rank.
@@ -418,6 +418,6 @@ try {
   console.log(`FAIL suite ${String(e?.message ?? e)}`);
 } finally {
   if (app) await app.close();
-  proc.kill();
+  stopDriver(proc);
 }
 process.exitCode = run.write(a.out ?? "e2e-result.json") ? 1 : 0;

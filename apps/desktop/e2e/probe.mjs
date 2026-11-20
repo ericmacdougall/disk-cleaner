@@ -2,7 +2,7 @@
 // called through its IPC bridge, refused by its capability list, and checked with axe?
 // usage: node e2e/probe.mjs --app <binary> --out <result.json> [--native-driver <path>]
 
-import { App, Run, args, startDriver } from "./driver.mjs";
+import { App, Run, args, startDriver, stopDriver } from "./driver.mjs";
 
 const a = args(process.argv.slice(2));
 const run = new Run("probe");
@@ -55,6 +55,6 @@ try {
   }
 } finally {
   if (app) await app.close();
-  proc.kill();
+  stopDriver(proc);
 }
 process.exitCode = run.write(a.out ?? "probe-result.json") ? 1 : 0;
