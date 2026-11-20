@@ -115,6 +115,7 @@ fn assert_refused(res: &ScanResult, repo: &Path, want: &str) {
 
 /// For a symlink in the git directory: the scan's own walk sets `plain_layout` to `no` whatever
 /// the config check found, and a `no` never offers anything.
+#[cfg(unix)]
 fn assert_refused_symlink(res: &ScanResult, repo: &Path, want: &str) {
     refused(res, repo, want, true, true);
 }
