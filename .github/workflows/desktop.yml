@@ -50,6 +50,28 @@ jobs:
           test -z "$(git status --porcelain -- Cargo.lock apps/desktop/src-tauri/Cargo.lock)" || {
             echo "::error::Cargo.lock is not current; commit the 'lockfiles' artifact of this run"; exit 1; }
 
+  deny-desktop:
+    # ci.yml's "cargo deny licenses" reads the root Cargo.lock only; the desktop app's
+    # dependencies (tauri, rlimit, the webview crates) are in apps/desktop/src-tauri/Cargo.lock.
+    name: cargo deny (desktop workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Every crate of the desktop lockfile with its licence
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          manifest-path: apps/desktop/src-tauri/Cargo.toml
+          command: list
+          command-arguments: --config apps/desktop/src-tauri/deny.toml --layout crate
+      - name: Licences and advisories
+        if: ${{ !cancelled() }}
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          manifest-path: apps/desktop/src-tauri/Cargo.toml
+          command: check licenses advisories
+          command-arguments: --config apps/desktop/src-tauri/deny.toml
+
   readonly-guard:
     name: read-only guard
     runs-on: ubuntu-latest
@@ -328,3 +350,30 @@ jobs:
           path: dist-bundles/*
           retention-days: 14
           if-no-files-found: error
+      - name: Webview data written by an idle launch (macOS; listed in docs/DESKTOP.md)
+        if: matrix.name == 'macos-arm64'
+        shell: bash
+        run: |
+          set -uo pipefail
+          id=io.github.ericmacdougall.prunedisk
+          data="$HOME/Library/WebKit/$id"
+          cache="$HOME/Library/Caches/$id"
+          if [ -e "$data" ] || [ -e "$cache" ]; then
+            echo "::error::webview folders exist before the launch"; exit 1
+          fi
+          app=$(ls -d apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app | head -1)
+          exe="$app/Contents/MacOS/$(ls "$app/Contents/MacOS" | head -1)"
+          "$exe" > launch.log 2>&1 &
+          pid=$!
+          sleep 20
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "::error::the app exited during the idle launch"; cat launch.log; exit 1
+          fi
+          kill "$pid"; wait "$pid" 2>/dev/null || true
+          echo "Written by a 20 s idle launch:"
+          find "$data" "$cache" -maxdepth 4 2>/dev/null | sed "s|^$HOME|~|"
+          du -sk "$data" "$cache" 2>/dev/null || true
+          if [ -e "$data/WebsiteData/ResourceLoadStatistics" ]; then
+            echo "::error::the webview keeps a persistent ResourceLoadStatistics store"; exit 1
+          fi
+          echo "No persistent ResourceLoadStatistics store."

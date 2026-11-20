@@ -5,8 +5,10 @@
 #![allow(clippy::disallowed_methods)]
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use disk_cleaner_core::{Plan, ScanResult};
 use disk_cleaner_tui::app::{App, Outcome, Tab};
 use disk_cleaner_tui::ui;
+use disk_cleaner_tui::worker::{Analysis, Msg};
 use disk_cleaner_view::dev::PlanInputs;
 use disk_cleaner_view::synth::{synthetic_scan, synthetic_tree, EPOCH, SEED};
 use disk_cleaner_view::tree::{EntryKind, NewEntry, TreeBuilder, WalkStats};
@@ -190,6 +192,294 @@ fn an_imported_scan_has_no_size_tree() {
     app.on_key(key(KeyCode::Char('1')));
     let s = screen(&mut app, 120, 20);
     assert!(s.contains("no size tree"), "{s}");
+}
+
+/// The screen as rows of cell symbols.
+fn cells(app: &mut App, w: u16, h: u16) -> Vec<Vec<String>> {
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| ui::draw(f, app)).unwrap();
+    let buf = t.backend().buffer().clone();
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// The inside of the box whose top border holds `title`, one string per row.
+fn boxed(rows: &[Vec<String>], title: &str) -> Option<Vec<String>> {
+    for (y, row) in rows.iter().enumerate() {
+        let line: String = row.concat();
+        let Some(byte) = line.find(title) else {
+            continue;
+        };
+        let mut col = 0;
+        let mut acc = 0;
+        for (i, s) in row.iter().enumerate() {
+            if acc >= byte {
+                col = i;
+                break;
+            }
+            acc += s.len();
+        }
+        // The tab bar also names the views; only a top border counts.
+        let Some(left) = (0..=col).rev().find(|&x| row[x] == "┌") else {
+            continue;
+        };
+        let Some(right) = (col..row.len()).find(|&x| row[x] == "┐") else {
+            continue;
+        };
+        let mut out = Vec::new();
+        for r in rows.iter().skip(y + 1) {
+            if r[left] == "└" {
+                break;
+            }
+            out.push(r[left + 1..right].concat());
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// Text with every run of whitespace made one space, so wrapped sentences compare whole.
+fn flat(rows: &[String]) -> String {
+    rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn flat_str(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn live_analysis(app: &mut App, scan: ScanResult, plan: Plan) {
+    app.on_message(Msg::Analysis(Box::new(Analysis { scan, plan })));
+}
+
+/// F3: a live scan finishes after the screen opened, so its time is later than the clock read
+/// at start; it is still a known time ("today"), not "an unknown time".
+#[test]
+fn a_live_scan_made_after_the_screen_opened_has_a_known_time() {
+    let mut app = App::new(EPOCH);
+    let mut scan = synthetic_scan(10, SEED);
+    scan.generated_at = EPOCH + 90;
+    let plan = disk_cleaner_tui::worker::plan_scan_with(&scan, &inputs(), EPOCH + 95);
+    live_analysis(&mut app, scan, plan);
+    app.on_key(key(KeyCode::Char('2')));
+    let s = screen(&mut app, 160, 40);
+    assert!(!s.contains("unknown time"), "{s}");
+    assert!(s.contains("scan made today"), "{s}");
+}
+
+/// A plan whose every notice is set: an imported scan older than the window, a partial process
+/// check, incomplete coverage and the remote-facts sentence.
+fn noisy_app(now: i64) -> App {
+    let mut app = App::new(now);
+    let scan = synthetic_scan(40, SEED);
+    let mut plan = disk_cleaner_tui::worker::plan_scan_with(&scan, &inputs(), now);
+    let process = "202 processes could not be inspected; a project they use may look idle";
+    let coverage = "Coverage is incomplete: 1 folder could not be read, so links or clones \
+                    inside it were not checked.";
+    plan.process_check = "partial".into();
+    plan.process_check_note = Some(process.into());
+    plan.coverage_complete = false;
+    plan.coverage_note = Some(coverage.into());
+    app.set_analysis(&scan, plan, true);
+    app.tab = Tab::Dev;
+    app
+}
+
+/// Every notice of the summary, as the view states it.
+fn notices(app: &App) -> Vec<String> {
+    let s = &app.dev.as_ref().unwrap().summary;
+    vec![
+        s.stale_warning.clone().expect("the scan is older than the window"),
+        s.imported_note.clone().expect("imported"),
+        s.process_check_note.clone().expect("partial"),
+        s.coverage_note.clone().expect("incomplete"),
+        s.remote_facts_note.clone(),
+        "Process check: partial".to_string(),
+    ]
+}
+
+/// Every screen the details overlay shows while scrolling from its top to its end.
+fn every_details_screen(app: &mut App, w: u16, h: u16) -> Vec<String> {
+    app.on_key(key(KeyCode::Char('i')));
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        let rows = cells(app, w, h);
+        if let Some(b) = boxed(&rows, "All notices") {
+            seen.push(flat(&b));
+        }
+        app.on_key(key(KeyCode::Down));
+    }
+    seen
+}
+
+/// F4: at 80x24 every safety notice can be read, on the main screen or by scrolling the
+/// details overlay (`i`), and a clipped header says so.
+#[test]
+fn every_safety_notice_is_reachable_at_80x24() {
+    let mut app = noisy_app(EPOCH + 400 * 86_400);
+    let wanted = notices(&app);
+    let rows = cells(&mut app, 80, 24);
+    let header = boxed(&rows, "Developer view").expect("the header box");
+    let header = flat(&header);
+    let screens = every_details_screen(&mut app, 80, 24);
+    assert!(!screens.is_empty(), "i opens no details overlay");
+    for n in &wanted {
+        let n = flat_str(n);
+        let on_header = header.contains(&n);
+        assert!(
+            on_header || screens.iter().any(|s| s.contains(&n)),
+            "not reachable at 80x24: {n}\nheader: {header}\noverlay: {screens:#?}"
+        );
+    }
+    // Esc closes the overlay.
+    app.on_key(key(KeyCode::Esc));
+    let rows = cells(&mut app, 80, 24);
+    assert!(boxed(&rows, "All notices").is_none());
+    let title = rows
+        .iter()
+        .map(|r| r.concat())
+        .find(|l| l.contains('┌') && l.contains("Developer view"));
+    assert!(
+        title.as_deref().unwrap_or("").contains("press i"),
+        "a clipped header must say how to see the rest: {title:?}"
+    );
+}
+
+/// F4: at 160x45 the header grows to fit every notice (nothing is cut).
+#[test]
+fn the_header_fits_every_notice_at_160x45() {
+    let mut app = noisy_app(EPOCH + 400 * 86_400);
+    let wanted = notices(&app);
+    let rows = cells(&mut app, 160, 45);
+    let header = flat(&boxed(&rows, "Developer view").expect("the header box"));
+    for n in &wanted {
+        assert!(header.contains(&flat_str(n)), "cut at 160x45: {n}\n{header}");
+    }
+}
+
+/// F4: a partial process check and incomplete coverage are stated even without a note.
+#[test]
+fn a_partial_process_check_and_incomplete_coverage_are_stated_without_notes() {
+    let mut app = App::new(EPOCH);
+    let scan = synthetic_scan(10, SEED);
+    let mut plan = disk_cleaner_tui::worker::plan_scan_with(&scan, &inputs(), EPOCH);
+    plan.process_check = "partial".into();
+    plan.process_check_note = None;
+    plan.coverage_complete = false;
+    plan.coverage_note = None;
+    app.set_analysis(&scan, plan, false);
+    app.tab = Tab::Dev;
+    let rows = cells(&mut app, 160, 45);
+    let header = flat(&boxed(&rows, "Developer view").expect("the header box"));
+    assert!(header.contains("Process check: partial"), "{header}");
+    assert!(header.contains("Coverage is incomplete"), "{header}");
+}
+
+/// F4 with core: a folder that cannot be read makes core's coverage incomplete, and the view
+/// states core's note (the click-test's tree2 case).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_folder_gives_a_coverage_note_from_core() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("f"), b"x").unwrap();
+    std::fs::write(dir.path().join("g"), b"y").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read_dir(&locked).is_ok();
+    let mut opts = disk_cleaner_core::ScanOptions::new(vec![dir.path().to_path_buf()]);
+    opts.collect_facts = false;
+    let scan = disk_cleaner_core::scan(&opts);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        println!("SKIP: this user can read a mode-000 folder (root)");
+        return;
+    }
+    let scan = scan.unwrap();
+    let plan = disk_cleaner_tui::worker::plan_scan_with(&scan, &inputs(), EPOCH);
+    assert!(!plan.coverage_complete);
+    let note = plan.coverage_note.clone().expect("core's coverage note");
+    let mut app = App::new(EPOCH);
+    app.set_analysis(&scan, plan, false);
+    app.tab = Tab::Dev;
+    let rows = cells(&mut app, 80, 24);
+    let header = flat(&boxed(&rows, "Developer view").expect("the header box"));
+    let screens = every_details_screen(&mut app, 80, 24);
+    let n = flat_str(&note);
+    assert!(
+        header.contains(&n) || screens.iter().any(|s| s.contains(&n)),
+        "core's coverage note is not reachable: {n}\n{header}\n{screens:#?}"
+    );
+}
+
+/// F5 and F8: the help shows every line whole at 80x24 and 160x45, including what the Size and
+/// % parent columns mean.
+#[test]
+fn the_help_is_whole_at_80x24_and_160x45() {
+    let sort = format!(
+        "sort by the next column ({}, size, files, modified, name)",
+        ui::allocated_header().to_lowercase()
+    );
+    let wanted = [
+        sort.as_str(),
+        "export the plan as JSON to a new file in the current folder",
+        "switch between the size tree and the developer view",
+        "Size: apparent size",
+        "% parent: share of the parent folder's allocated space",
+        "not a sort key",
+        "Nothing here deletes, moves or backs up anything.",
+    ];
+    for (w, h) in [(80, 24), (160, 45)] {
+        let mut app = app_with_tree();
+        app.on_key(key(KeyCode::Char('?')));
+        let rows = cells(&mut app, w, h);
+        let help = flat(&boxed(&rows, "Keys").expect("the help box"));
+        for t in wanted {
+            assert!(help.contains(t), "at {w}x{h} the help lacks: {t}\n{help}");
+        }
+    }
+}
+
+/// F6: a path too long for the list ends in its tail after an ellipsis, measured in display
+/// columns (wide characters included).
+#[test]
+fn long_paths_keep_their_tail_after_an_ellipsis() {
+    let mut app = App::new(EPOCH);
+    let scan = synthetic_scan(20, SEED);
+    let mut plan = disk_cleaner_tui::worker::plan_scan_with(&scan, &inputs(), EPOCH);
+    for (i, it) in plan.items.iter_mut().enumerate() {
+        let base = "/Users/someone/work/clients/a-rather-long-client-name/projects";
+        it.path = format!("{base}/ñandú-目录-{i}/node_modules");
+    }
+    app.set_analysis(&scan, plan, false);
+    app.tab = Tab::Dev;
+    app.on_key(key(KeyCode::Down));
+    let rows = cells(&mut app, 80, 30);
+    let list = boxed(&rows, "Items by class").expect("the list box");
+    let tails: Vec<&String> = list.iter().filter(|r| r.contains("modules")).collect();
+    assert!(!tails.is_empty(), "no item row shows its path's tail:\n{list:#?}");
+    for r in tails {
+        assert!(r.contains('…'), "a cut path must show an ellipsis: {r:?}");
+        assert!(r.trim_end().ends_with("node_modules"), "{r:?}");
+    }
+}
+
+/// Tiny terminals draw without panicking, in every view and overlay.
+#[test]
+fn tiny_terminals_do_not_panic() {
+    for (w, h) in [(1, 1), (2, 2), (10, 3), (20, 5), (40, 10), (80, 24)] {
+        let mut app = noisy_app(EPOCH + 400 * 86_400);
+        app.set_tree(small_tree());
+        for k in ['1', '2', '?', '?', 'i', 'j', 'G'] {
+            app.on_key(key(KeyCode::Char(k)));
+            let _ = cells(&mut app, w, h);
+        }
+    }
 }
 
 #[test]
