@@ -1,9 +1,23 @@
 # Apply spec: earlier reviews
 
-How revisions 5 and 6 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
-from section 22 (revision 5's answers in revision 6, revision 6's in revision 7). Criterion and
-negative-case ids are those of revision 5 and later; section numbers are those of APPLY-SPEC.md.
-Later changes to the same areas are listed in APPLY-SPEC.md section 22.
+How revisions 5 to 7 of [APPLY-SPEC.md](APPLY-SPEC.md) answered the earlier reviews, moved here
+from section 22 (revision 5's answers in revision 6, revision 6's in revision 7, revision 7's in
+revision 8). Criterion and negative-case ids are those of revision 5 and later; section numbers are
+those of APPLY-SPEC.md. Later changes to the same areas are listed in APPLY-SPEC.md section 22.
+
+## Review of revision 6 (acceptance)
+
+| Finding | Change in revision 7 | Criteria and negative cases |
+|---|---|---|
+| R6-1 the history rule misses unreachable objects (dropped stash, `git add` then `git rm --cached`) and names hidden by a duplicate or renamed blob | Examined set = every object in the store minus what the network tips reach; names from tree, index, tag and ref entries; an unnamed blob keeps the item; object and time limits; `--no-replace-objects`; disclosure in 17 (9.2, 7.5, 18, D-16). The reviewer's correction was evaluated as option (a). Revision 8 added `core.commitGraph=false` (F1) | AC-9, AC-12; NEG-41, NEG-43, NEG-45 |
+| S-1 scope of the package exemption | Only inside a regenerable or cache directory, with core's evidence (9.2); revision 8 added C-5 | AC-12; NEG-44 |
+| S-2 the content rule over-keeps inside regenerable children | A file with package evidence there is exempt from the content rule whatever its name; the name exemption stays limited to `fixture_prone` names; kept-by-rule counts measured on a corpus before release (9.2, 23) | AC-12; NEG-42 |
+| S-3 the AC-37 phrase test can pass on wrapped text | Rendered text, whitespace collapsed, a pairing check and a wrapped control (AC-37) | AC-37 |
+| S-5 NEG-27 describes a case 6.3 makes impossible | NEG-27 reworded; 6.2 states the 6.3 exception | AC-29; NEG-27 |
+| S-6 `--missing=allow-any` skips a missing tree silently | `--missing=allow-promisor`; reproduced with git 2.54.0: a missing tree in a repository that is not a partial clone gives exit 0 with `allow-any` and exit 128 with `allow-promisor` | AC-12; NEG-41 |
+| S-8 the spool limit had no observing step | The (b) flows record the spool directory's peak size and the free space (24) | AC-36 |
+| S-11 the history timeout had no value | 600 seconds per item, injected in tests (9.2) | AC-12; NEG-41 |
+| Owner, found while closing R6-1 | Replace refs, conflict images in `rr-cache`, a pack without its index, blobs that only a tag names (9.2) | AC-12; NEG-45 |
 
 ## Review of revision 5 (acceptance)
 
