@@ -762,8 +762,9 @@ every partial clone, is not a failure. The one exception is the 64 MiB content b
 blobs in history, which is documented best effort. A check that failed or could not run, for any
 reason other than the two limits above (a git error, output that does not parse, a missing
 object, a pack without its index), is a **check that could not run**: it keeps the item under
-every handling, `upload-all` included, because then it is the archive's completeness that is in
-doubt, not only its secrecy. An item whose layout core's check refused is never selected at all
+every automatic handling, `upload-all` included, because then the archive's completeness is in
+doubt, not only its secrecy. In ask mode it stays in the secrets set as before (11), so the
+answer `u` is the only route that uploads such an item. An item whose layout core's check refused is never selected at all
 (the plan gives it `ask`, as above, D-3), and a layout that fails only at apply's re-check (step 2)
 makes the item differ from the plan, so it is skipped; no handling applies to either.
 
@@ -792,9 +793,11 @@ runs in automatic mode it is `--secrets keep|upload|upload-all` or `[apply] secr
   never the default, never implied by `upload`, and has no effect on items in ask mode, which are
   asked as before.
 
-**The upload-all notice.** In a run where `upload-all` is in effect, before the first upload of
-any item (and in a dry run, before the first item is reported), apply prints once, on stderr and
-in the summary: "--secrets upload-all: items that run automatically are uploaded whole to REMOTE,
+**The upload-all notice.** In a run where `upload-all` is in effect, apply prints this notice
+exactly once on stderr, before the first upload of any item (in a dry run, before the first item
+is reported); `apply --resume` is a new process and prints it once again before its own first
+upload. The run summary repeats it once at its end, as part of the summary, not as a second
+notice. The notice: "--secrets upload-all: items that run automatically are uploaded whole to REMOTE,
 even when they hold secret-like files, secret-like names in local history, unnamed git objects
 or a history check that exceeded its limit. Unnamed objects and objects of 1 MiB or more may be
 uploaded unread; 'no pattern matched' is not evidence that an object holds no secret. Items whose
@@ -1154,7 +1157,8 @@ Where they apply:
 - `kept_reasons_overridden`: on a record whose `secrets_choice` is set, every rule that would
   otherwise have kept the item, each with its count and no names: `name`, `content`,
   `global-excludes`, `git-directory`, `history-name`, `unnamed-object` (with the counts read in
-  full, in part and not read) and `history-limit` (`objects` or `time`);
+  full, in part and not read), `history-limit` (`objects` or `time`) and `history-not-run` (the
+  check that could not run; only after `u`, since no automatic handling uploads such an item);
 - `completed_by`: `"unknown"` on a `removed` or `regenerable-removed` record written after the
   tool found a leftover's quarantine gone (10.1): the user, or the interrupted pass, finished it;
 - `restore`: the method (`archive` or `regenerable`) and the exact `disk-cleaner restore
@@ -1590,7 +1594,7 @@ which the user chose (option (i), sourced in D-16).
 - A repository whose store has more than 10 million objects, or whose history check takes more
   than 600 seconds, is kept unless `u` is answered for it or `upload-all` applies (9.2, D-4); its
   history is then uploaded unchecked, as the prompt and the notice say. A repository whose history
-  check could not run is kept under every handling.
+  check could not run is kept by every automatic handling; only `u` at the prompt uploads it.
 - **Secrets the user chose to upload** (D-4) are stored in the user's own storage like the rest of
   the archive, unencrypted unless the remote is `crypt`. The local vault option is not in this
   release.
@@ -1880,7 +1884,8 @@ two steps; it exists only in test builds (AC-35).
   not completed, the storage and the unencrypted statement for a non-`crypt` remote), and shows
   the three statements of 11 word for word whenever the set holds unnamed objects. `u` uploads
   the whole set of that item and nothing of any other; after `u` the item is asked about again;
-  the record carries `secrets_uploaded`, `unnamed_uploaded` and `secrets_choice`. No answer is
+  the record carries `secrets_uploaded`, `unnamed_uploaded`, `secrets_choice` and
+  `kept_reasons_overridden` (12.1). No answer is
   reused after F0 is taken again (11). Verify by: `ask.rs` through the library's prompt interface and the binary through a pseudo-terminal, comparing the prompt with the three statements of 11 and with each content result (read in full, first 64 KiB, 1 MiB or more, budget spent); and `secrets.rs`, which shows the item's secret values and unnamed values in the inflated archive after `u` and in no stored object after `n`, and no value of a second item in the same run in any stored object.
 - **AC-39** Quarantines follow 5, 7.4, 10.1 and 13.3: `quarantine list` prints every quarantine a
   journal names that still exists, in each state, with the text 5 gives for that state (the
@@ -1916,8 +1921,8 @@ two steps; it exists only in test builds (AC-35).
   = "upload-all"` selects it, never the default and never `upload`; for an automatic item it
   uploads the whole secrets set, unnamed objects and a history check past its limits included,
   and nothing of any other item; a check that could not run still keeps the item; the notice of
-  9.2 is printed exactly once per run, before the first upload (before the first report in a dry
-  run), with the storage's encryption state; each such record has `secrets_choice: "upload-all"`
+  9.2 is printed on stderr exactly once per process, before the first upload (before the first
+  report in a dry run), with the storage's encryption state, and repeated once in the summary; each such record has `secrets_choice: "upload-all"`
   and `kept_reasons_overridden` listing every rule that would otherwise have kept it; ask-mode
   items are asked as before. Verify by: `secrets.rs` and `ask.rs` with fixtures for each rule,
   each limit and each could-not-run case, under `keep`, `upload` and `upload-all`, in automatic
@@ -2261,10 +2266,11 @@ two steps; it exists only in test builds (AC-35).
   stored. Under `--secrets upload-all`: R1, R2, R2' and R3 archived, each record with
   `secrets_choice: "upload-all"` and `kept_reasons_overridden` naming its rules with counts and
   no names; R4 and R5 kept with the could-not-run reason; R6 not selected and R6' skipped as
-  changed, with no value of R4 to R6' in any stored object. The notice: printed exactly once
-  before the first part upload (the fake rclone's call log shows the order), with "not
-  encrypted" on a plain remote and "encrypted" on a `crypt` remote over a local one; printed
-  once by a dry run, which writes nothing; absent under `keep` and `upload`. `upload-all` with
+  changed, with no value of R4 to R6' in any stored object. The notice: on stderr exactly once,
+  before the first part upload (the fake rclone's call log shows the order), and once in the
+  summary, with "not encrypted" on a plain remote and "encrypted" on a `crypt` remote over a
+  local one; on stderr once by a dry run, which writes nothing; once again by an `apply
+  --resume` of a run killed after its first upload; absent under `keep` and `upload`. `upload-all` with
   `--require-encrypted-remote` on a plain remote: exit 1 before the notice, nothing uploaded.
   An ask-mode item in the same run: prompted as before, and `n` keeps it with nothing uploaded.
   `[apply] secrets = "upload-all"` with `--secrets upload`: R1 kept. `--secrets upload_all`:
