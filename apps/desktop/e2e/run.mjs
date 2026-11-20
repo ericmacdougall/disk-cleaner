@@ -190,10 +190,23 @@ try {
   let total = 0;
   await run.check("view.tree_drill_into_wide", async () => {
     await tab("Size tree");
-    const root = await app.s.find(".tg-scroll [role=row][aria-rowindex='2']");
-    await app.s.dblclick(root);
-    const wide = await app.s.findText(".tg-scroll [role=row] .name", "wide");
-    await app.s.dblclick(wide);
+    // Rows are re-rendered as pages arrive, so a row found a moment ago can be gone when the
+    // pointer reaches it (run 44688993733: "stale element reference"). The driver refuses
+    // such an action before it clicks, so trying again cannot click twice.
+    const again = async (f) => {
+      const end = Date.now() + 30_000;
+      for (;;) {
+        try {
+          return await f();
+        } catch (e) {
+          if (Date.now() > end || !/stale element|no such element/.test(String(e?.message))) throw e;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+    };
+    await again(async () => app.s.dblclick(await app.s.find(".tg-scroll [role=row][aria-rowindex='2']")));
+    await app.s.until("return document.querySelectorAll(\"nav[aria-label='Folder path'] button\").length >= 2", 15_000);
+    await again(async () => app.s.dblclick(await app.s.findText(".tg-scroll [role=row] .name", "wide")));
     total = await app.s.until(
       "const n = Number(document.querySelector('.tg-scroll').getAttribute('aria-rowcount')) - 1; return n >= 1000 ? n : 0;",
       30_000,
