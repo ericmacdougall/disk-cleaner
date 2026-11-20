@@ -480,6 +480,90 @@ fn long_paths_keep_their_tail_after_an_ellipsis() {
     }
 }
 
+/// A tree with a long root path, a 60-character name of wide characters and one entry the
+/// walk could not read.
+fn long_tree() -> disk_cleaner_view::Tree {
+    let mut b = TreeBuilder::new(true);
+    let root = "/Users/someone/work/clients/a-rather-long-client-name/projects/final-root";
+    let long = format!("{}末尾.txt", "あ".repeat(54));
+    let mut add = |parent, name: &str, kind, alloc| {
+        b.push(NewEntry {
+            parent,
+            name,
+            kind,
+            size: alloc,
+            alloc,
+            files: 0,
+            mtime: EPOCH,
+            flags: 0,
+        })
+        .unwrap()
+    };
+    let r = add(None, root, EntryKind::Dir, 4096);
+    add(Some(r), &long, EntryKind::File, 8192);
+    add(Some(r), "short.txt", EntryKind::File, 4096);
+    drop(add);
+    let stats = WalkStats {
+        unreadable: 1,
+        ..WalkStats::default()
+    };
+    b.finish(Vec::new(), stats)
+}
+
+fn rows_of(app: &mut App, w: u16, h: u16) -> Vec<String> {
+    cells(app, w, h).iter().map(|r| r.concat()).collect()
+}
+
+/// R2-1: a size-tree name too long for its column ends in its tail after an ellipsis,
+/// measured in display columns.
+#[test]
+fn long_tree_names_keep_their_tail_after_an_ellipsis() {
+    let mut app = App::new(EPOCH);
+    app.set_tree(long_tree());
+    let rows = rows_of(&mut app, 80, 24);
+    let row = rows
+        .iter()
+        .find(|r| r.contains("8.0 KiB") && !r.contains("16.0 KiB"))
+        .expect("the long file's row");
+    assert!(row.contains('…'), "no ellipsis: {row:?}");
+    // Wide characters leave a blank cell behind them; compare without blanks.
+    assert!(row.replace(' ', "").contains("末尾.txt"), "{row:?}");
+}
+
+/// R2-1: the size tree's title keeps the end of a long path and its source label.
+#[test]
+fn a_long_path_in_the_tree_title_keeps_its_tail() {
+    let mut app = App::new(EPOCH);
+    app.set_tree(long_tree());
+    // Open the root: the title then names its path.
+    app.on_key(key(KeyCode::Enter));
+    let rows = rows_of(&mut app, 80, 24);
+    let title = rows
+        .iter()
+        .find(|r| r.contains("Size tree:"))
+        .expect("the tree title");
+    assert!(title.contains('…'), "{title:?}");
+    assert!(title.contains("final-root"), "{title:?}");
+    assert!(title.contains("(source: size walk"), "{title:?}");
+}
+
+/// Counts of one read as one ("1 item", "1 entry"), not "1 items".
+#[test]
+fn counts_of_one_read_as_one() {
+    let mut app = App::new(EPOCH);
+    app.set_tree(long_tree());
+    let scan = synthetic_scan(10, SEED);
+    let mut plan = disk_cleaner_tui::worker::plan_scan_with(&scan, &inputs(), EPOCH);
+    plan.items.truncate(1);
+    app.set_analysis(&scan, plan, false);
+    app.tab = Tab::Dev;
+    let s = flat(&rows_of(&mut app, 160, 45));
+    assert!(s.contains("Size walk: 1 entry could not be read"), "{s}");
+    assert!(s.contains("(1 item,"), "{s}");
+    assert!(!s.contains("1 items"), "{s}");
+    assert!(!s.contains("1 entries"), "{s}");
+}
+
 /// Tiny terminals draw without panicking, in every view and overlay.
 #[test]
 fn tiny_terminals_do_not_panic() {

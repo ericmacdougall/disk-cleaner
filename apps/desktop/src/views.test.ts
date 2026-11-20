@@ -4,7 +4,7 @@ import { flush, mockBackend, syntheticPage, SETTINGS } from "./testing";
 import { changesFrom, parseWhole, SettingsForm } from "./views/settings";
 import { allocatedLabel, MAX_DOM_ROWS, TreeGrid } from "./views/tree";
 import type { DevItem, DevSummary, SaveResult } from "./api";
-import { DEV_PAGE, DevView } from "./views/dev";
+import { DEV_PAGE, DevView, summaryLines } from "./views/dev";
 import { layout } from "./views/treemap";
 
 const HOSTILE = '<img src=x onerror="window.__xss=1">';
@@ -478,6 +478,31 @@ describe("agent session folders (spec AC-13)", () => {
     expect(text).toContain("last changed 2026-01-01");
     expect(text).toContain("no plan action yet");
     expect(text).toContain("Inside /syn/home (keep).");
+  });
+
+  it("read a count of one as one (1 file, 1 day)", async () => {
+    expect(summaryLines({ ...SUMMARY, active_window_days: 1 }).join("\n")).toContain("Active window: 1 day (");
+    const b = mockBackend({
+      devSummary: async () => ({ ...SUMMARY, imported: false }),
+      sessionFolders: async () => [
+        {
+          id: 8,
+          layout: ".codex/sessions",
+          path: "/syn/home/.codex/sessions",
+          alloc: 4096,
+          size: 100,
+          files: 1,
+          newest_mtime: 1_767_268_800,
+          plan_note: "no plan action yet",
+          enclosing: null,
+        },
+      ],
+    });
+    const v = new DevView(b, 1, () => undefined);
+    document.body.replaceChildren(v.el);
+    await v.load();
+    const text = v.el.querySelector(".dev-sessions")?.textContent ?? "";
+    expect(text).toContain("/syn/home/.codex/sessions, 1 file, 4.0 KiB");
   });
 
   it("say why there are none for an imported scan", async () => {
