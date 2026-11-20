@@ -44,7 +44,7 @@ the site use obviously synthetic paths such as `~/projects/example-app`.
 |---|---|
 | Supercharge your dev machine | Shows what fills a developer's disk and what is safe to remove. |
 | Cleans your disk in one click | Plans removals you can read first. In the current version nothing is removed. |
-| Safe and secure | Unknown means keep. A check that fails counts as "keep". |
+| Safe and secure | Unknown never counts as yes. A check that fails or times out leaves its fact unknown, and the plan then asks you about an idle repo instead of proposing to remove it. |
 
 ## 4. Color tokens
 
