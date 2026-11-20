@@ -215,8 +215,7 @@ impl TreeView {
         }
         let sort = self.sort;
         let tree = &*self.tree;
-        self.order[tree.child_span(id)]
-            .sort_unstable_by(|&a, &b| compare(tree, sort, a, b));
+        self.order[tree.child_span(id)].sort_unstable_by(|&a, &b| compare(tree, sort, a, b));
         self.sorted_as[id as usize] = code;
     }
 
