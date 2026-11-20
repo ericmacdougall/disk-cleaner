@@ -602,6 +602,14 @@ class TestContent(unittest.TestCase):
         self.assertNotRegex(flat, r"(?i)times out means keep",
                             "the plan answers an unknown fact with ask, not with the keep action")
         self.assertNotRegex(re.sub(r"\s+", " ", read(ROOT_README)), r'(?i)counts as "keep"')
+        # The brand guide's voice examples are copied into new copy, so they must not teach the old rule.
+        old = r'(?i)unknown means keep|(?:fails|times out)[^.|]*(?:means|counts as) "?keep'
+        for path in (INDEX, ROOT_README, BRAND_MD):
+            self.assertNotRegex(re.sub(r"\s+", " ", read(path)), old, path.name)
+        # plan.rs: an idle repo with an unknown fact gets ask; the brand guide says so.
+        self.assertRegex(read(CORE_PLAN), r"facts\.any_unknown\(\) \{\s*\(\s*Action::Ask")
+        brand = re.sub(r"\s+", " ", read(BRAND_MD))
+        self.assertRegex(brand, r"Unknown never counts as yes[^|]*\bask")
 
     def test_skip_worktree_case_is_named(self):
         para = re.search(r"all eleven are yes.*?</p>", re.sub(r"\s+", " ", self.html)).group(0)

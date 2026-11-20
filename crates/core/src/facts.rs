@@ -853,10 +853,12 @@ fn parse_pseudoref(name: &str, bytes: &[u8]) -> Pseudo {
     }
 }
 
-/// Read at most [`MAX_PSEUDOREF_BYTES`] of a regular file.
+/// Read at most [`MAX_PSEUDOREF_BYTES`] of a regular file. Anything else, a FIFO or symlink
+/// swapped in after the caller's `lstat` included, is refused without blocking
+/// ([`crate::regular::open_regular`]).
 fn read_bounded(p: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+    let f = crate::regular::open_regular(p).map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     f.take(MAX_PSEUDOREF_BYTES + 1)
         .read_to_end(&mut buf)
@@ -1213,6 +1215,8 @@ fn local_config_keys(git: &crate::git::Git, path: &Path) -> Result<Vec<String>, 
             // `--worktree` fails when the file is missing. Missing means no keys, if git agrees:
             // its own listing must show no worktree scope. (When git rejects this git directory
             // and uses one above it, that one's file was not judged, so the repo is refused.)
+            // `--show-scope` is git 2.26; any failure of this listing is said in those words,
+            // with git's own error after them (its text is not matched).
             let all = git
                 .run(
                     path,
@@ -1224,7 +1228,13 @@ fn local_config_keys(git: &crate::git::Git, path: &Path) -> Result<Vec<String>, 
                         "--name-only",
                     ],
                 )
-                .map_err(|e| note("config", &e))?;
+                .map_err(|e| {
+                    format!(
+                        "git config --show-scope failed (it needs git 2.26 or newer), so whether \
+                         git reads worktree-scoped config that was not judged is unknown: {}",
+                        note("config", &e)
+                    )
+                })?;
             for line in all.lines() {
                 match line.split_once('\t') {
                     Some((scope, _)) if scope != "worktree" => {}
@@ -2380,6 +2390,61 @@ mod tests {
             "",
         ] {
             assert!(!is_network_url(u), "{u:?} should not be network");
+        }
+    }
+
+    /// Review M5: the callers `lstat` an entry before reading it, but the entry can be replaced
+    /// in between. A FIFO swapped in must be refused, not waited on (an open for reading blocks
+    /// until a writer comes), and a symlink swapped in must not be followed.
+    #[cfg(unix)]
+    mod swapped_in {
+        use super::*;
+        use crate::test_fifo::{mkfifo, must_not_block};
+
+        #[test]
+        fn read_bounded_refuses_a_fifo_without_blocking() {
+            let tmp = tempfile::tempdir().unwrap();
+            let fifo = tmp.path().join("ORIG_HEAD");
+            mkfifo(&fifo);
+            let p = fifo.clone();
+            let got = must_not_block(&fifo, move || read_bounded(&p));
+            assert_eq!(got, Err("not a regular file".to_string()));
+        }
+
+        #[test]
+        fn a_git_file_that_is_a_fifo_is_refused_without_blocking() {
+            let tmp = tempfile::tempdir().unwrap();
+            let wt = tmp.path().to_path_buf();
+            let fifo = wt.join(".git");
+            mkfifo(&fifo);
+            let (w, p) = (wt.clone(), fifo.clone());
+            let got = must_not_block(&fifo, move || gitfile_dir(&w, &p));
+            assert_eq!(
+                got,
+                Err(
+                    "the .git file was not read (not a regular file), so its config.worktree was \
+                     not found"
+                        .to_string()
+                )
+            );
+        }
+
+        #[test]
+        fn read_bounded_does_not_follow_a_symlink() {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = tmp.path().join("elsewhere");
+            std::fs::write(&target, "gitdir: /somewhere\n").unwrap();
+            let link = tmp.path().join(".git");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(read_bounded(&link).is_err(), "a symlink was followed");
+        }
+
+        #[test]
+        fn control_read_bounded_reads_a_regular_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = tmp.path().join("ORIG_HEAD");
+            std::fs::write(&file, "abc\n").unwrap();
+            assert_eq!(read_bounded(&file), Ok(b"abc\n".to_vec()));
         }
     }
 }

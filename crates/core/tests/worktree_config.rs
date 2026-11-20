@@ -211,14 +211,13 @@ fn absent_in_the_main_worktree_and_present_in_a_linked_one_reads_each_as_it_is()
     assert_inspected(&res, &wt);
 }
 
-/// A real bare repo (a bare clone) with the extension and no file is inspected.
-#[test]
-fn control_a_real_bare_repo_with_the_extension_and_no_file_is_inspected() {
-    let (_tmp, root, remotes) = workspace();
-    pushed_repo(&remotes, &remotes, "src");
+/// A real bare repo `root/mirror.git` (a bare clone of a pushed repo) with the extension on and no
+/// `config.worktree`.
+fn bare_clone(root: &Path, remotes: &Path) -> PathBuf {
+    pushed_repo(remotes, remotes, "src");
     let bare = root.join("mirror.git");
     git(
-        &root,
+        root,
         &[
             "clone",
             "-q",
@@ -229,21 +228,69 @@ fn control_a_real_bare_repo_with_the_extension_and_no_file_is_inspected() {
     );
     git(&bare, &["config", "extensions.worktreeConfig", "true"]);
     assert!(!bare.join("config.worktree").exists());
+    bare
+}
+
+/// The one node named `mirror.git`, whatever spelling of the scan root it was reported under.
+fn mirror_node(res: &ScanResult) -> PathBuf {
+    let found: Vec<&str> = res
+        .nodes
+        .iter()
+        .map(|n| n.path.as_str())
+        .filter(|p| p.ends_with("mirror.git"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    PathBuf::from(found[0])
+}
+
+/// A real bare repo (a bare clone) with the extension and no file is inspected.
+#[test]
+fn control_a_real_bare_repo_with_the_extension_and_no_file_is_inspected() {
+    let (_tmp, root, remotes) = workspace();
+    let bare = bare_clone(&root, &remotes);
     let res = scan_with(&root, network_everywhere());
     assert_eq!(node(&res, &bare).class, Class::BareRepo);
     assert_not_refused(&res, &bare);
 }
 
-/// A submodule checkout's `.git` file names its git directory relatively
-/// (`gitdir: ../.git/modules/sub`); the outer repo checks the submodule's config to compare its
-/// commit, and the checkout is its own node.
+/// Is the file system holding `dir` case-insensitive? Found by a probe file, not by OS name.
+fn case_insensitive(dir: &Path) -> bool {
+    let probe = dir.join("Case-Probe");
+    fs::write(&probe, "").unwrap();
+    let other = fs::symlink_metadata(dir.join("cASE-pROBE")).is_ok();
+    fs::remove_file(&probe).unwrap();
+    other
+}
+
+/// Gate guard: where the file system ignores case, a scan root spelled in the wrong case reaches
+/// the same bare repo; git's git directory and the scanned one are the same directory, so the
+/// git-directory check must not refuse it. Skipped on a case-sensitive file system, where the
+/// wrong spelling names nothing.
 #[test]
-fn a_submodule_checkout_with_a_relative_git_file_and_no_config_worktree_is_inspected() {
+fn a_bare_repo_under_a_wrong_case_scan_root_is_inspected_where_case_is_ignored() {
     let (tmp, root, remotes) = workspace();
-    let srcs = tmp.path().join("srcs");
+    if !case_insensitive(tmp.path()) {
+        eprintln!("skipped: {} is case-sensitive", tmp.path().display());
+        return;
+    }
+    bare_clone(&root, &remotes);
+    let name = root.file_name().unwrap().to_str().unwrap();
+    let wrong = tmp.path().join(name.to_uppercase());
+    assert_ne!(wrong, root);
+    assert!(wrong.is_dir());
+    let res = scan_with(&wrong, network_everywhere());
+    let bare = mirror_node(&res);
+    assert_eq!(node(&res, &bare).class, Class::BareRepo);
+    assert_not_refused(&res, &bare);
+}
+
+/// A pushed `outer` repo with a submodule checkout `sub` (whose `.git` file names
+/// `../.git/modules/sub`), committed and pushed.
+fn with_submodule(tmp: &Path, root: &Path, remotes: &Path) -> (PathBuf, PathBuf) {
+    let srcs = tmp.join("srcs");
     fs::create_dir_all(&srcs).unwrap();
-    let subsrc = pushed_repo(&srcs, &remotes, "subsrc");
-    let outer = pushed_repo(&root, &remotes, "outer");
+    let subsrc = pushed_repo(&srcs, remotes, "subsrc");
+    let outer = pushed_repo(root, remotes, "outer");
     git(
         &outer,
         &[
@@ -259,6 +306,16 @@ fn a_submodule_checkout_with_a_relative_git_file_and_no_config_worktree_is_inspe
     git(&outer, &["commit", "-q", "-m", "add submodule"]);
     git(&outer, &["push", "-q", "origin", "main"]);
     let sub = outer.join("sub");
+    (outer, sub)
+}
+
+/// A submodule checkout's `.git` file names its git directory relatively
+/// (`gitdir: ../.git/modules/sub`); the outer repo checks the submodule's config to compare its
+/// commit, and the checkout is its own node.
+#[test]
+fn a_submodule_checkout_with_a_relative_git_file_and_no_config_worktree_is_inspected() {
+    let (tmp, root, remotes) = workspace();
+    let (outer, sub) = with_submodule(tmp.path(), &root, &remotes);
     git(&sub, &["config", "extensions.worktreeConfig", "true"]);
     let text = fs::read_to_string(sub.join(".git")).unwrap();
     assert!(text.starts_with("gitdir: ../"), "{text:?}");
@@ -414,6 +471,151 @@ mod unix {
         symlink(&target, gd.join("config.worktree")).unwrap();
         let res = scan_with(&root, network_everywhere());
         assert_refused_symlink(&res, &wt, NOT_REGULAR);
+    }
+
+    // ------------------------------------------------------------ a .git that is not a plain entry
+
+    /// Gate F2: the outer repo compares each checked-out submodule's commit after checking the
+    /// submodule's config. With the extension on, a `.git` that is neither a directory nor a
+    /// regular file is refused when `config.worktree` is looked for (by `lstat`, not by git), and
+    /// the outer repo's `tree_clean` is unknown. (A node's own odd `.git` is never given to git.)
+    const ODD_DOTGIT: &str =
+        "tree_clean: submodule sub: .git is neither a directory nor a regular file";
+
+    fn assert_odd_dotgit_refused(res: &ScanResult, outer: &Path) {
+        let notes = notes(res, outer);
+        assert!(
+            notes.iter().any(|n| n == ODD_DOTGIT),
+            "no note {ODD_DOTGIT:?}: {notes:?}"
+        );
+        assert_eq!(facts_of(res, outer).tree_clean, Tri::Unknown, "{notes:?}");
+    }
+
+    /// git follows the symlink to the submodule's git directory and reads the extension there.
+    #[test]
+    fn a_submodule_checkout_whose_git_entry_is_a_symlink_is_refused() {
+        let (tmp, root, remotes) = workspace();
+        let (outer, sub) = with_submodule(tmp.path(), &root, &remotes);
+        git(&sub, &["config", "extensions.worktreeConfig", "true"]);
+        fs::remove_file(sub.join(".git")).unwrap();
+        symlink(Path::new("../.git/modules/sub"), sub.join(".git")).unwrap();
+        assert_eq!(
+            git(&sub, &["rev-parse", "--absolute-git-dir"]),
+            fs::canonicalize(outer.join(".git/modules/sub"))
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let res = scan_with(&root, network_everywhere());
+        assert_odd_dotgit_refused(&res, &outer);
+    }
+
+    /// A FIFO `.git`: git (2.56 on CI) itself refuses it, so the submodule's first config
+    /// listing fails before the `lstat`, and the refusal is git's (an older git that walked up
+    /// instead would reach the outer repo's config, extension on, and the `lstat` refusal). The
+    /// outer repo's `tree_clean` is unknown either way, and nothing opens the FIFO.
+    #[test]
+    fn a_submodule_checkout_whose_git_entry_is_a_fifo_is_refused() {
+        let (tmp, root, remotes) = workspace();
+        let (outer, sub) = with_submodule(tmp.path(), &root, &remotes);
+        git(&outer, &["config", "extensions.worktreeConfig", "true"]);
+        fs::remove_file(sub.join(".git")).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(sub.join(".git"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let res = scan_with(&root, network_everywhere());
+        let either = |n: &String| {
+            n == ODD_DOTGIT || n.starts_with("tree_clean: submodule sub: config: git exited")
+        };
+        let notes = notes(&res, &outer);
+        assert!(notes.iter().any(either), "{notes:?}");
+        assert_eq!(facts_of(&res, &outer).tree_clean, Tri::Unknown, "{notes:?}");
+    }
+
+    // ------------------------------------------------------------ a symlinked scan root
+
+    /// Gate guard: the scan root is a symlink to the directory holding a real bare repo. git
+    /// reports the real path of its git directory; that is still the scanned directory.
+    #[test]
+    fn a_bare_repo_under_a_symlinked_scan_root_is_inspected() {
+        let (tmp, root, remotes) = workspace();
+        bare_clone(&root, &remotes);
+        let alias = tmp.path().join("alias");
+        symlink(&root, &alias).unwrap();
+        let res = scan_with(&alias, network_everywhere());
+        let bare = mirror_node(&res);
+        assert_eq!(node(&res, &bare).class, Class::BareRepo);
+        assert_not_refused(&res, &bare);
+    }
+
+    // ------------------------------------------------------------ git older than 2.26
+
+    /// Review M4: the cross-check uses `git config --show-scope` (git 2.26). When that listing
+    /// fails the repo is refused, and the note says what the check needs in words, then git's
+    /// own error.
+    const OLD_GIT: &str = "git config --show-scope failed (it needs git 2.26 or newer), so \
+                           whether git reads worktree-scoped config that was not judged is \
+                           unknown: config: git exited";
+
+    /// The git the tests use, by absolute path (the scanner's git runs with a scrubbed
+    /// environment).
+    fn real_git() -> PathBuf {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|d| d.join("git"))
+            .find(|p| p.is_file())
+            .expect("git on PATH")
+    }
+
+    /// A git that rejects `--show-scope` as git before 2.26 does, and is the real git otherwise.
+    fn old_git(dir: &Path, probe_in: &Path) -> disk_cleaner_core::Git {
+        let body = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = --show-scope ]; then\n    \
+             echo \"error: unknown option \\`show-scope'\" >&2\n    exit 129\n  fi\ndone\n\
+             exec '{}' \"$@\"\n",
+            real_git().display()
+        );
+        let wrapper = script(dir, "old-git", &body);
+        let git = disk_cleaner_core::Git::new(&wrapper, std::time::Duration::from_secs(60));
+        // Retry while the OS refuses to run a just-written file another test thread's fork still
+        // holds open; then the wrapper must work as git.
+        let mut last = None;
+        for _ in 0..20 {
+            match git.run(probe_in, &["rev-parse", "--is-inside-work-tree"]) {
+                Err(disk_cleaner_core::GitError::Spawn(_)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(50))
+                }
+                other => {
+                    last = Some(other);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            last.map(|r| r.map(|s| s.trim().to_string()).map_err(|e| e.to_string())),
+            Some(Ok("true".to_string()))
+        );
+        git
+    }
+
+    #[test]
+    fn a_git_without_show_scope_is_refused_with_the_version_it_needs_in_words() {
+        let (tmp, root, repo) = extension_repo();
+        let git = old_git(tmp.path(), &repo);
+        let res = scan_with(&root, network_everywhere().with_git(git));
+        refused(&res, &repo, OLD_GIT, false, false);
+    }
+
+    /// Control: the same wrapper inspects a repo that does not need the cross-check.
+    #[test]
+    fn control_a_git_without_show_scope_inspects_a_repo_without_the_extension() {
+        let (tmp, root, remotes) = workspace();
+        let repo = pushed_repo(&root, &remotes, "app");
+        let git = old_git(tmp.path(), &repo);
+        let res = scan_with(&root, network_everywhere().with_git(git));
+        assert_inspected(&res, &repo);
     }
 }
 
