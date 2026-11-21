@@ -552,6 +552,39 @@ fn an_intact_readback_only_shard_is_reused_after_reading_it_back() {
     assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
 }
 
+/// The read-back on reuse is never trusted when it fails or comes back short: the content is
+/// uploaded again (main's ruling on the readback decision), and the second piece still restores.
+#[test]
+fn a_readback_that_fails_or_is_cut_short_means_upload_again() {
+    for (case, fake) in [
+        ("fails", "if [ \"$cmd\" = cat ]; then exit 1; fi"),
+        (
+            "short",
+            "if [ \"$cmd\" = cat ]; then \"$REAL\" \"$@\" | head -c 1000; exit 0; fi",
+        ),
+    ] {
+        let fx = Fx::new();
+        let content = vec![7u8; 200_000];
+        fx.write("a/x.bin", &content);
+        let y = fx.write("b/y.bin", &content);
+        let a = docs(&[&fx.data], &[P::tree(&fx.data.join("a"), "backup")]);
+        let b = docs(&[&fx.data], &[P::tree(&fx.data.join("b"), "backup")]);
+        let mut o = fx.opts(true);
+        o.hooks.force_readback = true;
+        apply(&a.0, &a.1, &o).unwrap();
+        // The reuse check follows the stored shard row (`readback-sha256:`); the new upload is
+        // verified by the listing hash, so only the reuse read-back meets the broken `cat`.
+        fx.set_fake(fake);
+        let rep = apply(&b.0, &b.1, &fx.opts(true)).unwrap();
+        fx.set_fake("");
+        assert_eq!(rep.shards_uploaded, 1, "{case}: uploaded again: {rep:?}");
+        assert_eq!(rep.pieces[0].outcome, "removed", "{case}: {rep:?}");
+        let r = restore(&y, &ropts(&fx)).unwrap();
+        assert!(r.failed.is_empty(), "{case}: {r:?}");
+        assert_eq!(fs::read(&y).unwrap(), content, "{case}");
+    }
+}
+
 // ---- Class 5: noise whose evidence fails is backed up instead (AC-7, NEG-7) ----
 
 #[test]
