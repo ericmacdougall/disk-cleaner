@@ -87,9 +87,16 @@ fn take_lock(dir: &Path) -> Result<Lock, ApplyError> {
         rustix::fs::Mode::from_raw_mode(0o600),
     )
     .map_err(|e| ApplyError::Io(format!("{}: {e}", p.display())))?;
-    rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .map_err(|_| ApplyError::Locked(p.clone()))?;
-    Ok(Lock { _fd: fd })
+    // Only "held by someone else" means another apply is running; an interrupted call is
+    // retried, and any other error is reported as itself rather than as a lock.
+    loop {
+        match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(Lock { _fd: fd }),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::WOULDBLOCK) => return Err(ApplyError::Locked(p.clone())),
+            Err(e) => return Err(ApplyError::Io(format!("cannot lock {}: {e}", p.display()))),
+        }
+    }
 }
 
 /// Newest mtime of any non-directory entry under `dir` (not following symlinks, skipping

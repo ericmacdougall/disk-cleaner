@@ -875,7 +875,10 @@ fn sibling_removed_in_an_earlier_run_passes_recheck() {
     fx.write("s/d2.bin", b"two");
     fx.write("s/rest/r.txt", b"rest");
     let scan = scan_doc(&[&fx.data], &[P::tree(&s, "backup")]);
-    // Run 1 removes only d1.
+    // Run 1 removes only d1, clearly after the scan: the folder's status-change time then
+    // falls after the scan whatever the clock resolution (stream A's directory re-check
+    // compares it, so without the wait the outcome under A depended on the second boundary).
+    std::thread::sleep(Duration::from_millis(1100));
     let plan_a = plan_doc(&scan, &[P::derived(&s, "d1.bin", 0, "backup")]);
     let rep = apply(&scan, &plan_a, &fx.opts(true)).unwrap();
     assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
