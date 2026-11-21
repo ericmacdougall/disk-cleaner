@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **15** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **16** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -46,6 +46,9 @@ in a dependency directory such as `.venv` unflagged, so it is refused. Version 1
 of any size anywhere inside an artifact unless it sits in an installed package's directory (see
 "Outputs"), with the node field `outputs_unlisted`; a version 14 scan could leave a small nested
 output (a `.venv/data/model.pt`) unlisted and its directory offered for removal, so it is refused.
+Version 16 added the optional scan field `pieces` (written by `scan --lanes`) and the plan field
+`lanes` (see "Pieces and lanes"); a version 15 scan is refused so that a plan never mixes a
+scan without the secret-name and partition rules with lanes.
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 Such a node therefore gets an `ask_reason` and is never offered for removal (see "File names git
@@ -60,7 +63,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 15 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification, 13 `checked` and the files git never reads, 14 no object verification and outputs in every artifact, 15 small outputs anywhere in an artifact outside installed packages; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 16 (16 the optional `pieces` survey, 3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification, 13 `checked` and the files git never reads, 14 no object verification and outputs in every artifact, 15 small outputs anywhere in an artifact outside installed packages; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots that were walked, as spelled (a kept inner root under the spelling of the root that encloses it); overlapping roots are normalised first (see "Overlapping scan roots") |
@@ -996,3 +999,267 @@ so such a file is under the object-store backup obligation instead.
 Not redundant, and not touched by the backup: dependents, hidden index entries, pseudorefs (they
 are about commits, which the remote check covers), coverage, the process check, alternates, linked
 worktrees and submodule git directories.
+
+## Pieces and lanes
+
+Status: **contract for schema 16**. A field marked *provisional* may still be renamed before the
+first release that applies a plan. Every other field, and every MUST below, is frozen for schema 16.
+The apply step (`crates/core/src/apply/`, `disk-cleaner apply`) codes against this section.
+
+`scan --lanes` adds a `pieces` survey to the scan, and from it `plan` builds a `lanes` section.
+The survey splits **every byte under the scan roots** into **pieces**: bounded sets of entries
+that a later apply step handles one at a time. The plan gives each piece exactly one **lane**,
+which says what to do with it, together with a reason in words and the evidence behind that
+reason. A scan without `--lanes` has no `pieces`, and its plan has no `lanes`. The plan's `items`
+and their actions are the same with or without lanes: lanes only add to the plan.
+
+Options: `scan --lanes [--max-piece-bytes N] [--max-piece-files N] [--min-dup-bytes N]`, with
+defaults of 1 GiB, 10000 and 64 KiB.
+
+The survey is a second read-only walk after the main one:
+
+- It keeps the file tree in memory, a few hundred bytes per entry.
+- It reads the content of the files it hashes (see "Blobs" below).
+- It never follows a symlink.
+- It opens files only through the regular-file check described above.
+- It changes nothing.
+
+### Scan field `pieces`
+
+| Field | Meaning |
+|---|---|
+| `options` | `max_piece_bytes`, `max_piece_files`, `min_dup_bytes`, as used |
+| `pieces` | the pieces, in walk order; `pieces[i].id == i` |
+| `blobs` | content groups that have more than one copy (see "Blobs") |
+| `totals` | `pieces`, `entries`, `bytes`, `logical_bytes`, `dir_overhead_bytes`, `hashed_files`, `hashed_bytes`, `changed_while_hashing`, `duplicate_bytes`, `hardlink_names` |
+
+A **piece** has these fields:
+
+| Field | Meaning |
+|---|---|
+| `id` | its index |
+| `kind` | `tree`, `files` or `git-node` |
+| `path` | absolute path. For `tree` and `git-node`: the directory. For `files`: the directory that holds the listed files |
+| `files` | `files` only. The names of the direct children of `path` that are members: regular files, symlinks or other non-directory entries. A piece made of one big file is a `files` piece with one name |
+| `excludes` | `tree` and `git-node` only. Sorted, `/`-separated paths relative to `path` of entries below it that belong to **other** pieces: nested pieces, secret entries, nested git nodes and nested artifact nodes |
+| `node` | index into `nodes` of the innermost classified directory that holds the piece (for `git-node`, that node itself). Absent when the piece is outside every node |
+| `entries` | how many non-directory members it has |
+| `bytes`, `logical_bytes` | allocated and logical bytes of the members, each inode counted once (see "Hard links"). A `tree` or `git-node` piece also counts the blocks of its own directories |
+| `bytes_linked_outside` | bytes of members whose inode has more hard links than the survey saw names for. Removing these names frees nothing |
+| `newest_mtime` | the newest modification time of the members. For `git-node`, of the work tree outside its git directory |
+| `walked_at` | unix seconds when the survey started reading this piece |
+| `fingerprint` | sha256 (hex) over the sorted member list (see "Re-check") |
+| `secret` | only on a secret piece: the kind of secret name that matched (`a private SSH key`) |
+| `incomplete` | only when the piece cannot be judged whole: the reason (`2 entries could not be read`, `a mount point that was not entered`, `a FIFO, socket or device file`) |
+
+**Membership is a list fixed at scan time, never "the directory, recursively".** A `tree` piece's
+members are the non-directory entries found below `path` at scan time, minus `excludes`. A `files`
+piece's members are exactly `files`. An entry that appears later is not a member (see "Re-check").
+
+**Partition.** Every non-directory entry under the scan roots is a member of exactly one piece.
+A directory's own blocks are counted in the `tree` or `git-node` piece that contains it. If the
+directory was split, its blocks go to `totals.dir_overhead_bytes` instead. So when the tree did
+not change between the two walks, the sum of `bytes` over all pieces plus `dir_overhead_bytes`
+equals the scan's `totals.allocated_bytes`.
+
+**Hard links.** An inode with several names is counted once, in the piece of its first name in
+walk order. Walk order sorts directory entries by name, in byte order, at every level. The other
+names are still members of their own pieces, with 0 bytes, and are counted in
+`totals.hardlink_names`. Every inode with more than one name is also a blob (see "Blobs"), so all
+of its names are listed together.
+
+**How pieces are cut.**
+
+- **Git nodes.** A `repo`, `worktree` or `bare-repo` node is one `git-node` piece: everything below
+  it except nested pieces. Its git directory is part of the piece, and the preserve obligation
+  still applies to it.
+- **Everything else** is cut by size. A directory whose entries total at most `max_piece_bytes`
+  and `max_piece_files` becomes one `tree` piece.
+- **Larger directories are split.** Each subdirectory is cut the same way, recursively. The
+  directory's direct files are packed, in name order, into `files` pieces that stay within both
+  bounds.
+- **Bounds.** A file larger than `max_piece_bytes` is a `files` piece of its own. Only a
+  single-file piece may exceed a bound.
+- **Node boundaries.** A piece never crosses a node boundary: a directory that is a classified
+  node starts new pieces. So every member of a piece has the same `node`.
+
+**Secret names.** An entry whose name matches a `[[secret_name]]` rule in `rules/artifacts.toml`,
+or a directory whose name matches a `[[secret_dir]]` rule, is always a piece of its own with
+`secret` set. A secret file is a `files` piece of one file, and a secret directory is a `tree`
+piece. This holds anywhere, including inside git nodes and artifacts. The enclosing piece lists it
+in `excludes`. Names are compared ignoring case, and no file is opened.
+
+The secret file names are:
+
+- `.env` and `.env.*`, except examples, samples and templates;
+- `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `*.kdbx`;
+- `id_rsa*`, `id_dsa*`, `id_ecdsa*`, `id_ed25519*`;
+- `*.tfstate`, `terraform.tfstate.*`, `*.tfvars`;
+- `.netrc`, `_netrc`, `.pgpass`, `.git-credentials`, `.npmrc`, `.pypirc`, `credentials`,
+  `credentials.json`;
+- any name containing `secret`, `credential`, `password`, `passwd` or `token`.
+
+The secret directories are `.ssh`, `.gnupg`, `.aws`, `.password-store` and `secrets`.
+
+The list over-matches on purpose: a file such as `tokenizer.py` matches too, and it stays on disk,
+which is the safe side.
+
+**Blobs.** Content is grouped in two steps:
+
+1. Regular files of at least `min_dup_bytes` (logical) are bucketed by length, one entry per inode.
+2. Each bucket with more than one inode is hashed with SHA-256. Every inode with more than one name
+   is hashed too, whatever its size.
+
+A file whose length, mtime or inode changed while it was being read is left unhashed and counted
+in `totals.changed_while_hashing`.
+
+A blob is a sha256 that has more than one copy:
+
+| Field | Meaning |
+|---|---|
+| `sha256` | hex |
+| `size` | logical bytes of one copy |
+| `bytes` | allocated bytes of the first copy's inode |
+| `copies` | in walk order, each with `path` (absolute), `piece` (id) and `inode`. Copies that share one inode have the same `inode` number; the numbers start at 0 within each blob |
+
+`totals.duplicate_bytes` is, summed over all blobs, `bytes` times (number of distinct inodes - 1).
+That is the space the duplicates take beyond one copy each.
+
+### Re-check
+
+`disk_cleaner_core::pieces::recheck(&piece) -> Result<(), Drift>` enumerates the piece again,
+read-only, and recomputes its fingerprint.
+
+The fingerprint is the SHA-256 of one line per member, with the lines sorted by relative path:
+
+```
+<relative path>\0<kind f|l|o>\0<length>\0<mtime seconds>.<nanoseconds>\0<device>\0<inode>\n
+```
+
+For a `git-node` piece the members are the work tree outside its git directory.
+
+`Drift` names the first path that differs, for any of these reasons:
+
+- a member was added or is missing;
+- a member changed in kind, length, mtime or inode;
+- a member's status-change time (`ctime`) is at or after `walked_at`.
+
+**An apply step MUST call `recheck` on a piece immediately before it backs up, uploads, bundles
+or removes any part of it. On `Drift` or on an error it MUST skip the piece and remove nothing of
+it.** For a plan piece that has a `source_piece` (see below), it rechecks the source piece.
+
+### Plan field `lanes`
+
+`lanes` is present when the scan has `pieces`.
+
+| Field | Meaning |
+|---|---|
+| `version` | 1 |
+| `pieces` | one entry per plan piece: every scan piece, plus each derived piece (see "Noise by duplicate") |
+| `blobs` | the scan's blobs, with each copy's lane and the copy to upload |
+| `totals` | `by_lane`, `scanned_bytes`, `dir_overhead_bytes`, `duplicate_bytes`, `dedup_saved_bytes`, `secret_pieces` (see below) |
+
+The `totals` fields:
+
+- `by_lane` maps each of `git`, `noise`, `backup` and `keep` to `pieces`, `entries`, `bytes`,
+  `reclaimable_bytes` and `upload_bytes`.
+- `scanned_bytes` is the survey's `bytes` plus `dir_overhead_bytes`.
+
+The `bytes` of the four lanes plus `dir_overhead_bytes` equal `scanned_bytes`: every byte is in
+exactly one lane.
+
+A **plan piece** has these fields:
+
+- `id`;
+- `source_piece` (*provisional*): only on a derived piece, the scan piece it was cut from;
+- `kind`, `path`, `files`, `node`, `entries`, `bytes`, `logical_bytes` and `secret`, as in the scan
+  piece;
+- `excludes`: the scan piece's excludes, plus the derived pieces cut out of it;
+- `lane` and `reason`;
+- `evidence`, on `noise` pieces only;
+- `git`, on `git` pieces only;
+- `state` and `state_reason`, as for items;
+- `reclaimable_bytes` and `upload_bytes`.
+
+**Lanes, in order.** The first rule that applies decides the lane:
+
+1. **`keep`, secret.** The piece has `secret`. Reason: "secret-named file (`<kind>`), stays local".
+   An apply step MUST NOT upload, push, bundle, archive or remove a secret piece unless the user
+   runs it with an explicit opt-in for secrets. When it removes the enclosing piece, it MUST leave
+   every excluded path in place.
+2. **`keep`, incomplete.** The piece has `incomplete`.
+3. **`keep`, cannot act.** The process check is `unknown`, or it is `partial` and not trusted. This
+   is the same rule as for items, and the reason says so.
+4. **`keep`, active or unknown.** The node that holds the piece is judged `active` or `unknown`
+   exactly as its item is: by the active window, the `--active` paths and running processes. A
+   piece outside every node is judged by its own `newest_mtime` and path. Activity is per node, so
+   one recent file keeps every piece of that node.
+5. **`keep`, inside a kept repository.** The piece is inside a git node whose own piece is `keep`.
+6. **`git`, for a `git-node` piece.** The lane is `git` when the item's action is
+   `backup-then-remove` or `recover-backup-then-remove`. Otherwise it is `keep`, with the item's
+   reason.
+7. **`noise`, by rule.** The piece's node is an artifact whose item has the action
+   `remove-regenerable`. Evidence: `{"kind": "rule", "rule": <name>, "markers": [...], "node": <index>}`.
+   No other name, extension or "looks derived" judgement leads to noise.
+8. **`backup`.** Everything else. Reason: no rule shows it can be regenerated, so it is backed up
+   before it is removed.
+
+**Noise by duplicate.** After the lanes are set, take each blob copy in a `backup` piece whose blob
+also has a copy in a `keep` piece:
+
+- The copy is cut out into a derived `files` piece of one file, in lane `noise`.
+- Its evidence is `{"kind": "duplicate", "sha256", "size", "retained_copy": <path>, "retained_piece": <id>}`.
+- The piece it came from lists it in `excludes` and gives up its bytes, unless those bytes are
+  counted for another member.
+
+Two copies that are both in removing lanes never cite each other. A duplicate inside the removal
+set is not noise; it is backed up once (see "Upload once").
+
+**An apply step MUST, before it removes a duplicate-noise file, check that `retained_copy` still
+exists, is a regular file, and has the recorded length and sha256. If any check fails, it MUST
+treat the file as `backup`.**
+
+The evidence kind `archive` (`{"kind": "archive", "sha256", "size", "archive": <location>}`, for a
+copy that is already in a verified backup) is reserved for apply. `plan` never produces it.
+
+**Upload once.**
+
+- For each blob, `upload_path` is its first copy in a `backup` piece. Every other copy in the
+  `backup` lane maps to it.
+- `saved_bytes` is the allocated bytes those other copies would have uploaded.
+- A plan piece's `upload_bytes` leaves out those copies and its 0-byte hard-link names.
+- `totals.dedup_saved_bytes` is the sum of `saved_bytes`.
+
+An apply step uploads a blob's content once and records every mapped path against it.
+
+**Reclaimable bytes.** For `noise`, `backup` and `git`, this is `bytes`, minus
+`bytes_linked_outside`, minus the bytes of members whose inode also has a name in a `keep` piece.
+For `keep` it is 0.
+
+**The git lane.** The `git` field holds:
+
+- `action`: the item's action;
+- `preserve`: true, meaning the preserve obligation applies in full;
+- `excludes_secret`: the relative paths of the secret entries inside. Recovery snapshots and
+  ignored-file archives MUST leave them out;
+- `recovery`, one of:
+  - `{"method": "none"}`, for `backup-then-remove`;
+  - for `recover-backup-then-remove` with a network remote: `{"method": "push-recovery-refs",
+    "remote": <name>, "url": <redacted url>, "fallback": "bundle-to-backup", "decided_at": "apply",
+    "note": ...}`;
+  - `{"method": "bundle-to-backup"}`, when there is no network remote.
+
+The plan does not know whether a remote is private. **An apply step MUST push recovery refs only
+after it has positively established, at apply time, that the remote is private.** For example,
+the hosting API reports the remote as private through the user's own sign-in, or its URL is
+listed in the config key `private_remotes`. If the remote is public, or its visibility is
+unknown, the apply step MUST use the fallback.
+
+The remote named is the first network remote by name, with `origin` taking precedence.
+
+**Human output.** Without `--json`, `plan` adds a lane summary:
+
+- bytes, pieces and reclaimable bytes per lane;
+- the bytes that dedup saves;
+- how many secret pieces are kept;
+- up to ten of the largest pieces in each lane, with their reasons.
