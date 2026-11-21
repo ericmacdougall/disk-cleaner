@@ -16,12 +16,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: brew install rclone && rclone version
-      - run: cargo test -p disk-cleaner-core --locked --test apply --test apply_repair --no-run
+      - run: cargo test --workspace --locked --no-run
       - name: Loop
+        env:
+          RUST_BACKTRACE: "1"
         run: |
           fails=0
-          for i in 1 2 3 4 5 6 7 8; do
-            if ! cargo test -p disk-cleaner-core --locked --test apply --test apply_repair --no-fail-fast > run-$i.log 2>&1; then
+          for i in 1 2 3; do
+            if ! cargo test --workspace --locked --no-fail-fast > run-$i.log 2>&1; then
               fails=$((fails+1)); echo "iteration $i FAILED"
               grep -E "FAILED|panicked|Locked" run-$i.log | head -20
               grep -A40 "PD-LOCK-DIAG" run-$i.log | head -120
@@ -29,7 +31,7 @@ jobs:
               echo "iteration $i ok"
             fi
           done
-          echo "failures: $fails of 8"
+          echo "failures: $fails of 3"
           test "$fails" = 0
       - uses: actions/upload-artifact@v4
         if: always()
