@@ -85,8 +85,39 @@ fn take_lock(dir: &Path) -> Result<Lock, ApplyError> {
         rustix::fs::Mode::from_raw_mode(0o600),
     )
     .map_err(|e| ApplyError::Io(format!("{}: {e}", p.display())))?;
-    rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .map_err(|_| ApplyError::Locked(p.clone()))?;
+    if rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+        // DIAGNOSTIC ONLY (branch diag/apply-lock-macos): who holds the lock?
+        let me = std::process::id();
+        let lsof = std::process::Command::new("lsof")
+            .args(["-nP", "--"])
+            .arg(&p)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_else(|e| format!("lsof failed: {e}"));
+        let ps = std::process::Command::new("ps")
+            .args(["-axo", "pid,ppid,stat,lstart,command"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let kids: Vec<&str> = ps
+            .lines()
+            .filter(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() > 1 && (f[0] == me.to_string() || f[1] == me.to_string())
+            })
+            .collect();
+        eprintln!("PD-LOCK-DIAG self={me}\nlsof:\n{lsof}\nself and children:\n{}", kids.join("\n"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let again = rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive);
+        let lsof2 = std::process::Command::new("lsof")
+            .args(["-nP", "--"])
+            .arg(&p)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        eprintln!("PD-LOCK-DIAG after 300 ms: retry ok={} lsof:\n{lsof2}", again.is_ok());
+        return Err(ApplyError::Locked(p.clone()));
+    }
     Ok(Lock { _fd: fd })
 }
 
