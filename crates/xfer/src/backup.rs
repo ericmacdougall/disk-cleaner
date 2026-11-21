@@ -765,8 +765,34 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
     };
     let repo = Repo::new(t.clone(), o.max_objects, o.policy)?;
 
-    // Load: one LIST each of index and packs, then the chunk maps.
-    let idx_list = repo.list_index()?;
+    // Load. Every store request is a round trip (0.1 to 1 s on B2), so independent requests run
+    // at once: the index, pack and snapshot listings and the format check, then the chunk maps
+    // beside the previous run's file table. Commit objects come from the state dir's cache when
+    // their listed checksum still matches, so a rerun downloads only what other runs added.
+    let serial = cfg!(feature = "broken-serial-load");
+    let (idx_list, packs, snap_list, format_ok) = if serial {
+        (
+            repo.list_index(),
+            repo.list_packs(),
+            repo.list_snapshots(),
+            repo.format_present(),
+        )
+    } else {
+        std::thread::scope(|s| {
+            let a = s.spawn(|| repo.list_index());
+            let p = s.spawn(|| repo.list_packs());
+            let n = s.spawn(|| repo.list_snapshots());
+            let f = repo.format_present();
+            let j = |e| Error::Bug(format!("load thread panicked: {e:?}"));
+            (
+                a.join().map_err(j).and_then(|r| r),
+                p.join().map_err(j).and_then(|r| r),
+                n.join().map_err(j).and_then(|r| r),
+                f,
+            )
+        })
+    };
+    let idx_list = idx_list?;
     if idx_list.len() * 10 > o.max_objects * 9 && !cfg!(feature = "broken-repo-guards") {
         return Err(Error::Refused(format!(
             "v1/index holds {} objects, over 90% of the cap of {}; the repository needs compaction (or pass --max-objects)",
@@ -774,38 +800,56 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
             o.max_objects
         )));
     }
-    repo.ensure_format(true)?;
-    let packs = repo.list_packs()?;
+    if !format_ok? {
+        repo.write_format(true)?;
+    }
+    let packs = packs?;
+    let snap_list = snap_list?;
     let listed_idx_bytes: u64 = idx_list.iter().map(|x| x.size).sum();
     let cache = match &o.state {
         Some(d) => Cache::open(d, &run, o.cache_budget, listed_idx_bytes)?,
         None => None,
     };
     let mut mi = Meter::new("the chunk map", b.i);
-    let (committed, _n_idx, referenced) =
-        repo.load_chunk_map(&idx_list, &packs, &mut mi, cache.as_ref())?;
-    let adopted = adopt_orphans(&repo, &packs, &referenced, o.adopt_limit, &mut mi);
-    rep.adopted_packs = adopted.len() as u64;
-
     // The previous run's file table, for the metadata fast path.
     let mut mw = Meter::new("the walk and the previous file table", b.w);
-    let mut prev: HashMap<Vec<u8>, Entry> = HashMap::new();
-    let prev_snap = repo
-        .snapshots()?
-        .into_iter()
-        .rev()
-        .find(|s| s.complete && s.root == o.root_label);
-    if let Some(s) = &prev_snap {
-        for (_, f) in repo.load_files(&s.run, &mut mw, None)? {
-            for e in f.entries {
-                if e.kind == Kind::File {
-                    if let Ok(rel) = e.rel() {
-                        prev.insert(rel, e);
+    let load_prev = |mw: &mut Meter| -> Result<HashMap<Vec<u8>, Entry>> {
+        let mut prev: HashMap<Vec<u8>, Entry> = HashMap::new();
+        let prev_snap = repo
+            .load_snapshots(&snap_list, cache.as_ref())?
+            .into_iter()
+            .rev()
+            .find(|s| s.complete && s.root == o.root_label);
+        if let Some(s) = &prev_snap {
+            for (_, f) in repo.load_commit_files(s, mw, cache.as_ref())? {
+                for e in f.entries {
+                    if e.kind == Kind::File {
+                        if let Ok(rel) = e.rel() {
+                            prev.insert(rel, e);
+                        }
                     }
                 }
             }
         }
-    }
+        Ok(prev)
+    };
+    let (maps, prev) = if serial {
+        let m = repo.load_chunk_map(&idx_list, &packs, &mut mi, cache.as_ref());
+        (m, load_prev(&mut mw))
+    } else {
+        std::thread::scope(|s| {
+            let h = s.spawn(|| load_prev(&mut mw));
+            let m = repo.load_chunk_map(&idx_list, &packs, &mut mi, cache.as_ref());
+            let p = h
+                .join()
+                .unwrap_or_else(|_| Err(Error::Bug("load thread panicked".into())));
+            (m, p)
+        })
+    };
+    let (committed, _n_idx, referenced) = maps?;
+    let prev = prev?;
+    let adopted = adopt_orphans(&repo, &packs, &referenced, o.adopt_limit, &mut mi);
+    rep.adopted_packs = adopted.len() as u64;
     rep.load_ms = t0.elapsed().as_millis() as u64;
 
     // Walk.
@@ -918,6 +962,7 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
         engine: &eng,
         nodes: &nodes,
         committed: &committed,
+        cache: cache.as_ref(),
         avail: HashSet::new(),
         waiting: Vec::new(),
         hard_waiting: hard,
@@ -1073,8 +1118,13 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
             complete: true,
         };
         let body = serde_json::to_vec(&snap).map_err(|e| Error::Bug(format!("snapshot: {e}")))?;
-        if let Err(e) = verified_put(&*t, &snapshot_key(&run), &body, o.policy, &|_| {}) {
-            rep.errors.push(format!("snapshot: {e}"));
+        match verified_put(&*t, &snapshot_key(&run), &body, o.policy, &|_| {}) {
+            Ok(_) => {
+                if let Some(c) = &cache {
+                    c.write(&snapshot_key(&run), &body);
+                }
+            }
+            Err(e) => rep.errors.push(format!("snapshot: {e}")),
         }
     }
     rep.wall_ms = t0.elapsed().as_millis() as u64;
@@ -1097,6 +1147,8 @@ struct Committer<'a> {
     engine: &'a str,
     nodes: &'a [Node],
     committed: &'a crate::repo::ChunkMap,
+    /// the state dir's cache of commit objects: what this run commits goes in as it verifies
+    cache: Option<&'a Cache>,
     /// chunks uploaded and verified in this run
     avail: HashSet<ChunkId>,
     waiting: Vec<(Entry, usize)>,
@@ -1132,7 +1184,21 @@ impl Committer<'_> {
     fn run(&mut self, ev_rx: &Receiver<Event>, commit_bytes: u64, every: Duration) -> Result<()> {
         let mut last = Instant::now();
         loop {
-            let ev = ev_rx.recv_timeout(Duration::from_millis(500));
+            // Wait for an event only while no commit is due, and never past the end of the
+            // one-second spacing: a due commit starts at once, not at the next 500 ms tick.
+            let ev = if self.due(last, commit_bytes, every)
+                && !cfg!(feature = "broken-commit-spacing")
+            {
+                ev_rx.try_recv().map_err(|e| match e {
+                    crossbeam_channel::TryRecvError::Empty => RecvTimeoutError::Timeout,
+                    crossbeam_channel::TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+                })
+            } else {
+                let wait = Duration::from_secs(1)
+                    .saturating_sub(last.elapsed())
+                    .clamp(Duration::from_millis(10), Duration::from_millis(500));
+                ev_rx.recv_timeout(wait)
+            };
             let closed = matches!(ev, Err(RecvTimeoutError::Disconnected));
             match ev {
                 Ok(Event::File(e, i)) => self.waiting.push((*e, i)),
@@ -1161,17 +1227,7 @@ impl Committer<'_> {
                 }
                 Err(_) => {}
             }
-            // At most one commit attempt per second; each scans the waiting list once. Freed
-            // space first: commit as soon as files worth 5% of the freeable bytes could be
-            // receipted, besides the byte, count and time triggers.
-            let due = last.elapsed() >= Duration::from_secs(1)
-                && (self.pending_pack_bytes >= commit_bytes
-                    || self.waiting.len() + self.ready.len() >= FILES_PER_COMMIT
-                    || (last.elapsed() >= every
-                        && (!self.waiting.is_empty()
-                            || !self.ready.is_empty()
-                            || !self.new_packs.is_empty()))
-                    || (self.freeable > 0 && self.ready_alloc() * 20 >= self.freeable));
+            let due = self.due(last, commit_bytes, every);
             if closed {
                 // final commits (possibly several, each bounded); hard links follow their data
                 while self.commit_once()? {
@@ -1197,10 +1253,31 @@ impl Committer<'_> {
                 return Ok(());
             }
             if due {
+                // the one-second spacing runs from the start of a commit, so a commit slower
+                // than that (four store round trips under a busy uplink) is followed at once
+                let started = Instant::now();
                 self.commit_once()?;
-                last = Instant::now();
+                last = if cfg!(feature = "broken-commit-spacing") {
+                    Instant::now()
+                } else {
+                    started
+                };
             }
         }
+    }
+
+    /// At most one commit per second, counted from the start of the previous one; each check
+    /// scans the waiting list once. Freed space first: commit as soon as files worth 5% of the
+    /// freeable bytes could be receipted, besides the byte, count and time triggers.
+    fn due(&self, last: Instant, commit_bytes: u64, every: Duration) -> bool {
+        last.elapsed() >= Duration::from_secs(1)
+            && (self.pending_pack_bytes >= commit_bytes
+                || self.waiting.len() + self.ready.len() >= FILES_PER_COMMIT
+                || (last.elapsed() >= every
+                    && (!self.waiting.is_empty()
+                        || !self.ready.is_empty()
+                        || !self.new_packs.is_empty()))
+                || (self.freeable > 0 && self.ready_alloc() * 20 >= self.freeable))
     }
 
     /// Allocated bytes of the files a commit now would receipt.
@@ -1296,50 +1373,52 @@ impl Committer<'_> {
         };
         let r = (|| -> Result<(ObjRef, ObjRef, Vec<Receipt>)> {
             let iz = encode(&idx)?;
-            let vi = verified_put(
-                &*self.repo.t,
-                &idx_key(self.run, seq),
-                &iz,
-                self.repo.policy,
-                &|_| {},
-            )?;
-            let iref = ObjRef {
-                key: vi.key,
-                size: vi.size,
-                hash: vi.hash,
-            };
+            let ikey = idx_key(self.run, seq);
             let fz = encode(&files)?;
             let fkey = files_key(self.run, seq);
-            let fhash = self.repo.kind.digest(&fz);
-            let pre = ObjRef {
-                key: fkey.clone(),
-                size: fz.len() as u64,
-                hash: fhash,
-            };
-            let make = |fr: &ObjRef| -> Vec<Receipt> {
+            let (t, pol) = (&*self.repo.t, self.repo.policy);
+            let put_idx = || verified_put(t, &ikey, &iz, pol, &|_| {});
+            let put_files = || verified_put(t, &fkey, &fz, pol, &|_| {});
+            let make = |ir: &ObjRef, fr: &ObjRef| -> Vec<Receipt> {
                 files
                     .entries
                     .iter()
-                    .map(|e| {
-                        Receipt::from_entry(e, self.repo_label, self.run, self.engine, &iref, fr)
-                    })
+                    .map(|e| Receipt::from_entry(e, self.repo_label, self.run, self.engine, ir, fr))
                     .collect()
+            };
+            let as_ref = |v: crate::transport::Verified| ObjRef {
+                key: v.key,
+                size: v.size,
+                hash: v.hash,
             };
             if cfg!(feature = "broken-commit-order") {
                 // The broken variant: receipts after the .idx alone (AC-2 must catch this).
-                let rs = make(&pre);
-                self.writer.write_batch(&rs)?;
-                let vf = verified_put(&*self.repo.t, &fkey, &fz, self.repo.policy, &|_| {})?;
-                let _ = vf;
+                let iref = as_ref(put_idx()?);
+                let pre = ObjRef {
+                    key: fkey.clone(),
+                    size: fz.len() as u64,
+                    hash: self.repo.kind.digest(&fz),
+                };
+                self.writer.write_batch(&make(&iref, &pre))?;
+                put_files()?;
                 return Ok((iref, pre, Vec::new()));
             }
-            let vf = verified_put(&*self.repo.t, &fkey, &fz, self.repo.policy, &|_| {})?;
-            let fref = ObjRef {
-                key: vf.key,
-                size: vf.size,
-                hash: vf.hash,
-            };
-            let rs = make(&fref);
+            // The .idx and the .files go up at once (one round trip instead of two). Receipts
+            // need both verified; readers ignore a .files whose .idx is not stored.
+            let (vi, vf) = std::thread::scope(|s| {
+                let h = s.spawn(put_idx);
+                let vf = put_files();
+                let vi = h
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::Bug("commit thread panicked".into())));
+                (vi, vf)
+            });
+            let (iref, fref) = (as_ref(vi?), as_ref(vf?));
+            if let Some(c) = self.cache {
+                c.write(&iref.key, &iz);
+                c.write(&fref.key, &fz);
+            }
+            let rs = make(&iref, &fref);
             Ok((iref, fref, rs))
         })();
         match r {

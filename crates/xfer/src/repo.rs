@@ -29,6 +29,10 @@ pub const OBJECT_JSON_MAX: usize = 64 << 20;
 pub const ENTRIES_MAX: usize = 2_000_000;
 pub const DEFAULT_MAX_OBJECTS: usize = 100_001;
 pub const LINK_MAX: usize = 4096;
+/// Commit objects fetched at once while loading (each request is one store round trip).
+pub const FETCH_PARALLEL: usize = 8;
+/// Compressed bytes of commit objects fetched at once (a larger single object is fetched alone).
+pub const FETCH_BYTES: u64 = 16 << 20;
 
 /// Crate version plus build commit: recorded in every commit object and receipt.
 pub fn engine() -> String {
@@ -447,24 +451,81 @@ impl Repo {
 
     /// Write `v1/format.json` if absent; refuse if it exists with other bytes.
     pub fn ensure_format(&self, write: bool) -> Result<()> {
-        match self.t.stat(FORMAT_KEY)? {
-            Some(o) => {
-                let b = self.t.get(FORMAT_KEY, 64 << 10)?;
-                let differs = b != FORMAT_BYTES || o.size != FORMAT_BYTES.len() as u64;
-                if differs && !cfg!(feature = "broken-repo-guards") {
-                    return Err(Error::Refused(
-                        "v1/format.json differs from this engine's format v1; refusing to write"
-                            .into(),
-                    ));
-                }
-                Ok(())
-            }
-            None if write => {
-                verified_put(&*self.t, FORMAT_KEY, FORMAT_BYTES, self.policy, &|_| {})?;
-                Ok(())
-            }
-            None => Err(Error::Refused("no v1 repository at this location".into())),
+        if self.format_present()? {
+            return Ok(());
         }
+        self.write_format(write)
+    }
+
+    /// Whether `v1/format.json` exists with this engine's bytes (false: absent). Refuses if it
+    /// exists with other bytes. A stat whose size and store checksum match needs no download.
+    pub fn format_present(&self) -> Result<bool> {
+        let Some(o) = self.t.stat(FORMAT_KEY)? else {
+            return Ok(false);
+        };
+        let size_ok = o.size == FORMAT_BYTES.len() as u64;
+        let known = o
+            .hash
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(&self.kind.digest(FORMAT_BYTES)));
+        let differs = if size_ok && known {
+            false
+        } else {
+            !size_ok || self.t.get(FORMAT_KEY, 64 << 10)? != FORMAT_BYTES
+        };
+        if differs && !cfg!(feature = "broken-repo-guards") {
+            return Err(Error::Refused(
+                "v1/format.json differs from this engine's format v1; refusing to write".into(),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Write `v1/format.json` (only when `write`; otherwise there is no repository here).
+    pub fn write_format(&self, write: bool) -> Result<()> {
+        if !write {
+            return Err(Error::Refused("no v1 repository at this location".into()));
+        }
+        verified_put(&*self.t, FORMAT_KEY, FORMAT_BYTES, self.policy, &|_| {})?;
+        Ok(())
+    }
+
+    /// Fetch several commit objects at once (each checked as [`Repo::fetch`] does), keeping
+    /// their order. At most `FETCH_PARALLEL` requests and about `FETCH_BYTES` are in flight.
+    pub fn fetch_many(&self, objs: &[RemoteObject], cache: Option<&Cache>) -> Result<Vec<Vec<u8>>> {
+        self.fetch_each(objs, cache).into_iter().collect()
+    }
+
+    /// As [`Repo::fetch_many`], with one result per object. A batch is fetched only after the
+    /// previous one completed, so at most one batch of bodies is held beyond what was returned.
+    pub fn fetch_each(&self, objs: &[RemoteObject], cache: Option<&Cache>) -> Vec<Result<Vec<u8>>> {
+        let mut out = Vec::with_capacity(objs.len());
+        let mut i = 0;
+        while i < objs.len() {
+            let mut j = i + 1;
+            let mut bytes = objs[i].size;
+            while j < objs.len() && j - i < FETCH_PARALLEL && bytes + objs[j].size <= FETCH_BYTES {
+                bytes += objs[j].size;
+                j += 1;
+            }
+            let batch = &objs[i..j];
+            if batch.len() == 1 || cfg!(feature = "broken-serial-load") {
+                out.extend(batch.iter().map(|o| self.fetch(o, cache)));
+            } else {
+                std::thread::scope(|s| {
+                    let hs: Vec<_> = batch
+                        .iter()
+                        .map(|o| s.spawn(move || self.fetch(o, cache)))
+                        .collect();
+                    out.extend(hs.into_iter().map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(Error::Bug("fetch thread panicked".into())))
+                    }));
+                });
+            }
+            i = j;
+        }
+        out
     }
 
     /// Fetch one commit object and check it against its listing (size and store hash).
@@ -530,19 +591,36 @@ impl Repo {
     ) -> Result<(ChunkMap, usize, HashMap<String, ObjRef>)> {
         let mut referenced: HashMap<String, ObjRef> = HashMap::new();
         let mut map = ChunkMap::default();
-        let mut z_total = 0u64;
-        for o in idx {
-            z_total += o.size;
-            if z_total > meter.limit {
-                return Err(Error::Budget(format!(
-                    "{} index objects ({} compressed) exceed the index share {}",
-                    idx.len(),
-                    crate::util::human(z_total),
-                    crate::util::human(meter.limit)
-                )));
+        let z_total: u64 = idx.iter().map(|o| o.size).sum();
+        if z_total > meter.limit {
+            return Err(Error::Budget(format!(
+                "{} index objects ({} compressed) exceed the index share {}",
+                idx.len(),
+                crate::util::human(z_total),
+                crate::util::human(meter.limit)
+            )));
+        }
+        // fetched in parallel batches, decoded and charged one at a time in listing order
+        for group in idx.chunks(FETCH_PARALLEL) {
+            let bodies = self.fetch_many(group, cache)?;
+            for (o, b) in group.iter().zip(bodies) {
+                self.add_index(o, &b, packs, meter, &mut map, &mut referenced)?;
             }
-            let b = self.fetch(o, cache)?;
-            let obj: IdxObj = decode(&b)?;
+        }
+        Ok((map, idx.len(), referenced))
+    }
+
+    fn add_index(
+        &self,
+        o: &RemoteObject,
+        b: &[u8],
+        packs: &HashMap<String, RemoteObject>,
+        meter: &mut Meter,
+        map: &mut ChunkMap,
+        referenced: &mut HashMap<String, ObjRef>,
+    ) -> Result<()> {
+        {
+            let obj: IdxObj = decode(b)?;
             if obj.v != 1 {
                 return Err(Error::Refused(format!("{}: unknown index version", o.key)));
             }
@@ -586,10 +664,12 @@ impl Repo {
                 }
             }
         }
-        Ok((map, idx.len(), referenced))
+        Ok(())
     }
 
-    /// The file table of one run: every `.files` object of that run, in commit order.
+    /// The file table of one run: every `.files` object of that run whose `.idx` of the same
+    /// seq is also stored, in commit order. A commit puts both at once, so a `.files` without
+    /// its `.idx` is a commit that never completed: nothing was receipted from it.
     pub fn load_files(
         &self,
         run: &str,
@@ -599,40 +679,113 @@ impl Repo {
         if !valid_run(run) {
             return Err(Error::Refused(format!("bad run id {run:?}")));
         }
+        let with_idx: std::collections::HashSet<u32> = self
+            .list(&format!("v1/index/{run}"))?
+            .into_iter()
+            .filter_map(|o| parse_commit_key(&o.key).map(|(_, s)| s))
+            .collect();
         let mut objs: Vec<(u32, RemoteObject)> = self
             .list(&format!("v1/files/{run}"))?
             .into_iter()
             .filter_map(|o| parse_commit_key(&o.key).map(|(_, s)| (s, o)))
+            .filter(|(s, _)| with_idx.contains(s) || cfg!(feature = "broken-commit-pair"))
             .collect();
         objs.sort_by_key(|(s, _)| *s);
-        let mut out = Vec::new();
-        for (seq, o) in objs {
-            let b = self.fetch(&o, cache)?;
-            let f: FilesObj = decode(&b)?;
-            if f.v != 1 || f.run != run || f.seq != seq {
+        self.decode_files(run, objs, meter, cache)
+    }
+
+    /// The file table of a completed run, from the commits its snapshot lists (no LIST needed).
+    pub fn load_commit_files(
+        &self,
+        snap: &Snapshot,
+        meter: &mut Meter,
+        cache: Option<&Cache>,
+    ) -> Result<Vec<(RemoteObject, FilesObj)>> {
+        if !valid_run(&snap.run) {
+            return Err(Error::Refused(format!("bad run id {:?}", snap.run)));
+        }
+        let mut objs = Vec::new();
+        for c in &snap.commits {
+            if c.files.key != files_key(&snap.run, c.seq) {
                 return Err(Error::corrupt(format!(
-                    "{}: header does not match its key",
-                    o.key
+                    "snapshot {} names {} for commit {}",
+                    snap.run, c.files.key, c.seq
                 )));
             }
-            if f.entries.len() > ENTRIES_MAX {
-                return Err(Error::corrupt(format!("{}: too many entries", o.key)));
+            objs.push((
+                c.seq,
+                RemoteObject {
+                    key: c.files.key.clone(),
+                    size: c.files.size,
+                    hash: Some(c.files.hash.clone()),
+                },
+            ));
+        }
+        objs.sort_by_key(|(s, _)| *s);
+        self.decode_files(&snap.run, objs, meter, cache)
+    }
+
+    fn decode_files(
+        &self,
+        run: &str,
+        objs: Vec<(u32, RemoteObject)>,
+        meter: &mut Meter,
+        cache: Option<&Cache>,
+    ) -> Result<Vec<(RemoteObject, FilesObj)>> {
+        let mut out = Vec::new();
+        for group in objs.chunks(FETCH_PARALLEL) {
+            let listed: Vec<RemoteObject> = group.iter().map(|(_, o)| o.clone()).collect();
+            let bodies = self.fetch_many(&listed, cache)?;
+            for ((seq, o), b) in group.iter().zip(bodies) {
+                let f: FilesObj = decode(&b)?;
+                if f.v != 1 || f.run != run || f.seq != *seq {
+                    return Err(Error::corrupt(format!(
+                        "{}: header does not match its key",
+                        o.key
+                    )));
+                }
+                if f.entries.len() > ENTRIES_MAX {
+                    return Err(Error::corrupt(format!("{}: too many entries", o.key)));
+                }
+                for e in &f.entries {
+                    meter.charge(e.charge())?;
+                }
+                out.push((o.clone(), f));
             }
-            for e in &f.entries {
-                meter.charge(e.charge())?;
-            }
-            out.push((o, f));
         }
         Ok(out)
     }
 
+    /// Every snapshot object (one LIST).
+    pub fn list_snapshots(&self) -> Result<Vec<RemoteObject>> {
+        Ok(self
+            .list("v1/snapshots")?
+            .into_iter()
+            .filter(|o| o.key.ends_with(".json") && o.size <= (16 << 20))
+            .collect())
+    }
+
     pub fn snapshots(&self) -> Result<Vec<Snapshot>> {
+        let listed = self.list_snapshots()?;
+        self.load_snapshots(&listed, None)
+    }
+
+    /// Fetch and parse listed snapshots (checked against the listing), oldest first by end time.
+    /// Objects that do not parse as a v1 snapshot for their own key are ignored.
+    pub fn load_snapshots(
+        &self,
+        listed: &[RemoteObject],
+        cache: Option<&Cache>,
+    ) -> Result<Vec<Snapshot>> {
         let mut v = Vec::new();
-        for o in self.list("v1/snapshots")? {
-            if !o.key.ends_with(".json") || o.size > (16 << 20) {
-                continue;
-            }
-            let b = self.t.get(&o.key, o.size)?;
+        for (o, b) in listed.iter().zip(self.fetch_each(listed, cache)) {
+            // a transport failure stops the load; a body that does not match its listing is
+            // ignored like one that does not parse
+            let b = match b {
+                Ok(b) => b,
+                Err(Error::Corrupt(_)) => continue,
+                Err(e) => return Err(e),
+            };
             match serde_json::from_slice::<Snapshot>(&b) {
                 Ok(s) if s.v == 1 && valid_run(&s.run) && o.key == snapshot_key(&s.run) => {
                     v.push(s)
@@ -660,17 +813,25 @@ impl Repo {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Local cache of verified index objects
+// Local cache of verified commit objects
 
-/// Holds verified copies of `.idx` objects only, within `--cache-budget`. Temporary files are
+/// Holds verified copies of commit objects (`.idx`, `.files`, snapshots: immutable under their
+/// keys), fetched or written by this engine, within `--cache-budget`. Temporary files are
 /// `<name>.tmp-<run>`; at start only tmp files older than one hour are removed, so a concurrent
 /// run's in-flight files survive. A cached file is trusted only if its size and store checksum
-/// still match the listing.
+/// still match the listing (or the snapshot's commit record).
 pub struct Cache {
     dir: PathBuf,
     run: String,
     budget: u64,
     used: std::sync::Mutex<u64>,
+}
+
+/// Commit objects are immutable once stored under their key: `.idx`, `.files` and snapshots.
+fn cacheable(key: &str) -> bool {
+    key.ends_with(".idx")
+        || key.ends_with(".files")
+        || (key.starts_with("v1/snapshots/") && key.ends_with(".json"))
 }
 
 fn cache_name(key: &str) -> String {
@@ -713,7 +874,7 @@ impl Cache {
     }
 
     pub fn read(&self, key: &str, size: u64, kind: HashKind, hash: &str) -> Option<Vec<u8>> {
-        if !key.ends_with(".idx") {
+        if !cacheable(key) {
             return None;
         }
         let p = self.dir.join(cache_name(key));
@@ -729,7 +890,7 @@ impl Cache {
     }
 
     pub fn write(&self, key: &str, data: &[u8]) {
-        if !key.ends_with(".idx") {
+        if !cacheable(key) {
             return;
         }
         let mut used = self.used.lock().expect("cache lock");
