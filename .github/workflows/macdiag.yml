@@ -1,7 +1,8 @@
 name: macdiag
 
-# TEMPORARY (branch diag/apply-lock-macos only): find why apply.lock is still held just after an
-# apply returns on macOS. Never merged.
+# TEMPORARY (branch diag/apply-lock-macos only): failing-first evidence on macOS for the apply.lock
+# fix at ed00006 on feat/apply-lanes. The guard tests must pass at ed00006 and fail with the
+# controlled broken variant lock-settle-zero (no wait). Never merged.
 on:
   push:
     branches: ["diag/**"]
@@ -10,47 +11,20 @@ permissions:
   contents: read
 
 jobs:
-  experiment:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Experiment
-        run: cargo test -p disk-cleaner-core --locked --test lock_diag -- --nocapture 2>&1 | grep -E "PD-LOCK-EXP|test result|panicked"
-
-  loop:
+  guard:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: brew install rclone && rclone version
-      - run: cargo test --workspace --locked --no-run
-      - name: Loop
-        env:
-          RUST_BACKTRACE: "1"
-        run: |
-          fails=0
-          for i in 1 2 3; do
-            export PD_LOCK_LOG="$PWD/lock-$i.log"
-            if ! cargo test --workspace --locked --no-fail-fast > run-$i.log 2>&1; then
-              fails=$((fails+1)); echo "iteration $i FAILED"
-              grep -E "FAILED|panicked|Locked" run-$i.log | head -20
-            else
-              echo "iteration $i ok"
-            fi
-            echo "lock waits in iteration $i: $(grep -c PD-LOCK lock-$i.log 2>/dev/null || echo 0)"
-            cat lock-$i.log 2>/dev/null | head -40
-          done
-          echo "failures: $fails of 3"
-          test "$fails" = 0
-      - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: loop-logs
-          path: |
-            run-*.log
-            lock-*.log
+          ref: ed00006ab2e53000e42e77cebe5ed43c2ee1baee
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Guard tests at ed00006 (must pass)
+        run: cargo test -p disk-cleaner-core --locked --test apply_lock 2>&1 | grep -E "^test |test result|takes after"
+      - name: Guard tests with lock-settle-zero (must fail)
+        run: |
+          perl -0777 -pi -e 's/std::time::Duration::from_millis\(500\);/std::time::Duration::from_millis(0);/ or die "pattern did not apply\n"' crates/core/src/apply/run.rs
+          grep -n "from_millis(0);" crates/core/src/apply/run.rs
+          if cargo test -p disk-cleaner-core --locked --test apply_lock > mut.log 2>&1; then
+            echo "SURVIVED"; grep -E "^test |test result" mut.log; exit 1
+          fi
+          echo "KILLED"; grep -E "^test |test result|takes after" mut.log
