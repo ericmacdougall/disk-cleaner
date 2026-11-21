@@ -9,7 +9,7 @@ mod apply_common;
 
 use apply_common::*;
 use disk_cleaner_core::apply::restore::{restore, RestoreOptions};
-use disk_cleaner_core::apply::{apply, ApplyError};
+use disk_cleaner_core::apply::{apply, ApplyError, ApplyOptions, ApplyReport};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -49,14 +49,56 @@ fn sum(p: &Path) -> PathBuf {
     PathBuf::from(format!("{}.sum", p.display()))
 }
 
-/// One acting run that backs up and removes `data/<name>` (written first when `write`).
-fn run_one(fx: &Fx, name: &str, write: bool) -> disk_cleaner_core::apply::ApplyReport {
+/// One acting run that would back up and remove `data/<name>` (written first when `write`).
+fn try_run(
+    fx: &Fx,
+    name: &str,
+    write: bool,
+    set: impl Fn(&mut ApplyOptions),
+) -> Result<ApplyReport, ApplyError> {
     if write {
         fx.write(&format!("{name}/f.txt"), name.as_bytes());
     }
     let pieces = vec![P::tree(&fx.data.join(name), "backup")];
     let (scan, plan) = docs(&[&fx.data], &pieces);
-    let rep = apply(&scan, &plan, &fx.opts(true)).unwrap();
+    let mut o = fx.opts(true);
+    set(&mut o);
+    apply(&scan, &plan, &o)
+}
+
+/// An acting run that finds a gap does nothing (A-6): no removal, and no object written.
+fn refused_to_act(fx: &Fx, name: &str, gap: &str) {
+    let before = (
+        tree_digest(&fx.data),
+        fs::read_dir(dir(fx)).unwrap().count(),
+    );
+    match try_run(fx, name, false, |_| {}) {
+        Err(ApplyError::HistoryGap(g)) => {
+            let all = g.join("; ");
+            assert!(all.contains(gap), "{all}");
+            let e = ApplyError::HistoryGap(g).to_string();
+            assert!(
+                e.contains("--accept-history-gap") && e.contains("nothing was done"),
+                "{e}"
+            );
+        }
+        other => panic!("an acting run went ahead with a gap ({gap}): {other:?}"),
+    }
+    let after = (
+        tree_digest(&fx.data),
+        fs::read_dir(dir(fx)).unwrap().count(),
+    );
+    assert_eq!(before, after, "nothing removed, nothing written");
+    assert!(fx.data.join(name).exists());
+}
+
+/// One acting run that backs up and removes `data/<name>` (written first when `write`).
+fn run_one(fx: &Fx, name: &str, write: bool) -> ApplyReport {
+    run_with(fx, name, write, |_| {})
+}
+
+fn run_with(fx: &Fx, name: &str, write: bool, set: impl Fn(&mut ApplyOptions)) -> ApplyReport {
+    let rep = try_run(fx, name, write, set).unwrap();
     assert!(
         !fx.data.join(name).exists(),
         "{name}: removal is not blocked: {rep:?}"
@@ -165,10 +207,12 @@ fn a_segment_replaced_by_an_older_one_is_refused() {
     }
 }
 
-/// The laundering guard: a later acting run that finds a gap reports it (status 6 in the CLI),
-/// removes what it was asked to, and keeps the gap in the head, so restore still refuses.
+/// A gap stops every acting run (ASSUMPTION A-6, main's choice): it removes nothing and writes
+/// nothing, and the error lists the gap and names the flag. With `accept_history_gap` the run
+/// goes ahead, the report records the gap it went ahead with, and the gap stays in the head
+/// (the laundering guard), so restore still refuses and the next run stops again.
 #[test]
-fn a_gap_survives_later_runs_and_each_reports_it() {
+fn a_gap_stops_acting_runs_until_accepted_and_survives_them() {
     let fx = Fx::new();
     let _ = history(&fx);
     let last = committed(&fx).last().unwrap().clone();
@@ -176,13 +220,17 @@ fn a_gap_survives_later_runs_and_each_reports_it() {
     fs::remove_file(sum(&last)).unwrap();
     let name = last.file_name().unwrap().to_string_lossy().to_string();
     for n in ["four", "five"] {
-        let rep = run_one(&fx, n, true);
+        fx.write(&format!("{n}/f.txt"), n.as_bytes());
+        refused_to_act(&fx, n, &name);
+        let rep = run_with(&fx, n, false, |o| o.accept_history_gap = true);
         assert!(
             rep.history_gaps.iter().any(|g| g.contains(&name)),
             "{n}: {rep:?}"
         );
     }
     refused(&fx, &name);
+    fx.write("nine/f.txt", b"nine");
+    refused_to_act(&fx, "nine", &name);
 }
 
 /// A missing head while segments are stored is refused, and stays a gap once a later run
@@ -194,15 +242,65 @@ fn a_missing_head_is_refused_and_recorded() {
     for slot in ["head.0", "head.1"] {
         let _ = fs::remove_file(dir(&fx).join(slot));
     }
-    // With the local manifest gone too, so the next run reads the head only when it mirrors.
+    // With the local manifest gone too.
     refused(
         &fx,
         "storage head that lists the committed segments was missing",
     );
-    let rep = run_one(&fx, "six", true);
+    fx.write("six/f.txt", b"six");
+    refused_to_act(
+        &fx,
+        "six",
+        "storage head that lists the committed segments was missing",
+    );
+    let rep = run_with(&fx, "six", false, |o| o.accept_history_gap = true);
     assert!(!rep.history_gaps.is_empty(), "{rep:?}");
     assert!(dir(&fx).join("head.0").exists() || dir(&fx).join("head.1").exists());
     refused(&fx, "an earlier apply run found a gap");
+}
+
+/// One label, one state directory (A-5). A second state directory using the label is refused
+/// before anything is done; `take_over_label` hands the label over and the report says from
+/// whom; then the first state directory is the one refused.
+#[test]
+fn a_second_state_directory_on_one_label_is_refused_until_it_takes_over() {
+    let fx = Fx::new();
+    let _ = history(&fx);
+    let other = fx.state.parent().unwrap().join("state-two");
+    fs::create_dir_all(&other).unwrap();
+    let second = |o: &mut ApplyOptions| {
+        o.state_dir = other.clone();
+        o.manifest = other.join("manifest.jsonl");
+    };
+    fx.write("ten/f.txt", b"ten");
+    let before = (
+        tree_digest(&fx.data),
+        fs::read_dir(dir(&fx)).unwrap().count(),
+    );
+    match try_run(&fx, "ten", false, second) {
+        Err(e @ ApplyError::LabelInUse { .. }) => {
+            assert!(e.to_string().contains("--take-over-label"), "{e}")
+        }
+        other => panic!("a second state directory went ahead: {other:?}"),
+    }
+    assert_eq!(
+        before,
+        (
+            tree_digest(&fx.data),
+            fs::read_dir(dir(&fx)).unwrap().count()
+        )
+    );
+    let first_id = fs::read_to_string(fx.state.join("lock").join("state-id")).unwrap();
+    let rep = run_with(&fx, "ten", false, |o| {
+        second(o);
+        o.take_over_label = true;
+    });
+    assert_eq!(rep.took_over_label_from.as_deref(), Some(first_id.trim()));
+    fx.write("eleven/f.txt", b"eleven");
+    assert!(matches!(
+        try_run(&fx, "eleven", false, |_| {}),
+        Err(ApplyError::LabelInUse { .. })
+    ));
 }
 
 /// A head that cannot be stored is a mirror failure, never skipped: until the head lists a
@@ -222,6 +320,56 @@ fn a_head_that_cannot_be_stored_is_reported() {
         Ok(rep) => assert!(rep.mirror_failed.is_some(), "{rep:?}"),
     }
     fx.set_fake("");
+}
+
+/// A manifest object that is listed but cannot be read (a storage outage) stops the run with a
+/// storage error: nothing removed, nothing written, and no gap recorded, so the run after the
+/// outage goes ahead with clean history and restore still finds every segment.
+#[test]
+fn a_manifest_read_that_fails_stops_the_run_and_records_no_gap() {
+    let fx = Fx::new();
+    let _ = history(&fx);
+    fx.write("ten/f.txt", b"ten");
+    for (kind, pat) in [
+        ("segment", "*manifests/*.jsonl"),
+        ("sidecar", "*manifests/*.sum"),
+        ("head slot", "*manifests/*/head.?"),
+    ] {
+        fx.set_fake(&format!(
+            "if [ \"$cmd\" = cat ]; then case \"$*\" in {pat}) echo outage >&2; exit 1;; esac; fi"
+        ));
+        let before = (
+            tree_digest(&fx.data),
+            fs::read_dir(dir(&fx)).unwrap().count(),
+        );
+        match try_run(&fx, "ten", false, |o| o.accept_history_gap = true) {
+            Err(ApplyError::Storage(e)) => assert!(e.contains("cannot read"), "{kind}: {e}"),
+            other => panic!("{kind}: a failed manifest read did not stop the run: {other:?}"),
+        }
+        let after = (
+            tree_digest(&fx.data),
+            fs::read_dir(dir(&fx)).unwrap().count(),
+        );
+        assert_eq!(before, after, "{kind}: nothing removed, nothing written");
+        let _ = fs::remove_file(fx.manifest());
+        assert!(
+            matches!(restore(&fx.data, &ropts(&fx)), Err(ApplyError::Storage(_))),
+            "{kind}: restore must stop on a failed read, never skip the segment"
+        );
+        fx.set_fake("");
+    }
+    let rep = run_one(&fx, "ten", false);
+    assert!(
+        rep.history_gaps.is_empty(),
+        "an outage became history: {rep:?}"
+    );
+    let _ = fs::remove_file(fx.manifest());
+    let r = restore(&fx.data, &ropts(&fx)).unwrap();
+    assert!(
+        r.failed.is_empty() && r.rejected_segments.is_empty(),
+        "{r:?}"
+    );
+    assert_eq!(fs::read(fx.data.join("one/f.txt")).unwrap(), b"one");
 }
 
 /// What is not a loss is not refused: the newer head slot rolled back or cut mid-write (the

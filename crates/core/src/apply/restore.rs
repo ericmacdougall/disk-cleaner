@@ -86,16 +86,28 @@ pub(crate) const HEAD_SLOTS: [&str; 2] = ["head.0", "head.1"];
 pub(crate) struct Head {
     /// `None`: no head that parses is stored.
     pub gen: Option<u64>,
+    /// The id of the state directory that wrote it (A-5: one label, one state directory).
+    pub state: Option<String>,
     pub segs: BTreeMap<String, String>,
     pub lost: Vec<String>,
 }
 
-pub(crate) fn format_head(gen: u64, segs: &BTreeMap<String, String>, lost: &[String]) -> String {
+/// A state directory id: 32 lowercase hex digits.
+pub(crate) fn is_state_id(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+pub(crate) fn format_head(gen: u64, h: &Head) -> String {
     let mut t = format!("disk-cleaner manifest head\ngen {gen}\n");
-    for (n, sha) in segs {
+    if let Some(s) = &h.state {
+        t.push_str(&format!("state {s}\n"));
+    }
+    for (n, sha) in &h.segs {
         t.push_str(&format!("seg {n} {sha}\n"));
     }
-    for l in lost {
+    for l in &h.lost {
         let one: String = l
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
@@ -126,6 +138,11 @@ fn parse_head(text: &str) -> Option<Head> {
                 return None;
             }
             h.segs.insert(n.to_string(), sha.to_string());
+        } else if let Some(s) = l.strip_prefix("state ") {
+            if h.state.is_some() || !is_state_id(s) {
+                return None;
+            }
+            h.state = Some(s.to_string());
         } else {
             h.lost.push(l.strip_prefix("lost ")?.to_string());
         }
@@ -174,46 +191,53 @@ pub(crate) fn covered(orphan: &[u8], committed: &[Vec<u8>]) -> bool {
     })
 }
 
-fn segment_state(rc: &Rclone, dir: &str, name: &str, names: &BTreeSet<String>) -> SegState {
-    let read = |n: &str| rc.cat(&format!("{dir}/{n}"));
+/// Read one listed manifest object. A failed read is a storage error that stops the caller,
+/// never a damaged segment or a gap: a transient failure must not become permanent history.
+fn read_listed(rc: &Rclone, dir: &str, name: &str) -> Result<Vec<u8>, ApplyError> {
+    rc.cat(&format!("{dir}/{name}"))
+        .map_err(|e| ApplyError::Storage(format!("cannot read {dir}/{name}: {e}")))
+}
+
+fn segment_state(
+    rc: &Rclone,
+    dir: &str,
+    name: &str,
+    names: &BTreeSet<String>,
+) -> Result<SegState, ApplyError> {
     let sum_name = format!("{name}.sum");
     let sidecar = if names.contains(&sum_name) {
-        match read(&sum_name) {
-            Ok(b) => parse_sidecar(&String::from_utf8_lossy(&b)),
-            Err(e) => return SegState::Damaged(format!("its checksum file cannot be read: {e}")),
-        }
+        parse_sidecar(&String::from_utf8_lossy(&read_listed(rc, dir, &sum_name)?))
     } else {
         None
     };
-    let b = match read(name) {
-        Ok(b) => b,
-        Err(e) => return SegState::Damaged(e),
-    };
+    let b = read_listed(rc, dir, name)?;
     let Some((want_sha, want_len, want_name)) = sidecar else {
-        return SegState::Interrupted(b);
+        return Ok(SegState::Interrupted(b));
     };
     if want_name != name {
-        return SegState::Damaged(format!(
+        return Ok(SegState::Damaged(format!(
             "its checksum file belongs to another segment, {want_name} (copied over it?)"
-        ));
+        )));
     }
     if b.len() as u64 != want_len {
-        return SegState::Damaged(format!(
+        return Ok(SegState::Damaged(format!(
             "it is {} bytes, its checksum file says {want_len}",
             b.len()
-        ));
+        )));
     }
     if hex::encode(Sha256::digest(&b)) != want_sha {
-        return SegState::Damaged("its sha256 differs from its checksum file".into());
+        return Ok(SegState::Damaged(
+            "its sha256 differs from its checksum file".into(),
+        ));
     }
     let text = match std::str::from_utf8(&b) {
         Ok(t) => t,
-        Err(_) => return SegState::Damaged("it is not UTF-8".into()),
+        Err(_) => return Ok(SegState::Damaged("it is not UTF-8".into())),
     };
-    match manifest::parse_segment(text) {
+    Ok(match manifest::parse_segment(text) {
         Ok(rows) => SegState::Committed(rows, b),
         Err(e) => SegState::Damaged(e),
-    }
+    })
 }
 
 /// The manifest history this host's label holds in storage.
@@ -240,27 +264,30 @@ pub(crate) struct RemoteManifest {
 
 const INTERRUPTED: &str = "its upload was interrupted before its checksum file was written, and no committed segment holds its rows; the next acting apply run stores them again from the local manifest";
 
-/// The stored head: the slot with the highest generation that parses. `Err` when slots exist
-/// and none parses or can be read.
-fn read_head(rc: &Rclone, dir: &str, set: &BTreeSet<String>) -> Result<Option<Head>, String> {
+/// The stored head: the slot with the highest generation that parses. The inner `Err` when
+/// slots exist and none parses. A slot that cannot be read stops the caller (the outer `Err`):
+/// a failed read never counts as a missing head, which would record a permanent gap.
+fn read_head(
+    rc: &Rclone,
+    dir: &str,
+    set: &BTreeSet<String>,
+) -> Result<Result<Option<Head>, String>, ApplyError> {
     let mut best: Option<Head> = None;
     let mut present = 0;
     for slot in HEAD_SLOTS.iter().filter(|s| set.contains(**s)) {
         present += 1;
-        let Ok(b) = rc.cat(&format!("{dir}/{slot}")) else {
-            continue;
-        };
+        let b = read_listed(rc, dir, slot)?;
         if let Some(h) = parse_head(&String::from_utf8_lossy(&b)) {
             if best.as_ref().is_none_or(|x| h.gen > x.gen) {
                 best = Some(h);
             }
         }
     }
-    match (best, present) {
+    Ok(match (best, present) {
         (Some(h), _) => Ok(Some(h)),
         (None, 0) => Ok(None),
-        (None, _) => Err("no head slot can be read and parsed".into()),
-    }
+        (None, _) => Err("no head slot parses".into()),
+    })
 }
 
 /// Every manifest segment in storage, classified; only committed segments give rows. Two
@@ -278,7 +305,7 @@ pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest
     let mut out = RemoteManifest::default();
     let segments: Vec<&String> = names.iter().filter(|n| n.ends_with(".jsonl")).collect();
     for n in &segments {
-        match segment_state(rc, &dir, n, &set) {
+        match segment_state(rc, &dir, n, &set)? {
             SegState::Committed(rows, b) => {
                 committed.insert(n.to_string(), hex::encode(Sha256::digest(&b)));
                 good.push(rows);
@@ -289,7 +316,7 @@ pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest
         }
     }
     // The head (A-5).
-    let (head, mut new_lost) = match read_head(rc, &dir, &set) {
+    let (head, mut new_lost) = match read_head(rc, &dir, &set)? {
         Ok(Some(h)) => (h, Vec::new()),
         Ok(None) if segments.is_empty() => (Head::default(), Vec::new()),
         Ok(None) => (
@@ -299,7 +326,7 @@ pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest
         Err(_) if segments.is_empty() => (Head::default(), Vec::new()),
         Err(why) => (
             Head::default(),
-            vec![format!("the storage head was unreadable while segments were stored ({why}), so segments missing before then cannot be named")],
+            vec![format!("the storage head was damaged while segments were stored ({why}), so segments missing before then cannot be named")],
         ),
     };
     let damaged: BTreeSet<String> = out.gaps.iter().map(|(n, _)| n.clone()).collect();
@@ -849,12 +876,28 @@ mod tests {
         let sha = "ab".repeat(32);
         let mut segs = BTreeMap::new();
         segs.insert("1-2-00000003.jsonl".to_string(), sha.clone());
-        let t = format_head(7, &segs, &["a gap\nwith a newline".into()]);
+        let head = super::Head {
+            gen: None,
+            state: Some("0f".repeat(16)),
+            segs: segs.clone(),
+            lost: vec!["a gap\nwith a newline".into()],
+        };
+        let t = format_head(7, &head);
         let h = parse_head(&t).unwrap();
         assert_eq!(
-            (h.gen, h.segs, h.lost),
-            (Some(7), segs, vec!["a gap with a newline".into()])
+            (h.gen, h.state, h.segs, h.lost),
+            (
+                Some(7),
+                Some("0f".repeat(16)),
+                segs,
+                vec!["a gap with a newline".into()]
+            )
         );
+        assert!(parse_head(&t.replace("state 0f", "state 0F")).is_none());
+        assert!(parse_head(
+            &t.replace("gen 7\n", "gen 7\nstate 00000000000000000000000000000000\n")
+        )
+        .is_none());
         // Cut anywhere, it does not parse: the reader falls back to the other slot.
         for cut in 1..t.len() {
             assert!(parse_head(&t[..cut]).is_none(), "{cut}");

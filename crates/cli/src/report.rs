@@ -377,11 +377,17 @@ pub fn apply_summary(r: &disk_cleaner_core::apply::ApplyReport) -> String {
     if !r.history_gaps.is_empty() {
         let _ = writeln!(
             o,
-            "Manifest history in storage has gaps that apply cannot repair; restore --from-remote refuses until you add --accept-partial, which restores what is stored:"
+            "This run went ahead with --accept-history-gap. The manifest history in storage has gaps that apply cannot repair; restore --from-remote refuses until you add --accept-partial, which restores what is stored:"
         );
         for g in &r.history_gaps {
             let _ = writeln!(o, "  {g}");
         }
+    }
+    if let Some(from) = &r.took_over_label_from {
+        let _ = writeln!(
+            o,
+            "This run took over the storage label from state directory {from} (--take-over-label)."
+        );
     }
     if !r.rescan_needed.is_empty() {
         let _ = writeln!(

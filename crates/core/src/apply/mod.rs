@@ -54,6 +54,19 @@ pub enum ApplyError {
     /// Storage could not be reached for a step that needs it.
     #[error("storage: {0}")]
     Storage(String),
+    /// The manifest history in storage has gaps (A-5): objects in the bucket that removal relies
+    /// on have gone missing or changed, so an acting run does nothing (ASSUMPTION A-6, main's
+    /// choice) unless `accept_history_gap` is set. Lists every gap.
+    #[error("the manifest history in storage has gaps, so nothing was done (pass --accept-history-gap to go ahead after reading them): {}", .0.join("; "))]
+    HistoryGap(Vec<String>),
+    /// The label's storage head was written by another state directory (another host, or a
+    /// second state directory on this one); nothing was done unless `take_over_label` is set.
+    #[error("the manifest label {label} in storage belongs to another state directory ({theirs}; this one is {ours}), so nothing was done; if that state directory is gone for good, pass --take-over-label")]
+    LabelInUse {
+        label: String,
+        theirs: String,
+        ours: String,
+    },
     /// A test-injected crash (test-hooks only).
     #[error("injected crash at {0}")]
     InjectedCrash(&'static str),
@@ -201,6 +214,12 @@ pub struct ApplyOptions {
     pub act: bool,
     /// The user's opt-in to upload secret pieces (`--secrets upload`).
     pub secrets_upload: bool,
+    /// Go ahead although the manifest history in storage has gaps (`--accept-history-gap`, for
+    /// this run only; the report records it). Without it such a run does nothing.
+    pub accept_history_gap: bool,
+    /// This state directory takes over a label whose storage head another state directory
+    /// wrote (`--take-over-label`, after that one is gone for good).
+    pub take_over_label: bool,
     /// URLs (redacted form) the user declares private.
     pub private_remotes: Vec<String>,
     /// Hosts recovery refs may be pushed to.
@@ -257,6 +276,8 @@ impl ApplyOptions {
             label: short_hostname(),
             act: false,
             secrets_upload: false,
+            accept_history_gap: false,
+            take_over_label: false,
             private_remotes: Vec::new(),
             git_hosts: vec![
                 "github.com".into(),
@@ -367,11 +388,15 @@ pub struct ApplyReport {
     /// storage is behind until the next acting run stores it (restore from storage alone would
     /// miss this run). The CLI exits with its own status when this is set.
     pub mirror_failed: Option<String>,
-    /// Manifest history in storage that this host cannot bring back (A-5, A-6): segments the
-    /// storage head lists that are missing, changed or not committed, damaged segments, and
-    /// gaps recorded earlier. Restore from storage refuses without `--accept-partial` while any
-    /// remain. Removal is not blocked; the CLI exits with the mirror status when this is set.
+    /// Manifest history in storage that this host cannot bring back (A-5): segments the storage
+    /// head lists that are missing, changed or not committed, damaged segments, and gaps
+    /// recorded earlier. Restore from storage refuses without `--accept-partial` while any
+    /// remain. Not empty only when the run went ahead with `accept_history_gap` (A-6): without
+    /// it the run returns `ApplyError::HistoryGap` and does nothing.
     pub history_gaps: Vec<String>,
+    /// This run took over its label from another state directory (`take_over_label`): the id
+    /// of the state directory that wrote the head before.
+    pub took_over_label_from: Option<String>,
 }
 
 /// The reason given for a piece kept because an earlier run of the same scan changed its

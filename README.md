@@ -94,7 +94,9 @@ Run `scan` again and make a new plan.
 | 3 | Another `apply` is running (its lock was still held after a 0.5 s wait). |
 | 4 | A shard failed; the pieces that depend on it were kept. |
 | 5 | Some pieces were kept because an earlier apply run changed their folder; scan again. |
-| 6 | The run finished, but the manifest copy in storage could not be updated (run `apply` again to store it), or it has a gap that apply cannot repair (listed; see below). |
+| 6 | The run finished, but the manifest copy in storage could not be updated; run `apply` again to store it. |
+| 7 | The manifest history in storage has gaps (listed; see below), so nothing was uploaded or removed. After reading the list, `--accept-history-gap` lets one run go ahead. |
+| 8 | The storage label was last written by another state directory (another host, or a second state directory here), so nothing was done. One label belongs to one state directory; `--take-over-label` hands it over when the old one is gone for good. |
 
 When more than one applies, 6 is reported before 4, and 4 before 5.
 
@@ -109,8 +111,13 @@ until a later `apply --apply` run has stored its rows again (from the local mani
 sees that storage holds them, skips the interrupted copy and says so. Storage also keeps a small
 head that lists every stored manifest copy. When a listed copy is missing, changed or replaced, or
 the head itself is missing, restore refuses and names what is missing; `--accept-partial` restores
-what is stored. Such a gap is permanent: later `apply` runs report it (status 6) and never drop
-it. The head cannot show the newest copy deleted together with the newer of its two slots, or the
+what is stored. Such a gap is permanent and never dropped. A copy that storage fails to send
+(an outage) is not a gap: `apply` and `restore` stop with the storage error and change nothing,
+so run them again once storage answers. Because removal relies on the same
+storage holding the backups, an `apply --apply` run that finds a gap does nothing and exits 7;
+`--accept-history-gap` lets that one run go ahead, and its report says so. Two hosts or two state
+directories sharing one label are not supported; apply refuses a label another state directory
+wrote (status 8). The head cannot show the newest copy deleted together with the newer of its two slots, or the
 whole folder rolled back to an older state. Add `--run <id>` (printed by `apply`) to restore an older generation of a path that was backed up more than once. Replacing or downgrading the
 `disk-cleaner` binary never brings data back; `restore` does.
 

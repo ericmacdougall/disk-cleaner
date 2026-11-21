@@ -713,10 +713,14 @@ fn an_intact_readback_only_shard_is_reused_after_reading_it_back() {
 #[test]
 fn a_readback_that_fails_or_is_cut_short_means_upload_again() {
     for (case, fake) in [
-        ("fails", "if [ \"$cmd\" = cat ]; then exit 1; fi"),
+        // Only shard reads break: a failed manifest read stops the run (apply_history).
+        (
+            "fails",
+            "if [ \"$cmd\" = cat ]; then case \"$*\" in *manifests/*) ;; *) exit 1;; esac; fi",
+        ),
         (
             "short",
-            "if [ \"$cmd\" = cat ]; then \"$REAL\" \"$@\" | head -c 1000; exit 0; fi",
+            "if [ \"$cmd\" = cat ]; then case \"$*\" in *manifests/*) ;; *) \"$REAL\" \"$@\" | head -c 1000; exit 0;; esac; fi",
         ),
     ] {
         let fx = Fx::new();

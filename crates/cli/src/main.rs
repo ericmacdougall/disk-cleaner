@@ -71,6 +71,14 @@ struct ApplyArgs {
     /// `upload`: also upload pieces holding secret-named files (default `keep`: they stay local).
     #[arg(long, value_name = "MODE")]
     secrets: Option<String>,
+    /// Go ahead although the manifest history in storage has gaps (listed when apply refuses
+    /// with status 7). For this run only; the report records it.
+    #[arg(long)]
+    accept_history_gap: bool,
+    /// This state directory takes over the storage label from the state directory that wrote
+    /// it last (apply refuses with status 8 otherwise). Only when that one is gone for good.
+    #[arg(long)]
+    take_over_label: bool,
     /// A remote URL (without credentials) you declare private; recovery refs may be pushed to
     /// it. Repeatable; added to `private_remotes` from the config file.
     #[arg(long = "private-remote", value_name = "URL")]
@@ -358,6 +366,8 @@ fn run_apply(a: ApplyArgs) -> Result<()> {
     opts.shard_bytes = a.shard_mib.max(1) << 20;
     opts.shard_timeout = Duration::from_secs(a.shard_timeout_secs.max(10));
     opts.secrets_upload = secrets_upload;
+    opts.accept_history_gap = a.accept_history_gap;
+    opts.take_over_label = a.take_over_label;
     opts.private_remotes = cfg.private_remotes;
     opts.private_remotes.extend(a.private_remotes);
     opts.rclone = a.rclone;
@@ -382,7 +392,9 @@ fn run_apply(a: ApplyArgs) -> Result<()> {
 /// Exit status of `apply`, documented in the README: 0 done; 1 another error; 2 the scan or
 /// plan was refused before anything was done; 3 another apply holds the lock; 4 a shard failed,
 /// so the pieces depending on it were kept; 5 pieces were kept because an earlier apply run
-/// changed their folder, so scan again to continue. A failed shard outranks a stale scan.
+/// changed their folder, so scan again to continue; 6 the manifest copy in storage is behind; 7
+/// the manifest history in storage has gaps, so nothing was done; 8 the storage label belongs
+/// to another state directory, so nothing was done. 6 outranks 4, which outranks 5.
 fn apply_exit_code(
     res: &Result<disk_cleaner_core::apply::ApplyReport, disk_cleaner_core::apply::ApplyError>,
 ) -> i32 {
@@ -390,8 +402,10 @@ fn apply_exit_code(
     match res {
         Err(ApplyError::Plan(_)) => 2,
         Err(ApplyError::Locked(_)) => 3,
+        Err(ApplyError::HistoryGap(_)) => 7,
+        Err(ApplyError::LabelInUse { .. }) => 8,
         Err(_) => 1,
-        Ok(rep) if rep.mirror_failed.is_some() || !rep.history_gaps.is_empty() => 6,
+        Ok(rep) if rep.mirror_failed.is_some() => 6,
         Ok(rep) if !rep.shards_failed.is_empty() => 4,
         Ok(rep) if !rep.rescan_needed.is_empty() => 5,
         Ok(_) => 0,
@@ -468,23 +482,39 @@ mod tests {
         assert_eq!(apply_exit_code(&Ok(behind.clone())), 6);
         let s = super::report::apply_summary(&behind);
         assert!(s.contains("run apply again to store it"), "{s}");
-        // So does history in storage with a gap (A-6), alone or with the others.
+        // A history gap refuses the run (A-6), and so does a label of another state directory.
+        assert_eq!(
+            apply_exit_code(&Err(ApplyError::HistoryGap(vec![
+                "a-1.jsonl: missing".into()
+            ]))),
+            7
+        );
+        assert_eq!(
+            apply_exit_code(&Err(ApplyError::LabelInUse {
+                label: "h".into(),
+                theirs: "a".into(),
+                ours: "b".into()
+            })),
+            8
+        );
+        // A run that went ahead with --accept-history-gap says so and lists the gaps.
         let gap = ApplyReport {
             history_gaps: vec!["a-1.jsonl: missing".into()],
+            took_over_label_from: Some("0f".repeat(16)),
             ..Default::default()
         };
-        assert_eq!(apply_exit_code(&Ok(gap.clone())), 6);
+        assert_eq!(apply_exit_code(&Ok(gap.clone())), 0);
         let s = super::report::apply_summary(&gap);
         assert!(
-            s.contains("a-1.jsonl: missing") && s.contains("--accept-partial"),
+            s.contains("went ahead with --accept-history-gap")
+                && s.contains("a-1.jsonl: missing")
+                && s.contains("--accept-partial")
+                && s.contains(&format!(
+                    "took over the storage label from state directory {}",
+                    "0f".repeat(16)
+                )),
             "{s}"
         );
-        let all = ApplyReport {
-            mirror_failed: None,
-            history_gaps: gap.history_gaps.clone(),
-            ..behind
-        };
-        assert_eq!(apply_exit_code(&Ok(all)), 6);
     }
 
     #[test]

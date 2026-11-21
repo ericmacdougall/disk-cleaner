@@ -74,6 +74,54 @@ fn random_id(now: i64) -> String {
     format!("{now}-{}", &hex::encode(h.finalize())[..16])
 }
 
+/// This state directory's id (A-5): 32 hex digits in `<state_dir>/state-id`, made once (mode
+/// 0600, fsynced, never replaced) by the first acting run. The storage head records the id of
+/// the state directory that wrote it, so a second state directory on one label is refused.
+fn state_id(state_dir: &Path) -> Result<String, ApplyError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let p = state_dir.join("state-id");
+    let read = |p: &Path| -> Result<String, ApplyError> {
+        let t = std::fs::read_to_string(p)
+            .map_err(|e| ApplyError::Io(format!("{}: {e}", p.display())))?;
+        let t = t.trim_end_matches('\n');
+        if super::restore::is_state_id(t) {
+            Ok(t.to_string())
+        } else {
+            Err(ApplyError::Io(format!(
+                "{} is not a state id; it is never replaced, so move it away only if this state directory is new",
+                p.display()
+            )))
+        }
+    };
+    if p.exists() {
+        return read(&p);
+    }
+    let id = hex::encode(&Sha256::digest(random_id(0).as_bytes())[..16]);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&p)
+    {
+        Ok(mut f) => {
+            f.write_all(format!("{id}\n").as_bytes())
+                .and_then(|_| f.sync_all())
+                .map_err(|e| ApplyError::Io(format!("{}: {e}", p.display())))?;
+            fsops_sync_dir(state_dir);
+            Ok(id)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read(&p),
+        Err(e) => Err(ApplyError::Io(format!("{}: {e}", p.display()))),
+    }
+}
+
+fn fsops_sync_dir(dir: &Path) {
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
 struct Lock {
     _fd: rustix::fd::OwnedFd,
 }
@@ -90,18 +138,56 @@ fn take_lock(dir: &Path) -> Result<Lock, ApplyError> {
     // Only a lock still held after LOCK_SETTLE means another apply is running; an interrupted
     // call is retried, and any other error is reported as itself rather than as a lock.
     let start = std::time::Instant::now();
+    let mut waited = false;
     loop {
         match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(Lock { _fd: fd }),
+            Ok(()) => {
+                if waited {
+                    lock_wait_log(
+                        &p,
+                        &format!("cleared_ms={:.1}", start.elapsed().as_secs_f64() * 1e3),
+                    );
+                }
+                return Ok(Lock { _fd: fd });
+            }
             Err(rustix::io::Errno::INTR) => continue,
             Err(rustix::io::Errno::WOULDBLOCK) if start.elapsed() < LOCK_SETTLE => {
+                waited = true;
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            Err(rustix::io::Errno::WOULDBLOCK) => return Err(ApplyError::Locked(p.clone())),
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                lock_wait_log(&p, &format!("gave_up_after_ms={}", LOCK_SETTLE.as_millis()));
+                return Err(ApplyError::Locked(p.clone()));
+            }
             Err(e) => return Err(ApplyError::Io(format!("cannot lock {}: {e}", p.display()))),
         }
     }
 }
+
+/// With `test-hooks` only (main's ruling 4 on R6-12): each lock wait, and how it ended, is
+/// appended to `$PD_LOCK_LOG` when that is set, so a run can show whether a just-released lock
+/// was met. Never compiled into the CLI.
+#[cfg(feature = "test-hooks")]
+fn lock_wait_log(lock: &Path, what: &str) {
+    use std::io::Write;
+    if let Some(f) = std::env::var_os("PD_LOCK_LOG") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(f)
+        {
+            let _ = writeln!(
+                f,
+                "PD-LOCK-RETRY {what} pid={} lock={}",
+                std::process::id(),
+                lock.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn lock_wait_log(_lock: &Path, _what: &str) {}
 
 /// How long `take_lock` waits for a lock that is held when it asks. An flock belongs to the
 /// open file description, and a child that any thread of this process spawns holds a copy of
@@ -157,6 +243,8 @@ pub(crate) struct Ctx<'a> {
     pub unlinked_inodes: std::collections::BTreeSet<(u64, u64)>,
     /// The head the next manifest write stores (A-5), read from storage once per run.
     pub head: Option<super::restore::Head>,
+    /// This state directory's id (acting runs only), written into every head.
+    pub state_id: String,
     pub report: ApplyReport,
 }
 
@@ -220,6 +308,7 @@ pub fn apply(
     } else {
         None
     };
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
     let mut manifest = Manifest::load(&opts.manifest, &run)?;
     #[cfg(feature = "test-hooks")]
     {
@@ -239,6 +328,7 @@ pub fn apply(
         procs: (opts.process)(),
         unlinked_inodes: Default::default(),
         head: None,
+        state_id: String::new(),
         report: ApplyReport {
             dry_run: !opts.act,
             run: run.clone(),
@@ -246,8 +336,18 @@ pub fn apply(
         },
     };
     let rederived = opts.oracle.rederive(scan_text, plan_text);
-    if opts.act && !ctx.manifest.rows.is_empty() {
-        seed_unmirrored(&mut ctx)?;
+    if opts.act {
+        // Before anything is uploaded or removed: the label's history in storage, its owner,
+        // and its gaps (A-5, A-6).
+        ctx.state_id = state_id(&opts.state_dir)?;
+        let remote = load_head(&mut ctx)?;
+        check_label_owner(&mut ctx)?;
+        if !ctx.report.history_gaps.is_empty() && !opts.accept_history_gap {
+            return Err(ApplyError::HistoryGap(ctx.report.history_gaps.clone()));
+        }
+        if !ctx.manifest.rows.is_empty() {
+            seed_unmirrored(&mut ctx, &remote);
+        }
     }
     let begun = ctx.manifest.begun();
     let done = ctx.manifest.done(&inputs.plan_digest);
@@ -1023,11 +1123,10 @@ fn upload_phase(ctx: &mut Ctx, prepared: &[Prepared]) -> Result<BTreeSet<String>
 
 /// Queue for mirroring every local row the remote copy lacks (a run that stopped before its
 /// mirror leaves rows only in the local file). Rows naming another remote stay local.
-fn seed_unmirrored(ctx: &mut Ctx) -> Result<(), ApplyError> {
+fn seed_unmirrored(ctx: &mut Ctx, remote: &super::restore::RemoteManifest) {
     // Rows of a segment that is not committed count as absent here: they are mirrored again, in
     // local order and in one segment, which is what lets restore skip the interrupted upload
     // (`restore::covered`).
-    let remote = load_head(ctx)?;
     let line = |e: &super::manifest::Envelope| serde_json::to_string(e).unwrap_or_default();
     for e in &ctx.manifest.rows {
         let other_remote = match &e.row {
@@ -1039,7 +1138,29 @@ fn seed_unmirrored(ctx: &mut Ctx) -> Result<(), ApplyError> {
             ctx.manifest.unmirrored.push(l);
         }
     }
-    Ok(())
+}
+
+/// One label, one state directory (A-5). A stored head written by another state directory (a
+/// second state directory on this host, or another host using this label) refuses the run
+/// before anything is uploaded or removed, unless `take_over_label`; a head with no state id
+/// is not one this tool wrote and counts as another's.
+fn check_label_owner(ctx: &mut Ctx) -> Result<(), ApplyError> {
+    let Some(head) = &ctx.head else {
+        return Ok(());
+    };
+    if head.gen.is_none() || head.state.as_deref() == Some(ctx.state_id.as_str()) {
+        return Ok(());
+    }
+    let theirs = head.state.clone().unwrap_or_else(|| "no state id".into());
+    if ctx.opts.take_over_label {
+        ctx.report.took_over_label_from = Some(theirs);
+        return Ok(());
+    }
+    Err(ApplyError::LabelInUse {
+        label: ctx.opts.label.clone(),
+        theirs,
+        ours: ctx.state_id.clone(),
+    })
 }
 
 /// Upload `bytes` as `name` and verify it by hash.
@@ -1063,8 +1184,8 @@ fn upload_verified(rc: &Rclone, name: &str, bytes: &[u8]) -> Result<(), ApplyErr
     .map_err(ApplyError::Storage)
 }
 
-/// Read the label's manifest history in storage once per run: the head the next write stores,
-/// and the gaps found (reported, A-6). Returns the reading for the caller's own use.
+/// Read the label's manifest history in storage once per acting run, before anything else: the
+/// head the next write stores, and the gaps found (A-5, A-6). Returns the reading.
 fn load_head(ctx: &mut Ctx) -> Result<super::restore::RemoteManifest, ApplyError> {
     let remote = super::restore::remote_manifest(&ctx.rc, &ctx.opts.label)?;
     ctx.head = Some(remote.next_head.clone());
@@ -1080,7 +1201,9 @@ fn load_head(ctx: &mut Ctx) -> Result<super::restore::RemoteManifest, ApplyError
 /// skipped: restore needs the head to tell a missing segment from one never written.
 fn write_head(ctx: &Ctx, head: &super::restore::Head, gen: u64) -> Result<(), ApplyError> {
     let slot = super::restore::HEAD_SLOTS[(gen % 2) as usize];
-    let text = super::restore::format_head(gen, &head.segs, &head.lost);
+    let mut head = head.clone();
+    head.state = Some(ctx.state_id.clone());
+    let text = super::restore::format_head(gen, &head);
     upload_verified(
         &ctx.rc,
         &format!("manifests/{}/{slot}", ctx.opts.label),
@@ -1096,10 +1219,12 @@ fn mirror(ctx: &mut Ctx) -> Result<(), ApplyError> {
     if ctx.manifest.unmirrored.is_empty() {
         return Ok(());
     }
-    if ctx.head.is_none() {
-        load_head(ctx)?;
-    }
-    let mut head = ctx.head.clone().unwrap_or_default();
+    // Read at the start of every acting run (owner and gap checks); never read here instead.
+    let Some(mut head) = ctx.head.clone() else {
+        return Err(ApplyError::Io(
+            "internal: the manifest head was not read before the first manifest write".into(),
+        ));
+    };
     let gen = match head.gen {
         Some(g) => g,
         None => {
