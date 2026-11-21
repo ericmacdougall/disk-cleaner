@@ -328,8 +328,8 @@ class Mutants(unittest.TestCase):
     def test_the_output_capture_writable_by_path(self):
         orig = tr.Declarations.judge
 
-        def by_path(self, op, path, via, tgid):
-            return orig(self, op, path, "fd" if via == "path" else via, tgid)
+        def by_path(self, op, path, via, tgid, excl=False):
+            return orig(self, op, path, "fd" if via == "path" else via, tgid, excl)
 
         with mock.patch.object(tr.Declarations, "judge", by_path):
             self.assertFalse(Lines.stdio_by_path_caught())
@@ -637,6 +637,79 @@ class Lines(unittest.TestCase):
                     '1234  bind(3<socket:[1]>, {sa_family=AF_UNIX, sun_path="$W/run/at-spi2-aB3dE9/socket"}, 110) = 0',
                     '1234  openat(AT_FDCWD</>, "$W/conf/config.toml.1234.0.tmp", O_WRONLY|O_CREAT|O_EXCL, 0600) = 7<$W/conf/config.toml.1234.0.tmp>'], 0)
         self.assertTrue(self.template_neighbours_caught())
+
+    # A file made new (click-test N2, the plan export): the name is stamped and the folder may
+    # hold other plans, so "--file" with the template would excuse replacing one of them.
+    PLAN = "$W/sb/home/exports/prunedisk-plan-20261121-093141"
+    EXPORT = ('1234  openat(AT_FDCWD</>, "$W/sb/home/exports/prunedisk-plan-20261121-093141-2.json", '
+              'O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0666) = 5<$W/sb/home/exports/prunedisk-plan-20261121-093141-2.json>',
+              '1234  write(5<$W/sb/home/exports/prunedisk-plan-20261121-093141-2.json>, "{\\n", 2) = 2',
+              '1234  fsync(5<$W/sb/home/exports/prunedisk-plan-20261121-093141-2.json>) = 0',
+              '1234  close(5<$W/sb/home/exports/prunedisk-plan-20261121-093141-2.json>) = 0')
+    NOT_NEW = (
+        # an existing plan replaced: opened to write, with or without truncation, or truncated
+        f'1234  openat(AT_FDCWD</>, "{PLAN}.json", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 5<{PLAN}.json>',
+        f'1234  openat(AT_FDCWD</>, "{PLAN}.json", O_WRONLY|O_CLOEXEC) = 5<{PLAN}.json>',
+        f'1234  truncate("{PLAN}.json", 0) = 0',
+        # renamed over, removed, its mode changed
+        f'1234  rename("$W/sb/subtree/plan", "{PLAN}.json") = 0',
+        f'1234  unlink("{PLAN}.json") = 0',
+        f'1234  chmod("{PLAN}.json", 0777) = 0',
+        # another name, or the name in a subfolder
+        '1234  openat(AT_FDCWD</>, "$W/sb/home/exports/prunedisk-plan-x.json", O_WRONLY|O_CREAT|O_EXCL, 0666) = 5<$W/sb/home/exports/prunedisk-plan-x.json>',
+        f'1234  openat(AT_FDCWD</>, "$W/sb/home/exports/sub/prunedisk-plan-20261121-093141.json", O_WRONLY|O_CREAT|O_EXCL, 0666) = 5<$W/sb/home/exports/sub/prunedisk-plan-20261121-093141.json>',
+    )
+
+    @classmethod
+    def plan_verdict(cls, lines, kind: str = "--new") -> tuple[int, str, str]:
+        with cls.world() as w:
+            # A plan that was there (the suite plants such names), so a call by its path resolves.
+            Path(cls.PLAN.replace("$W", w) + ".json").write_text("{}\n")
+            code, out = cls.report(w, [ln.replace("$W", w) for ln in lines], kind,
+                                   f"{w}/sb/home/exports/prunedisk-plan-{{STAMP}}{{SEQ}}.json")
+            return code, out, w
+
+    @classmethod
+    def new_rules_hold(cls) -> bool:
+        """The export passes, and every way of touching a plan that was there fails."""
+        code, _, _ = cls.plan_verdict(list(cls.EXPORT))
+        return code == 0 and all(cls.plan_verdict([ln])[0] == 1 for ln in cls.NOT_NEW)
+
+    def test_a_new_file_declaration_allows_a_new_file_only(self):
+        code, out, w = self.plan_verdict(list(self.EXPORT))
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"declared openat: {w}/sb/home/exports/prunedisk-plan-20261121-093141-2.json", out.splitlines())
+        for line in self.NOT_NEW:
+            with self.subTest(line=line):
+                code, out, w = self.plan_verdict([line])
+                self.assertEqual(code, 1, out)
+                self.assertRegex(out, r"(?m)^OTHER \w+: " + re.escape(w) + r"/sb/(home/exports|subtree)/")
+
+    def test_a_file_declaration_of_the_same_name_would_excuse_replacing_a_plan(self):
+        # Why the kind exists: "--file" allows writes to whatever matches, including a plan that
+        # was there before.
+        for line in self.NOT_NEW[:3]:
+            with self.subTest(line=line):
+                code, out, _ = self.plan_verdict([line], "--file")
+                self.assertEqual(code, 0, out)
+
+    def test_the_new_file_rules_are_load_bearing(self):
+        orig = tr.Declarations.judge
+        mutants = {
+            # O_EXCL not required of the create
+            "excl ignored": lambda self, op, p, via, tgid, excl=False: orig(self, op, p, via, tgid, True),
+            # a write by path (an open without O_CREAT, truncate) taken as one through the descriptor
+            "path writes allowed": lambda self, op, p, via, tgid, excl=False: orig(
+                self, op, p, "fd" if via == "path" and op == "write" else via, tgid, excl),
+            # "new" judged as "file"
+            "new as file": lambda self, op, p, via, tgid, excl=False: orig(
+                tr.Declarations([replace(d, kind="file") if d.kind == "new" else d for d in self.decls]) if any(
+                    d.kind == "new" for d in self.decls) else self, op, p, via, tgid, excl),
+        }
+        self.assertTrue(self.new_rules_hold())
+        for name, m in mutants.items():
+            with self.subTest(mutant=name), mock.patch.object(tr.Declarations, "judge", m):
+                self.assertFalse(self.new_rules_hold(), f"mutant survived: {name}")
         self.assertTrue(self.pid_template_caught())
         for p in ("$W/sb/data/recently-used.xbel.Q7-K2B", "$W/sb/data/recently-used.xbel.Q7ZK2B.bak",
                   "$W/sb/data/recently-used.xbelXQ7ZK2B", "$W/sb/data/other.xbel.Q7ZK2B", "$W/sb/data/x/recently-used.xbel.Q7ZK2B",
@@ -777,6 +850,33 @@ class Snapshot(unittest.TestCase):
     def test_an_unlistable_folder_fails(self):
         code, out = self.judge({"/w/sb": self.folder()}, {"/w/sb": {"kind": "dir", "mode": 493, "mtime_ns": 2, "names": "unlistable: x"}}, *self.D)
         self.assertEqual(code, 1, out)
+
+    def test_a_new_file_declaration_allows_added_files_only(self):
+        # The plan export (N2): added plans pass; a plan that was there and changed, was removed
+        # or became a link fails, and so does any other name or a subfolder.
+        new = ["--new", "/w/ex/prunedisk-plan-{STAMP}{SEQ}.json"]
+        old = "prunedisk-plan-20261121-093141.json"
+        before = {"/w/ex": self.folder(old), f"/w/ex/{old}": self.file()}
+        added = {"prunedisk-plan-20261121-093141-2.json": self.file(sha="n")}
+        after = {"/w/ex": self.folder(old, *added, mtime=2), f"/w/ex/{old}": self.file()} | {f"/w/ex/{k}": v for k, v in added.items()}
+        code, out = self.judge(before, after, *new)
+        self.assertEqual(code, 0, out)
+        bad = {
+            "changed": {**after, f"/w/ex/{old}": self.file(sha="b")},
+            "removed": {"/w/ex": self.folder(mtime=2)},
+            "made a link": {**after, f"/w/ex/{old}": {"kind": "link", "mode": 511, "mtime_ns": 2, "target": "/etc/passwd"}},
+            "other name": {"/w/ex": self.folder(old, "other.json", mtime=2), f"/w/ex/{old}": self.file(), "/w/ex/other.json": self.file()},
+            "subfolder": {"/w/ex": self.folder(old, "sub", mtime=2), f"/w/ex/{old}": self.file(), "/w/ex/sub": self.folder()},
+            "added as a link": {"/w/ex": self.folder(old, "prunedisk-plan-20261121-093142.json", mtime=2), f"/w/ex/{old}": self.file(),
+                                "/w/ex/prunedisk-plan-20261121-093142.json": {"kind": "link", "mode": 511, "mtime_ns": 2, "target": "/etc"}},
+        }
+        for name, a in bad.items():
+            with self.subTest(case=name):
+                code, out = self.judge(before, a, *new)
+                self.assertEqual(code, 1, out)
+                # the same with "--file" lets the changed plan through: why "new" exists
+        code, out = self.judge(before, bad["changed"], "--file", new[1])
+        self.assertEqual(code, 0, out)
 
 
 # ----------------------------------------------------------------------------------------------

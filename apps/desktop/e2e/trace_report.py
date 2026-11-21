@@ -28,6 +28,9 @@ DECLARATIONS, each an exact path; a path may hold {XXXXXX} (exactly six letters 
 or a dash and digits):
   --file PATH     a regular file: created, written, truncated, its metadata changed, removed,
                   renamed onto or away, hard-linked to; and a shared writable map of it
+  --new PATH      a regular file made new: by path only an open with O_CREAT and O_EXCL (which
+                  never replaces or follows an existing name), then written through that
+                  descriptor; in a snapshot, an entry that was not there before
   --dir PATH      a folder that may be created (mkdir) and nothing else: no entry inside it
   --socket PATH   a Unix socket: bound, its mode changed, removed
   --subtree PATH  a folder that is wholly a library's data (src/writes.ts says so): anything in it
@@ -88,9 +91,11 @@ inotify_add_watch inotify_rm_watch fanotify_mark name_to_handle_at timer_create
 timer_settime timer_gettime timer_getoverrun timer_delete timerfd_settime timerfd_gettime
 io_getevents io_pgetevents io_cancel io_destroy kcmp process_vm_readv cachestat statmount
 listmount lsm_get_self_attr lsm_list_modules landlock_add_rule landlock_restrict_self
-process_mrelease tee vmsplice umask sysfs uretprobe uprobe
+process_mrelease tee vmsplice umask sysfs uretprobe uprobe listns rseq_slice_yield
 """.split())
-# sendto, sendmsg and sendmmsg work only on sockets; tee and vmsplice only on pipes.
+# sendto, sendmsg and sendmmsg work only on sockets; tee and vmsplice only on pipes. listns (470)
+# lists namespace ids; rseq_slice_yield (471) ends an rseq time slice extension. Both are newer
+# than 6.8, and the CI runner's unistd_64.h has them (desktop run 44895185802).
 
 # Make a descriptor that names no file (or whose file the kernel names in the result).
 ANON_FD = set("""
@@ -193,9 +198,11 @@ def strace_args() -> list[str]:
 # ----------------------------------------------------------------------------------------------
 # Declarations
 
-KINDS = ("file", "dir", "socket", "subtree", "stdio", "device")
+KINDS = ("file", "new", "dir", "socket", "subtree", "stdio", "device")
 OPS_ALLOWED = {
     "file": {"create", "write", "meta", "unlink", "rename-from", "rename-to", "link-to", "map"},
+    # Made new and written, never anything that was there: see Declarations.judge.
+    "new": {"create", "write"},
     "dir": {"mkdir"},
     "socket": {"bind", "meta", "unlink"},
     "stdio": {"write"},
@@ -273,13 +280,20 @@ class Declarations:
         for d in decls:
             self.on_the_way.update(d.ancestors())
 
-    def judge(self, op: str, path: str, via: str, tgid: str | None) -> bool:
+    def judge(self, op: str, path: str, via: str, tgid: str | None, excl: bool = False) -> bool:
         """Whether `op` on the object at `path` (canonical) is declared. `via` is "fd" when the
         change went through a descriptor, "path" when a call named it by path, "snapshot" when
-        two snapshots show it."""
+        two snapshots show it. `excl`: the create was an open with O_CREAT and O_EXCL."""
         for d in self.decls:
             if op in OPS_ALLOWED[d.kind] and d.matches(path, tgid):
                 if d.kind == "stdio" and via == "path":
+                    continue
+                # A "new" file: by path only an O_CREAT|O_EXCL open (the kernel refuses it when
+                # the name exists, even as a dangling link), then writes through its descriptor;
+                # in a snapshot, an entry that was not there before.
+                if d.kind == "new" and not (
+                        (via == "path" and op == "create" and excl) or (via == "fd" and op == "write")
+                        or (via == "snapshot" and op == "create")):
                     continue
                 return True
         return op == "mkdir" and path in self.on_the_way
@@ -505,6 +519,7 @@ class PathOp:
     peer: int | None = None  # seq of the other half of a rename, exchange or link; -1 when it could not be placed
     kernel: bool = False  # the kernel named this object (an open's result): already canonical
     exchange: bool = False
+    excl: bool = False  # an open with O_CREAT and O_EXCL: it made the name, or failed
 
 
 class Report:
@@ -605,7 +620,7 @@ class Report:
                 self.note("anonymous", o.call, p)
             else:
                 obj = object_path(p)
-                self.note("declared" if self.decls.judge(o.op, obj, "path", o.tgid) else "OTHER", o.call, obj)
+                self.note("declared" if self.decls.judge(o.op, obj, "path", o.tgid, o.excl) else "OTHER", o.call, obj)
             ns.apply(o, p)
 
     # -- the verdict -----------------------------------------------------------------------
@@ -1069,12 +1084,13 @@ class LogState:
         if not writes or "O_PATH" in fl:
             return
         op = "create" if fl & {"O_CREAT", "O_TMPFILE"} else "write"
+        excl = {"O_CREAT", "O_EXCL"} <= fl
         if robj is not None:
             # The kernel's answer: the object opened, every link resolved.
             if anonymous(robj):
                 self.r.note("anonymous", name, robj)
             else:
-                self.queue(PathOp(ts, 0, t.tid, t.tgid, name, op, object_path(robj), False, kernel=True))
+                self.queue(PathOp(ts, 0, t.tid, t.tgid, name, op, object_path(robj), False, kernel=True, excl=excl))
             return
         if patharg is None:
             self.r.note("UNRESOLVED", name, f"{name} in process {t.tid} without a decoded descriptor")
@@ -1083,7 +1099,7 @@ class LogState:
         if name == "openat2" and re.search(r"RESOLVE_IN_ROOT|RESOLVE_BENEATH", a[flagarg]):
             self.r.note("UNRESOLVED", name, f"openat2 with RESOLVE_IN_ROOT or RESOLVE_BENEATH in process {t.tid}")
             return
-        self.pathop(t, ts, name, op, a[dirarg] if dirarg is not None else None, string_arg(a[patharg]), follow)
+        self.pathop(t, ts, name, op, a[dirarg] if dirarg is not None else None, string_arg(a[patharg]), follow, excl=excl)
 
     AT = {"mkdirat": (0, 1), "mknodat": (0, 1), "unlinkat": (0, 1), "fchmodat": (0, 1), "fchmodat2": (0, 1),
           "fchownat": (0, 1), "utimensat": (0, 1), "futimesat": (0, 1), "setxattrat": (0, 1),
@@ -1422,7 +1438,7 @@ def parse_declarations(argv: list[str]) -> tuple[list[str], list[Decl], list[str
     """(the remaining arguments, the declarations, the --links-from snapshots)."""
     rest, decls, seeds = [], [], []
     profile, roots = None, {}
-    flags = {"--file": "file", "--dir": "dir", "--socket": "socket", "--subtree": "subtree",
+    flags = {"--file": "file", "--new": "new", "--dir": "dir", "--socket": "socket", "--subtree": "subtree",
              "--stdio": "stdio", "--device": "device"}
     argv = list(argv)
     while argv:

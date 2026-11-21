@@ -6,7 +6,8 @@ to the entry of src/writes.ts that discloses it.
   declarations.py NAME VAR=PATH...      print the profile's declarations as trace_report options
 
 A declaration is (kind, root, path under the root, the src/writes.ts path that discloses it).
-Kinds are those of trace_report.py: "file" (exactly that file), "dir" (that folder may be
+Kinds are those of trace_report.py: "file" (exactly that file), "new" (a file made new by an
+O_CREAT|O_EXCL open and written through it, never one that was there), "dir" (that folder may be
 created, nothing in it), "socket", "subtree" (anything inside: only where src/writes.ts says the
 whole folder is a library's or the app's data), "stdio" and "device". Paths may hold {XXXXXX}
 (six letters or digits), {PID} (the writing process), {N} (digits), {STAMP} (YYYYMMDD-HHMMSS)
