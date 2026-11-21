@@ -165,12 +165,17 @@ pub struct ApplyOptions {
     /// Current time (unix seconds).
     pub now: i64,
     pub home: Option<PathBuf>,
-    pub process: crate::ProcessCheck,
+    /// Reads the running processes' working directories. Called at the start of a run and again
+    /// before each removal batch (the contract repeats the process check after the backup).
+    pub process: ProcessProbe,
     pub oracle: Box<dyn PlanOracle>,
     /// Test seams. Present only with the `test-hooks` feature.
     #[cfg(feature = "test-hooks")]
     pub hooks: TestHooks,
 }
+
+/// A process snapshot source.
+pub type ProcessProbe = Box<dyn Fn() -> crate::ProcessCheck + Send + Sync>;
 
 /// Test seams (feature `test-hooks`, never enabled by the CLI).
 #[cfg(feature = "test-hooks")]
@@ -216,7 +221,7 @@ impl ApplyOptions {
             wip_max_file_bytes: 50 << 20,
             now,
             home: std::env::var_os("HOME").map(PathBuf::from),
-            process: crate::ProcessCheck::none_running(),
+            process: Box::new(crate::procs::running_cwds),
             oracle: Box::new(CoreOracle),
             #[cfg(feature = "test-hooks")]
             hooks: TestHooks::default(),

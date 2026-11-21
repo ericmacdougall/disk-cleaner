@@ -92,6 +92,7 @@ impl Fx {
         o.shard_bytes = 1 << 20;
         o.label = "testhost".into();
         o.home = Some(PathBuf::from("/nonexistent-home"));
+        o.process = Box::new(disk_cleaner_core::ProcessCheck::none_running);
         o
     }
 
@@ -317,4 +318,12 @@ pub fn tree_digest(dir: &Path) -> Vec<(String, String)> {
     }
     out.sort();
     out
+}
+
+/// Bind a plan built separately to `scan` (same `scan_generated_at`), for derived-piece plans.
+pub fn bind(scan: &str, plan: &str) -> String {
+    let gen = serde_json::from_str::<Value>(scan).unwrap()["generated_at"].clone();
+    let mut pv: Value = serde_json::from_str(plan).unwrap();
+    pv["scan_generated_at"] = gen;
+    pv.to_string()
 }

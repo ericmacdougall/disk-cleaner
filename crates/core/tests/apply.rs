@@ -172,7 +172,9 @@ fn failed_shard_removes_nothing() {
 fn lying_hash_removes_nothing() {
     let fx = Fx::new();
     let (scan, plan) = dedup_fixture(&fx);
-    fx.set_fake("if [ \"$cmd\" = lsjson ]; then \"$REAL\" \"$@\" | sed -E 's/\"(sha1|md5|sha256|SHA-1|MD5)\":\"[0-9a-f]+\"/\"\\1\":\"00\"/g'; exit ${PIPESTATUS[0]}; fi");
+    // Only shard listings lie (the manifest mirror stays honest), so the shard check is the one
+    // under test.
+    fx.set_fake("if [ \"$cmd\" = lsjson ] && [[ \"$*\" == *shards/* ]]; then \"$REAL\" \"$@\" | sed -E 's/\"(sha1|md5|sha256|SHA-1|MD5)\":\"[0-9a-f]+\"/\"\\1\":\"00\"/g'; exit ${PIPESTATUS[0]}; fi");
     let before = tree_digest(&fx.data);
     let rep = apply(&scan, &plan, &fx.opts(true));
     assert_eq!(tree_digest(&fx.data), before, "nothing removed: {rep:?}");
@@ -795,4 +797,124 @@ fn unlink_guard_keeps_changed_and_swapped() {
     );
     assert_eq!(fs::read(sentinel.join("f.txt")).unwrap(), b"sentinel");
     let _ = Path::new("/");
+}
+
+#[test]
+fn running_process_or_unknown_check_keeps_piece() {
+    use disk_cleaner_core::ProcessCheck;
+    for case in ["inside", "unknown"] {
+        let fx = Fx::new();
+        let d = fx.data.join("p");
+        fx.write("p/f.txt", b"x");
+        let (scan, plan) = docs(&[&fx.data], &[P::tree(&d, "backup")]);
+        let mut o = fx.opts(true);
+        let cwd = d.join("sub");
+        o.process = match case {
+            "inside" => Box::new(move || ProcessCheck::Ok {
+                cwds: vec![cwd.clone()],
+            }),
+            _ => Box::new(|| ProcessCheck::Unknown {
+                reason: "test".into(),
+            }),
+        };
+        let rep = apply(&scan, &plan, &o).unwrap();
+        assert_eq!(rep.pieces[0].outcome, "kept", "{case}: {rep:?}");
+        assert!(d.join("f.txt").exists(), "{case}");
+        assert!(
+            !fx.log().contains("rcat"),
+            "{case}: nothing uploaded for a kept piece"
+        );
+    }
+}
+
+#[test]
+fn process_started_during_backup_keeps_piece() {
+    use disk_cleaner_core::ProcessCheck;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let fx = Fx::new();
+    let d = fx.data.join("p");
+    fx.write("p/f.txt", b"x");
+    let (scan, plan) = docs(&[&fx.data], &[P::tree(&d, "backup")]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c2 = calls.clone();
+    let cwd = d.clone();
+    let mut o = fx.opts(true);
+    // Idle at the start of the run; a process works in the piece once the backup is done.
+    o.process = Box::new(move || {
+        if c2.fetch_add(1, Ordering::SeqCst) == 0 {
+            ProcessCheck::none_running()
+        } else {
+            ProcessCheck::Ok {
+                cwds: vec![cwd.clone()],
+            }
+        }
+    });
+    let rep = apply(&scan, &plan, &o).unwrap();
+    assert!(
+        calls.load(Ordering::SeqCst) >= 2,
+        "the process check is repeated before removal"
+    );
+    assert_eq!(rep.pieces[0].outcome, "kept", "{rep:?}");
+    assert!(
+        rep.pieces[0].reason.contains("active before removal"),
+        "{rep:?}"
+    );
+    assert!(d.join("f.txt").exists());
+}
+
+#[test]
+fn sibling_removed_in_an_earlier_run_passes_recheck() {
+    let fx = Fx::new();
+    let s = fx.data.join("s");
+    fx.write("s/d1.bin", b"one");
+    fx.write("s/d2.bin", b"two");
+    fx.write("s/rest/r.txt", b"rest");
+    let (scan, _) = docs(&[&fx.data], &[P::tree(&s, "backup")]);
+    let derived = |names: &[&str]| {
+        let mut p = P::files(&s, names, "backup");
+        p.scan_piece = Some(0);
+        p
+    };
+    // Run 1 removes only d1.
+    let (_, plan_a) = docs(&[&fx.data], &[derived(&["d1.bin"])]);
+    let rep = apply(&scan, &bind(&scan, &plan_a), &fx.opts(true)).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
+    // Run 2, same scan: the rest must pass recheck with d1 accounted for by the manifest.
+    let mut residual = P::tree(&s, "backup");
+    residual.excludes = vec!["d1.bin".into(), "d2.bin".into()];
+    let (_, plan_b) = docs(&[&fx.data], &[residual, derived(&["d2.bin"])]);
+    let rep = apply(&scan, &bind(&scan, &plan_b), &fx.opts(true)).unwrap();
+    assert!(
+        rep.pieces.iter().all(|p| p.outcome == "removed"),
+        "{rep:#?}"
+    );
+    assert!(!s.exists());
+}
+
+#[test]
+fn many_derived_pieces_cross_the_batch_boundary() {
+    let fx = Fx::new();
+    let s = fx.data.join("s");
+    let names: Vec<String> = (0..70).map(|k| format!("f{k:02}.txt")).collect();
+    for (k, n) in names.iter().enumerate() {
+        fx.write(&format!("s/{n}"), format!("content {k}").as_bytes());
+    }
+    let (scan, _) = docs(&[&fx.data], &[P::tree(&s, "backup")]);
+    let pieces: Vec<P> = names
+        .iter()
+        .map(|n| {
+            let mut p = P::files(&s, &[n.as_str()], "backup");
+            p.scan_piece = Some(0);
+            p
+        })
+        .collect();
+    let (_, plan) = docs(&[&fx.data], &pieces);
+    let rep = apply(&scan, &bind(&scan, &plan), &fx.opts(true)).unwrap();
+    assert_eq!(
+        rep.pieces.iter().filter(|p| p.outcome == "removed").count(),
+        70,
+        "{rep:#?}"
+    );
+    assert_eq!(fs::read_dir(&s).unwrap().count(), 0);
 }

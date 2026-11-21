@@ -122,6 +122,8 @@ pub(crate) struct Ctx<'a> {
     pub rc: Rclone,
     pub manifest: Manifest,
     pub group_cache: BTreeMap<PathBuf, Option<String>>,
+    /// The latest process snapshot.
+    pub procs: crate::ProcessCheck,
     /// (dev, ino) of entries unlinked in this run (hard-link ctime drift).
     pub unlinked_inodes: std::collections::BTreeSet<(u64, u64)>,
     pub report: ApplyReport,
@@ -134,7 +136,7 @@ impl Ctx<'_> {
             return c.clone();
         }
         let mut why = None;
-        match &self.opts.process {
+        match &self.procs {
             crate::ProcessCheck::Unknown { reason } => {
                 why = Some(format!("the process check failed: {reason}"))
             }
@@ -203,6 +205,7 @@ pub fn apply(
         rc,
         manifest,
         group_cache: BTreeMap::new(),
+        procs: (opts.process)(),
         unlinked_inodes: Default::default(),
         report: ApplyReport {
             dry_run: !opts.act,
@@ -797,6 +800,10 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
         let mut go: Vec<&Prepared> = Vec::new();
         let mut rows = Vec::new();
         let begun_now = ctx.manifest.begun();
+        // Contract (b): repeat the process check and the activity judgement, fresh, after the
+        // backup and before the first removal.
+        ctx.procs = (opts.process)();
+        ctx.group_cache.clear();
         for pr in batch {
             let p = &ctx.inputs.pieces[pr.piece];
             let begun = begun_now.contains_key(&(p.path.clone(), p.id));
@@ -807,6 +814,15 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
                 #[cfg(feature = "test-hooks")]
                 if let Some(f) = opts.hooks.before_remove {
                     f(&p.path);
+                }
+                if let Some(why) = ctx.group_active(p) {
+                    set_outcome(
+                        &mut ctx.report,
+                        pr.piece,
+                        "kept",
+                        &format!("active before removal: {why}"),
+                    );
+                    continue;
                 }
                 if let Err(d) = recheck::recheck(sp, &removed) {
                     set_outcome(

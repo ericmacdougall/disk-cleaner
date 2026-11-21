@@ -302,7 +302,6 @@ fn run_apply(a: ApplyArgs) -> Result<()> {
     opts.secrets_upload = secrets_upload;
     opts.private_remotes = a.private_remotes;
     opts.rclone = a.rclone;
-    opts.process = running_cwds();
     let local = PathBuf::from(&a.remote);
     if local.is_absolute() {
         opts.remote_local = Some(local);
