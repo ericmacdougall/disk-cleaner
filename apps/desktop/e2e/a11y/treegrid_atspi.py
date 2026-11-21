@@ -176,6 +176,13 @@ def inside(o, g):
 
 
 CELL_ROLES = (pyatspi.ROLE_TABLE_CELL, pyatspi.ROLE_COLUMN_HEADER, pyatspi.ROLE_ROW_HEADER)
+# What each ARIA role of the treegrid must arrive as over AT-SPI (Core-AAM 1.2).
+EXPECTED_ROLE = {
+    "treegrid": pyatspi.ROLE_TREE_TABLE,
+    "row": pyatspi.ROLE_TABLE_ROW,
+    "gridcell": pyatspi.ROLE_TABLE_CELL,
+    "columnheader": pyatspi.ROLE_COLUMN_HEADER,
+}
 
 
 def grid_rows(g):
@@ -327,6 +334,15 @@ def check():
                 missing = [k for k in ("rowindex", "level", "posinset", "setsize") if k not in i["attrs"]]
             if missing:
                 fails.append(f"{label}: focused object lacks {missing}")
+            # The role number must be the one the page's role maps to (Core-AAM). WebKitGTK 2.50.0
+            # to 2.50.4 sends roles from Paragraph (73) on one too low (WebKit bug 300090): a row
+            # then reaches the reader as "input method window". Judged against computed-role, not
+            # against hard-coded numbers, so it holds on any libatspi.
+            computed = attrs(f).get("computed-role")
+            want = EXPECTED_ROLE.get(computed)
+            if want is not None and f.getRole() != want:
+                fails.append(f"{label}: a {computed} reaches the reader as {i['role_name']!r} ({i['role']}),"
+                             f" expected {int(want)}")
             if not (i["name"] or i["text"]):
                 fails.append(f"{label}: focused object has no name or text")
         return i
