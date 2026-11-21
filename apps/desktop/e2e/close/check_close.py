@@ -22,8 +22,8 @@ Routes:
   sigterm, sighup, sigkill   the signal, to the app's own pid
 
 How the app must end, per route (anything else, a crash above all, fails the case):
-  wm-close, destroy-*   exit 0 through the run loop's exit (the `e2e: event exit` line), which
-                        ends the worker (Inner::shutdown)
+  wm-close, destroy-*   exit 0 after the app's own shutdown ran (lib.rs end_app, which ends
+                        the worker: the `e2e: shutdown done` line)
   kill-client           exit 1 (GTK ends a program whose display connection is gone)
   sigterm, sighup, sigkill   killed by that signal (the worker's own watchdog then ends it
                         and its gits: the parent-death backstop)
@@ -148,7 +148,7 @@ def recorded_pids(path: Path) -> list[int]:
 class Case:
     def __init__(self, phase: str, route: str, args, n: int):
         self.phase, self.route, self.args, self.n = phase, route, args, n
-        self.name = f"{phase}-{route}"
+        self.name = f"{phase}-{route}-{n:02d}"
         self.dir = Path(args.out) / self.name
         self.display = f":{90 + n}"
         self.wm = route in ("wm-close", "destroy-wm", "kill-client")
@@ -384,7 +384,7 @@ class Case:
         want = EXPECTED_STATUS.get(self.route)
         res["expected_status"] = want
         ended_cleanly = (want is None or res.get("app_status") == want) and (
-            want != "exit 0" or "e2e: event exit" in res.get("events", []))
+            want != "exit 0" or "e2e: shutdown done" in res.get("events", []))
         if self.keeps_running:
             ok = bool("error" not in res and res.get("app_running_after_5_s")
                       and res.get("toplevel_still_shown") and res.get("window_gone_after_destroy")
@@ -460,7 +460,10 @@ def main() -> int:
     if args.cases:
         cases = [tuple(c.split(":", 1)) for c in args.cases.split(",") if c]
     else:
+        # The outside destroy races the app's next drawing (CI run 44876259316: one of four
+        # runs at 682a0ff quit, three crashed), so each destroy route runs three times.
         cases = ([(p, r) for p in PHASES for r in ROUTES]
+                 + [(p, r) for _ in range(2) for p in PHASES for r in ("destroy-wm", "destroy-nowm")]
                  + [("analyse", "destroy-leader"), ("analyse", "none")])
     results = []
     for n, (phase, route) in enumerate(cases):

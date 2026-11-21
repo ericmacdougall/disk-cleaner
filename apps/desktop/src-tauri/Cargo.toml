@@ -38,6 +38,11 @@ libc = "0.2"
 # sweep (worker::stop_new_processes). MIT, depends only on libc.
 rlimit = "0.10.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The window's GTK destroy signal (lib.rs, quit_when_the_window_is_destroyed): a window
+# destroyed from outside gets no Tauri event. Already in the lockfile through tauri.
+gtk = "0.18"
+
 [target.'cfg(windows)'.dependencies]
 # A job object for the analysis worker (worker::spawn_worker only).
 command-group = "5"

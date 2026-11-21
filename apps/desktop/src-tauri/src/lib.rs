@@ -26,13 +26,15 @@ pub fn run() {
     #[cfg(feature = "e2e")]
     e2e_open(&inner);
     let on_exit = std::sync::Arc::clone(&inner);
-    #[cfg(feature = "e2e")]
     let on_setup = std::sync::Arc::clone(&inner);
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |_app| {
+            #[cfg(target_os = "linux")]
+            quit_when_the_window_is_destroyed(_app, std::sync::Arc::clone(&on_setup));
             #[cfg(feature = "e2e")]
             e2e_start(_app.handle(), &on_setup);
+            let _ = &on_setup;
             Ok(())
         })
         .manage(AppState(inner))
@@ -63,9 +65,58 @@ pub fn run() {
         #[cfg(feature = "e2e")]
         e2e_log(&event);
         if let tauri::RunEvent::Exit = event {
-            // End any analysis worker and the git commands it started.
-            on_exit.shutdown();
+            end_app(&on_exit);
         }
+    });
+}
+
+/// The one way out of the app while it still runs code. The run loop's Exit (the window's
+/// close button or the window manager's close, the last window gone, a quit) and a window
+/// destroyed from outside (Linux) both end here: it ends the analysis worker and every git
+/// command it started ([`Inner::shutdown`], which may run more than once). Ways out that run
+/// no code in the app (a signal that kills it, a lost display connection) are left to the
+/// worker, which ends itself and its gits when its input closes (worker.rs); the close check
+/// (e2e/close/check_close.py) exercises every one of them.
+fn end_app(inner: &Inner) {
+    inner.shutdown();
+    #[cfg(feature = "e2e")]
+    eprintln!("e2e: shutdown done");
+}
+
+/// Linux: a top-level window destroyed from outside with no close request (another program
+/// destroys it, or a window manager does so to an app it judged hung) reaches no Tauri event:
+/// GTK reports it only as the window's destroy-event, and the webview then crashes drawing
+/// into the window that is gone (Gdk-ERROR BadDrawable, CI run 44875748442). Treat it as a
+/// quit: end the work, then exit at once, before anything draws again.
+#[cfg(target_os = "linux")]
+fn quit_when_the_window_is_destroyed(app: &tauri::App, inner: std::sync::Arc<Inner>) {
+    use gtk::prelude::*;
+    use tauri::Manager;
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(gtk_window) = window.gtk_window() else {
+        return;
+    };
+    #[cfg(feature = "e2e")]
+    {
+        gtk_window.connect_destroy(|_| eprintln!("e2e: gtk window destroy signal"));
+        let w = gtk_window.clone();
+        let mut told = false;
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            let gone = w.window().is_none_or(|g| g.is_destroyed());
+            if gone && !told {
+                eprintln!("e2e: gtk sees the top-level gdk window destroyed");
+                told = true;
+            }
+            gtk::glib::ControlFlow::Continue
+        });
+    }
+    gtk_window.connect_destroy_event(move |_, _| {
+        #[cfg(feature = "e2e")]
+        eprintln!("e2e: event window main destroyed from outside");
+        end_app(&inner);
+        std::process::exit(0)
     });
 }
 
