@@ -1,0 +1,35 @@
+[package]
+name = "disk-cleaner-xfer"
+description = "PruneDisk backup engine: zero-staging CDC dedup, rate-matched compression and verified parallel packs to object storage through rclone"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "xfer"
+
+[[bin]]
+name = "prunedisk-xfer"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1.8"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+fastcdc = "3"
+md-5 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+thiserror = "1"
+# Plain HTTP only: the engine talks to its own rclone rcd on 127.0.0.1 and nothing else.
+ureq = { version = "2", default-features = false }
+zstd = { version = "0.13", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+xattr = "1"
+
+[dev-dependencies]
+tempfile = "3"
