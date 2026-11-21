@@ -594,29 +594,50 @@ in the probe runs before the PR head (each run's numbers are in its `e2e.json`, 
 
 | | IPC p95 | Scroll p95 | Slowest scroll sample |
 |---|---|---|---|
-| Linux (under strace, Xvfb and software rendering) | 2 to 6 ms | 36 to 44 ms | up to 50 ms |
+| Linux (probe runs: the earlier strace wrapper, Xvfb and software rendering) | 2 to 6 ms | 36 to 44 ms | up to 50 ms |
 | Windows (windows-latest) | 2.4 ms | 35.5 ms | 36.2 ms |
 
-The scroll check has little headroom, most of all on Linux, where strace and software
-rendering add to every frame. A slow runner can turn it red. The response is to read that
-run's samples (the `e2e-<os>` artifact) for a real regression against a slow runner. The
-limit stays at 50 ms.
+The scroll check has little headroom, most of all on Linux, where software rendering adds to
+every frame. A slow runner can turn it red. The response is to read that run's samples (the
+`e2e-<os>` artifact) for a real regression against a slow runner. The limit stays at 50 ms.
 
-Where every timing is taken (main's ruling, relayed by the stream owner; inferred). The
-rebuilt write observer traces every call, which pushed the default fixture's
-`timing.scroll_p95` to 43/50 ms (run 44895185802) and 55/62 ms (run 44896444434, a fail)
-under strace, against 33/35 ms untraced (a83db44). So
-every timing assertion, here and at one million rows, is taken in a launch with the untraced
-switch (below), with its threshold, n and no-retry rule unchanged, and the same steps also run
-in a traced launch, not timed, under the write observer. The probe-run numbers in the table
-above were traced. Windows has no tracer, so its timings stay in the main session.
+Timing is never measured under the tracer (main's ruling, relayed by the stream owner;
+inferred). On Linux every timing check of the suite (these two and AC-9's below) is taken in a
+launch of its own with `PRUNEDISK_E2E_UNTRACED=1`, which the wrapper in `e2e/check.sh` starts
+without strace. The same steps run again in a traced launch, under the write observer, where
+they must complete and are not timed (`steps.*traced*` in `e2e/run.mjs`). The thresholds, n and
+the no-retry rule are unchanged. The probe-run numbers in the table above were traced. Windows
+has no tracer, so its timings stay in the main session. The reason is that the observer stops
+every call twice, at its entry and at its exit, because it runs without `--seccomp-bpf`
+(above), and that alone moved the first session's scroll check (`timing.scroll_p95`, p50/p95
+in ms, the ubuntu-22.04 job "end-to-end"):
+
+| Wrapper | Commit (job or run) | p50/p95 |
+|---|---|---|
+| `--seccomp-bpf`, a list of file calls | 87221db (jobs 136790146688, 136790148313) | 33/39, 33/39 |
+| the same | 02b2f79 (job 136781477066) | 33/36 |
+| the same | a83db44 (job 136804431733) | 33/35 |
+| the same | 2752d36 (job 136799767817) | 34/36 |
+| every call stops | 9e97d44 (run 44895185802) | 43/50, a pass only at the limit |
+| every call stops | 5d0c2ce (run 44896444434) | 55/62, a fail |
+
+Under the full trace the number measures strace as much as the app. In run 44896444434 the
+main session ran every other step under the full trace within the suite's existing timeouts,
+so no timeout was raised. The one-million-row traced launch has not yet run under the full
+trace (that run predates the AC-9 sessions); if it needs more time, only the traced launch's
+timeouts are raised, and this section says so. The switch is honoured only by the CI wrapper and
+only for an e2e build (below, "The untraced switch"); a release build holds no
+`PRUNEDISK_E2E_` name, and `e2e/check-shipped.sh` checks for `PRUNEDISK_E2E_UNTRACED` on
+its own. An untraced launch is outside the write trace but inside the snapshot judge and
+the survivor check, and the trace step fails when the write-proof flows ran with no traced
+launch.
 
 Preconditions of every timed session (Linux), judged in this order before each timing check;
 a failure fails that check with a reason ending "not measured", and nothing is retried:
 
 1. The trace state: every app process of the launch (`TracerPid` in `/proc`) is untraced,
    else "not shown to be untraced; not measured" (`trace.default.timed_launch_untraced`,
-   `trace.synth_1m.timed_launch_untraced`).
+   `trace.synth_1m.timed_launch_untraced`; the variant `untraced-ignored`).
 2. No other app instance alive at the session's start: any `/proc` entry named `e2e` or
    `prunedisk-deskt`, zombies counted, read once at the start, else "another app instance is
    alive at the session start (...); not measured". Pre-registered before any result (WAL
@@ -676,14 +697,18 @@ The untraced switch. `e2e/run.mjs` sets `PRUNEDISK_E2E_UNTRACED=1` for the timed
 (the default fixture's and the one-million-row one) and the investigation's untraced arms; the
 main session's environment never holds it. `e2e/check.sh`'s app wrapper (CI only; it never
 ships) then starts that launch without strace, but only when the e2e binary holds the switch's
-name, which only a `--features e2e` build does (`src-tauri/src/e2e.rs`). The app checks the
-claim for the synthetic tree: with the switch set and a tracer attached, it shows none. An
-untraced launch is still a session of the survivor check: its processes carry
-`PRUNEDISK_TRACE_SESSION` and `e2e/traced.py settle` records it in `close.<pid>.txt` like a
-traced launch, so nothing it started may outlive it. Each untraced launch leaves a marker in
-`$OUT/untraced/`, each traced one-million-row launch one in `$OUT/traced-synth/`, and the trace
-step fails when a traced one-million-row launch left no strace log or none ran. A release
-binary holds no `PRUNEDISK_E2E_` name (check.sh's string
+name, which only a `--features e2e` build does (`src-tauri/src/e2e.rs`). The switch alone
+selects it: any other value, an empty one or the old name `PRUNEDISK_AC9_UNTRACED` is traced,
+and every launch without the switch is traced ("Timing is never measured under the tracer",
+above). The app checks the claim for the synthetic tree: with the switch set and a tracer
+attached, it shows none. An untraced launch is still a session of the survivor check: the
+wrapper exports `PRUNEDISK_TRACE_SESSION=$OUT/trace/untraced.<pid>` (inside the folder that
+`e2e/traced.py sweep` covers) and starts `e2e/traced.py settle` on it, which records it in
+`close.untraced.<pid>.txt`; check.sh's survivor step reads the record of every launch, traced
+(its log) or untraced (its marker), so nothing an untraced launch started may outlive it. Each
+untraced launch leaves a marker in `$OUT/untraced/`, each traced one-million-row launch one in
+`$OUT/traced-synth/`, and the trace step fails when a traced one-million-row launch left no
+strace log or none ran. A release binary holds no `PRUNEDISK_E2E_` name (check.sh's string
 check); `e2e/check-shipped.sh` names `PRUNEDISK_E2E_UNTRACED` on its own, check.sh's control
 requires it to report that name on the e2e binary, and the variant `untraced-switch-shipped`
 (below) plants the switch in a release build, which check-shipped.sh must fail.
@@ -1038,8 +1063,12 @@ identical):
 
 Main ruled the leftover a test-tooling defect. Likely, not proven: the driver ends the process it
 started, which was strace; strace's exit detaches the app, which is then orphaned and runs on
-untraced. The wrapper fix (`strace -DD`) is to show it: after it, the traced session must leave
-nothing. Writes after the detach were not traced.
+untraced. The wrapper fix (`strace -DD`, 9e97d44, with the survivor check `e2e/traced.py`:
+check.sh's "survivors" step fails when any process of a launch, traced or untraced, is alive 2 s
+after its app ended) is to show it: after it, the traced session must leave nothing. Its first
+run, desktop 44895185802 at 9e97d44 (before the AC-9 sessions were added to the suite), reported
+"every process of the session ended within 16 ms" for the suite's one launch on Linux. Writes
+after the detach were not traced.
 
 The DOM limit counts every `.tg-row`, selected or not, the header row included. Since 5530ecf
 the grid holds to it in every state (main's ruling, relayed by the stream owner; inferred): at
