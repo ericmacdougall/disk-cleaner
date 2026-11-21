@@ -1157,10 +1157,15 @@ naming the first path that differs when:
 - a member's status-change time (`ctime`) is at or after `walked_at` (an overwrite of the same
   length with its mtime set back still changes `ctime`);
 - an entry that is not a member and not under `excludes` appeared below a `tree` or `git-node`
-  piece.
+  piece;
+- the piece's directory, or a directory below it that is not under `excludes`, has a
+  status-change time at or after `walked_at` (adding, removing or renaming an entry changes its
+  directory's `ctime`, so a new empty directory is caught too). This is reported after any
+  difference of an entry.
 
 `scope` is `RecheckScope::All` by default. `RecheckScope::WorkTree`, for a `git-node` piece only,
-leaves out its git directory. An apply step uses it only for the second recheck, after its own
+leaves out its git directory: `.git` for a repository or worktree, and the whole piece for a bare
+repository (a `git-node` piece with no `.git` member). An apply step uses it only for the second recheck, after its own
 recovery step has written recovery refs or a bundle into that git directory. The git directory is
 then covered by the preserve obligation instead: it is enumerated again at apply, backed up and
 verified. On a platform without file identity, `recheck` always returns `Drift`. `recheck` does

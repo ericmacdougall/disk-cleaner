@@ -1191,6 +1191,77 @@ fn recheck_ok_when_unchanged_and_drift_on_every_change() {
     let _ = gitp;
 }
 
+/// PR review F1: a new empty directory, at the top or nested, is drift.
+#[cfg(unix)]
+#[test]
+fn recheck_a_new_empty_directory_is_drift() {
+    let (_tmp, root, _) = workspace();
+    let d = root.join("d");
+    write(&d.join("a.txt"), "a");
+    write(&d.join("sub").join("b.txt"), "b");
+    let res = lanes_scan(&root);
+    let survey = res.pieces.as_ref().unwrap();
+    let tree = survey
+        .pieces
+        .iter()
+        .find(|p| Path::new(&p.path) == d)
+        .expect("d is one tree piece")
+        .clone();
+    assert_eq!(recheck(&tree, RecheckScope::All), Ok(()));
+    fs::create_dir(d.join("sub").join("new-nested")).unwrap();
+    let e = recheck(&tree, RecheckScope::All).unwrap_err();
+    assert_eq!(e.path, "sub", "{e}");
+    // A fresh scan, then a new empty directory directly in the piece's directory.
+    let res = lanes_scan(&root);
+    let tree = res
+        .pieces
+        .as_ref()
+        .unwrap()
+        .pieces
+        .iter()
+        .find(|p| Path::new(&p.path) == d)
+        .unwrap()
+        .clone();
+    assert_eq!(recheck(&tree, RecheckScope::All), Ok(()));
+    fs::create_dir(d.join("new-top")).unwrap();
+    let e = recheck(&tree, RecheckScope::All).unwrap_err();
+    assert_eq!(e.path, "", "{e}");
+}
+
+/// PR review F2: the work-tree scope of a bare repository leaves out all of it.
+#[cfg(unix)]
+#[test]
+fn recheck_worktree_scope_of_a_bare_repo() {
+    let (_tmp, root, remotes) = workspace();
+    // The source and its remote live outside the scan root.
+    let src = pushed_repo(&remotes, &remotes.join("r"), "src");
+    let bare = root.join("mirror.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            src.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    let res = lanes_scan(&root);
+    let survey = res.pieces.as_ref().unwrap();
+    let gp = survey
+        .pieces
+        .iter()
+        .find(|p| Path::new(&p.path) == bare)
+        .expect("the bare repo is a piece")
+        .clone();
+    assert_eq!(gp.kind, disk_cleaner_core::PieceKind::GitNode);
+    assert_eq!(recheck(&gp, RecheckScope::All), Ok(()));
+    // What apply's recovery step writes into a bare repository.
+    write(&bare.join("refs").join("recovery").join("main"), "0000\n");
+    assert!(recheck(&gp, RecheckScope::All).is_err());
+    assert_eq!(recheck(&gp, RecheckScope::WorkTree), Ok(()));
+}
+
 #[cfg(unix)]
 #[test]
 fn recheck_scan_piece_with_a_derived_exclude_is_ok() {

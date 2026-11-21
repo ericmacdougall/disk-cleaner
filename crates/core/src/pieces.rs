@@ -1123,18 +1123,38 @@ fn hash_file(path: &Path, want: &Meta) -> Option<String> {
     if !same_file(&before, want) {
         return None;
     }
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f.read(&mut buf).ok()?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-    }
+    let digest = hash_bounded(&mut f, want.len)?;
     let after = meta(&f.metadata().ok()?);
     if !same_file(&after, want) {
         return None;
+    }
+    Some(digest)
+}
+
+/// SHA-256 of exactly `len` bytes of `r`, reading at most `len + 1` bytes: a reader that ends
+/// early or has more (a file that grew while it was read) gives `None`, so a hash budget bounds
+/// the bytes actually read.
+fn hash_bounded<R: Read>(r: &mut R, len: u64) -> Option<String> {
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut left = len;
+    while left > 0 {
+        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = r.read(&mut buf[..want]).ok()?;
+        if n == 0 {
+            return None; // shorter than recorded
+        }
+        h.update(&buf[..n]);
+        left -= n as u64;
+    }
+    let mut one = [0u8; 1];
+    loop {
+        match r.read(&mut one) {
+            Ok(0) => break,
+            Ok(_) => return None, // longer than recorded
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
     }
     Some(hex(&h.finalize()))
 }
@@ -1446,7 +1466,11 @@ pub fn recheck(piece: &Piece, scope: RecheckScope) -> Result<(), Drift> {
     }
     let base = Path::new(&piece.path);
     let skip_git = scope == RecheckScope::WorkTree && piece.kind == PieceKind::GitNode;
-    let in_scope = |rel: &str| !(skip_git && under(rel, ".git"));
+    // A git-node piece with no `.git` member is a bare repository: all of it is the git
+    // directory, so the work-tree scope leaves all of it out (the preserve obligation covers it).
+    let bare =
+        piece.kind == PieceKind::GitNode && !piece.members.iter().any(|m| under(&m.0, ".git"));
+    let in_scope = |rel: &str| !(skip_git && (bare || under(rel, ".git")));
     let mut want: BTreeMap<&str, &Member> = BTreeMap::new();
     for m in &piece.members {
         if in_scope(&m.0) {
@@ -1466,6 +1490,17 @@ pub fn recheck(piece: &Piece, scope: RecheckScope) -> Result<(), Drift> {
     let md = std::fs::metadata(base).map_err(|_| drift("", "the piece's directory is missing"))?;
     if !md.is_dir() {
         return Err(drift("", "the piece's directory is no longer a directory"));
+    }
+    // A directory's status-change time moves when an entry is added to, removed from or renamed
+    // in it, so a new (even empty) directory or entry below the piece shows up on its parent.
+    // Reported after any entry-level difference, which names the path more usefully.
+    let dir_changed = |md: &std::fs::Metadata| meta(md).ctime >= piece.walked_at;
+    let mut dir_drift: Option<Drift> = None;
+    if !(skip_git && bare) && dir_changed(&md) {
+        dir_drift = Some(drift(
+            "",
+            "the piece's directory changed after the scan read it (status-change time)",
+        ));
     }
     let mut seen: HashSet<String> = HashSet::new();
     let mut stack: Vec<(PathBuf, String)> = vec![(base.to_path_buf(), String::new())];
@@ -1491,6 +1526,12 @@ pub fn recheck(piece: &Piece, scope: RecheckScope) -> Result<(), Drift> {
             let p = dir.join(&name);
             let md = std::fs::symlink_metadata(&p).map_err(|_| drift(&rel, "cannot be read"))?;
             if md.is_dir() {
+                if dir_drift.is_none() && dir_changed(&md) {
+                    dir_drift = Some(drift(
+                        &rel,
+                        "directory changed after the scan read it (status-change time)",
+                    ));
+                }
                 stack.push((p, rel));
                 continue;
             }
@@ -1504,5 +1545,29 @@ pub fn recheck(piece: &Piece, scope: RecheckScope) -> Result<(), Drift> {
     if let Some((rel, _)) = want.iter().find(|(r, _)| !seen.contains(**r)) {
         return Err(drift(rel, "is missing"));
     }
-    Ok(())
+    match dir_drift {
+        Some(d) => Err(d),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash_bounded;
+    use std::io::Read;
+
+    #[test]
+    fn hashing_reads_at_most_one_byte_past_the_recorded_length() {
+        // Exact length: hashed.
+        let mut exact: &[u8] = b"abcdef";
+        assert!(hash_bounded(&mut exact, 6).is_some());
+        // Shorter than recorded: refused.
+        let mut short: &[u8] = b"abc";
+        assert!(hash_bounded(&mut short, 6).is_none());
+        // A source that never ends (a file that keeps growing): refused after len + 1 bytes.
+        let mut endless = std::io::repeat(7).take(u64::MAX);
+        assert!(hash_bounded(&mut endless, 1000).is_none());
+        let read = u64::MAX - endless.limit();
+        assert_eq!(read, 1001, "read {read} bytes for a 1000-byte budget");
+    }
 }
