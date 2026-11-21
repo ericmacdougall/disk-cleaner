@@ -1044,7 +1044,7 @@ A **piece**:
 | `bytes`, `logical_bytes` | allocated and logical bytes of the members, each inode counted once (below); a `tree` or `git-node` piece also counts the blocks of its directories |
 | `bytes_linked_outside` | bytes of members whose inode has more hard links than names the survey saw: removing these names frees nothing |
 | `newest_mtime` | newest modification time of the members (for `git-node`, of the work tree outside its git directory); absent when it has no members |
-| `walked_at` | unix seconds when the survey started reading this piece |
+| `walked_at` | unix seconds, rounded down, at the start of the survey walk (before any entry of this piece was read) |
 | `secret` | present on a secret piece: the kind of secret name that matched (`a private SSH key`) |
 | `incomplete` | present when the piece cannot be judged whole, with why: entries that could not be read, a mount point that was not entered, a FIFO, socket or device file, a name that is not valid UTF-8 (it could not be written back exactly) |
 
@@ -1075,7 +1075,8 @@ walk order; the other names are members of their own pieces with 0 bytes, counte
 (below), so its names are listed together, unless it is a secret inode.
 
 **Secret inodes.** An inode is secret when any of the names the survey saw for it is a secret
-name, or lies inside a secret directory, whichever name comes first in walk order. Every name of a
+name, or lies inside a secret directory, in whatever order the names come. This is decided after
+the whole walk, before any piece is cut. Every name of a
 secret inode is a secret piece of its own. For example, `.env` hard-linked as `data.bin` gives two
 secret pieces, and the second has `secret` = "a hard link to a secret-named file". A secret inode
 is never hashed and never appears in `blobs`.
@@ -1126,7 +1127,9 @@ one inode, and every non-secret inode with more than one name whatever its size,
 SHA-256. Not hashed (counted in `totals.unhashed_candidates`, and never part of a blob): a sparse
 file (allocated below half its length), a file whose length, mtime or inode changed while it was
 read, one that could not be opened as a regular file, and every candidate once `max_hash_bytes`
-have been read. A blob is a sha256 with more than one copy:
+have been read. An inode that has more hard links than names the survey saw is also left
+unhashed: a name outside the scan roots could be a secret name. A blob is a sha256 with more than
+one copy:
 
 | Field | Meaning |
 |---|---|
@@ -1157,7 +1160,14 @@ naming the first path that differs when:
 leaves out its git directory. An apply step uses it only for the second recheck, after its own
 recovery step has written recovery refs or a bundle into that git directory. The git directory is
 then covered by the preserve obligation instead: it is enumerated again at apply, backed up and
-verified. On a platform without file identity, `recheck` always returns `Drift`.
+verified. On a platform without file identity, `recheck` always returns `Drift`. `recheck` does
+not compare link counts. A new hard link made after the scan changes `ctime`, so recheck catches
+it. A link removed elsewhere changes only how many bytes a removal frees, never what is safe to
+remove.
+
+A secret inside a git directory (a hook named `token-check`, a `.git/credentials`) is never cut
+out, because the preserve obligation covers every file of the git directory. It makes the
+`git-node` piece `incomplete` instead, so the repository is kept.
 
 Every plan piece carries `scan_piece`, the scan piece it comes from; a plan piece and the
 derived pieces cut from it share it. **An apply step MUST recheck the scan piece `scan_piece`
@@ -1260,10 +1270,13 @@ inside the group. One recent file keeps every piece of its group.
    before it is removed.
 
 Then **noise by duplicate**: each blob copy in a `backup` piece whose blob also has a copy in a
-`keep` piece that is not a secret is cut out into a derived `files` piece of one name, lane
+durable `keep` piece is cut out into a derived `files` piece of one name, lane
 `noise`, evidence `{"kind": "duplicate", "sha256", "size", "retained_copy": <path>,
 "retained_piece": <plan piece id>}`. Its former piece lists it in `moved_out` and gives up its
-entry, and its bytes when it owned the inode. Two copies that are both in removing lanes never
+entry, and its bytes when it owned the inode. A durable keep piece is one kept by rule 5 (inside a
+kept repository) or rule 6 (a git node that is not removed). A piece kept because it is secret,
+incomplete or active, or because processes could not be checked, may change or go away soon, so
+a copy there never makes another copy noise. Two copies that are both in removing lanes never
 cite each other: a duplicate inside the removal set is backed up once (below), not called noise.
 **Before removing a duplicate-noise file an apply step MUST re-hash it and check that it still
 has the recorded length and sha256, and `lstat` the `retained_copy`: it must be a different path,
