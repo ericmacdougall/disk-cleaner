@@ -340,10 +340,14 @@ impl Walk {
     fn ingest(&mut self, entry: &jwalk::DirEntry<ClientState>, opts: &ScanOptions, root: usize) {
         let path = entry.path();
         let root_meta;
+        // A root may be spelled through a symlink to a directory (CT-A2); the walk lists the
+        // directory it names, so the root is that directory, counted with its own blocks, never
+        // the link object (CT-A3). The survey counts it the same way.
+        let mut root_is_dir = false;
         let meta: &EntryMeta = if entry.depth == 0 {
-            root_meta = std::fs::symlink_metadata(&path)
-                .map(|md| meta_from(&md))
-                .unwrap_or_default();
+            let md = std::fs::metadata(&path);
+            root_is_dir = md.as_ref().is_ok_and(|m| m.is_dir());
+            root_meta = md.map(|md| meta_from(&md)).unwrap_or_default();
             &root_meta
         } else {
             &entry.client_state
@@ -360,7 +364,7 @@ impl Walk {
         let name = entry.file_name.to_string_lossy().into_owned();
         let rules = &opts.rules;
 
-        if ft.is_dir() {
+        if ft.is_dir() || root_is_dir {
             if entry.depth == 0 && self.pruned_hit.contains(&root) {
                 // An enclosing root's walk counted this directory and stopped at it.
                 self.aggs.entry(path).or_default();
@@ -703,11 +707,23 @@ fn has_package_evidence(build: &Build, dirs: &[(PathBuf, DirAgg)], i: usize) -> 
 /// a nested directory that its own rule says can hold unique content (`ask`, `ask_if_contains`),
 /// and file names from the unique-state list. Names only; nothing is opened or read. The first
 /// finding becomes the owner's `ask_reason`; it names the kind of thing, never its contents.
-fn note_nested_state(build: &mut Build, dirs: &[(PathBuf, DirAgg)], i: usize, rules: &RuleSet) {
+fn note_nested_state(
+    build: &mut Build,
+    dirs: &[(PathBuf, DirAgg)],
+    i: usize,
+    rules: &RuleSet,
+    names: &RootNames,
+) {
     let (path, agg) = (&dirs[i].0, &dirs[i].1);
     let rel = rel_slash(path, &build.path);
     if !rel.is_empty() {
-        if let Some(rule) = match_rule(dirs, i, rules) {
+        // An ask protects, so the walked spelling and the real path both count.
+        let real = names.real_of(path);
+        let matched = [
+            match_rule(dirs, i, path, rules),
+            match_rule(dirs, i, &real, rules),
+        ];
+        for rule in matched.into_iter().flatten() {
             if let Some(why) = rule.ask.as_deref() {
                 build.node.ask_reason.get_or_insert_with(|| {
                     diag(&format!(
@@ -778,12 +794,45 @@ fn marker_beside(dirs: &[(PathBuf, DirAgg)], path: &Path, markers: &[String]) ->
     }
 }
 
-fn match_rule<'a>(dirs: &[(PathBuf, DirAgg)], i: usize, rules: &'a RuleSet) -> Option<&'a Rule> {
+/// The rule that matches directory `i` when its names are read as `named` (its walked path, or
+/// its real path); markers are always looked for beside the walked path.
+fn match_rule<'a>(
+    dirs: &[(PathBuf, DirAgg)],
+    i: usize,
+    named: &Path,
+    rules: &'a RuleSet,
+) -> Option<&'a Rule> {
     let path = &dirs[i].0;
     rules
-        .candidates(path)
+        .candidates(named)
         .into_iter()
         .find(|r| r.markers.is_empty() || marker_beside(dirs, path, &r.markers))
+}
+
+/// Each walked root's spelling with its real path (the spelling itself when it has none).
+struct RootNames(Vec<(PathBuf, PathBuf)>);
+
+impl RootNames {
+    /// The real path of a walked path: the real path of the closest walked root that holds it,
+    /// joined with the rest. The walk never follows a link below a root, so the rest is real.
+    /// A root's spelling (a symlink named `.cache`, a parent named `.m2`) is a name the user
+    /// gave, not the directory's: it may add protection (asks, secret context), never make a
+    /// directory a regenerable or cache node.
+    fn real_of<'p>(&self, path: &'p Path) -> std::borrow::Cow<'p, Path> {
+        let best = self
+            .0
+            .iter()
+            .filter(|(s, _)| path.starts_with(s))
+            .max_by_key(|(s, _)| s.components().count());
+        match best {
+            Some((s, c)) if s != c => match path.strip_prefix(s) {
+                Ok(rel) if rel.as_os_str().is_empty() => std::borrow::Cow::Owned(c.clone()),
+                Ok(rel) => std::borrow::Cow::Owned(c.join(rel)),
+                Err(_) => std::borrow::Cow::Borrowed(path),
+            },
+            _ => std::borrow::Cow::Borrowed(path),
+        }
+    }
 }
 
 fn bare_shape(agg: &DirAgg) -> bool {
@@ -795,6 +844,7 @@ fn classify(
     dirs: &mut [(PathBuf, DirAgg)],
     rules: &RuleSet,
     roots: &HashSet<PathBuf>,
+    names: &RootNames,
     odd_dirs: &mut Vec<PathBuf>,
 ) -> Vec<Build> {
     let mut builds: Vec<Build> = Vec::new();
@@ -869,7 +919,7 @@ fn classify(
                     found = Some((Class::Repo, None));
                 } else if bare_shape(agg) {
                     found = Some((Class::BareRepo, None));
-                } else if let Some(rule) = match_rule(dirs, i, rules) {
+                } else if let Some(rule) = match_rule(dirs, i, &names.real_of(path), rules) {
                     found = Some((rule.class, Some(rule)));
                 } else if owner.is_none()
                     && (agg.has_manifest || (agg.has_source && !roots.contains(path)))
@@ -943,7 +993,7 @@ fn classify(
             // evaluation would have said about it still counts.
             if let Some(o) = new_owner {
                 if builds[o].node.class.is_artifact() && !now_in_git {
-                    note_nested_state(&mut builds[o], dirs, i, rules);
+                    note_nested_state(&mut builds[o], dirs, i, rules, names);
                 }
             }
         }
@@ -1018,7 +1068,9 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     // own directory entry.
     for &k in &plan_r.walk_order {
         let root = &roots[k];
-        let root_dev = std::fs::symlink_metadata(root)
+        // The device of the directory the root names (a symlinked root's target), as the survey
+        // takes it: with --one-file-system its own folders are on its device, not the link's.
+        let root_dev = std::fs::metadata(root)
             .map(|md| meta_from(&md).dev)
             .unwrap_or(0);
         let prune = Arc::new(plan_r.prune[k].clone());
@@ -1104,7 +1156,14 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
     let root_set: HashSet<PathBuf> = roots.iter().cloned().collect();
     let mut odd_dirs: Vec<PathBuf> = Vec::new();
-    let mut builds = classify(&mut dirs, &opts.rules, &root_set, &mut odd_dirs);
+    let names = RootNames(
+        roots
+            .iter()
+            .cloned()
+            .zip(plan_r.canon.iter().cloned())
+            .collect(),
+    );
+    let mut builds = classify(&mut dirs, &opts.rules, &root_set, &names, &mut odd_dirs);
     if roots.len() > 1 && !plan_r.unresolved.is_empty() {
         for (r, err) in &plan_r.unresolved {
             warnings.push(diag(&format!(

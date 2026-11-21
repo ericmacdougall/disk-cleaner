@@ -125,7 +125,10 @@ the directory that holds them); `output_bytes` counts them separately.
   logical length (allocated and compressed size are not read in this phase).
 - A file with more than one hard link is counted once per `(device, inode)`. On Windows hard links
   are not detected and are counted per name.
-- Symlinks are never followed; a symlink counts as the small link object.
+- Symlinks are never followed; a symlink counts as the small link object. The one exception is a
+  scan root spelled through a symlink to a directory: the root is that directory, counted with its
+  own blocks and on its own device (for `--one-file-system`), never as the link object, and its
+  totals equal a scan of the directory itself.
 - `--one-file-system` skips directories on another device than their scan root. It is ignored on
   Windows and a warning says so. A skipped directory's contents are never seen, so the node that
   holds it (or the mount point itself, when a rule matches it) records it in `skipped_mounts` and is
@@ -192,7 +195,11 @@ Classification rules (design section 3): a directory with a `.git` directory is 
 A directory whose name matches a rule in `rules/artifacts.toml` is `regenerable` or `cache` when
 the rule's marker file or directory exists in the directory beside it, that is, its parent (a marker
 further up proves nothing; a rule without markers matches by name alone; ambiguous names such as
-`build` always have markers). Regenerable and cache directories are opaque: nothing inside them is
+`build` always have markers). A rule matches the directory's real names: a scan root spelled
+through a symlink (`.cache` or `.m2` linking to a folder named otherwise) is classified by the
+directory it names, so the link's name never makes a directory regenerable or cache; for the asks
+of nested directories (below) the walked spelling counts too, since an ask only protects.
+Regenerable and cache directories are opaque: nothing inside them is
 classified, so a repo vendored inside `node_modules` is not reported as a node; instead the
 directory gets an `ask_reason`. Opaque does not mean unchecked: while the scan is inside one, the
 rules that carry `ask` or `ask_if_contains` are still evaluated for the directories nested in it,

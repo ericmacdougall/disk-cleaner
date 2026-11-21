@@ -362,11 +362,9 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
             _ => continue,
         };
         let root_dev = md.dev;
-        // The root's own blocks are counted as the main scan counts them: those of the name
-        // given (a symlink's, not its target directory's).
-        let root_alloc = std::fs::symlink_metadata(root)
-            .map(|l| meta(&l).alloc)
-            .unwrap_or(md.alloc);
+        // The root's own blocks are counted as the main scan counts them: those of the directory
+        // it names (a symlinked root's target), never the link object's (CT-A3).
+        let root_alloc = md.alloc;
         let idx = t.dirs.len();
         t.dirs.push(DirRec {
             path: root.clone(),
