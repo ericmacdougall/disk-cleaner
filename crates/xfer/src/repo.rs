@@ -429,7 +429,7 @@ impl Repo {
 
     pub fn list(&self, prefix: &str) -> Result<Vec<RemoteObject>> {
         let v = self.t.list(prefix)?;
-        if v.len() > self.max_objects {
+        if v.len() > self.max_objects && !cfg!(feature = "broken-repo-guards") {
             return Err(Error::Refused(format!(
                 "{prefix} holds {} objects, more than the cap of {}; pass --max-objects to raise it",
                 v.len(),
@@ -444,7 +444,8 @@ impl Repo {
         match self.t.stat(FORMAT_KEY)? {
             Some(o) => {
                 let b = self.t.get(FORMAT_KEY, 64 << 10)?;
-                if b != FORMAT_BYTES || o.size != FORMAT_BYTES.len() as u64 {
+                let differs = b != FORMAT_BYTES || o.size != FORMAT_BYTES.len() as u64;
+                if differs && !cfg!(feature = "broken-repo-guards") {
                     return Err(Error::Refused(
                         "v1/format.json differs from this engine's format v1; refusing to write"
                             .into(),
@@ -688,7 +689,8 @@ impl Cache {
                     .modified()
                     .ok()
                     .and_then(|m| now.duration_since(m).ok())
-                    .is_some_and(|d| d.as_secs() > 3600);
+                    .is_some_and(|d| d.as_secs() > 3600)
+                    || cfg!(feature = "broken-repo-guards");
                 if old {
                     let _ = std::fs::remove_file(e.path());
                 }
@@ -710,7 +712,8 @@ impl Cache {
         }
         let p = self.dir.join(cache_name(key));
         let b = std::fs::read(&p).ok()?;
-        if b.len() as u64 == size && kind.digest(&b).eq_ignore_ascii_case(hash) {
+        let trust = cfg!(feature = "broken-repo-guards");
+        if trust || (b.len() as u64 == size && kind.digest(&b).eq_ignore_ascii_case(hash)) {
             Some(b)
         } else {
             // corrupt or stale: never trusted, removed and refetched

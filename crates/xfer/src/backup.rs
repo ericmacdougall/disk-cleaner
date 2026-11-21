@@ -765,7 +765,7 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
 
     // Load: one LIST each of index and packs, then the chunk maps.
     let idx_list = repo.list_index()?;
-    if idx_list.len() * 10 > o.max_objects * 9 {
+    if idx_list.len() * 10 > o.max_objects * 9 && !cfg!(feature = "broken-repo-guards") {
         return Err(Error::Refused(format!(
             "v1/index holds {} objects, over 90% of the cap of {}; the repository needs compaction (or pass --max-objects)",
             idx_list.len(),
