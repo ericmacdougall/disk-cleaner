@@ -2,6 +2,8 @@
 
 The GitHub-hosted `ci`, `Site tests` and `Pages` workflows are `workflow_dispatch` only. They no longer run on push or pull request, because the personal account's included Actions minutes are exhausted.
 
+**Status (2026-11-21): 10 workflows are disabled in the repository's Actions settings** (`ci`, `Site tests`, `desktop`, `desktop-close`, `mutants`, `e2e-probe`, `e2e-variants`, `macdiag`, `release`, `release checks`), so none of them run on any branch, including the feature-branch copies. Checks now run locally with `./scripts/local-ci.sh`. Only `Pages` (the deploy, `workflow_dispatch` only on `main`) is still enabled.
+
 ## How to run the same checks
 
 From the repository root, with a stable Rust toolchain and `python3` on `PATH`:
@@ -31,16 +33,25 @@ They remain in the workflow files and can be run by hand with `gh workflow run` 
 
 ## Manual GitHub runs (optional)
 
-If Actions minutes are available again, the workflows can still be started by hand:
+If Actions minutes are available again, re-enable a workflow first (a disabled workflow cannot be dispatched), then start it by hand:
 
 ```
+gh workflow enable ci.yml        # or: gh workflow enable 423127909
+gh workflow enable site.yml      # or: gh workflow enable 423305490
 gh workflow run ci.yml
 gh workflow run site.yml
 gh workflow run pages.yml
 ```
 
+Afterwards, disable them again so pushes do not start burning minutes:
+
+```
+gh workflow disable 423127909    # ci
+gh workflow disable 423305490    # Site tests
+```
+
 ## Feature-branch workflows
 
-**This change alone does not stop the feature-branch burn.** Feature branches (`feat/**` and others) still carry their own copies of `ci.yml` (push on `main` and `feat/**`) and `site.yml` (push on any branch). Those copies keep their push triggers until each branch is rebased onto this change; merging to `main` does not change them. In the last 100 runs before this change, 60 were these feature-branch copies (48 `ci`, 12 `Site tests`). To stop them, either disable the `ci` and `Site tests` workflows in the repository's Actions settings (which also blocks the manual `gh workflow run` below), or rebase the feature branches.
+**This change alone does not stop the feature-branch burn.** Feature branches (`feat/**` and others) still carry their own copies of `ci.yml` (push on `main` and `feat/**`) and `site.yml` (push on any branch). Those copies keep their push triggers until each branch is rebased onto this change; merging to `main` does not change them. In the last 100 runs before this change, 60 were these feature-branch copies (48 `ci`, 12 `Site tests`). That is why `ci` (423127909) and `Site tests` (423305490) were disabled in the Actions settings on 2026-11-21 as well. Rebasing the feature branches onto this change would let them be re-enabled safely.
 
-`desktop.yml`, `desktop-close.yml`, `mutants.yml`, `e2e-probe.yml`, `e2e-variants.yml`, `macdiag.yml`, `release.yml` and `release-checks.yml` exist on feature branches, not on `main`. A change on `main` cannot stop those from firing on those branches. Disable those workflows in the repository's Actions settings (or rebase the branch onto this change and drop the push triggers) to keep them from using minutes. Those eight workflows were disabled in the repository's Actions settings on 2026-11-21 (re-enable with `gh workflow enable <id>`); `ci` and `Site tests` were left enabled.
+`desktop.yml`, `desktop-close.yml`, `mutants.yml`, `e2e-probe.yml`, `e2e-variants.yml`, `macdiag.yml`, `release.yml` and `release-checks.yml` exist on feature branches, not on `main`. A change on `main` cannot stop those from firing on those branches. Disable those workflows in the repository's Actions settings (or rebase the branch onto this change and drop the push triggers) to keep them from using minutes. Those eight workflows were disabled in the repository's Actions settings on 2026-11-21 (re-enable with `gh workflow enable <id>`), together with `ci` and `Site tests`: 10 in all.
