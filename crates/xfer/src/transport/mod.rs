@@ -25,7 +25,9 @@ pub fn check_key(key: &str) -> Result<()> {
         || key.starts_with('/')
         || key.contains('\\')
         || key.bytes().any(|b| b < 0x20 || b == 0x7f)
-        || key.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+        || key
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
     {
         return Err(Error::Refused(format!("bad object key {key:?}")));
     }
@@ -195,6 +197,11 @@ pub fn check_remote(
     kind: HashKind,
     local: &str,
 ) -> Result<()> {
+    // The broken variant skips the comparison; the verify_guard test must fail against it.
+    // Never enabled in a release build.
+    if cfg!(feature = "broken-verify") {
+        return Ok(());
+    }
     if o.size != size {
         return Err(Error::Mismatch {
             key: key.into(),

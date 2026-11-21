@@ -126,15 +126,34 @@ impl PackBuilder {
 
     /// Append a finished segment. `stored` is either the raw bytes (codec 0) or one zstd frame.
     pub fn add_segment(&mut self, seg: &OpenSegment, codec: u8, stored: &[u8]) {
+        self.add_stored(&seg.chunks, seg.data.len() as u64, codec, stored);
+    }
+
+    /// Append a segment whose raw bytes are already gone: `chunks` are (id, offset, len) within
+    /// the decoded segment of `ulen` bytes.
+    pub fn add_stored(
+        &mut self,
+        chunks: &[(ChunkId, u32, u32)],
+        ulen: u64,
+        codec: u8,
+        stored: &[u8],
+    ) {
         let idx = self.segments.len() as u32;
+        // The broken variant records an off-by-one offset; seal_and_check must catch it
+        // (AC-14a). Never enabled in a release build.
+        let skew = if cfg!(feature = "broken-pack-offset") {
+            1
+        } else {
+            0
+        };
         self.segments.push(SegmentInfo {
-            off: self.buf.len() as u64,
+            off: self.buf.len() as u64 + skew,
             clen: stored.len() as u64,
-            ulen: seg.data.len() as u64,
+            ulen,
             codec,
         });
         self.buf.extend_from_slice(stored);
-        for &(id, off, len) in &seg.chunks {
+        for &(id, off, len) in chunks {
             self.chunks.push(ChunkLoc {
                 id,
                 seg: idx,
@@ -142,7 +161,7 @@ impl PackBuilder {
                 len,
             });
         }
-        self.raw_bytes += seg.data.len() as u64;
+        self.raw_bytes += ulen;
     }
 
     /// Serialize the trailer and return the finished pack bytes and its trailer.

@@ -13,6 +13,13 @@ name = "xfer"
 name = "prunedisk-xfer"
 path = "src/main.rs"
 
+[features]
+# Broken variants for failing-first evidence only. Each makes one guard test fail; none is ever
+# enabled in a build that is shipped or benchmarked.
+broken-verify = []        # verified_put skips the size and checksum comparison
+broken-commit-order = []  # receipts go out after the .idx alone, before the .files commit
+broken-pack-offset = []   # the pack writer records an off-by-one segment offset
+
 [dependencies]
 blake3 = "1.8"
 clap = { version = "4", features = ["derive"] }
