@@ -167,6 +167,7 @@ All in CI; nothing is built on a developer machine by default.
 | frontend unit tests (vitest, jsdom, mocked backend) | job "frontend unit tests" (`npm test` in `apps/desktop`) |
 | desktop backend, worker and containment (Cancel; the parent's input closing; the parent dying with every pipe; a real parent process killed; a stuck ending cut short by the deadline; a worker that dies on its own) | jobs "desktop backend (linux)", "worker containment" (`cargo build --examples`, then `cargo test` in `apps/desktop/src-tauri`, then `scripts/repeat-containment.sh 10`) |
 | one million nodes | job "performance at one million nodes" (results in the job summary and the `perf-results` artifact) |
+| size tree scroll at one million rows, mocked backend, headless Chromium (spec AC-9) | job "size tree scroll at one million rows" (`npm run perf:tree` in `apps/desktop`; results in the job summary and the `tree-scroll-1m` artifact) |
 | a wide install: 20,000 sibling folders with pages and Cancel asked meanwhile | `tests/state_flow.rs` in the desktop backend and containment jobs (the `PERF install_wide` and `PERF cancel_wide` lines) |
 | the packaged app through WebDriver, Linux and Windows (below) | job "end-to-end" (`apps/desktop/e2e/check.sh`; results in the `e2e-<os>` artifact) |
 | each end-to-end check caught by a broken variant | workflow "e2e-variants" (`apps/desktop/e2e/variants/*.patch`, `e2e/expect_variant.py`) |
@@ -235,6 +236,8 @@ One session (`e2e/run.mjs`) covers these flows, in order:
 8. Open a valid scan file, a malformed one (focus returns to Open) and a cancelled one.
 9. Check that the CSP blocks inline script.
 
+A second session then opens on a one-million-row size tree for the AC-9 timings (below).
+
 axe-core 4.14 runs on the chooser, each view and the imported developer view; any violation
 fails.
 
@@ -289,6 +292,88 @@ rendering add to every frame. A slow runner can turn it red. The response is to 
 run's samples (the `e2e-<os>` artifact) for a real regression against a slow runner. The
 limit stays at 50 ms.
 
+#### Timings at one million rows (spec AC-9, PR gate F9)
+
+Built to a quoted excerpt of spec v6 AC-9; the spec text was not re-read. Registered before any
+sample (WAL w8d2cd55d39e). The steps, boundary, samples, thresholds and verdict are in one
+file, `e2e/ac9.mjs`, shared by checks (2) and (3).
+
+Workload: `synth::wide_tree(1_000_000, 16452)` (crates/view), one root folder holding
+1,000,000 files, root expanded, so the size tree has 1,000,001 rows. The e2e build loads it at
+start when `PRUNEDISK_E2E_SYNTH_NODES=1000000` is set (`src-tauri/src/e2e.rs`,
+`open_synthetic`). It goes through the scan path: a job starts as Start starts one,
+`show_walk` installs the tree, and a one-folder `synth::synthetic_scan` finishes the job with
+`show_scan`, so the window opens on the results (Done). No command is added, and the
+release-binary string check covers the name. The pre-registration's wording names
+`synthetic_scan(1_000_000)` as the workload; a scan document has no size tree, so the tree is
+`wide_tree` as briefed (an assumption awaiting the owner's ruling).
+
+Every percentile is nearest rank; pass means p95 strictly under the threshold. A miss is
+reported as measured, with no retry to pass.
+
+1. IPC (Linux; `timing.synth_1m.ipc_tree_page_p95` in `e2e/run.mjs`). A second app session at
+   the end of the WebDriver suite, with its own tauri-driver (ports 4446 and 4447), because the
+   app takes its environment from the driver. In the page, `__TAURI_INTERNALS__.invoke`
+   `tree_page` with offset k * 200 and limit 200: 10 warm-up pages, then k = 0..99 timed with
+   `performance.now()`. Each page must hold 200 rows at its offset. Pass: p95 < 50 ms over
+   100 samples.
+2. Running-app scroll (Linux and Windows; `timing.synth_1m.scroll_p95`, same session). Size
+   tree, 10 warm-up steps, then 200 steps of 10 rows (280 px). The boundary:
+   - the clock starts just before `.tg-scroll`'s `scrollTop` is set;
+   - it stops after the first animation frame in which the step's target row
+     (`#tg-row-<index>`) is in the DOM, plus one post-paint task (`requestAnimationFrame`, then
+     a `MessageChannel` message);
+   - the target is the last row fully in view after the step. The grid fetches 5 rows above
+     the top and 10 past the bottom, so the new top row is already in the DOM before a 10-row
+     step and would time one frame whatever the backend does. Before each measured step the
+     target must be absent, or the check fails.
+   - Hard limit on every step, warm-up included, and on the first render:
+     `document.querySelectorAll('.tg-row').length <= 200` (the header row is one). The first
+     step over it fails the check and is named. The highest and lowest counts are recorded.
+
+   Pass: p95 < 50 ms over 200 samples.
+3. Mocked backend (`perf/tree.spec.ts`, job "size tree scroll at one million rows"). Playwright
+   @playwright/test 1.64.1, headless Chromium, window 1200 x 800 (the app's). The real
+   `TreeGrid` (`src/views/tree.ts`) is mounted over `mockBackend` with
+   `syntheticPage(view, 1_000_000, offset, limit)` (`src/testing.ts`) in a test page that vite
+   builds into `dist-perf/` (`perf/vite.config.ts`), never into the app's `dist/`. Same steps,
+   boundary, samples, threshold and DOM limit as (2). Results are in the `tree-scroll-1m`
+   artifact and the job summary.
+
+Controls (none lowers a threshold):
+
+- every timing check also judges its own samples against 0 ms, and that verdict must fail;
+- (3) runs a second time over a backend that answers each page 100 ms late, and that run must
+  miss the 50 ms threshold (p50 at least 100 ms). A timing that stopped on a row already shown,
+  or before the page answered, would pass there;
+- variant `row-cap-removed.patch` (below) must fail (2).
+
+Demonstrations, not committed (t2-dev, docker node:22-bookworm, Playwright 1.64.1, before the
+first commit): a copy of (3) with the threshold set to 0.001 ms failed (p95 17.7 ms); with
+`row-cap-removed.patch` applied, (3) failed on the first render ("1001 .tg-row elements in the
+DOM, more than 200").
+
+Results, as measured (workflow "desktop" run 44877232202 at commit 86fafdc; the controls and
+the variant behaved as required). Milliseconds; Rows is the highest `.tg-row` count on any
+step, the header row included:
+
+| Check | Where | n | p50 | p95 | max | Rows | Verdict |
+|---|---|---|---|---|---|---|---|
+| (1) IPC `tree_page`, limit 200 | Linux, ubuntu-22.04, under strace and Xvfb | 100 | 2 | 3 | 10 | | pass |
+| (2) running-app scroll | Linux, ubuntu-22.04, under strace and Xvfb | 200 | 33 | 41 | 46 | 29 | pass |
+| (2) running-app scroll | Windows, windows-latest | 200 | 31.2 | 32.2 | 32.9 | 28 | pass |
+| (3) mocked scroll | headless Chromium 156.0.8078.4, ubuntu-latest | 200 | 16.7 | 17.2 | 19.4 | 29 | pass |
+| (3) control: backend 100 ms late | same | 200 | 133.3 | 133.5 | 136.6 | 29 | misses 50 ms, as required |
+
+Both builds showed 1,000,001 rows before measuring. Linux's WebDriver clock ticks in whole
+milliseconds. The variant run is workflow "e2e-variants" run 44877270665 at 86fafdc. In it,
+`row-cap-removed` failed `timing.synth_1m.scroll_p95` on the first render ("1001 .tg-row
+elements in the DOM, more than 200"), and the other six variants were still caught.
+
+The DOM limit counts every `.tg-row`, selected or not. A grid that keeps the selected row in
+the DOM while it is scrolled away can hold one row more than `MAX_DOM_ROWS` at the cap. At the
+app's window height the grid holds about 28 rows, far under the limit.
+
 Broken variants (workflow "e2e-variants", Linux): each patch in `e2e/variants/` breaks one
 guarantee, and `e2e/expect_variant.py` passes only when the check written for it fails:
 
@@ -298,6 +383,7 @@ guarantee, and `e2e/expect_variant.py` passes only when the check written for it
 | `offered-check-removed.patch` | Start no longer checks that a root was offered | `ipc.refused.root_not_offered`, `ipc.refused.subfolder_of_offered_root` |
 | `capability-broadened.patch` | grants `core:path:default` | `ipc.refused.not_in_capabilities.path` |
 | `focus-broken.patch` | the shorten question no longer takes focus | `settings.save_confirm_keep_escape` |
+| `row-cap-removed.patch` | the size tree's row cap is raised to 1000 and the grid renders up to the cap (a 1000-row buffer). Raising or deleting `MAX_DOM_ROWS` alone changes nothing at the app's window height, where the visible height (about 28 rows) is the binding limit, so the patch also renders the cap | `timing.synth_1m.scroll_p95` |
 
 macOS: no WebDriver exists for an app's WKWebView. Apple's safaridriver drives Safari only,
 and tauri-driver supports Linux and Windows only. On macOS the app is covered by:
