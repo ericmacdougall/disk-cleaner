@@ -140,10 +140,14 @@ differ. Outside the folders it scans, the app writes only this:
 
 - `~/.local/share/io.github.ericmacdougall.prunedisk/`: the web view's private session still stores random salts (storage/salt, mediakeys/v1/salt, CacheStorage/salt, WebKitCache/Version 17/salt), an empty WebKitCache/Version 17/Blobs folder and its HTTPS policy store (hsts-storage.sqlite). No browsing data: the app shows only its own page.
 - `~/.cache/mesa_shader_cache/`: the graphics driver's shader cache, as for any program that draws with Mesa.
+- `~/.cache/mesa_shader_cache_db/`: the same cache in newer Mesa's single-file form.
 - `~/.cache/fontconfig/`: the font cache, when the system's is out of date.
-- `$XDG_RUNTIME_DIR/dconf/user`: the settings system's change flag, in memory, not on disk.
-- `~/.local/share/recently-used.xbel`: the file dialog (GTK) adds the folders and files you pick in it to your recent files, as in every GTK app.
-- `dconf: org.gtk.Settings.FileChooser`: the file dialog saves its own size and view settings when it closes. Not yet observed by the app's checks.
+- `$XDG_RUNTIME_DIR/dconf/user`: the settings system's change flag, in memory, not on disk (in ~/.cache/dconf/user on a system with no runtime folder).
+- `$XDG_RUNTIME_DIR/at-spi2-XXXXXX/`: only while a screen reader or other assistive technology is on: the accessibility bridge's socket for the window, in memory (in ~/.cache on a system with no runtime folder). XXXXXX is six random letters or digits.
+- `~/.local/share/recently-used.xbel`: the file dialog (GTK) adds the folders and files you pick in it to your recent files, as in every GTK app. It writes a temporary recently-used.xbel.XXXXXX (six random letters or digits) beside the list and renames it over the list.
+- `~/.config/gtk-3.0/`: an empty folder the file dialog creates for its bookmarks, when there is none.
+- `~/.config/glib-2.0/settings/`: an empty folder for the settings system's file store, on a system without dconf.
+- `dconf: org.gtk.Settings.FileChooser`: the file dialog saves its own size and view settings when it closes. Not yet observed by the app's checks: the settings service writes it from its own process, which the trace does not follow.
 - `~/.dbus/session-bus/ and /tmp/dbus-*`: only on a system with no desktop session bus, where the system library starts one.
 
 **macOS**
@@ -167,16 +171,24 @@ Recent files (Linux). GTK has a setting that turns its recent-files list off, bu
 the next dialog accept rewrites the account's `recently-used.xbel` empty: the user's existing
 list is erased (measured with GTK 3.24.41: a real file dialog accepted through its Open
 button, with one entry already in the list). So the app leaves the setting alone and lists the
-entry above. ASSUMPTION, not confirmed by the owner: that listing it is the chosen behaviour;
-the alternatives are removing the app's own entries after each dialog, or the desktop portal.
+entry above. The owner chose this ("Keep and disclose", GoodQA goodqa#16452); removing the
+app's own entries after each dialog and the desktop portal are not built.
 
 How the Linux list is checked. `e2e/idle-launch.sh` runs the shipped build (the release binary
 in the end-to-end job) idle for 20 s in a sandbox, with a session bus, under strace, and
 `e2e/trace_report.py` fails on any write outside the declared salts, Blobs folder, HTTPS policy
 store, Mesa and fontconfig caches and dconf flag. In the owner's run of the 682a0ff AppImage
 (Docker on Ubuntu 24.04, not a click-test) that was every write; without a session bus the same
-launch also wrote `~/.dbus/session-bus/` and `/tmp/dbus-*`. The file dialog's writes come only
-from a dialog accepted by a person (the end-to-end suite picks folders through a test hook).
+launch also wrote `~/.dbus/session-bus/` and `/tmp/dbus-*`. The end-to-end suite picks folders
+through a test hook, so the file dialog's writes are checked by the `appimage-hosts` job:
+`e2e/appimage-dialog.sh` runs the AppImage through the same idle launch on bare Fedora 41 and
+Debian 12, opens the real dialog through the accessibility bus and accepts a folder, and the
+trace may then add only the dialog's entries above: the recent-files list and its temporary
+file, the empty `gtk-3.0` and `glib-2.0/settings` folders and the accessibility socket folder.
+A randomly named file is declared as a template (`--declared-temp`), which allows exactly six
+letters or digits in place of `XXXXXX` and nothing else; a neighbouring name still fails. The
+dialog's own settings are written by the settings service, a separate process the trace does
+not follow, so that entry stays "not yet observed".
 
 Webview data. The window is the system webview, which keeps data in folders named after the
 bundle id `io.github.ericmacdougall.prunedisk`. These do not follow `HOME`: WebKit uses the

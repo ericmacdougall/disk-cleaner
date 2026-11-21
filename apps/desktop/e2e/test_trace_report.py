@@ -41,6 +41,55 @@ def report(lines: list[str], *extra: str) -> tuple[int, str]:
     return code, out.getvalue()
 
 
+RECENT = f"{SB}/data/recently-used.xbel"
+TEMPS = ("--declared", RECENT, "--declared-temp", f"{RECENT}.XXXXXX", "--declared-temp", "/run/user/1000/at-spi2-XXXXXX")
+
+
+class Templates(unittest.TestCase):
+    """--declared-temp: GLib's randomly named files and folders, and nothing next to them."""
+
+    def test_glibs_temporary_file_renamed_over_a_declared_file_passes(self):
+        # g_file_set_contents as the GTK file dialog ran it on Debian 12 (bundle fixer's dialog check).
+        code, out = report([
+            f'1234  openat(AT_FDCWD</>, "{RECENT}.Q7ZK2B", O_RDWR|O_CREAT|O_EXCL, 0666) = 9<{RECENT}.Q7ZK2B>',
+            f'1234  fallocate(9<{RECENT}.Q7ZK2B>, 0, 0, 762) = 0',
+            f'1234  rename("{RECENT}.Q7ZK2B", "{RECENT}") = 0',
+        ], *TEMPS)
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, rf"(?m)^declared .*: {re.escape(RECENT)}\.Q7ZK2B$")
+
+    def test_the_accessibility_bridges_folder_and_socket_pass(self):
+        code, out = report([
+            '1234  mkdir("/run/user/1000/at-spi2-aB3dE9", 0700) = 0',
+            '1234  chmod("/run/user/1000/at-spi2-aB3dE9/socket", 0666) = 0',
+        ], *TEMPS)
+        self.assertEqual(code, 0, out)
+
+    def test_a_neighbour_of_a_template_fails(self):
+        for p in (f"{RECENT}.Q7ZK2",       # five characters
+                  f"{RECENT}.Q7ZK2BX",     # seven
+                  f"{RECENT}.Q7-K2B",      # not a letter or digit
+                  f"{RECENT}.Q7ZK2B.bak",  # a further name on the file
+                  f"{RECENT}XQ7ZK2B",      # the dot is part of the template
+                  f"{SB}/data/other.xbel.Q7ZK2B",
+                  f"{SB}/data/x/recently-used.xbel.Q7ZK2B",
+                  "/run/user/1000/at-spi2-aB3dE9x/socket",
+                  "/run/user/1001/at-spi2-aB3dE9/socket"):
+            code, out = report([f'1234  openat(AT_FDCWD</>, "{p}", O_WRONLY|O_CREAT, 0644) = 9<{p}>'], *TEMPS)
+            self.assertEqual(code, 1, f"{p}: {out}")
+            self.assertRegex(out, rf"(?m)^OTHER .*: {re.escape(p)}$")
+
+    def test_a_template_is_not_a_folder_declaration(self):
+        # The folder holding a template is not declared: a write beside the template fails.
+        code, out = report([f'1234  openat(AT_FDCWD</>, "{SB}/data/notes.txt", O_WRONLY|O_CREAT, 0644) = 9<{SB}/data/notes.txt>'], *TEMPS)
+        self.assertEqual(code, 1, out)
+
+    def test_a_template_must_end_in_six_xs(self):
+        for bad in (f"{RECENT}.XXXXX", f"{RECENT}.*", f"{SB}/data/XXXXXX/x"):
+            code, _ = report(['1234  openat(AT_FDCWD</>, "/etc/hosts", O_RDONLY) = 8</etc/hosts>'], "--declared-temp", bad)
+            self.assertEqual(code, 2, bad)
+
+
 class Observer(unittest.TestCase):
     def test_declared_writes_and_reads_pass(self):
         code, out = report([
@@ -235,6 +284,21 @@ class Contract(unittest.TestCase):
         self.assertGreaterEqual(len(declared), 9, declared)
         for tail in declared:
             self.assertIn(tail.removesuffix("-journal"), listed, f"idle-launch.sh declares {tail}; src/writes.ts does not list it")
+
+    def test_every_path_the_dialog_check_declares_is_in_the_apps_own_list(self):
+        # e2e/appimage-dialog.sh adds the file dialog's writes through IDLE_DECLARE; each must be
+        # one the app tells the user about (the user chose to keep GTK's behaviour and disclose it).
+        here = Path(__file__).resolve().parent
+        script = (here / "appimage-dialog.sh").read_text()
+        listed = (here.parent / "src" / "writes.ts").read_text()
+        block = re.search(r'export IDLE_DECLARE="([^"]*)"', script)
+        self.assertIsNotNone(block, "appimage-dialog.sh sets no IDLE_DECLARE")
+        lines = [ln for ln in block.group(1).splitlines() if ln.strip()]
+        self.assertGreaterEqual(len(lines), 5, lines)
+        for ln in lines:
+            m = re.fullmatch(r'\$(?:RESULT/launch/sandbox/(?:data|config|cache)|RUN_DIR)/(.+)', ln.strip())
+            self.assertIsNotNone(m, f"IDLE_DECLARE line outside the sandbox and runtime folder: {ln}")
+            self.assertIn(m.group(1), listed, f"appimage-dialog.sh declares {m.group(1)}; src/writes.ts does not list it")
 
     def test_the_scripts_take_the_call_list_from_the_observer_and_gate_on_it(self):
         here = Path(__file__).resolve().parent

@@ -130,9 +130,16 @@ $extract
 cd "$W/chosen-by-dialog"
 export RESULT="$RESULT" WEBKIT_DISABLE_COMPOSITING_MODE=1
 export IDLE_DRIVER="bash '$HERE/appimage-dialog.sh' --driver"
-# Accepting the dialog adds the folder to GTK's recently used list (XDG_DATA_HOME/recently-used.xbel,
-# written through a temporary file in the same folder): GTK's own record of a pick, not the user's data.
-export IDLE_DECLARE="$RESULT/launch/sandbox/data/recently-used.xbel"
+# What the dialog adds, each listed in src/writes.ts (shown in Settings; the user chose to keep
+# GTK's behaviour and disclose it, GoodQA #16452). Accepting the dialog adds the folder to GTK's
+# recently used list, written through a temporary recently-used.xbel.XXXXXX renamed over it; the
+# dialog makes empty gtk-3.0 (bookmarks) and, without dconf, glib-2.0/settings folders; the
+# accessibility bridge this check turns on (as a screen reader would) makes its socket folder.
+export IDLE_DECLARE="$RESULT/launch/sandbox/data/recently-used.xbel
+$RESULT/launch/sandbox/data/recently-used.xbel.XXXXXX
+$RESULT/launch/sandbox/config/gtk-3.0
+$RESULT/launch/sandbox/config/glib-2.0/settings
+$RUN_DIR/at-spi2-XXXXXX"
 bash "$HERE/idle-launch.sh" "$W/squashfs-root/AppRun" "$RESULT/launch"
 EOF
 observer=0
