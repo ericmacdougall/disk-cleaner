@@ -19,6 +19,8 @@ EXPECT = {
     "offered-check-removed": (["ipc.refused.root_not_offered", "ipc.refused.subfolder_of_offered_root"], None),
     "capability-broadened": (["ipc.refused.not_in_capabilities.path"], None),
     "focus-broken": (["settings.save_confirm_keep_escape"], None),
+    # PR gate F8: the question opened without showModal, inert or the Tab trap.
+    "modal-trap-removed": (["settings.confirm_focus_contained"], None),
 }
 
 

@@ -1,13 +1,15 @@
 // Settings (spec AC-5, NEG-4, NEG-5, NEG-14). Two core keys (active window, git admin limit)
 // are saved to core's config file only on Save and only when changed; the app's scan settings
 // are its own. While a save is pending the form is disabled (no double save, no edit lost in
-// flight). Shortening the active window asks first; Escape or "Keep" keeps the old window and
-// the draft. After a save the form shows what the file now holds.
+// flight). Shortening the active window asks first, in the app's one modal question
+// (src/modal.ts); Escape or "Keep" keeps the old window and the draft. After a save the form
+// shows what the file now holds.
 
 import type { AppSettings, Backend, CoreChanges, SettingsPayload } from "../api";
 import { errorKind, errorMessage } from "../api";
 import { h, replace } from "../dom";
 import { formatBytes } from "../format";
+import { showModal } from "../modal";
 
 const MIB = 1024 * 1024;
 
@@ -69,7 +71,6 @@ export class SettingsForm {
   private fields: HTMLFieldSetElement;
   private message: HTMLElement;
   private facts: HTMLElement;
-  private dialog: HTMLElement;
   private inputs: Record<keyof Draft, HTMLInputElement>;
   private current: SettingsPayload | null = null;
   pending = false;
@@ -92,7 +93,6 @@ export class SettingsForm {
       h("div", { class: "field" }, h("label", { for: id }, label), input, h("p", { id: `${id}-help`, class: "help" }, help));
     this.message = h("p", { role: "status", "aria-live": "polite", class: "message" });
     this.facts = h("div", { class: "facts" });
-    this.dialog = h("div", { class: "confirm", hidden: true });
     this.fields = h(
       "fieldset",
       {},
@@ -106,7 +106,7 @@ export class SettingsForm {
       h("button", { type: "submit", class: "primary" }, "Save"),
     );
     this.form = h("form", { "aria-label": "Settings", onsubmit: (e) => { e.preventDefault(); void this.save(false); } }, this.fields);
-    this.el = h("section", { class: "settings", "aria-label": "Settings" }, h("h2", {}, "Settings"), this.form, this.dialog, this.message, this.facts);
+    this.el = h("section", { class: "settings", "aria-label": "Settings" }, h("h2", {}, "Settings"), this.form, this.message, this.facts);
   }
 
   draft(): Draft {
@@ -120,6 +120,9 @@ export class SettingsForm {
   }
 
   async load(): Promise<void> {
+    // A re-render of the app (a scan event) shows this form again and loads it; while a save is
+    // pending or the shorten question is open, the draft stays as it is (PR gate F8).
+    if (this.pending || this.confirming) return;
     try {
       const p = await this.backend.getSettings();
       this.show(p);
@@ -196,16 +199,15 @@ export class SettingsForm {
     }
   }
 
+  /** Ask before shortening the active window, through the app's one modal primitive (PR gate
+   * F8): nothing behind the question can be reached until it is answered. */
   private confirm(e: { old?: number; new?: number; message: string }, c: { core: CoreChanges; app: AppSettings }): void {
     this.confirming = true;
     this.message.textContent = "";
-    const keep = h("button", { type: "button", onclick: () => close(false) }, `Keep ${e.old ?? ""} days`);
-    const shorten = h("button", { type: "button", class: "primary", onclick: () => close(true) }, `Shorten to ${e.new ?? ""} days`);
-    const close = (go: boolean) => {
+    const answer = (go: boolean) => {
       if (!this.confirming) return;
       this.confirming = false;
-      this.dialog.hidden = true;
-      replace(this.dialog);
+      modal.close(this.inputs.activeWindowDays);
       if (go) {
         void this.submit(c, true).then(() => this.inputs.activeWindowDays.focus());
       } else {
@@ -214,26 +216,14 @@ export class SettingsForm {
         this.message.textContent = "Not saved: the active window was kept.";
       }
     };
-    replace(
-      this.dialog,
-      h(
-        "div",
-        {
-          role: "alertdialog",
-          "aria-modal": "true",
-          "aria-labelledby": "confirm-title",
-          "aria-describedby": "confirm-text",
-          onkeydown: (ev) => {
-            if ((ev as KeyboardEvent).key === "Escape") close(false);
-          },
-        },
-        h("h3", { id: "confirm-title" }, "Shorten the active window?"),
-        h("p", { id: "confirm-text" }, e.message),
-        keep,
-        shorten,
-      ),
-    );
-    this.dialog.hidden = false;
-    keep.focus();
+    const modal = showModal({
+      title: "Shorten the active window?",
+      text: e.message,
+      buttons: [
+        { label: `Keep ${e.old ?? ""} days`, initial: true, onClick: () => answer(false) },
+        { label: `Shorten to ${e.new ?? ""} days`, primary: true, onClick: () => answer(true) },
+      ],
+      onCancel: () => answer(false),
+    });
   }
 }
