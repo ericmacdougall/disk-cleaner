@@ -19,6 +19,7 @@ path = "src/main.rs"
 broken-verify = []        # verified_put skips the size and checksum comparison
 broken-commit-order = []  # receipts go out after the .idx alone, before the .files commit
 broken-pack-offset = []   # the pack writer records an off-by-one segment offset
+broken-retry = []         # a retried put skips the stat that finds an already-stored object
 
 [dependencies]
 blake3 = "1.8"

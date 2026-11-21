@@ -258,7 +258,7 @@ pub fn verified_put(
     };
     let mut attempt = 0u32;
     loop {
-        if attempt > 0 {
+        if attempt > 0 && !cfg!(feature = "broken-retry") {
             match t.stat(key) {
                 Ok(Some(o)) if check_remote(&o, key, size, kind, &local).is_ok() => {
                     return Ok(done())

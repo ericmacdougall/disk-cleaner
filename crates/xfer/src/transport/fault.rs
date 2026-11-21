@@ -21,8 +21,10 @@ pub enum HashFault {
 pub struct FaultConfig {
     /// 0-based put numbers whose response is lost: the object is stored, the caller gets an error.
     pub lose_response: HashSet<u64>,
-    /// The first N puts fail with a throttling error (nothing stored).
+    /// The first N puts of keys starting with `throttle_prefix` (empty: every key) fail with a
+    /// throttling error (nothing stored).
     pub throttle_first: u64,
+    pub throttle_prefix: String,
     /// How stat and list report checksums for keys starting with `hash_prefix`.
     pub hash_fault: HashFault,
     pub hash_prefix: String,
@@ -41,6 +43,8 @@ pub struct Faulty {
     inner: Arc<dyn Transport>,
     cfg: Mutex<FaultConfig>,
     pub puts: AtomicU64,
+    /// puts that matched `throttle_prefix` so far
+    throttle_seen: AtomicU64,
     pub stored: AtomicU64,
     pub put_keys: Mutex<Vec<String>>,
 }
@@ -51,6 +55,7 @@ impl Faulty {
             inner,
             cfg: Mutex::new(cfg),
             puts: AtomicU64::new(0),
+            throttle_seen: AtomicU64::new(0),
             stored: AtomicU64::new(0),
             put_keys: Mutex::new(Vec::new()),
         }
@@ -98,12 +103,9 @@ impl Transport for Faulty {
             let c = self.cfg.lock().expect("fault cfg");
             let delay = c.put_delay.filter(|_| key.starts_with(&c.slow_prefix));
             let fail = !c.fail_put_prefix.is_empty() && key.starts_with(&c.fail_put_prefix);
-            (
-                n < c.throttle_first,
-                c.lose_response.contains(&n),
-                delay,
-                fail,
-            )
+            let throttle = key.starts_with(&c.throttle_prefix)
+                && self.throttle_seen.fetch_add(1, Ordering::SeqCst) < c.throttle_first;
+            (throttle, c.lose_response.contains(&n), delay, fail)
         };
         if let Some(d) = delay {
             std::thread::sleep(d);
