@@ -177,6 +177,18 @@ describe("status line (CT-F6, CT-c)", () => {
     expect(live(app)).toBe("");
   });
 
+  it("Add folders is disabled while a file is read, so the read's answer is not superseded", async () => {
+    const d = deferred<CurrentState | null>();
+    const app = await mount({ openScanFile: () => d.promise });
+    button(app, "Open a scan file...").click();
+    await flush(2);
+    expect(button(app, "Add folders...").disabled).toBe(true);
+    d.reject({ kind: "failed", message: "not a scan file" });
+    await flush(5);
+    expect(button(app, "Add folders...").disabled).toBe(false);
+    expect(live(app)).toBe("Cannot open that scan file: not a scan file");
+  });
+
   it("a plan-export confirmation stays while the user changes tab in the same results", async () => {
     const app = await mount({ currentState: async () => LOADED, exportPlan: async () => "/out/p.json" });
     button(app, "Export plan...").click();

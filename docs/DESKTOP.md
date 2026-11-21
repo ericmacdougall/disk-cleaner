@@ -99,7 +99,10 @@ or `XDG_CONFIG_HOME` (Linux: `$XDG_CONFIG_HOME/disk-cleaner/`, else `~/.config/d
   `max_git_admin_bytes` change), `config.toml.bak` (the text Settings loaded),
   `config.toml.lock` (the save lock; it stays, empty, by design) and, during the save, a temp
   file that is renamed over `config.toml` or removed;
-- a plan export, always a new file, in the folder chosen for it.
+- a plan export, always a new file, in the folder chosen for it. The app then says
+  "Plan exported to <the file>. Nothing else was changed." Every file and folder dialog
+  starts in your Documents folder, or your home folder when there is none; the app does not
+  remember the last folder used.
 
 Webview data. The window is the system webview, which keeps data in folders named after the
 bundle id `io.github.ericmacdougall.prunedisk`. These do not follow `HOME`: WebKit uses the
@@ -231,8 +234,11 @@ One session (`e2e/run.mjs`) covers these flows, in order:
 5. Page the developer view (Next and Previous), keeping focus on the pager, then switch class.
 6. In Settings: save a longer window, then try a shorter one three times, answering with
    Escape, Keep and Shorten. Each answer checks focus and the saved value.
-7. Export the plan, then try a second export, which is cancelled and writes nothing.
-8. Open a valid scan file, a malformed one (focus returns to Open) and a cancelled one.
+7. Export the plan (the message names the file and says nothing else changed), then New
+   scan: the chooser shows no status from the results.
+8. Open a valid scan file (no status left from the read), try a second export, which is
+   cancelled and writes and says nothing, then New scan and Add folders (no status from the
+   import), a malformed file (focus returns to Open) and a cancelled one.
 9. Check that the CSP blocks inline script.
 
 axe-core 4.14 runs on the chooser, each view and the imported developer view; any violation

@@ -1,17 +1,37 @@
-//! Where native file dialogs start (click test CT-F3). RED STUB: this reproduces the behaviour
-//! of 0112370, where no dialog sets a start folder, so the dialog opens in the process's
-//! working folder (for an AppImage, its own read-only mount). The fix replaces it.
+//! Every native file dialog of the app is built here (click test CT-F3). Each one starts in the
+//! user's documents folder, or the home folder when there is none, on every system; never in
+//! the folder the app was started from (an AppImage starts in its own read-only mount). Nothing
+//! remembers a last folder: the start is worked out again for each dialog, and nothing is
+//! written.
 
 use std::path::PathBuf;
+use tauri::{AppHandle, Runtime};
+use tauri_plugin_dialog::{DialogExt, FileDialogBuilder};
 
-/// The start folder chosen from the candidates. Today: none.
-pub fn start_dir_from(_documents: Option<PathBuf>, _home: Option<PathBuf>) -> Option<PathBuf> {
-    None
+/// The first candidate that is an absolute path to an existing folder: `documents`, else
+/// `home`. `None` when neither is.
+pub fn start_dir_from(documents: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    [documents, home]
+        .into_iter()
+        .flatten()
+        .find(|p| p.is_absolute() && p.is_dir())
 }
 
-/// Where every dialog starts on this machine. Today: none.
+/// Where every dialog starts on this machine: the documents folder (Linux: XDG_DOCUMENTS_DIR
+/// of user-dirs.dirs; macOS: ~/Documents; Windows: the Documents known folder), else home.
+/// These are the folders tauri's own `document_dir` and `home_dir` name (same crate).
 pub fn start_dir() -> Option<PathBuf> {
     start_dir_from(dirs::document_dir(), dirs::home_dir())
+}
+
+/// A file dialog with `title`, starting in `start_dir()`. When no start folder is known the
+/// system's own default is left (the dialog is never pointed anywhere else).
+pub fn file_dialog<R: Runtime>(app: &AppHandle<R>, title: &str) -> FileDialogBuilder<R> {
+    let dialog = app.dialog().file().set_title(title);
+    match start_dir() {
+        Some(dir) => dialog.set_directory(dir),
+        None => dialog,
+    }
 }
 
 #[cfg(test)]

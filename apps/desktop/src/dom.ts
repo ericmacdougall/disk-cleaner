@@ -43,8 +43,3 @@ export function replace(el: Element, ...children: Child[]): void {
   el.replaceChildren();
   append(el, ...children);
 }
-
-/** A polite live region message (status lines). */
-export function announce(region: Element, text: string): void {
-  region.textContent = text;
-}
