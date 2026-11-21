@@ -10,7 +10,9 @@ Subcommands (all read their inputs from the environment the workflow sets, see e
   meta               decide tag, version, commit and whether this run may create a draft release
   package            write dist/SHA256SUMS and fill in the release notes
   check-attestations run the published verification command against every file in SHA256SUMS
-  check-binding      the tag on the remote still points at the commit that was built
+  check-binding      the tag on the remote still points at the commit that was built (with
+                     --after-create: if not, delete this run's draft, by identity, and fail)
+  create-draft       create the draft release, upload every file, record the release's identity
   lint-workflow      static checks over release.yml (also run by the tests)
 
 These guards are hygiene. They run from the workflow file in the tagged commit, so someone who can
@@ -28,6 +30,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -42,6 +45,7 @@ RELEASE_WORKFLOW = ".github/workflows/release.yml"
 CI_WORKFLOW_FILE = "ci.yml"
 CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
 SUMS = "SHA256SUMS"
+IDENTITY_FILE = "release-identity.json"
 PLACEHOLDERS = ("BIN", "TAG", "VERSION", "REPO", "SHA")
 
 
@@ -398,8 +402,8 @@ def package(dist, template_path, notes_out, tag, version, sha, bin_name, repo):
 # check-binding
 
 
-def check_binding(tag, sha, remote="origin", cwd=None, after_create=False, run=None, repo=None,
-                  out=sys.stdout):
+def check_binding(tag, sha, remote="origin", cwd=None, after_create=False, api=None, repo=None,
+                  identity_path=IDENTITY_FILE, out=sys.stdout):
     validate_tag(tag)
     validate_sha(sha)
     at = remote_tag_commit(remote, tag, cwd)
@@ -408,13 +412,148 @@ def check_binding(tag, sha, remote="origin", cwd=None, after_create=False, run=N
         return
     why = "tag %s now points at %s, not at the built commit %s" % (tag, at or "nothing", sha)
     if after_create:
-        # The draft was made for a tag that moved: remove that draft (only a draft) and fail.
-        if run is None:
-            run = lambda args: subprocess.run(args).returncode  # noqa: E731
-        repo = validate_repo(repo or "")
-        rc = run(["gh", "release", "delete", tag, "--repo", repo, "--yes"])
-        why += "; the draft just created was %s" % ("deleted" if rc == 0 else "NOT deleted, delete it by hand")
+        # The draft this run made hangs on a tag that moved. Remove exactly that release, and only
+        # while it is still an unpublished draft with the identity recorded when it was created.
+        with open(identity_path, encoding="utf-8") as f:
+            identity = json.load(f)
+        try:
+            why += "; " + cleanup_draft(api, validate_repo(repo or ""), identity)
+        except GuardError as e:
+            why += "; %s" % e
     raise GuardError(why)
+
+
+# ---------------------------------------------------------------------------------------------
+# create-draft and its cleanup. A release is identified by the id GitHub returned when this run
+# created it (plus its tag, author, creation time and node id), never by its tag name alone, and
+# only a release that is still a draft with that exact identity is ever deleted.
+
+IDENTITY_KEYS = ("id", "node_id", "tag_name", "created_at", "author")
+RELEASE_TITLE = "PruneDisk %s"
+
+
+class GitHubAPI:
+    """Minimal REST client. The token goes only to the API host and GitHub's upload host."""
+
+    def __init__(self, token, api="https://api.github.com", transport=None):
+        self.api = api.rstrip("/")
+        parsed = urllib.parse.urlparse(self.api)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise GuardError("API URL %r is not https" % (api,))
+        self.hosts = {parsed.hostname}
+        if parsed.hostname == "api.github.com":
+            self.hosts.add("uploads.github.com")
+        self.token = token
+        self.transport = transport or self._urllib
+
+    def _urllib(self, method, url, data, headers):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def call(self, method, url, body=None, raw=None, content_type="application/json"):
+        if not url.startswith("https://"):
+            url = self.api + url
+        host = urllib.parse.urlparse(url).hostname
+        if host not in self.hosts:
+            raise GuardError("refusing to send the token to %s" % host)
+        data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+        headers = {"Accept": "application/vnd.github+json", "Authorization": "Bearer " + self.token,
+                   "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "release-guard"}
+        if data is not None:
+            headers["Content-Type"] = content_type
+        status, payload = self.transport(method, url, data, headers)
+        try:
+            parsed = json.loads(payload.decode() or "null") if payload else None
+        except ValueError:
+            parsed = None
+        return status, parsed
+
+
+def identity_of(release):
+    return {"id": release.get("id"), "node_id": release.get("node_id"), "tag_name": release.get("tag_name"),
+            "created_at": release.get("created_at"), "author": (release.get("author") or {}).get("login")}
+
+
+def cleanup_draft(api, repo, identity):
+    """Delete the release this run created, if and only if it is still that same draft."""
+    rid = identity.get("id")
+    if not isinstance(rid, int):
+        raise GuardError("no recorded release id; nothing deleted")
+    status, rel = api.call("GET", "/repos/%s/releases/%d" % (repo, rid))
+    if status == 404:
+        return "release %d no longer exists; nothing deleted" % rid
+    if status != 200 or not isinstance(rel, dict):
+        raise GuardError("could not read release %d (HTTP %s); NOT deleted, check it by hand" % (rid, status))
+    if rel.get("draft") is not True:
+        raise GuardError("release %d is no longer a draft (published?); NOT deleted, check it by hand" % rid)
+    now = identity_of(rel)
+    changed = [k for k in IDENTITY_KEYS if now.get(k) != identity.get(k)]
+    if changed:
+        raise GuardError("release %d changed (%s) since this run created it; NOT deleted" % (rid, ", ".join(changed)))
+    status, _ = api.call("DELETE", "/repos/%s/releases/%d" % (repo, rid))
+    if status != 204:
+        raise GuardError("deleting draft %d failed (HTTP %s); delete it by hand" % (rid, status))
+    return "the draft this run created (release %d) was deleted; the tag is untouched" % rid
+
+
+def release_files(dist):
+    names = sorted(os.listdir(dist))
+    for n in names:
+        p = os.path.join(dist, n)
+        if not NAME_RE.fullmatch(n) or os.path.islink(p) or not os.path.isfile(p):
+            raise GuardError("%r in %s is not a plain file to publish" % (n, dist))
+    if SUMS not in names or len(names) < 2:
+        raise GuardError("%s must hold %s and the archives" % (dist, SUMS))
+    return names
+
+
+def create_draft(api, repo, tag, dist, notes_path, identity_path=IDENTITY_FILE, out=sys.stdout):
+    """Create a draft release for an existing tag, upload every file in dist, and record its identity.
+
+    Returns the identity. On any failure after the draft exists, removes that draft (by identity)
+    and fails.
+    """
+    validate_tag(tag)
+    validate_repo(repo)
+    names = release_files(dist)
+    with open(notes_path, encoding="utf-8") as f:
+        notes = f.read()
+    status, rel = api.call("POST", "/repos/%s/releases" % repo, {
+        "tag_name": tag, "name": RELEASE_TITLE % tag, "body": notes, "draft": True,
+        "prerelease": is_prerelease(tag)})
+    if status != 201 or not isinstance(rel, dict):
+        raise GuardError("creating the draft failed (HTTP %s): %s" % (status, str(rel)[:300]))
+    identity = identity_of(rel)
+    with open(identity_path, "w", encoding="utf-8") as f:
+        json.dump(identity, f)
+    try:
+        if rel.get("draft") is not True or rel.get("tag_name") != tag:
+            raise GuardError("GitHub did not create a draft for %s" % tag)
+        upload = str(rel.get("upload_url") or "").split("{", 1)[0]
+        for n in names:
+            with open(os.path.join(dist, n), "rb") as f:
+                data = f.read()
+            st, asset = api.call("POST", upload + "?" + urllib.parse.urlencode({"name": n}), raw=data,
+                                 content_type="application/octet-stream")
+            if st != 201 or not isinstance(asset, dict) or asset.get("name") != n or asset.get("size") != len(data):
+                raise GuardError("uploading %s failed (HTTP %s)" % (n, st))
+        st, now = api.call("GET", "/repos/%s/releases/%d" % (repo, identity["id"]))
+        now = now if isinstance(now, dict) else {}
+        got = sorted(str(a.get("name")) for a in now.get("assets", []))
+        if st != 200 or now.get("draft") is not True or got != names:
+            raise GuardError("the draft does not hold exactly the files built (HTTP %s, assets %s)" % (st, got))
+    except Exception as e:
+        try:
+            note = cleanup_draft(api, repo, identity)
+        except GuardError as c:
+            note = str(c)
+        raise GuardError("%s; %s" % (e, note))
+    print("draft=true release_id=%d assets=%d (%s)" % (identity["id"], len(names), ", ".join(names)), file=out)
+    return identity
 
 
 # ---------------------------------------------------------------------------------------------
@@ -426,8 +565,11 @@ GUARD_LINES = {
     "package": ["python3 -I .github/scripts/release_meta.py package",
                 "python3 -I .github/scripts/release_meta.py check-attestations"],
     "draft-release": ["python3 -I .github/scripts/release_meta.py check-binding",
+                      "python3 -I .github/scripts/release_meta.py create-draft",
                       "python3 -I .github/scripts/release_meta.py check-binding --after-create"],
 }
+# Releases are created and removed only by release_meta.py (draft only, removal by identity).
+RELEASE_WRITES = re.compile(r"\bgh\s+(release|api)\b|\bcurl\b[^\n]*/releases")
 GUARD_STEP_KEYS = {"name", "id", "env", "run"}
 GATED_JOBS = ("meta", "build", "package", "draft-release")
 NEEDS = {"build": "meta", "package": "[meta, build]", "draft-release": "[meta, package]"}
@@ -503,6 +645,8 @@ def lint_workflow(text, strict=True):
         for rx, what in NESTED_SINKS:
             if rx.search(script):
                 problems.append("line %d: %s" % (line, what))
+        if strict and RELEASE_WRITES.search(script):
+            problems.append("line %d: release created, changed or deleted outside release_meta.py" % line)
     if not strict:
         return problems
 
@@ -544,15 +688,11 @@ def lint_workflow(text, strict=True):
     if draft:
         order = [s for _, s in run_blocks(draft)]
         try:
-            before = order.index(GUARD_LINES["draft-release"][0])
-            create = next(i for i, s in enumerate(order) if "gh release create" in s)
-            after = order.index(GUARD_LINES["draft-release"][1])
+            before, create, after = (order.index(g) for g in GUARD_LINES["draft-release"])
             if not before < create < after:
                 problems.append("draft-release: binding checks are not before and after the create")
-        except (ValueError, StopIteration):
+        except ValueError:
             problems.append("draft-release: binding checks or create step missing")
-        if "--draft" not in draft:
-            problems.append("draft-release does not pass --draft")
     if len(re.findall(r"^\s+contents: write\s*$", text, re.M)) != 1 or "contents: write" not in draft:
         problems.append("contents: write must appear once, in draft-release")
     pkg = jobs.get("package", "")
@@ -576,6 +716,9 @@ def main(argv=None):
     ca.add_argument("--dist", default="dist")
     cb = sub.add_parser("check-binding")
     cb.add_argument("--after-create", action="store_true")
+    cd = sub.add_parser("create-draft")
+    cd.add_argument("--dist", default="out/dist")
+    cd.add_argument("--notes", default="out/dist-notes.md")
     vt = sub.add_parser("validate-tag")
     vt.add_argument("tag")
     lw = sub.add_parser("lint-workflow")
@@ -597,8 +740,13 @@ def main(argv=None):
             check_attestations(a.dist, env.get("GITHUB_REPOSITORY", ""), env.get("TAG", ""),
                                env.get("PUBLISH", ""), env.get("GITHUB_REF", ""))
         elif a.cmd == "check-binding":
-            check_binding(env.get("TAG", ""), env.get("SHA", ""), after_create=a.after_create,
+            api = GitHubAPI(env.get("GH_TOKEN", ""), env.get("GITHUB_API_URL", "https://api.github.com")) \
+                if a.after_create else None
+            check_binding(env.get("TAG", ""), env.get("SHA", ""), after_create=a.after_create, api=api,
                           repo=env.get("GITHUB_REPOSITORY", ""))
+        elif a.cmd == "create-draft":
+            api = GitHubAPI(env.get("GH_TOKEN", ""), env.get("GITHUB_API_URL", "https://api.github.com"))
+            create_draft(api, env.get("GITHUB_REPOSITORY", ""), env.get("TAG", ""), a.dist, a.notes)
         elif a.cmd == "validate-tag":
             validate_tag(a.tag)
         elif a.cmd == "lint-workflow":

@@ -944,7 +944,10 @@ class TestReleaseWorkflow(unittest.TestCase):
         draft = self.y[self.y.index("  draft-release:"):self.y.index("  crates-dry-run:")]
         self.assertIn("contents: write", draft)
         self.assertIn("needs.meta.outputs.publish == 'true'", draft)
-        self.assertIn("--draft", draft)
+        # The release is made only by release_meta.py create-draft, which always posts draft: true
+        # (tested in .github/scripts/test_release_meta.py, TestCreateDraft).
+        self.assertIn("release_meta.py create-draft", draft)
+        self.assertNotRegex(self.y, r"\bgh release (create|delete|edit)\b")
 
     def test_rehearsal_never_publishes(self):
         self.assertIn("workflow_dispatch:", self.y)
@@ -993,7 +996,7 @@ class TestReleaseWorkflow(unittest.TestCase):
         self.assertIn("PruneDisk", first)
         flat = re.sub(r"\s+", " ", self.notes)
         self.assertRegex(flat, r"still called `@BIN@`; it will be renamed to `prunedisk`")
-        self.assertIn('--title "PruneDisk $TAG"', self.y)
+        self.assertEqual(load_release_meta().RELEASE_TITLE % "v1.2.3", "PruneDisk v1.2.3")
 
     def test_notes_say_what_the_attestation_does_not_prove(self):
         flat = re.sub(r"\s+", " ", self.notes)
@@ -1032,6 +1035,23 @@ class TestReleaseWording(unittest.TestCase):
         for name, flat in self.texts.items():
             self.assertNotRegex(flat, self.TAG_MAKES_RELEASE, name)
             self.assertNotRegex(flat, self.PRESENT_TENSE_DOWNLOAD, name)
+
+    # Sentences that are false inside a published release (the README is packaged in every archive).
+    STALE_IN_A_RELEASE = re.compile(
+        r"(?i)(?<!lists )\bno (tagged )?release\b|download page yet|installers and releases|not released")
+
+    def packaged_files(self):
+        y = read(RELEASE_YML)
+        m = re.search(r'^\s*cp "target/\$TARGET/release/\$\{BIN_NAME\}\$\{EXT\}" (.+) "dist/\$name/"\s*$', y, re.M)
+        self.assertIsNotNone(m, "release.yml: the staging cp line changed; update this test")
+        return m.group(1).split()
+
+    def test_everything_packaged_reads_true_in_a_release(self):
+        files = self.packaged_files()
+        self.assertIn("README.md", files)
+        for rel in files:
+            flat = re.sub(r"\s+", " ", read(ROOT / rel))
+            self.assertNotRegex(flat, self.STALE_IN_A_RELEASE, rel + " is packaged in every release archive")
 
     def test_readme_and_site_say_a_tag_makes_a_draft(self):
         for name in ("README.md", "site/index.html"):

@@ -71,9 +71,11 @@ command with `--source-ref refs/tags/<rehearsal name>` must fail while the same 
 own branch ref must pass (step "Check the published verification command"). Its `meta` step prints
 what a tag on that commit would be refused for.
 
-Never push a `v*` tag to rehearse: the tag rules make it permanent. The tag-to-draft path has
-therefore not run yet. **The first real tag is the first execution of the draft step**, and that step
-only creates a draft. If it fails, nothing is public; fix it and release the next patch version.
+Never push a `v*` tag here to rehearse: the tag rules make it permanent. The tag-to-draft path is
+rehearsed only in a separate, disposable repository with the same rules (its slug differs, so its
+attestations say nothing about this repository). **In this repository the first real tag is the
+first execution of the draft step**, and that step only creates a draft. If it fails, nothing is
+public; fix it and release the next patch version.
 
 The `crates-dry-run` job in the same run is the crates.io check (below). It does not block.
 
@@ -93,7 +95,9 @@ The `crates-dry-run` job in the same run is the crates.io check (below). It does
    that commit succeeded; and the tag on GitHub still points at that commit (lightweight and
    annotated tags are both peeled to the commit). Every later job checks out that commit, and the
    draft job checks again, just before and just after creating the draft, that the tag still points
-   at it (if not, it deletes the draft it made and fails).
+   at it. If it moved, the job fails, and it deletes only the release it created, found by the id it
+   recorded, and only while that release is still an unchanged draft. A release that was published,
+   edited or replaced meanwhile is never deleted; the job fails and says so.
 4. The workflow creates a **draft** release with the archives, `SHA256SUMS` and the notes, titled
    `PruneDisk vX.Y.Z`. Nothing is public yet. Read it: the notes name the commit; check it is the one
    you meant (`git rev-parse vX.Y.Z^{commit}`). Download one archive and verify it:
@@ -106,8 +110,10 @@ The `crates-dry-run` job in the same run is the crates.io check (below). It does
 5. Update the status wording in `README.md` and `site/index.html` only if it no longer reads true
    (the download text is written to be true with or without a release).
 
-Rollback: before publishing, delete the draft (`gh release delete vX.Y.Z`, without `--cleanup-tag`;
-the tag cannot be deleted anyway). After publishing, the assets and the tag cannot be changed or
+Rollback: before publishing, first check it is still a draft
+(`gh release view vX.Y.Z --json isDraft` must say `true`), then delete it
+(`gh release delete vX.Y.Z`, without `--cleanup-tag`; the tag cannot be deleted anyway). Never
+delete a published release to roll back. After publishing, the assets and the tag cannot be changed or
 removed: supersede the release with a new patch version (fix on `main`, bump, tag `vX.Y.(Z+1)`), say
 in the new notes what was wrong with the old one, and edit the old release's notes to point at the
 new one (or mark it a pre-release). Attestations stay; they are history.

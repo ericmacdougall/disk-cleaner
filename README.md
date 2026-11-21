@@ -5,7 +5,8 @@ safe to remove. It is planned to become a cleaner for Windows, macOS and Linux. 
 PruneDisk; the repository and the command are still called disk-cleaner.
 
 > **Status: early, read-only.** The `scan` and `plan` commands are on the main branch. There is no
-> tagged release, installer or download page yet, so you build it from source. (Continuous
+> installer. Prebuilt archives exist only for a published release (see "Download a release");
+> otherwise you build it from source. (Continuous
 > integration also builds unsigned binaries for each platform and keeps them as workflow artifacts
 > for 14 days; they are test builds, not releases.) No command removes, moves or changes anything:
 > the only file it writes is the one you name with `scan --out`.
@@ -86,7 +87,7 @@ None of this exists yet:
 - detection and backup of coding-agent sessions and logs, and age and size policies for caches and
   outputs;
 - a desktop app with outline, sunburst, treemap and biggest-files views;
-- installers and releases;
+- installers;
 - renaming the repository and the command to `prunedisk`.
 
 ## Safety model in one paragraph

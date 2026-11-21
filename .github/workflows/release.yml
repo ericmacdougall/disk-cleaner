@@ -252,18 +252,16 @@ jobs:
           TAG: ${{ needs.meta.outputs.tag }}
           SHA: ${{ needs.meta.outputs.sha }}
         run: python3 -I .github/scripts/release_meta.py check-binding
+      # Always a draft, titled "PruneDisk <tag>", pre-release when the tag has a suffix. Uploads every
+      # file in out/dist, re-reads the release by its id and requires exactly those assets. Records
+      # the release's identity (id, node id, tag, author, creation time) for the next step.
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.meta.outputs.tag }}
-        run: |
-          set -euo pipefail
-          args=(--repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "PruneDisk $TAG" --notes-file out/dist-notes.md)
-          case "$TAG" in *-*) args+=(--prerelease) ;; esac
-          # gh fails if a release for this tag already exists; that is intended.
-          gh release create "$TAG" "${args[@]}" out/dist/*
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets \
-            --jq '"draft=\(.isDraft) assets=\(.assets | length)"'
+        run: python3 -I .github/scripts/release_meta.py create-draft
+      # If the tag moved, deletes only the release with the recorded identity, and only while it
+      # is still a draft; a published or replaced release is never deleted (the job fails instead).
       - name: The tag did not move while the draft was made
         env:
           GH_TOKEN: ${{ github.token }}
