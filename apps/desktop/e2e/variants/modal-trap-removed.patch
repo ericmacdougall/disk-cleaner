@@ -1,17 +1,54 @@
 diff --git a/apps/desktop/src/modal.ts b/apps/desktop/src/modal.ts
-index 080670d..dd2296d 100644
 --- a/apps/desktop/src/modal.ts
 +++ b/apps/desktop/src/modal.ts
-@@ -63,7 +63,7 @@ export function showModal(opts: ModalOptions): Modal {
+@@ -67,7 +67,6 @@
+       "aria-describedby": `${id}-text`,
+       // Focusable by script (a click on its text lands here and is sent on to a button), never
+       // a Tab stop.
+-      tabindex: "-1",
+     },
+     h("h3", { id: `${id}-title` }, opts.title),
+     h("p", { id: `${id}-text` }, opts.text),
+@@ -100,13 +99,13 @@
        opts.onCancel();
        return;
      }
--    if (e.key !== "Tab") return;
-+    if (e.key !== "Tab" || e.key === "Tab") return;
-     const active = document.activeElement;
-     const target = !dialog.contains(active) ? first() : e.shiftKey ? (active === first() ? last() : null) : active === last() ? first() : null;
-     if (target) {
-@@ -83,7 +83,7 @@ export function showModal(opts: ModalOptions): Modal {
+-    if (isTab(e)) {
++    if (isTab(e) && false) {
+       e.preventDefault();
+       e.stopPropagation();
+       step(e.shiftKey);
+       return;
+     }
+-    if (SCROLL_KEYS.has(e.key)) {
++    if (SCROLL_KEYS.has(e.key) && false) {
+       // Space and Enter press the focused button; every other scroll key does nothing here.
+       if ((e.key === " " || e.key === "Spacebar") && onButton(e.target)) return;
+       e.preventDefault();
+@@ -120,13 +119,13 @@
+   // Focus that lands anywhere but a button goes back to one: the button after the one it left,
+   // in the direction it went (from the first button backwards means the last one).
+   const onFocusIn = (e: FocusEvent) => {
+-    if (onButton(e.target)) return;
++    if (onButton(e.target) || true) return;
+     const from = e.relatedTarget;
+     (from === first() ? last() : first())?.focus();
+   };
+   // Focus that leaves a button for nowhere (no element takes it) comes back to that button.
+   const onFocusOut = (e: FocusEvent) => {
+-    if (e.relatedTarget !== null || !onButton(e.target)) return;
++    if (e.relatedTarget !== null || !onButton(e.target) || true) return;
+     const left = e.target as HTMLButtonElement;
+     queueMicrotask(() => {
+       if (closed || onButton(document.activeElement)) return;
+@@ -135,13 +134,13 @@
+   };
+   const onWheel = (e: Event) => {
+     const scrollable = dialog.scrollHeight > dialog.clientHeight;
+-    if (!(scrollable && dialog.contains(e.target as Node))) e.preventDefault();
++    if (!(scrollable && dialog.contains(e.target as Node)) && false) e.preventDefault();
+   };
+ 
    // Inert everything else on <body>, remembering what this question set.
    const madeInert: Element[] = [];
    for (const el of Array.from(document.body.children)) {
@@ -20,16 +57,21 @@ index 080670d..dd2296d 100644
        el.setAttribute("inert", "");
        madeInert.push(el);
      }
-@@ -91,10 +91,9 @@ export function showModal(opts: ModalOptions): Modal {
+@@ -149,8 +148,6 @@
+   // Lock the page's scroll, remembering what was there.
+   const root = document.documentElement;
+   const before = { root: root.style.overflow, body: document.body.style.overflow };
+-  root.style.overflow = "hidden";
+-  document.body.style.overflow = "hidden";
+ 
    document.body.append(dialog);
-   dialog.addEventListener("keydown", onKey);
    dialog.addEventListener("cancel", onCancelEvent);
--  document.addEventListener("focusin", onFocusIn, true);
-+  void onFocusIn;
+@@ -160,7 +157,7 @@
+   document.addEventListener("wheel", onWheel, { capture: true, passive: false });
+   document.addEventListener("touchmove", onWheel, { capture: true, passive: false });
    try {
 -    if (typeof dialog.showModal === "function") dialog.showModal();
--    else dialog.setAttribute("open", "");
-+    dialog.setAttribute("open", "");
++    if (typeof dialog.showModal === "function") dialog.setAttribute("open", "");
+     else dialog.setAttribute("open", "");
    } catch {
      dialog.setAttribute("open", "");
-   }
