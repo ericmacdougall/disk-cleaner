@@ -1108,9 +1108,10 @@ entry is **never hashed** and never appears in `blobs`. The list:
 - suffixes: `.pem`, `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`, `.kdbx`, `.tfstate`, `.tfvars`;
 - prefixes: `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `terraform.tfstate.`;
 - substrings `secret`, `credential`, `password`, `passwd`, `token`, applied **outside** artifact
-  nodes only (inside `node_modules`, `.venv` and the like they would match package source such as
+  nodes only. An artifact node is a node of class `regenerable` or `cache`, including every entry
+  below it. Inside `node_modules`, `.venv` and the like they would match package source such as
   `tokenizer.js` by the thousand; there the exact, suffix and prefix names still apply, and the
-  scan's state-file rule already makes such artifacts ask);
+  scan's state-file rule already makes such artifacts ask;
 - directories: `.ssh`, `.gnupg`, `.aws`, `.password-store`, `secrets`.
 
 Over-matching (a `tokenizer.py` in loose code) keeps a file on disk, the safe side. **Known
@@ -1170,21 +1171,33 @@ not inside one of the scan's `roots`.
 ### Removal
 
 **An apply step MUST remove only a piece's enumerated members, each one by name and only if it is
-still the entry the scan saw (same kind, device and inode, not followed if it is a symlink: the
-link is removed, never its target). It MUST NOT remove `path` recursively. After removing members
+still the entry the scan saw. Immediately before each unlink it MUST `lstat` the member again.
+Its kind, device, inode, length and mtime must still match `members`. A symlink is never
+followed: the link itself is removed, never its target. The member's parent directories are
+reached without following symlinks. It MUST NOT remove `path` recursively. After removing members
 it MAY remove a directory of the piece that is then empty, and nothing else. Every path in
 `excludes` is left in place, whatever its lane.** An entry that appeared after the scan is not a
 member and survives.
+
+**The git directory of a `git-node` piece.** Once apply has verified its backup of the git
+directory, and before it removes anything, it MUST compare the git directory with the
+enumeration it backed up. It checks every file's length, mtime and ctime, and looks for new
+entries other than its own recovery output. **On any difference it keeps the piece and removes
+nothing.** A commit, a reflog append or an in-place edit made while the backup ran is therefore
+never removed without being backed up.
 
 ### Plan field `lanes`
 
 This field is present when the scan has `pieces`. Plan pieces point at the scan's member lists
 and do not copy them, so **an apply step reads both files. It MUST refuse a scan whose
-`generated_at` differs from the plan's `scan_generated_at`.**
+`generated_at` differs from the plan's `scan_generated_at`, and a scan whose `pieces` section
+does not hash to `lanes.scan_pieces_sha256`.** That hash is the SHA-256 of the compact JSON
+serialization of the scan's `pieces` value (`disk_cleaner_core::pieces::pieces_digest`).
 
 | Field | Meaning |
 |---|---|
 | `version` | 1 |
+| `scan_pieces_sha256` | the digest of the scan's `pieces` section that this plan was built from (see above) |
 | `pieces` | one entry per plan piece: every scan piece, and each derived piece (below) |
 | `blobs` | one entry per scan blob (below) |
 | `totals` | `by_lane` (map `git`, `noise`, `backup`, `keep` to `pieces`, `entries`, `bytes`, `reclaimable_bytes`, `upload_bytes`), `scanned_bytes` (the survey's `bytes` plus `dir_overhead_bytes`), `dir_overhead_bytes`, `duplicate_bytes`, `dedup_saved_bytes`, `secret_pieces` |
@@ -1259,7 +1272,8 @@ fails, the file is treated as `backup`.** The evidence kind `archive` (`{"kind":
 "sha256", "size", "archive": <location>}`, a copy already in a verified backup) is reserved for
 apply and never produced by `plan`.
 
-**Upload once.** For each blob, `upload_path` is its first copy in a `backup` piece; every other
+**Upload once** is computed after the duplicate-noise cut, so `upload_path` is never a copy that
+became noise. For each blob, `upload_path` is its first copy in a `backup` piece; every other
 backup-lane copy maps to it, and `saved_bytes` is the allocated bytes those other copies would
 have uploaded (their distinct inodes). A plan piece's `upload_bytes` leaves out such copies and
 0-byte hard-link names. `totals.dedup_saved_bytes` sums `saved_bytes`. **An apply step uploads a
