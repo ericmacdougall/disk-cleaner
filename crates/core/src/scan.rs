@@ -980,6 +980,12 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             path: abs.clone(),
             source: e,
         })?;
+        // A root is a directory, or a symlink to one (CT-A2). A root that resolves to anything
+        // else is refused before anything is walked or written; one that does not resolve is
+        // reported by the walk as before.
+        if std::fs::metadata(&abs).is_ok_and(|m| !m.is_dir()) {
+            return Err(Error::NotADirectory { path: abs });
+        }
         spelled.push(abs);
     }
     let mut warnings: Vec<String> = Vec::new();
