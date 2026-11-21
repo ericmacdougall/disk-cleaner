@@ -38,6 +38,24 @@ nothing applies it yet.
 The scan and plan formats, every fact and every rule are described in
 [docs/SCAN-FORMAT.md](docs/SCAN-FORMAT.md). The overall design is in [docs/DESIGN.md](docs/DESIGN.md).
 
+## Download a release
+
+When a version is tagged, the [releases page](https://github.com/ericmacdougall/disk-cleaner/releases)
+carries one archive for each of Linux (x86-64), macOS (Apple Silicon and Intel) and Windows (x86-64),
+plus a `SHA256SUMS` file. If that page lists no release yet, there is nothing to download: build from
+source (next section).
+
+The programs are **not code-signed or notarized**, so macOS Gatekeeper and Windows SmartScreen can warn
+when you first run one; the release notes say what to do. Check a download before you run it:
+
+```
+sha256sum -c --ignore-missing SHA256SUMS                      # Linux; see the release notes for macOS and Windows
+gh attestation verify <archive file name> --repo ericmacdougall/disk-cleaner
+```
+
+The first shows the file matches the release; the second shows which repository and workflow built it.
+How a release is cut is in [docs/RELEASING.md](docs/RELEASING.md).
+
 ## Build from source
 
 You need a stable Rust toolchain (with `cargo`) and `git` on the `PATH`; the scanner runs `git` to

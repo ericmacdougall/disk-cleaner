@@ -18,6 +18,7 @@ ROOT_README = ROOT / "README.md"
 CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 PAGES_YML = ROOT / ".github" / "workflows" / "pages.yml"
 SITE_YML = ROOT / ".github" / "workflows" / "site.yml"
+RELEASE_YML = ROOT / ".github" / "workflows" / "release.yml"
 ALLOWED_LINK_PREFIX = "https://github.com/ericmacdougall/"
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
 UNIT_CMD = "python3 -m unittest discover -s site/tests -v"
@@ -540,7 +541,7 @@ class TestContent(unittest.TestCase):
         self.assertIn("It deletes nothing", flat)
         self.assertRegex(flat, r"read-only")
         self.assertIn("merged into the main branch", flat)
-        self.assertIn("not released", flat)
+        self.assertIn("releases page", flat)
 
     def test_no_stale_review_claims(self):
         # The scanner and planner were merged into main; copy written while they were on a draft pull
@@ -562,7 +563,7 @@ class TestContent(unittest.TestCase):
 
     def test_no_download_button_or_install_claim(self):
         self.assertNotRegex(self.html, r'(?i)<a[^>]*class="btn[^"]*"[^>]*>[^<]*download')
-        self.assertIn("nothing to install yet", re.sub(r"\s+", " ", self.text))
+        self.assertIn("no installer", re.sub(r"\s+", " ", self.text))
 
     def test_repo_and_command_still_disk_cleaner(self):
         flat = re.sub(r"\s+", " ", self.text)
@@ -663,11 +664,15 @@ class TestContent(unittest.TestCase):
 
     def test_download_wording_matches_ci(self):
         flat = re.sub(r"\s+", " ", self.text)
-        # CI keeps unsigned binaries as workflow artifacts, so "no download" is not quite true; there is
-        # no release and no download page.
-        self.assertNotIn("no release or download yet", flat)
-        self.assertNotIn("Nothing to download yet", flat)
-        self.assertIn("no release or download page", flat)
+        # Written to be true before and after the first release exists: it points at the releases page
+        # and says what to do when that page lists nothing.
+        self.assertNotIn("no release or download page", flat)
+        self.assertNotIn("Merged, not released", flat)
+        self.assertIn("lists no release yet", flat)
+        for needed in ("not code-signed or notarized", "SHA256SUMS", "gh attestation verify",
+                       "Gatekeeper", "SmartScreen", "build from source"):
+            self.assertIn(needed, flat)
+        self.assertIn("https://github.com/ericmacdougall/disk-cleaner/releases", self.html)
         days = re.search(r"retention-days:\s*(\d+)", read(CI_YML)).group(1)
         readme = re.sub(r"\s+", " ", read(ROOT_README))
         self.assertNotIn("no tagged release, installer or download yet", readme)
@@ -906,6 +911,80 @@ def load_gate():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+class TestReleaseWorkflow(unittest.TestCase):
+    """release.yml: pinned, least privilege, never publishes by itself, one place for the binary name."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.y = read(RELEASE_YML)
+        cls.notes = read(ROOT / ".github" / "release-notes.md")
+
+    def test_actions_pinned(self):
+        refs = action_refs(self.y)
+        self.assertTrue(refs)
+        for r in refs:
+            self.assertRegex(r, r"^[\w./-]+@[0-9a-f]{40}$", f"release.yml: {r} is not pinned to a SHA")
+
+    def test_top_level_permissions_read_only(self):
+        self.assertEqual(top_level_permissions(self.y), {"contents": "read"})
+
+    def test_only_the_draft_job_can_write_contents(self):
+        writers = re.findall(r"^\s+contents: write", self.y, re.M)
+        self.assertEqual(len(writers), 1)
+        draft = self.y[self.y.index("  draft-release:"):self.y.index("  crates-dry-run:")]
+        self.assertIn("contents: write", draft)
+        self.assertIn("needs.meta.outputs.publish == 'true'", draft)
+        self.assertIn("--draft", draft)
+
+    def test_rehearsal_never_publishes(self):
+        self.assertIn("workflow_dispatch:", self.y)
+        # publish is true only for a tag push; every other event is a rehearsal.
+        self.assertRegex(self.y, r'publish=false')
+        self.assertEqual(self.y.count("publish=true"), 1)
+        self.assertNotIn("--draft=false", self.y)
+        self.assertNotIn("cargo publish\n", self.y)
+        self.assertNotRegex(self.y, r"cargo publish(?! --dry-run)")
+
+    def test_tag_guards_present(self):
+        for needed in ("does not match the workspace version", "is not on main", "no successful ci.yml run"):
+            self.assertIn(needed, self.y)
+
+    def test_builds_locked_for_the_four_targets(self):
+        self.assertIn("cargo build --release --locked", self.y)
+        for t in ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"):
+            self.assertIn(f"target: {t}", self.y)
+            self.assertIn(t, self.notes)
+
+    def test_binary_name_is_set_in_one_place(self):
+        self.assertEqual(len(re.findall(r"^\s+BIN_NAME:", self.y, re.M)), 1)
+        self.assertEqual(len(re.findall(r"^\s+CLI_PACKAGE:", self.y, re.M)), 1)
+        # the name is not typed anywhere else in the file
+        rest = re.sub(r"^\s+(BIN_NAME|CLI_PACKAGE):.*$", "", self.y, flags=re.M)
+        rest = "\n".join(l for l in rest.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn("disk-cleaner", rest)
+
+    def test_attests_and_checksums(self):
+        self.assertIn("SHA256SUMS", self.y)
+        self.assertIn("actions/attest@", self.y)
+        for perm in ("id-token: write", "attestations: write"):
+            self.assertIn(perm, self.y)
+
+    def test_notes_say_unsigned_and_how_to_verify(self):
+        flat = re.sub(r"\s+", " ", self.notes)
+        for needed in ("not code-signed or notarized", "Gatekeeper", "SmartScreen", "SHA256SUMS",
+                       "gh attestation verify", "com.apple.quarantine"):
+            self.assertIn(needed, flat)
+        self.assertTrue(set(re.findall(r"@([A-Z]+)@", self.notes)) <= {"BIN", "TAG", "VERSION", "REPO"})
+
+    def test_desktop_extension_point_is_marked(self):
+        self.assertIn("EXTENSION POINT (desktop bundles)", self.y)
+
+    def test_site_lists_the_same_platforms(self):
+        flat = re.sub(r"\s+", " ", read(INDEX))
+        for p in ("Linux (x86-64)", "macOS (Apple Silicon and Intel)", "Windows (x86-64)"):
+            self.assertIn(p, flat)
 
 
 class TestPagesGate(unittest.TestCase):
