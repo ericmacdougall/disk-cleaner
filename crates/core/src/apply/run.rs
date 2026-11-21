@@ -204,9 +204,46 @@ pub fn hold_lock(state_dir: &Path) -> Result<impl std::fmt::Debug + Send, ApplyE
     take_lock(state_dir).map(|l| l._fd)
 }
 
+/// Apply's own files: the state directory (lock, state id), the manifest and the files beside
+/// it named after it (torn copies). A scan of the home folder holds them, so no piece removes
+/// them and the activity check does not count apply's own writes as the user's.
+pub(crate) struct OwnState {
+    dirs: Vec<PathBuf>,
+    manifests: Vec<PathBuf>,
+}
+
+impl OwnState {
+    pub(crate) fn new(opts: &ApplyOptions) -> Self {
+        OwnState {
+            dirs: super::input::spellings(Some(&opts.state_dir)),
+            manifests: super::input::spellings(Some(&opts.manifest)),
+        }
+    }
+
+    /// The paths a removing piece must not hold ([`super::input::holds`]).
+    fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.dirs.iter().chain(self.manifests.iter())
+    }
+
+    /// Whether `p` is one of apply's own files or folders.
+    fn owns(&self, p: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        self.dirs.iter().any(|d| p.starts_with(d))
+            || self.manifests.iter().any(|m| {
+                p == m
+                    || (p.parent() == m.parent()
+                        && m.file_name().is_some_and(|n| {
+                            p.file_name()
+                                .is_some_and(|f| f.as_bytes().starts_with(n.as_bytes()))
+                        }))
+            })
+    }
+}
+
 /// Newest mtime of any non-directory entry under `dir` (not following symlinks, skipping
-/// `.git` directories). Errors count as "now" so the group is judged active (unknown means keep).
-fn newest_mtime(dir: &Path, cap_now: i64) -> i64 {
+/// `.git` directories and apply's own files). Errors count as "now" so the group is judged
+/// active (unknown means keep).
+fn newest_mtime(dir: &Path, cap_now: i64, own: &OwnState) -> i64 {
     let mut newest = 0i64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -215,6 +252,9 @@ fn newest_mtime(dir: &Path, cap_now: i64) -> i64 {
         };
         for ent in rd {
             let Ok(ent) = ent else { return cap_now };
+            if own.owns(&ent.path()) {
+                continue;
+            }
             let Ok(md) = ent.path().symlink_metadata() else {
                 return cap_now;
             };
@@ -278,7 +318,7 @@ impl Ctx<'_> {
             }
         }
         if why.is_none() && group.exists() {
-            let n = newest_mtime(&group, self.opts.now);
+            let n = newest_mtime(&group, self.opts.now, &OwnState::new(self.opts));
             // Same second as the scan counts as after it: the conservative side.
             if n >= self.inputs.scan_generated_at {
                 why = Some(format!("{} was modified after the scan", group.display()));
@@ -359,6 +399,10 @@ pub fn apply(
     let begun = ctx.manifest.begun();
     let done = ctx.manifest.done(&inputs.plan_digest);
 
+    // A scan of the home folder holds apply's own state directory (manifest, lock, state id):
+    // a piece that would remove any of it is kept, and the rest of the plan goes ahead.
+    let own_state = OwnState::new(opts);
+
     // 1. Prepare every removing piece.
     let mut prepared: Vec<Prepared> = Vec::new();
     for p in &inputs.pieces {
@@ -373,6 +417,19 @@ pub fn apply(
         };
         if p.lane == Lane::Keep {
             rep.outcome = "kept".into();
+            ctx.report.pieces.push(rep);
+            continue;
+        }
+        if let Some(s) = own_state
+            .paths()
+            .find(|s| super::input::holds(p, s.as_path()))
+        {
+            rep.outcome = "kept".into();
+            rep.reason = format!(
+                "it holds apply's own state directory {} (the manifest and the lock), which \
+                 apply never removes",
+                s.display()
+            );
             ctx.report.pieces.push(rep);
             continue;
         }

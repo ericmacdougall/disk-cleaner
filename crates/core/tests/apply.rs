@@ -604,6 +604,91 @@ fn hostile_plans_are_refused() {
     let mut o = fx.opts(true);
     o.home = Some(d.clone());
     assert!(matches!(apply(&scan, &plan, &o), Err(ApplyError::Plan(_))));
+    // Stream A contract (rescue, point 1): piece paths are real paths, so the remote and the
+    // home directory spelled through a link are compared by their real paths too. A remote
+    // folder that does not exist yet resolves through its deepest existing folder.
+    let alias = fx.tmp.path().join("alias");
+    std::os::unix::fs::symlink(&d, &alias).unwrap();
+    for (name, remote, home) in [
+        ("remote through a link", Some(alias.join("store/new")), None),
+        ("home through a link", None, Some(alias.clone())),
+    ] {
+        let mut o = fx.opts(true);
+        o.remote_local = remote;
+        if home.is_some() {
+            o.home = home;
+        }
+        let r = apply(&scan, &plan, &o);
+        assert!(matches!(r, Err(ApplyError::Plan(_))), "{name}: {r:?}");
+        assert!(d.join("f.txt").exists(), "{name}");
+    }
+    // A `files` piece holds only its names: the remote in a sibling folder of those loose
+    // files is no overlap (a scan of the home folder lists its loose files as one).
+    fx.write("loose.txt", b"loose");
+    let (scan3, plan3) = docs(&[&fx.data], &[P::files(&fx.data, &["loose.txt"], "backup")]);
+    let mut o = fx.opts(false);
+    o.remote_local = Some(fx.data.join("store"));
+    assert!(apply(&scan3, &plan3, &o).is_ok());
+    o.remote_local = Some(fx.data.join("loose.txt").join("x"));
+    assert!(matches!(
+        apply(&scan3, &plan3, &o),
+        Err(ApplyError::Plan(_))
+    ));
+}
+
+/// A scan of the home folder holds apply's own state directory (manifest, lock, state id).
+/// A piece that would remove any of it is kept with a reason, spelled or through a link, and
+/// the rest of the plan goes ahead; a `files` piece of the folder's loose files is not held.
+#[test]
+fn a_piece_holding_the_state_directory_is_kept_and_the_rest_goes() {
+    for through_link in [false, true] {
+        let fx = Fx::new();
+        let home = fx.data.join("home");
+        fx.write("home/notes/n.txt", b"notes");
+        fx.write("home/old/o.txt", b"old");
+        fx.write("home/loose.txt", b"loose");
+        let state = home.join(".disk-cleaner/prunedisk");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("keepme"), b"state").unwrap();
+        let (scan, plan) = docs(
+            &[&fx.data],
+            &[
+                P::tree(&home.join(".disk-cleaner"), "backup"),
+                P::tree(&home.join("old"), "backup"),
+                P::files(&home, &["loose.txt"], "backup"),
+            ],
+        );
+        let mut o = fx.opts(true);
+        let spelled = if through_link {
+            let alias = fx.tmp.path().join("alias");
+            std::os::unix::fs::symlink(&home, &alias).unwrap();
+            alias.join(".disk-cleaner/prunedisk")
+        } else {
+            state.clone()
+        };
+        o.state_dir = spelled.clone();
+        o.manifest = spelled.join("testhost.jsonl");
+        // Apply's own lock and manifest writes land in a later second than the scan, so the
+        // activity check must not count them as the user's (else `home`'s loose files stay).
+        std::thread::sleep(Duration::from_millis(1100));
+        let rep = apply(&scan, &plan, &o).unwrap();
+        assert_eq!(rep.pieces[0].outcome, "kept", "{through_link}: {rep:#?}");
+        assert!(
+            rep.pieces[0].reason.contains("apply's own state directory"),
+            "{}",
+            rep.pieces[0].reason
+        );
+        assert_eq!(rep.pieces[1].outcome, "removed", "{rep:#?}");
+        assert_eq!(rep.pieces[2].outcome, "removed", "{rep:#?}");
+        assert_eq!(fs::read(state.join("keepme")).unwrap(), b"state");
+        assert!(
+            state.join("apply.lock").exists(),
+            "the lock is where apply left it"
+        );
+        assert!(state.join("testhost.jsonl").exists(), "the manifest stays");
+        assert!(!home.join("old").exists() && !home.join("loose.txt").exists());
+        assert_eq!(fs::read(home.join("notes/n.txt")).unwrap(), b"notes");
+    }
 }
 
 #[test]
@@ -792,6 +877,80 @@ fn derived_siblings_and_residual_converge() {
     let r = restore(&s, &ropts(&fx)).unwrap();
     assert!(r.failed.is_empty() && r.conflicts.is_empty(), "{r:?}");
     assert_eq!(tree_digest(&s), before);
+}
+
+/// Stream A contract (rescue, point 2): a derived piece's `member` is its relative path in the
+/// scan piece's members, so a copy deep inside a tree piece is a member with `/` in it. Such a
+/// plan is accepted, the nested member alone is removed, the rest of the tree stays with its
+/// residual piece, and a `..` or absolute member is still refused. Both lanes a derived piece
+/// takes: backup, and noise by duplicate (stream A's case) with its retained copy elsewhere.
+#[test]
+fn a_derived_piece_of_a_nested_member_is_accepted_and_removes_only_it() {
+    for lane in ["backup", "noise"] {
+        let fx = Fx::new();
+        let s = fx.data.join("s");
+        let d1_path = fx.write("s/deep/er/d1.bin", b"one copy of these bytes\n");
+        fx.write("s/deep/keep.txt", b"stays with the residual");
+        let orig = fx.write("kept/orig.bin", b"one copy of these bytes\n");
+        let mut residual = P::tree(&s, "keep");
+        residual.moved_out = vec!["deep/er/d1.bin".into()];
+        residual.reason = "kept by test".into();
+        let mut d1 = P::derived(&s, "deep/er/d1.bin", 0, lane);
+        if lane == "noise" {
+            d1.evidence = Some(serde_json::json!({
+                "kind": "duplicate", "sha256": sha(&orig), "size": 24,
+                "retained_copy": orig, "retained_piece": 1
+            }));
+        }
+        let (scan, plan) = docs(
+            &[&fx.data],
+            &[residual, P::tree(&fx.data.join("kept"), "keep"), d1],
+        );
+        let mut o = fx.opts(true);
+        o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+        let rep = apply(&scan, &plan, &o).unwrap();
+        let d = &rep.pieces[2];
+        assert_eq!(d.outcome, "removed", "{lane}: {rep:#?}");
+        assert!(!d1_path.exists(), "{lane}");
+        assert_eq!(
+            fs::read(s.join("deep/keep.txt")).unwrap(),
+            b"stays with the residual"
+        );
+        assert_eq!(fs::read(&orig).unwrap(), b"one copy of these bytes\n");
+        let r = restore(&d1_path, &ropts(&fx)).unwrap();
+        assert!(
+            r.failed.is_empty() && r.conflicts.is_empty(),
+            "{lane}: {r:?}"
+        );
+        assert_eq!(fs::read(&d1_path).unwrap(), b"one copy of these bytes\n");
+        if lane == "noise" {
+            assert_eq!(fx.shard_total(), 0, "a duplicate is never uploaded");
+        }
+    }
+    let fx = Fx::new();
+    let s = fx.data.join("s");
+    fx.write("s/deep/er/d1.bin", b"one");
+    let mut residual = P::tree(&s, "keep");
+    residual.moved_out = vec!["deep/er/d1.bin".into()];
+    let d1 = P::derived(&s, "deep/er/d1.bin", 0, "backup");
+    let (scan, plan) = docs(&[&fx.data], &[residual, d1]);
+    assert!(apply(&scan, &plan, &fx.opts(false)).is_ok());
+    for bad_member in [
+        "../s/deep/er/d1.bin",
+        "/etc/passwd",
+        "deep/../deep/er/d1.bin",
+    ] {
+        let mut v: serde_json::Value = serde_json::from_str(&plan).unwrap();
+        v["lanes"]["pieces"][1]["member"] = serde_json::json!(bad_member);
+        let r = apply(&scan, &v.to_string(), &fx.opts(false));
+        assert!(matches!(r, Err(ApplyError::Plan(_))), "{bad_member}: {r:?}");
+    }
+    // A scan `files` piece still lists direct children only.
+    let (scan, plan) = docs(&[&fx.data], &[P::files(&s, &["deep/er/d1.bin"], "backup")]);
+    match apply(&scan, &plan, &fx.opts(false)) {
+        Err(ApplyError::Plan(m)) => assert!(m.contains("direct child"), "{m}"),
+        other => panic!("a nested member of a scan files piece: {other:?}"),
+    }
 }
 
 #[test]

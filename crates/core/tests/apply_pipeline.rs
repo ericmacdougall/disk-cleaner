@@ -247,6 +247,112 @@ fn a_plan_the_scan_does_not_support_is_kept_by_the_core_oracle() {
     assert!(w.proj.join("package.json").exists());
 }
 
+/// Stream A contract (rescue AC-21, point 4): a secret-named entry inside an artifact is its own
+/// kept piece. Removing the artifact on the real pipeline leaves every secret in place with its
+/// parent directories, removes the rest, and neither fails nor reports the piece unfinished
+/// because a directory is not empty. A plan that kept the whole artifact instead would pass the
+/// "left in place" half, so the test also needs the other members gone.
+#[test]
+fn removing_an_artifact_leaves_its_secret_entries_and_their_folders() {
+    let (_tmp, root, _remotes) = workspace();
+    let root = root.canonicalize().unwrap();
+    let proj = root.join("proj");
+    write(&proj.join("package.json"), "{}\n");
+    write(&proj.join("requirements.txt"), "certifi\n");
+    let pkg = proj.join("node_modules").join("pkg");
+    write(&pkg.join("package.json"), "{\"name\": \"pkg\"}\n");
+    write_bytes(&pkg.join("index.js"), 9000);
+    write(
+        &pkg.join(".npmrc"),
+        "registry=https://registry.example.invalid/\n",
+    );
+    write(&pkg.join("test").join("fixture.pem"), "not a key\n");
+    let venv = proj.join("venv");
+    write(&venv.join("pyvenv.cfg"), "home = /usr/bin\n");
+    let certifi = venv.join("lib/python3.11/site-packages/pip/_vendor/certifi");
+    write(&certifi.join("cacert.pem"), "not a bundle\n");
+    write_bytes(&certifi.join("core.py"), 9000);
+    std::thread::sleep(Duration::from_millis(1100));
+    let mut so = ScanOptions::new(vec![root.clone()]);
+    so.facts = network_everywhere();
+    so.lanes = Some(PieceOptions::default());
+    let res = scan(&so).expect("scan");
+    let p = plan(&res, &PlanOptions::new(7, far_future()));
+    let (scan_s, plan_s) = (
+        serde_json::to_string(&res).unwrap(),
+        serde_json::to_string(&p).unwrap(),
+    );
+    let secrets = [
+        pkg.join(".npmrc"),
+        pkg.join("test").join("fixture.pem"),
+        certifi.join("cacert.pem"),
+    ];
+    let before: Vec<String> = secrets.iter().map(|s| apply_common::sha(s)).collect();
+    let fx = Fx::new();
+    let mut o = fx.opts(true);
+    o.oracle = core_oracle();
+    let rep = apply(&scan_s, &plan_s, &o).unwrap();
+    let acted: Vec<_> = rep
+        .pieces
+        .iter()
+        .filter(|p| p.lane == Lane::Noise || p.lane == Lane::Backup)
+        .filter(|p| p.path.starts_with(proj.join("node_modules")) || p.path.starts_with(&venv))
+        .collect();
+    assert!(
+        !acted.is_empty(),
+        "the artifacts are in a removing lane: {rep:#?}"
+    );
+    for p in &acted {
+        assert_eq!(p.outcome, "removed", "{}: {}", p.path.display(), p.reason);
+    }
+    assert!(
+        rep.rescan_needed.is_empty() && rep.shards_failed.is_empty(),
+        "{rep:#?}"
+    );
+    for (s, sha) in secrets.iter().zip(&before) {
+        assert_eq!(&apply_common::sha(s), sha, "{} left in place", s.display());
+    }
+    assert!(!pkg.join("index.js").exists() && !pkg.join("package.json").exists());
+    assert!(!certifi.join("core.py").exists() && !venv.join("pyvenv.cfg").exists());
+}
+
+/// Stream A contract (rescue, point 5): a directory swapped after the scan for a copy that keeps
+/// every name, length and modification time is drift, so nothing in either copy is removed.
+#[test]
+fn a_folder_swapped_for_a_lookalike_copy_after_the_scan_is_kept() {
+    let w = world();
+    let nm = w.proj.join("node_modules");
+    let moved = w.proj.join("node_modules.moved");
+    std::fs::rename(&nm, &moved).unwrap();
+    let st = std::process::Command::new("cp")
+        .arg("-pR")
+        .arg(&moved)
+        .arg(&nm)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let (before_nm, before_moved) = (
+        apply_common::tree_digest(&nm),
+        apply_common::tree_digest(&moved),
+    );
+    assert_eq!(before_nm, before_moved, "a lookalike copy");
+    let fx = Fx::new();
+    let mut o = fx.opts(true);
+    o.oracle = core_oracle();
+    let rep = apply(&w.scan, &w.plan, &o).unwrap();
+    let mine: Vec<_> = rep
+        .pieces
+        .iter()
+        .filter(|p| p.path.starts_with(&nm))
+        .collect();
+    assert!(!mine.is_empty(), "{rep:#?}");
+    for p in &mine {
+        assert_eq!(p.outcome, "kept", "{}: {}", p.path.display(), p.reason);
+    }
+    assert_eq!(apply_common::tree_digest(&nm), before_nm);
+    assert_eq!(apply_common::tree_digest(&moved), before_moved);
+}
+
 #[test]
 fn a_process_now_running_in_the_repo_keeps_it() {
     let w = world();

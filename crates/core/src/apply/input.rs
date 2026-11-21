@@ -425,11 +425,79 @@ pub fn parse(
     Ok(inputs)
 }
 
+/// A path as spelled and as its real path (stream A: piece paths are real paths). A path that
+/// does not exist yet resolves through its deepest existing ancestor, so a remote folder apply
+/// is about to create is still compared where it will be. A path that cannot be resolved is
+/// compared as spelled only.
+pub fn spellings(p: Option<&Path>) -> Vec<PathBuf> {
+    let Some(p) = p else { return Vec::new() };
+    let mut out = vec![p.to_path_buf()];
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut at = p;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            let real = rest.iter().rev().fold(real, |acc, c| acc.join(c));
+            if real != p {
+                out.push(real);
+            }
+            break;
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name);
+                at = parent;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Whether removing piece `p` would touch `r`: `r` is inside one of its members, or the piece
+/// lies inside `r`. A `files` piece holds only its listed names (its `path` is their folder,
+/// often a scanned folder's own loose files), and a tree's excludes stay in place.
+pub fn holds(p: &PlanPiece, r: &Path) -> bool {
+    if p.path.starts_with(r) {
+        return true;
+    }
+    let Ok(rel) = r.strip_prefix(&p.path) else {
+        return false;
+    };
+    match p.kind {
+        PieceKind::Files => p
+            .files
+            .iter()
+            .any(|f| rel.starts_with(f) || Path::new(f).starts_with(rel)),
+        PieceKind::Tree | PieceKind::GitNode => {
+            rel.as_os_str().is_empty() || !p.excludes.iter().any(|x| rel.starts_with(x))
+        }
+    }
+}
+
+/// Refuse the plan when a piece in a removing lane holds `path` or lies inside it ([`holds`]),
+/// comparing the path as spelled and as its real path.
+pub fn refuse_overlap(i: &Inputs, what: &str, path: Option<&Path>) -> Result<(), ApplyError> {
+    let spelled = spellings(path);
+    for p in i.pieces.iter().filter(|p| p.lane != Lane::Keep) {
+        for r in &spelled {
+            if holds(p, r) {
+                return Err(bad(format!(
+                    "{what} {} overlaps the removing piece {}",
+                    r.display(),
+                    p.path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate(
     i: &Inputs,
     home: Option<&Path>,
     remote_local: Option<&Path>,
 ) -> Result<(), ApplyError> {
+    let homes = spellings(home);
     for (k, sp) in i.scan_pieces.iter().enumerate() {
         if sp.id != k {
             return Err(bad(format!("scan piece {k} has id {}", sp.id)));
@@ -452,7 +520,7 @@ fn validate(
                 p.path.display()
             )));
         }
-        if home.is_some_and(|h| h == p.path) {
+        if homes.contains(&p.path) {
             return Err(bad(format!(
                 "plan piece {k}: the home directory itself is a piece"
             )));
@@ -478,7 +546,11 @@ fn validate(
         if p.kind == PieceKind::Files && p.files.is_empty() {
             return Err(bad(format!("plan piece {k}: a files piece lists no files")));
         }
-        if p.files.iter().any(|f| f.contains('/')) {
+        // A scan `files` piece lists direct children (SCAN-FORMAT, `members`). A derived piece's
+        // one member is its path in the scan piece's members, nested for a tree piece (stream A
+        // `lanes.rs`: `rel_path(scan piece, copy)`); `plain_relative` above already refuses
+        // `..`, `.`, empty components and a leading `/`, and parse bound it to a real member.
+        if !p.derived && p.files.iter().any(|f| f.contains('/')) {
             return Err(bad(format!(
                 "plan piece {k}: a files member must be a direct child"
             )));
@@ -499,17 +571,9 @@ fn validate(
         }
         if p.lane != Lane::Keep {
             removing.push((&p.path, k));
-            if let Some(r) = remote_local {
-                if r.starts_with(&p.path) || p.path.starts_with(r) {
-                    return Err(bad(format!(
-                        "the backup remote {} overlaps the removing piece {}",
-                        r.display(),
-                        p.path.display()
-                    )));
-                }
-            }
         }
     }
+    refuse_overlap(i, "the backup remote", remote_local)?;
     // Overlap: two removing pieces may share a directory only through `files` pieces (siblings in
     // one directory) or when one excludes the other.
     let by_path: BTreeMap<usize, &PlanPiece> = i.pieces.iter().map(|p| (p.id, p)).collect();
