@@ -438,8 +438,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # shared-mime-info, adwaita-icon-theme and hicolor-icon-theme are what
+          # src-tauri/appimage/stage-data.mjs copies into the AppImage (docs/DESKTOP.md).
           sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential file libxdo-dev \
-            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            shared-mime-info adwaita-icon-theme hicolor-icon-theme
       - name: Frontend and icons
         working-directory: apps/desktop
         shell: bash
@@ -456,6 +459,32 @@ jobs:
         working-directory: apps/desktop
         shell: bash
         run: bash e2e/check-shipped.sh "src-tauri/target/${{ matrix.target }}/release/bundle" "$RUNNER_TEMP/shipped"
+      - name: The AppImage carries the folder dialog's data (CT-F1, docs/DESKTOP.md)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(ls "$GITHUB_WORKSPACE"/apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage)
+          d="$RUNNER_TEMP/appimage-data"; rm -rf "$d"; mkdir -p "$d"
+          (cd "$d" && "$app" --appimage-extract > /dev/null)
+          s="$d/squashfs-root/usr/share"
+          missing=0
+          for f in mime/mime.cache mime/magic mime/globs2 mime/subclasses mime/aliases \
+            icons/Adwaita/index.theme icons/Adwaita/scalable/places/user-home-symbolic.svg \
+            icons/Adwaita/scalable/places/folder-symbolic.svg icons/hicolor/index.theme \
+            doc/shared-mime-info/copyright doc/adwaita-icon-theme/copyright doc/hicolor-icon-theme/copyright; do
+            [ -s "$s/$f" ] || { echo "::error::the AppImage has no $f"; missing=1; }
+          done
+          if [ -e "$s/icons/Adwaita/icon-theme.cache" ]; then
+            echo "::error::the AppImage's Adwaita has an icon-theme.cache that does not match its files"; missing=1
+          fi
+          grep -q 'GDK_PIXBUF_MODULE_FILE="$APPDIR' "$d/squashfs-root/apprun-hooks/linuxdeploy-plugin-gtk.sh" ||
+            { echo "::error::the AppRun hook no longer points gdk-pixbuf inside the image"; missing=1; }
+          grep -q 'XDG_DATA_DIRS="$APPDIR/usr/share' "$d/squashfs-root/apprun-hooks/linuxdeploy-plugin-gtk.sh" ||
+            { echo "::error::the AppRun hook no longer puts the image's usr/share first"; missing=1; }
+          du -sh "$s/mime" "$s/icons/Adwaita"
+          rm -rf "$d"
+          exit "$missing"
       - name: Stage bundles and checksums
         shell: bash
         run: |
