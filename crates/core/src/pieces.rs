@@ -640,6 +640,7 @@ impl Place {
     /// secrecy, git-directory context and inexactness found there are added, never taken away.
     fn of_root(
         root: &Path,
+        spellings: &[PathBuf],
         root_node: Option<usize>,
         real_nodes: &HashMap<PathBuf, usize>,
         nodes: &[Node],
@@ -671,30 +672,32 @@ impl Place {
                 rules,
             );
         }
-        let mut spelled = Place::top();
-        let names: Vec<&Path> = root.ancestors().collect();
-        for a in names.iter().rev() {
-            spelled = spelled.step(
-                &DirFacts {
-                    name: a.file_name(),
-                    node: None,
-                    has_head: false,
-                    has_objects_and_refs: false,
-                },
-                nodes,
-                rules,
-            );
+        for spelling in std::iter::once(root).chain(spellings.iter().map(PathBuf::as_path)) {
+            let mut spelled = Place::top();
+            let names: Vec<&Path> = spelling.ancestors().collect();
+            for a in names.iter().rev() {
+                spelled = spelled.step(
+                    &DirFacts {
+                        name: a.file_name(),
+                        node: None,
+                        has_head: false,
+                        has_objects_and_refs: false,
+                    },
+                    nodes,
+                    rules,
+                );
+            }
+            if place.secret_dir.is_none() {
+                place.secret_dir = spelled.secret_dir;
+            }
+            if spelled.in_gitdir && !place.in_gitdir {
+                place.in_gitdir = true;
+                place.git_top = false;
+                place.git_area = false;
+                place.git_named = false;
+            }
+            place.exact = place.exact && spelled.exact;
         }
-        if place.secret_dir.is_none() {
-            place.secret_dir = spelled.secret_dir;
-        }
-        if spelled.in_gitdir && !place.in_gitdir {
-            place.in_gitdir = true;
-            place.git_top = false;
-            place.git_area = false;
-            place.git_named = false;
-        }
-        place.exact = place.exact && spelled.exact;
         place
     }
 
@@ -754,8 +757,26 @@ fn real_node_paths(roots: &[PathBuf], nodes: &[Node]) -> HashMap<PathBuf, usize>
 
 /// Fill every directory's place (`Place`), top down, and every entry's git-directory and secret
 /// status from its directory's place and its own name.
-fn annotate(t: &mut Tree, roots: &[PathBuf], nodes: &[Node], rules: &RuleSet, order: &[usize]) {
+fn annotate(
+    t: &mut Tree,
+    roots: &[PathBuf],
+    spellings: &[Vec<PathBuf>],
+    nodes: &[Node],
+    rules: &RuleSet,
+    order: &[usize],
+) {
     let real_nodes = real_node_paths(roots, nodes);
+    let names_of = |p: &Path| -> Vec<PathBuf> {
+        let mut v = vec![p.to_path_buf()];
+        if let Some(k) = roots.iter().position(|r| r == p) {
+            for s in spellings.get(k).into_iter().flatten() {
+                if !v.contains(s) {
+                    v.push(s.clone());
+                }
+            }
+        }
+        v
+    };
     let named = |t: &Tree, d: usize, name: &str, want_dir: bool| {
         t.dirs[d].children.iter().any(|c| match *c {
             Child::Ent(e) if !want_dir => {
@@ -788,7 +809,15 @@ fn annotate(t: &mut Tree, roots: &[PathBuf], nodes: &[Node], rules: &RuleSet, or
                 } else {
                     None
                 };
-                Place::of_root(&t.dirs[d].path, root_node, &real_nodes, nodes, rules)
+                let names = names_of(&t.dirs[d].path);
+                Place::of_root(
+                    &t.dirs[d].path,
+                    &names,
+                    root_node,
+                    &real_nodes,
+                    nodes,
+                    rules,
+                )
             }
         };
         place.apply(&mut t.dirs[d]);
@@ -1606,12 +1635,27 @@ pub fn survey(
     rules: &RuleSet,
     opts: &PieceOptions,
 ) -> PieceSurvey {
+    let spellings: Vec<Vec<PathBuf>> = roots.iter().map(|r| vec![r.clone()]).collect();
+    survey_named(roots, &spellings, nodes, one_file_system, rules, opts)
+}
+
+/// [`survey`] with, per root, every spelling the user gave for it (the scan's normalised roots):
+/// each one's names add context (secrecy, git directory, inexactness) to its root, never take it
+/// away.
+pub(crate) fn survey_named(
+    roots: &[PathBuf],
+    spellings: &[Vec<PathBuf>],
+    nodes: &[Node],
+    one_file_system: bool,
+    rules: &RuleSet,
+    opts: &PieceOptions,
+) -> PieceSurvey {
     let walked_at = unix_now();
     let mut totals = PieceTotals::default();
     let mut t = read_tree(roots, one_file_system, nodes);
     let dirs_order = preorder_dirs(&t);
     let ents_order = preorder_ents(&t);
-    annotate(&mut t, roots, nodes, rules, &dirs_order);
+    annotate(&mut t, roots, spellings, nodes, rules, &dirs_order);
     let names = own_inodes(&mut t, &ents_order, &mut totals);
 
     let mut cutter = Cutter {

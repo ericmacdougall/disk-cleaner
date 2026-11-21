@@ -1056,13 +1056,16 @@ fn partition_a_symlinked_scan_root_is_surveyed() {
     std::os::unix::fs::symlink(&root, &alias).unwrap();
     let res = lanes_scan(&alias);
     assert!(res.totals.allocated_bytes > 0);
-    check_partition(&alias, &res);
+    // The survey records the root's real path, never the alias (AC-16 of the rescue,
+    // goodqa#16529): apply opens every recorded path component by component.
+    let real_root = fs::canonicalize(&alias).unwrap();
+    check_partition(&real_root, &res);
     let p = plan(&res, &idle_opts());
     check_invariants(&res, &p);
     let survey = res.pieces.as_ref().unwrap();
     assert!(!survey.pieces.is_empty());
     for sp in &survey.pieces {
-        assert!(Path::new(&sp.path).starts_with(&alias), "{}", sp.path);
+        assert!(Path::new(&sp.path).starts_with(&real_root), "{}", sp.path);
         assert_eq!(recheck(sp, RecheckScope::All), Ok(()), "{}", sp.path);
     }
 }
@@ -2240,7 +2243,8 @@ fn invalid_name_is_secret(n: &[u8]) -> bool {
 fn invalid_name_violations(label: &str, res: &ScanResult, p: &Plan, root: &Path) -> Vec<String> {
     use std::os::unix::ffi::OsStrExt;
     let mut found: Vec<PathBuf> = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    // The scan records real paths (AC-16 of the rescue, goodqa#16529), so look under the root's.
+    let mut stack = vec![fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())];
     while let Some(d) = stack.pop() {
         let Ok(rd) = fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
@@ -2265,7 +2269,8 @@ fn invalid_name_violations(label: &str, res: &ScanResult, p: &Plan, root: &Path)
                     .any(|m| Path::new(&sp.path).join(m.path()).to_string_lossy() == lossy)
         });
         let secret = invalid_name_is_secret(f.file_name().unwrap().as_bytes());
-        let in_git = oracle_in_gitdir(f.parent().unwrap());
+        // `f` is found under the root's real path; the root's spelling adds its context too.
+        let in_git = oracle_in_gitdir(f.parent().unwrap()) || oracle_in_gitdir(root);
         match holder {
             None if in_git => {}
             None => v.push(format!("{label}: {lossy} is in no survey piece")),

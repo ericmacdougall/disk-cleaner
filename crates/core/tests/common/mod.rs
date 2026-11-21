@@ -140,8 +140,11 @@ pub fn write_bytes(path: &Path, len: usize) {
 /// Scan root and remote live side by side so the remote is not part of the scan.
 pub fn workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
-    let scan_root = tmp.path().join("scan");
-    let remotes = tmp.path().join("remotes");
+    // The scan records real paths on Unix (macOS spells the temporary directory through the
+    // /var symlink), so the fixtures are built under the real path and compare equal to it.
+    let base = fs::canonicalize(tmp.path()).unwrap();
+    let scan_root = base.join("scan");
+    let remotes = base.join("remotes");
     fs::create_dir_all(&scan_root).unwrap();
     fs::create_dir_all(&remotes).unwrap();
     (tmp, scan_root, remotes)

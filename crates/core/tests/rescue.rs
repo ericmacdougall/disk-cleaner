@@ -829,3 +829,183 @@ fn artifact_secret_a_secret_entry_stays_in_place_and_the_artifact_is_still_noise
     }
     verdict(bad);
 }
+
+// ----------------------------------------------------------------------------------------------
+// AC-16 (ASSUMPTION, the apply stream's requirement relayed by main, not user-confirmed): on Unix
+// every path the scan and the plan record is real, so apply can open it component by component.
+
+/// Every recorded path of a scan and its plan, with what it is.
+fn recorded_paths(res: &ScanResult, p: &Plan) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    out.extend(res.roots.iter().map(|r| ("root".to_string(), r.clone())));
+    out.extend(
+        res.nodes
+            .iter()
+            .map(|n| ("node".to_string(), n.path.clone())),
+    );
+    out.extend(
+        res.outputs
+            .iter()
+            .map(|o| ("output".to_string(), o.path.clone())),
+    );
+    out.extend(
+        res.big_files
+            .iter()
+            .map(|b| ("big file".to_string(), b.path.clone())),
+    );
+    for e in &res.enclosing_repos {
+        out.push(("enclosing root".to_string(), e.root.clone()));
+        out.push(("enclosing repo".to_string(), e.repo.clone()));
+    }
+    out.extend(p.items.iter().map(|i| ("item".to_string(), i.path.clone())));
+    if let Some(s) = res.pieces.as_ref() {
+        out.extend(
+            s.pieces
+                .iter()
+                .map(|sp| ("scan piece".to_string(), sp.path.clone())),
+        );
+        for b in &s.blobs {
+            out.extend(
+                b.copies
+                    .iter()
+                    .map(|c| ("blob copy".to_string(), c.path.clone())),
+            );
+        }
+    }
+    if let Some(l) = p.lanes.as_ref() {
+        out.extend(
+            l.pieces
+                .iter()
+                .map(|lp| ("plan piece".to_string(), lp.path.clone())),
+        );
+    }
+    out
+}
+
+/// The first existing ancestor of `path` (or `path` itself) that is a symlink (`lstat`).
+fn symlinked_component(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .filter(|a| a.parent().is_some())
+        .find(|a| fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink()))
+        .map(Path::to_path_buf)
+}
+
+/// Every recorded path is real and lies under `real_root`.
+fn expect_real_paths(
+    bad: &mut Vec<String>,
+    label: &str,
+    res: &ScanResult,
+    p: &Plan,
+    real_root: &Path,
+) {
+    let all = recorded_paths(res, p);
+    if all.len() < 5 {
+        bad.push(format!("{label}: vacuous, {} recorded paths", all.len()));
+    }
+    for (what, path) in all {
+        let pp = Path::new(&path);
+        if let Some(link) = symlinked_component(pp) {
+            bad.push(format!(
+                "{label}: {what} {path} goes through the symlink {}",
+                link.display()
+            ));
+        }
+        if !pp.starts_with(real_root) {
+            bad.push(format!(
+                "{label}: {what} {path} is not under {}",
+                real_root.display()
+            ));
+        }
+    }
+}
+
+#[test]
+fn real_paths_every_recorded_path_is_real_and_the_spelling_is_only_warned() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The temporary directory as the system spells it: on macOS under /var, a symlink to
+    // /private/var.
+    let spelled_base = tmp.path().to_path_buf();
+    let base = real(&spelled_base);
+    let target = base.join("real");
+    let proj = target.join("proj");
+    write(&proj.join("package.json"), "{}\n");
+    write_bytes(&proj.join("node_modules").join("x").join("i.js"), 9 * KIB);
+    content(&proj.join("docs"));
+    symlink(&target, base.join("alias")).unwrap();
+    symlink(&base, base.join("up")).unwrap();
+    let mut bad = Vec::new();
+    let reference = scan_roots(std::slice::from_ref(&proj));
+    let pref = idle_plan(&reference);
+    let want = serde_json::to_value(&pref.lanes.as_ref().unwrap().totals.by_lane).unwrap();
+    expect_real_paths(&mut bad, "real", &reference, &pref, &proj);
+    let cases: Vec<(&str, Vec<PathBuf>)> = vec![
+        ("alias root", vec![base.join("alias").join("proj")]),
+        (
+            "symlinked ancestor",
+            vec![base.join("up").join("real").join("proj")],
+        ),
+        (
+            "system spelling",
+            vec![spelled_base.join("real").join("proj")],
+        ),
+        ("dotdot", vec![proj.join("docs").join("..")]),
+        (
+            "same directory twice",
+            vec![proj.clone(), base.join("alias").join("proj")],
+        ),
+        (
+            "alias first",
+            vec![base.join("alias").join("proj"), proj.clone()],
+        ),
+    ];
+    for (label, roots) in cases {
+        let res = scan_roots(&roots);
+        let p = idle_plan(&res);
+        expect_real_paths(&mut bad, label, &res, &p, &proj);
+        if res.roots != vec![proj.display().to_string()] {
+            bad.push(format!(
+                "{label}: roots are {:?}, not the one real root",
+                res.roots
+            ));
+        }
+        let got = serde_json::to_value(&p.lanes.as_ref().unwrap().totals.by_lane).unwrap();
+        if got != want {
+            bad.push(format!(
+                "{label}: lanes {got} differ from the real root's {want}"
+            ));
+        }
+        for r in roots.iter().filter(|r| **r != proj) {
+            let shown = format!(
+                "scanned {}, which you gave as {}",
+                proj.display(),
+                r.display()
+            );
+            let dup = format!("is the same directory as scan root {}", proj.display());
+            if !res
+                .warnings
+                .iter()
+                .any(|w| w.contains(&shown) || w.contains(&dup))
+            {
+                bad.push(format!(
+                    "{label}: no warning shows both forms of {}: {:?}",
+                    r.display(),
+                    res.warnings
+                ));
+            }
+        }
+    }
+    // A firmlink spelling (macOS): the same directory by identity under another real path.
+    let data = Path::new("/System/Volumes/Data").join(proj.strip_prefix("/").unwrap());
+    if fs::metadata(&data).is_ok() {
+        use std::os::unix::fs::MetadataExt;
+        let (a, b) = (fs::metadata(&proj).unwrap(), fs::metadata(&data).unwrap());
+        if (a.dev(), a.ino()) == (b.dev(), b.ino()) {
+            let res = scan_roots(&[proj.clone(), data.clone()]);
+            if res.roots.len() != 1 {
+                bad.push(format!("firmlink: {:?} walked twice", res.roots));
+            }
+            println!("real_paths: firmlink spelling checked: {}", data.display());
+        }
+    }
+    verdict(bad);
+}

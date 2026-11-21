@@ -717,12 +717,15 @@ fn note_nested_state(
     let (path, agg) = (&dirs[i].0, &dirs[i].1);
     let rel = rel_slash(path, &build.path);
     if !rel.is_empty() {
-        // An ask protects, so the walked spelling and the real path both count.
+        // An ask protects, so the walked path, the real path and every spelling count.
         let real = names.real_of(path);
-        let matched = [
+        let mut matched = vec![
             match_rule(dirs, i, path, rules),
             match_rule(dirs, i, &real, rules),
         ];
+        for s in names.spellings_of(path) {
+            matched.push(match_rule(dirs, i, &s, rules));
+        }
         for rule in matched.into_iter().flatten() {
             if let Some(why) = rule.ask.as_deref() {
                 build.node.ask_reason.get_or_insert_with(|| {
@@ -809,10 +812,38 @@ fn match_rule<'a>(
         .find(|r| r.markers.is_empty() || marker_beside(dirs, path, &r.markers))
 }
 
-/// Each walked root's spelling with its real path (the spelling itself when it has none).
-struct RootNames(Vec<(PathBuf, PathBuf)>);
+/// Each walked root's path with its real path (the path itself when it has none) and every
+/// spelling the user gave for it.
+struct RootNames(Vec<(PathBuf, PathBuf, Vec<PathBuf>)>);
 
 impl RootNames {
+    /// The other names of a walked path: each spelling of the closest walked root that holds it
+    /// (other than the walked path), joined with the rest.
+    fn spellings_of(&self, path: &Path) -> Vec<PathBuf> {
+        let best = self
+            .0
+            .iter()
+            .filter(|(s, _, _)| path.starts_with(s))
+            .max_by_key(|(s, _, _)| s.components().count());
+        let Some((s, _, names)) = best else {
+            return Vec::new();
+        };
+        let Ok(rel) = path.strip_prefix(s) else {
+            return Vec::new();
+        };
+        names
+            .iter()
+            .filter(|n| *n != s)
+            .map(|n| {
+                if rel.as_os_str().is_empty() {
+                    n.clone()
+                } else {
+                    n.join(rel)
+                }
+            })
+            .collect()
+    }
+
     /// The real path of a walked path: the real path of the closest walked root that holds it,
     /// joined with the rest. The walk never follows a link below a root, so the rest is real.
     /// A root's spelling (a symlink named `.cache`, a parent named `.m2`) is a name the user
@@ -822,10 +853,10 @@ impl RootNames {
         let best = self
             .0
             .iter()
-            .filter(|(s, _)| path.starts_with(s))
-            .max_by_key(|(s, _)| s.components().count());
+            .filter(|(s, _, _)| path.starts_with(s))
+            .max_by_key(|(s, _, _)| s.components().count());
         match best {
-            Some((s, c)) if s != c => match path.strip_prefix(s) {
+            Some((s, c, _)) if s != c => match path.strip_prefix(s) {
                 Ok(rel) if rel.as_os_str().is_empty() => std::borrow::Cow::Owned(c.clone()),
                 Ok(rel) => std::borrow::Cow::Owned(c.join(rel)),
                 Err(_) => std::borrow::Cow::Borrowed(path),
@@ -1161,6 +1192,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             .iter()
             .cloned()
             .zip(plan_r.canon.iter().cloned())
+            .zip(plan_r.spellings.iter().cloned())
+            .map(|((r, c), s)| (r, c, s))
             .collect(),
     );
     let mut builds = classify(&mut dirs, &opts.rules, &root_set, &names, &mut odd_dirs);
@@ -1478,7 +1511,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
 
     // Scan roots inside a repository the scan does not cover: the artifacts there are checked
     // against that repository's git, exactly as a full-repo scan would.
-    let enclosing_repos = check_enclosing_repos(&mut builds, &roots, &plan_r.canon, opts);
+    let enclosing_repos =
+        check_enclosing_repos(&mut builds, &roots, &plan_r.canon, &plan_r.spellings, opts);
 
     // Totals by class.
     for b in &builds {
@@ -1494,10 +1528,16 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
 
     let nodes: Vec<Node> = builds.into_iter().map(|b| b.node).collect();
     // The second, read-only walk behind plan lanes (docs/SCAN-FORMAT.md, "Pieces and lanes").
-    let pieces = opts
-        .lanes
-        .as_ref()
-        .map(|po| crate::pieces::survey(&roots, &nodes, opts.one_file_system, &opts.rules, po));
+    let pieces = opts.lanes.as_ref().map(|po| {
+        crate::pieces::survey_named(
+            &roots,
+            &plan_r.spellings,
+            &nodes,
+            opts.one_file_system,
+            &opts.rules,
+            po,
+        )
+    });
 
     Ok(ScanResult {
         schema_version: SCHEMA_VERSION,
@@ -1529,9 +1569,12 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
 /// The nearest repository above `root`, looking at each ancestor's `.git` without following
 /// symlinks: `(repository directory, kind of .git entry)`. The canonical path is searched first
 /// (git works from the real directory), then the spelled one.
-fn find_enclosing_repo(root: &Path) -> Option<(PathBuf, GitEntry)> {
+fn find_enclosing_repo(root: &Path, spellings: &[PathBuf]) -> Option<(PathBuf, GitEntry)> {
     let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    for start in [real.as_path(), root] {
+    let starts = std::iter::once(real.as_path())
+        .chain(std::iter::once(root))
+        .chain(spellings.iter().map(PathBuf::as_path));
+    for start in starts {
         for dir in start.ancestors().skip(1) {
             match std::fs::symlink_metadata(dir.join(".git")) {
                 Ok(m) if m.is_dir() => return Some((dir.to_path_buf(), GitEntry::Dir)),
@@ -1561,12 +1604,14 @@ fn check_enclosing_repos(
     builds: &mut [Build],
     roots: &[PathBuf],
     canon_roots: &[PathBuf],
+    spellings: &[Vec<PathBuf>],
     opts: &ScanOptions,
 ) -> Vec<EnclosingRepo> {
     let mut out: Vec<EnclosingRepo> = Vec::new();
     let mut seen: Vec<(PathBuf, GitEntry, Vec<PathBuf>)> = Vec::new();
-    for root in roots {
-        let (repo, kind) = match find_enclosing_repo(root) {
+    for (k, root) in roots.iter().enumerate() {
+        let names = spellings.get(k).map(Vec::as_slice).unwrap_or(&[]);
+        let (repo, kind) = match find_enclosing_repo(root, names) {
             Some(x) => x,
             None => continue,
         };
@@ -1745,10 +1790,23 @@ fn link_odd_gits(builds: &mut [Build], odd_dirs: &[PathBuf], warnings: &mut Vec<
     }
 }
 
+/// The physical identity of the directory `p` names (symlinks followed), or `None` on a platform
+/// or file system that has none (device and inode both 0).
+fn dir_identity(p: &Path) -> Option<(u64, u64)> {
+    let md = std::fs::metadata(p).ok()?;
+    let m = meta_from(&md);
+    (m.dev != 0 || m.ino != 0).then_some((m.dev, m.ino))
+}
+
 /// The scan roots after normalisation: every directory is walked once however the roots overlap.
 struct RootPlan {
-    /// The roots that are walked, spelled as given (absolute), in the order given.
+    /// The roots that are walked, in the order given. On Unix each is its real path, so no path
+    /// the scan records has a symlinked component; elsewhere, spelled as given (absolute).
     roots: Vec<PathBuf>,
+    /// Per walked root, every spelling the user gave that names it (by identity), the root's own
+    /// path included. A spelling is a name the user gave: it may add protection (asks, secret
+    /// context), never make anything removable.
+    spellings: Vec<Vec<PathBuf>>,
     /// Their real paths, in the same order.
     canon: Vec<PathBuf>,
     /// Per walked root: directories below it, in its spelling, that are other walked roots (index
@@ -1775,7 +1833,9 @@ struct RootPlan {
 /// repository on a mount under `node_modules` then belongs to that `node_modules` however the
 /// mount was spelled. Every other root keeps the spelling the user gave.
 fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -> RootPlan {
-    let mut uniq: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // (walked path, real path, identity, spellings).
+    type Root = (PathBuf, PathBuf, Option<(u64, u64)>, Vec<PathBuf>);
+    let mut uniq: Vec<Root> = Vec::new();
     let mut unresolved: Vec<(PathBuf, String)> = Vec::new();
     for s in spelled {
         let c = match std::fs::canonicalize(&s) {
@@ -1787,7 +1847,17 @@ fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -
                 s.clone()
             }
         };
-        if let Some((first, _)) = uniq.iter().find(|(_, k)| *k == c) {
+        // Two roots are one directory when they have one identity (a symlinked spelling, a
+        // firmlink or bind mount spelling, `dir/..`); without identity, when one real path.
+        let id = dir_identity(&c);
+        let same = uniq.iter_mut().find(|(_, k, kid, _)| match (id, *kid) {
+            (Some(a), Some(b)) => a == b,
+            _ => *k == c,
+        });
+        if let Some((first, _, _, names)) = same {
+            if !names.contains(&s) {
+                names.push(s.clone());
+            }
             if *first != s {
                 warnings.push(diag(&format!(
                     "scan root {} is the same directory as scan root {} and was scanned once",
@@ -1797,61 +1867,98 @@ fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -
             }
             continue;
         }
-        uniq.push((s, c));
+        // On Unix the walk starts at the real path, so every recorded path is real (an apply
+        // step opens it component by component); the spelling is kept for context and shown in
+        // a warning. Elsewhere the spelling is walked, as before.
+        let walked = if cfg!(unix) { c.clone() } else { s.clone() };
+        if walked != s {
+            warnings.push(diag(&format!(
+                "scanned {}, which you gave as {}",
+                walked.display(),
+                s.display()
+            )));
+        }
+        let mut names = vec![walked.clone()];
+        if s != walked {
+            names.push(s);
+        }
+        uniq.push((walked, c, id, names));
     }
-    // Shallowest first, so an enclosing root is decided before the roots inside it.
+    // Every root that encloses each root, closest first, with the path from it: an ancestor of
+    // the real path is one of them when it has that root's identity, so a firmlink or bind mount
+    // spelling of an enclosing root is found too (by path text when there is no identity).
+    let encloses: Vec<Vec<(usize, PathBuf)>> = (0..uniq.len())
+        .map(|i| {
+            let c = &uniq[i].1;
+            let mut found: Vec<(usize, PathBuf)> = Vec::new();
+            for a in c.ancestors().skip(1) {
+                let aid = dir_identity(a);
+                for (k, (_, kc, kid, _)) in uniq.iter().enumerate() {
+                    if k == i || found.iter().any(|(e, _)| *e == k) {
+                        continue;
+                    }
+                    let hit = match (aid, *kid) {
+                        (Some(x), Some(y)) => x == y,
+                        _ => a == kc.as_path(),
+                    };
+                    if let (true, Ok(rel)) = (hit, c.strip_prefix(a)) {
+                        found.push((k, rel.to_path_buf()));
+                    }
+                }
+            }
+            found
+        })
+        .collect();
+    // Outermost first (a root has fewer enclosing roots than any root inside it), so an
+    // enclosing root is decided before the roots inside it.
     let mut order: Vec<usize> = (0..uniq.len()).collect();
-    order.sort_by_key(|&i| uniq[i].1.components().count());
+    order.sort_by_key(|&i| (encloses[i].len(), uniq[i].1.components().count()));
     let mut kept = vec![false; uniq.len()];
     let mut prune_by: Vec<Vec<(PathBuf, usize)>> = vec![Vec::new(); uniq.len()];
     for &i in &order {
-        let c = uniq[i].1.clone();
-        let enclosing: Vec<usize> = (0..uniq.len())
-            .filter(|&k| kept[k] && c != uniq[k].1 && c.starts_with(&uniq[k].1))
-            .collect();
-        if let Some(&k) = enclosing
+        let enclosing: Vec<(usize, PathBuf)> = encloses[i]
             .iter()
-            .find(|&&k| walk_reaches(&uniq[k].1, &c, one_fs))
+            .filter(|(k, _)| kept[*k])
+            .cloned()
+            .collect();
+        if let Some((k, _)) = enclosing
+            .iter()
+            .find(|(k, rel)| walk_reaches(&uniq[*k].1, &uniq[*k].1.join(rel), one_fs))
         {
             warnings.push(diag(&format!(
                 "scan root {} lies inside scan root {} and was scanned as part of it",
                 uniq[i].0.display(),
-                uniq[k].0.display()
+                uniq[*k].0.display()
             )));
             continue;
         }
         kept[i] = true;
-        // Enclosing roots were decided first (shallower), so their spellings are final.
-        let closest = enclosing
-            .iter()
-            .copied()
-            .max_by_key(|&k| uniq[k].1.components().count());
-        if let Some(k) = closest {
-            if let Ok(rel) = c.strip_prefix(&uniq[k].1) {
-                let at = uniq[k].0.join(rel);
-                if at != uniq[i].0 {
-                    warnings.push(diag(&format!(
-                        "scan root {} is the directory {} inside scan root {}, and is reported \
-                         under that path",
-                        uniq[i].0.display(),
-                        at.display(),
-                        uniq[k].0.display()
-                    )));
-                    uniq[i].0 = at;
+        // Enclosing roots were decided first (shallower), so their paths are final.
+        if let Some((k, rel)) = enclosing.first() {
+            let at = uniq[*k].0.join(rel);
+            if at != uniq[i].0 {
+                warnings.push(diag(&format!(
+                    "scan root {} is the directory {} inside scan root {}, and is reported \
+                     under that path",
+                    uniq[i].0.display(),
+                    at.display(),
+                    uniq[*k].0.display()
+                )));
+                if !uniq[i].3.contains(&at) {
+                    uniq[i].3.insert(0, at.clone());
                 }
+                uniq[i].0 = at;
             }
         }
-        for k in enclosing {
-            if let Ok(rel) = c.strip_prefix(&uniq[k].1) {
-                let at = uniq[k].0.join(rel);
-                prune_by[k].push((at, i));
-            }
+        for (k, rel) in &enclosing {
+            prune_by[*k].push((uniq[*k].0.join(rel), i));
         }
     }
     let walked: Vec<usize> = (0..uniq.len()).filter(|&i| kept[i]).collect();
     let pos = |i: usize| walked.iter().position(|&k| k == i).unwrap_or(0);
     RootPlan {
         roots: walked.iter().map(|&i| uniq[i].0.clone()).collect(),
+        spellings: walked.iter().map(|&i| uniq[i].3.clone()).collect(),
         canon: walked.iter().map(|&i| uniq[i].1.clone()).collect(),
         prune: walked
             .iter()
