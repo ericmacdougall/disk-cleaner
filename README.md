@@ -125,6 +125,22 @@ wrote (status 8). The head cannot show the newest copy deleted together with the
 whole folder rolled back to an older state. Add `--run <id>` (printed by `apply`) to restore an older generation of a path that was backed up more than once. Replacing or downgrading the
 `disk-cleaner` binary never brings data back; `restore` does.
 
+Known limits of the stored history, none of which loses a backed-up file:
+
+- **Two labels or two remotes for the same files.** Each acting run reads the history of its own
+  label on its own remote only. If you clean the same folders under two labels, or switch to
+  another remote after the local manifest was lost, what runs under the other label or remote
+  relied on (for example the kept copy of a removed duplicate) is not seen, and nothing detects
+  this. Use one label and one remote per state directory.
+- **A take-over while the old state directory is still in use.** `--take-over-label` is for a
+  state directory that is gone for good. A later run from the old one is refused (status 8), but
+  a run of the old one still in progress during the take-over can overwrite the new owner's head
+  in storage with its next write; nothing detects this.
+- **Restore's default generation.** Without `--run`, restore picks the newest generation of a
+  path by the time in its run id. If two hosts' clocks disagree (for example after a take-over),
+  it can pick an older generation; `--run <id>` picks any generation, and every generation stays
+  in storage.
+
 The scan and plan formats, every fact and every rule are described in
 [docs/SCAN-FORMAT.md](docs/SCAN-FORMAT.md). The overall design is in [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -156,7 +172,9 @@ None of this exists yet:
 
 Scanning and planning are read-only. Apply removes nothing unless the tool has shown that it is
 backed up and verified, regenerable, or present elsewhere, and has re-checked that at the moment of
-removal.
+removal. It never removes its own records: a piece that holds its state folder or manifest (a scan
+of your home folder includes `~/.disk-cleaner`) is kept with that reason, and the rest of the plan
+goes ahead.
 A check that fails or times out leaves its fact unknown, and an unknown fact never leads the plan to
 propose removal: an idle repo with one is marked `ask`. Every removal is written to a manifest with a restore command.
 
