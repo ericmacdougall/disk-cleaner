@@ -424,7 +424,10 @@ the disk as it is when the report runs. An open is also judged by the object the
 returned.
 
 Declarations are typed and exact (`e2e/declarations.py`): a file (created, written, its
-metadata changed, renamed, removed, mapped), a folder that may only be created, a socket, a
+metadata changed, renamed, removed, mapped), a file made new (by path only an open with
+`O_CREAT|O_EXCL`, then writes through that descriptor; in a snapshot, an entry that was not there
+before: for names that may sit beside others the app must never touch), a folder that may only
+be created, a socket, a
 subtree (only where the entry above says the whole folder is a library's, and the e2e build's
 webview profile), the harness's capture of standard output (through a descriptor only) and the
 null device. Placeholders: `{XXXXXX}` (six letters or digits), `{PID}` (the writing process's
