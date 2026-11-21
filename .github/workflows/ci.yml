@@ -87,6 +87,19 @@ jobs:
         env:
           DC_TEST_ALIAS_MOUNT_ROOT: ${{ runner.temp }}/aliastest
         run: cargo test -p disk-cleaner-core --locked --test mount_alias -- --nocapture
+      - name: Mount two tmpfs inside secret directories of a scan root
+        if: success() || failure()
+        run: |
+          for m in secrets/mnt .aws/mnt; do
+            mkdir -p "$RUNNER_TEMP/secretmount/$m"
+            sudo mount -t tmpfs -o size=16m tmpfs "$RUNNER_TEMP/secretmount/$m"
+            sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/secretmount/$m"
+          done
+      - name: Test a mounted scan root inside a secret directory (with --lanes)
+        if: success() || failure()
+        env:
+          DC_TEST_SECRET_MOUNT_ROOT: ${{ runner.temp }}/secretmount
+        run: cargo test -p disk-cleaner-core --locked --test mount_secret_root -- --nocapture
       - name: Create a repository owned by another user (root)
         if: success() || failure()
         run: |

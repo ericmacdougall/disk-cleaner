@@ -515,19 +515,105 @@ fn preorder_ents(t: &Tree) -> Vec<usize> {
     out
 }
 
-/// Fill node, git-directory, artifact and secret context, top down.
-fn annotate(t: &mut Tree, nodes: &[Node], rules: &RuleSet, order: &[usize]) {
+/// The context a directory hands to its children.
+#[derive(Clone, Debug, Default)]
+struct Inherited {
+    node: Option<usize>,
+    is_node: bool,
+    in_gitdir: bool,
+    in_artifact: bool,
+    secret_dir: Option<String>,
+}
+
+/// The context a scan root inherits from the directories that physically enclose it, as if the
+/// walk had reached it from above: whatever the order of the roots, and whether or not an
+/// enclosing root was scanned too (a root walked on its own because it is another file system
+/// under `--one-file-system`, or a root given alone). Node, git-directory and artifact context
+/// follow the root's real path; secrecy follows any secret-named directory above the root in its
+/// real path or its spelling, so everything inside a secret directory stays local.
+fn enclosing_context(
+    root: &Path,
+    real_nodes: &HashMap<PathBuf, usize>,
+    nodes: &[Node],
+    rules: &RuleSet,
+) -> Inherited {
+    let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let class_of = |n: Option<usize>| n.and_then(|n| nodes.get(n)).map(|n| n.class);
+    let secret_name = |a: &Path| {
+        a.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| rules.secret_dir(n))
+            .map(|k| k.to_string())
+    };
+    let mut c = Inherited::default();
+    let above: Vec<&Path> = real.ancestors().skip(1).collect();
+    for a in above.into_iter().rev() {
+        let here = real_nodes.get(a).copied();
+        let pclass = if c.is_node { class_of(c.node) } else { None };
+        let name_is_git = a.file_name() == Some(OsStr::new(".git"));
+        c.in_gitdir = c.in_gitdir
+            || class_of(here) == Some(Class::BareRepo)
+            || (name_is_git && matches!(pclass, Some(Class::Repo) | Some(Class::Worktree)));
+        if here.is_some() {
+            c.node = here;
+        }
+        c.is_node = here.is_some();
+        c.in_artifact = c.in_artifact || class_of(c.node).map(|k| k.is_artifact()).unwrap_or(false);
+        if c.secret_dir.is_none() {
+            c.secret_dir = secret_name(a);
+        }
+    }
+    if c.secret_dir.is_none() {
+        c.secret_dir = root.ancestors().skip(1).find_map(secret_name);
+    }
+    c
+}
+
+/// The real path of every node: its root's real path plus the rest, since the walk only
+/// descends real directories.
+fn real_node_paths(roots: &[PathBuf], nodes: &[Node]) -> HashMap<PathBuf, usize> {
+    let canon: Vec<PathBuf> = roots
+        .iter()
+        .map(|r| std::fs::canonicalize(r).unwrap_or_else(|_| r.clone()))
+        .collect();
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let p = Path::new(&n.path);
+            let best = roots
+                .iter()
+                .zip(&canon)
+                .filter(|(r, _)| p.starts_with(r))
+                .max_by_key(|(r, _)| r.components().count());
+            let real = match best.map(|(r, c)| (p.strip_prefix(r), c)) {
+                Some((Ok(rel), c)) if rel.as_os_str().is_empty() => c.clone(),
+                Some((Ok(rel), c)) => c.join(rel),
+                _ => p.to_path_buf(),
+            };
+            (real, i)
+        })
+        .collect()
+}
+
+/// Fill node, git-directory, artifact and secret context, top down. A scan root starts from the
+/// context of the directories that enclose it (`enclosing_context`).
+fn annotate(t: &mut Tree, roots: &[PathBuf], nodes: &[Node], rules: &RuleSet, order: &[usize]) {
+    let real_nodes = real_node_paths(roots, nodes);
     for &d in order {
         let parent = t.dirs[d].parent;
-        let (pnode, pgit, part, psecret) = match parent {
-            Some(p) => (
-                t.dirs[p].node,
-                t.dirs[p].in_gitdir,
-                t.dirs[p].in_artifact,
-                t.dirs[p].secret_dir.clone(),
-            ),
-            None => (None, false, false, None),
+        let pctx = match parent {
+            Some(p) => Inherited {
+                node: t.dirs[p].node,
+                is_node: t.dirs[p].is_node,
+                in_gitdir: t.dirs[p].in_gitdir,
+                in_artifact: t.dirs[p].in_artifact,
+                secret_dir: t.dirs[p].secret_dir.clone(),
+            },
+            None => enclosing_context(&t.dirs[d].path, &real_nodes, nodes, rules),
         };
+        let (pnode, pgit, part, psecret) =
+            (pctx.node, pctx.in_gitdir, pctx.in_artifact, pctx.secret_dir);
         if t.dirs[d].node.is_none() {
             t.dirs[d].node = pnode;
         }
@@ -542,7 +628,7 @@ fn annotate(t: &mut Tree, nodes: &[Node], rules: &RuleSet, order: &[usize]) {
         t.dirs[d].in_gitdir = pgit
             || class == Some(Class::BareRepo)
             || (name_is_git
-                && parent.map(|p| t.dirs[p].is_node).unwrap_or(false)
+                && pctx.is_node
                 && matches!(pclass, Some(Class::Repo) | Some(Class::Worktree)));
         let nclass = t.dirs[d].node.and_then(|n| nodes.get(n)).map(|n| n.class);
         t.dirs[d].in_artifact = part || nclass.map(|c| c.is_artifact()).unwrap_or(false);
@@ -553,6 +639,10 @@ fn annotate(t: &mut Tree, nodes: &[Node], rules: &RuleSet, order: &[usize]) {
             // directory it is not cut out (the git piece stays whole), but its entries are
             // secret-in-git-dir, which makes the git piece incomplete.
             t.dirs[d].secret_dir = Some(kind.to_string());
+            t.dirs[d].secret_top = !t.dirs[d].in_gitdir;
+        }
+        // A scan root inside a secret directory is the top of a secret piece of its own.
+        if parent.is_none() && t.dirs[d].secret_dir.is_some() {
             t.dirs[d].secret_top = !t.dirs[d].in_gitdir;
         }
     }
@@ -1315,7 +1405,7 @@ pub fn survey(
     let mut t = read_tree(roots, one_file_system, nodes);
     let dirs_order = preorder_dirs(&t);
     let ents_order = preorder_ents(&t);
-    annotate(&mut t, nodes, rules, &dirs_order);
+    annotate(&mut t, roots, nodes, rules, &dirs_order);
     let names = own_inodes(&mut t, &ents_order, &mut totals);
 
     let mut cutter = Cutter {

@@ -1500,3 +1500,120 @@ fn contract_digest_binds_the_plan_to_the_scan() {
     let text = serde_json::to_string(&plan(&plain, &idle_opts())).unwrap();
     assert!(!text.contains("\"lanes\""));
 }
+
+/// A survey of `roots` (outer and retained inner roots, as the scan keeps them when the inner one
+/// is another file system under `--one-file-system`) put in place of the scan's own survey.
+fn with_survey(mut res: ScanResult, roots: &[PathBuf]) -> ScanResult {
+    let s = disk_cleaner_core::pieces::survey(
+        roots,
+        &res.nodes,
+        false,
+        &RuleSet::builtin(),
+        &PieceOptions::default(),
+    );
+    res.pieces = Some(s);
+    res
+}
+
+/// PR review 3, F1: a scan root walked on its own inside a secret directory stays secret, in
+/// either root order and with or without the enclosing root, and none of it is hashed. The real
+/// mount case runs in CI (`mount_secret_root.rs`); here the outer walk skips the inner root
+/// exactly as it does for a retained root.
+#[test]
+fn neg1_a_scan_root_inside_a_secret_directory_stays_secret() {
+    for secret in ["secrets", ".aws"] {
+        let (_tmp, root, _) = workspace();
+        let root = fs::canonicalize(&root).unwrap();
+        let inner = root.join(secret).join("mnt");
+        write_bytes(&inner.join("a.bin"), 100 * KIB);
+        write_bytes(&inner.join("b.bin"), 100 * KIB);
+        // Outside the secret directory, two more copies: hashing does run.
+        write_bytes(&root.join("loose").join("c.bin"), 100 * KIB);
+        write_bytes(&root.join("loose").join("d.bin"), 100 * KIB);
+        let base = lanes_scan(&root);
+        let orders: [Vec<PathBuf>; 3] = [
+            vec![root.clone(), inner.clone()],
+            vec![inner.clone(), root.clone()],
+            vec![inner.clone()],
+        ];
+        for roots in orders {
+            let res = with_survey(base.clone(), &roots);
+            let survey = res.pieces.as_ref().unwrap();
+            let inner_pieces: Vec<_> = survey
+                .pieces
+                .iter()
+                .filter(|p| Path::new(&p.path).starts_with(&inner))
+                .collect();
+            assert!(!inner_pieces.is_empty(), "{secret} {roots:?}");
+            for p in &inner_pieces {
+                assert!(p.secret.is_some(), "{secret} {roots:?}: {p:#?}");
+            }
+            for b in &survey.blobs {
+                for c in &b.copies {
+                    assert!(
+                        !Path::new(&c.path).starts_with(root.join(secret)),
+                        "{secret} {roots:?}: {} was hashed",
+                        c.path
+                    );
+                }
+            }
+            if roots.len() == 2 {
+                assert_eq!(
+                    survey.blobs.len(),
+                    1,
+                    "{secret} {roots:?}: the loose copies"
+                );
+            }
+            let p = plan(&res, &idle_opts());
+            for f in [inner.join("a.bin"), inner.join("b.bin")] {
+                let lp = the_piece(&res, lanes_of(&p), &f);
+                assert_eq!(lp.lane, Lane::Keep, "{secret} {roots:?}: {}", f.display());
+                assert!(lp.secret.is_some(), "{secret} {roots:?}: {}", f.display());
+            }
+        }
+    }
+}
+
+/// PR review 3, F1: a retained inner root takes the node of the directory that encloses it, so
+/// its pieces are judged with that node rather than as an ungrouped root.
+#[test]
+fn partition_a_retained_inner_root_inherits_its_enclosing_node() {
+    let (_tmp, root, _) = workspace();
+    let root = fs::canonicalize(&root).unwrap();
+    let proj = root.join("proj");
+    write(&proj.join("package.json"), "{}");
+    write(&proj.join("node_modules").join("x").join("index.js"), "x");
+    let inner = proj.join("node_modules").join("mnt");
+    write_bytes(&inner.join("a.bin"), 10 * KIB);
+    let base = lanes_scan(&root);
+    let nm = base
+        .nodes
+        .iter()
+        .position(|n| Path::new(&n.path) == proj.join("node_modules"))
+        .expect("node_modules is a node");
+    for roots in [
+        vec![root.clone(), inner.clone()],
+        vec![inner.clone(), root.clone()],
+    ] {
+        let res = with_survey(base.clone(), &roots);
+        let survey = res.pieces.as_ref().unwrap();
+        let p = survey
+            .pieces
+            .iter()
+            .find(|p| {
+                p.members
+                    .iter()
+                    .any(|m| Path::new(&p.path).join(&m.0) == inner.join("a.bin"))
+            })
+            .expect("a.bin is in a piece");
+        assert_eq!(p.node, Some(nm), "{roots:?}: {p:#?}");
+        // Counted once: the outer walk does not enter the inner root.
+        let n = survey
+            .pieces
+            .iter()
+            .flat_map(|p| p.members.iter().map(move |m| Path::new(&p.path).join(&m.0)))
+            .filter(|m| *m == inner.join("a.bin"))
+            .count();
+        assert_eq!(n, 1, "{roots:?}");
+    }
+}

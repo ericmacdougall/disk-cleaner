@@ -1118,6 +1118,13 @@ entry is **never hashed** and never appears in `blobs`. The list:
   scan's state-file rule already makes such artifacts ask;
 - directories: `.ssh`, `.gnupg`, `.aws`, `.password-store`, `secrets`.
 
+A scan root takes its context from the directories that enclose it, as if the walk had reached
+it from above. This holds in any root order, and whether or not an enclosing root was scanned too:
+for example, a root walked on its own because it is another file system under `--one-file-system`.
+Its node, git-directory and artifact context follow its real path. If any directory above it, in
+its real path or as spelled, has a secret directory name, the root is a secret `tree` piece. A
+scan root that itself has a secret directory name is one too.
+
 Over-matching (a `tokenizer.py` in loose code) keeps a file on disk, the safe side. **Known
 limit:** secrets are found by name only. A secret under an ordinary name (a copied `.env` saved as
 `settings.txt`, a token inside a script) is not detected and is treated like any other file.
