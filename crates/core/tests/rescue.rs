@@ -575,23 +575,40 @@ fn n1_a_secret_named_symlink_protects_what_it_names() {
 
 /// A directory reached through `hops` relative symlink hops, each adding a 200-byte component,
 /// so its real path is longer than PATH_MAX (4096 on Linux, 1024 on macOS) while the spelling
-/// stays short: canonicalize fails, listing and stat work. Returns the spelling.
-fn too_long_to_resolve(base: &Path, hops: usize) -> PathBuf {
+/// stays short: canonicalize fails, listing and stat work. Returns the spelling, or `None` on
+/// macOS, whose kernel refuses a lookup once a symlink's expansion makes the path longer than
+/// its PATH_MAX (ENAMETOOLONG at about the fifth hop): there no such root can be listed at all,
+/// so the case cannot be built. Every other OS must build it.
+fn too_long_to_resolve(base: &Path, hops: usize) -> Option<PathBuf> {
     let long = "d".repeat(200);
     fs::create_dir_all(base.join("h0")).unwrap();
     for i in 0..hops {
         // `base/h{i}` is short to spell; the kernel resolves it.
-        fs::create_dir(base.join(format!("h{i}")).join(&long)).unwrap();
+        match fs::create_dir(base.join(format!("h{i}")).join(&long)) {
+            Ok(()) => {}
+            Err(e)
+                if cfg!(target_os = "macos") && e.kind() == std::io::ErrorKind::InvalidFilename =>
+            {
+                println!(
+                    "unresolved_root: hop {i}: {e}: this OS cannot reach a directory whose \
+                     resolved path is longer than PATH_MAX, so the case cannot be built here"
+                );
+                return None;
+            }
+            Err(e) => panic!("fixture: hop {i}: {e}"),
+        }
         symlink(format!("h{i}/{long}"), base.join(format!("h{}", i + 1))).unwrap();
     }
-    base.join(format!("h{hops}"))
+    Some(base.join(format!("h{hops}")))
 }
 
 #[test]
 fn unresolved_root_keeps_its_own_pieces_and_another_root_still_reclaims() {
     let tmp = tempfile::tempdir().unwrap();
     let base = real(tmp.path());
-    let spelled = too_long_to_resolve(&base.join("deep"), 25);
+    let Some(spelled) = too_long_to_resolve(&base.join("deep"), 25) else {
+        return;
+    };
     // Vacuous unless the real path really cannot be established.
     assert!(
         fs::canonicalize(&spelled).is_err(),
