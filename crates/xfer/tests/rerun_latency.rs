@@ -104,6 +104,14 @@ impl Latent {
             .map(|o| o.start)
             .min()
     }
+    /// Key and end of every op of `kind` on keys under `prefix`.
+    fn ends(&self, kind: &str, prefix: &str) -> Vec<(String, Instant)> {
+        let ops = self.ops.lock().expect("ops");
+        ops.iter()
+            .filter(|o| o.kind == kind && o.key.starts_with(prefix))
+            .map(|o| (o.key.clone(), o.end))
+            .collect()
+    }
     /// (start, end) of the first op of `kind` on `key`.
     fn span(&self, kind: &str, key: &str) -> Option<(Instant, Instant)> {
         let ops = self.ops.lock().expect("ops");
@@ -262,7 +270,10 @@ fn slow_commits_follow_each_other_and_put_both_objects_at_once() {
             &rand_bytes(300 + i, 1 << 20),
         );
     }
-    let slow = Duration::from_millis(1200);
+    // Commits slower than the one-second spacing and slower than a pack takes to make (0.9 s
+    // put here, about 2.5 s on a macOS CI runner in a debug build), so packs are verified while
+    // a commit is in flight and keep coming for several commits.
+    let slow = Duration::from_millis(3000);
     let t = Latent::with_puts(
         env.local(),
         Duration::ZERO,
@@ -278,9 +289,19 @@ fn slow_commits_follow_each_other_and_put_both_objects_at_once() {
     o.commit_bytes = 1 << 40;
     let rep = xfer::backup::backup(t.clone(), &o).expect("backup");
     assert_eq!(rep.exit_code, 0, "{rep:#?}");
-    assert!(rep.commits >= 3, "{rep:#?}");
+    assert!(rep.commits >= 2, "{rep:#?}");
     let run = rep.run.clone();
+    let store = env.local();
     let mut spans = Vec::new();
+    let stored = store.list("v1/index").expect("list idx");
+    let mut listed: Vec<std::collections::HashSet<String>> = Vec::new();
+    for seq in 0..rep.commits {
+        let ik = xfer::repo::idx_key(&run, seq);
+        let o = stored.iter().find(|o| o.key == ik).expect("idx stored");
+        let obj: xfer::repo::IdxObj =
+            xfer::repo::decode(&store.get(&o.key, o.size).expect("get idx")).expect("idx");
+        listed.push(obj.packs.into_iter().map(|p| p.key).collect());
+    }
     for seq in 0..rep.commits {
         let ik = xfer::repo::idx_key(&run, seq);
         let fk = xfer::repo::files_key(&run, seq);
@@ -301,15 +322,35 @@ fn slow_commits_follow_each_other_and_put_both_objects_at_once() {
             .expect("end");
         spans.push((i.0.min(f.0), end));
     }
-    // Packs keep arriving, so every commit before the last two has work waiting when it ends:
-    // the next must start at once, not a second later.
-    for w in spans.windows(2).take(spans.len().saturating_sub(2)) {
-        let gap = w[1].0.saturating_duration_since(w[0].1);
+    // Work was waiting when commit k ended if a pack verified (its stat returned) before then
+    // and no commit up to k lists it; that is read from the recorded requests and the stored
+    // .idx objects, not assumed from timing. Each such commit must be followed at once (the
+    // one-second spacing runs from the start of the commit, which is over 3 s ago), not a
+    // second later. The last commit is left out as a successor: once the input is done the
+    // final commit starts without the spacing check, so it proves nothing.
+    let verified = t.ends("stat", "v1/packs/");
+    let mut waiting_boundaries = 0;
+    for k in 0..spans.len().saturating_sub(2) {
+        let end = spans[k].1;
+        let waiting = verified
+            .iter()
+            .any(|(key, at)| *at < end && !listed[..=k].iter().any(|l| l.contains(key)));
+        if !waiting {
+            continue;
+        }
+        waiting_boundaries += 1;
+        let gap = spans[k + 1].0.saturating_duration_since(end);
         assert!(
             gap < Duration::from_millis(500),
-            "{} ms between one commit's end and the next start:\n{}",
+            "{} ms between the end of commit {k}, with a verified pack waiting, and the next \
+             start:\n{}",
             gap.as_millis(),
             t.describe_ops()
         );
     }
+    assert!(
+        waiting_boundaries >= 1,
+        "no commit ended with a verified pack waiting, so nothing was checked:\n{}",
+        t.describe_ops()
+    );
 }

@@ -26,7 +26,20 @@ fn rss_unit() -> u64 {
     }
 }
 
+/// This process's own peak RSS: what a child spawned from it starts its `ru_maxrss` at.
 fn self_rss() -> u64 {
+    // On Linux, RUSAGE_SELF also carries the peak of whatever process spawned this one (cargo,
+    // over 100 MiB on CI), because exec keeps the old peak. The child inherits only this
+    // address space's peak, which is VmHWM, so read that.
+    if cfg!(target_os = "linux") {
+        let s = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
+        let kb: u64 = s
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .expect("VmHWM");
+        return kb << 10;
+    }
     // SAFETY: zeroed rusage is a valid value for getrusage to fill.
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
@@ -369,24 +382,30 @@ fn unsafe_paths_and_links_are_refused_before_the_target_exists() {
     }
 }
 
-/// `n` zero bytes as one zstd frame, encoded in a stream so this process never holds them (a
-/// child's peak RSS includes its parent's at spawn, so the parent stays small).
-fn zero_bomb(n: usize) -> Vec<u8> {
+/// `n` copies of `byte` as one zstd frame, encoded in a stream so this process never holds them
+/// (a child's peak RSS includes its parent's at spawn, so the parent stays small).
+fn bomb_of(byte: u8, n: usize) -> Vec<u8> {
     use std::io::Write;
     let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3).expect("encoder");
-    let zeros = [0u8; 64 << 10];
-    for _ in 0..n / zeros.len() {
-        enc.write_all(&zeros).expect("encode");
+    let block = [byte; 64 << 10];
+    for _ in 0..n / block.len() {
+        enc.write_all(&block).expect("encode");
     }
     enc.finish().expect("finish")
+}
+
+fn zero_bomb(n: usize) -> Vec<u8> {
+    bomb_of(0, n)
 }
 
 #[test]
 fn hostile_commit_objects_are_refused_within_bounded_memory() {
     let a = rand_bytes(3, 3000);
     let base = || Repo::new(&[&a], vec![entry(b"f.bin", Kind::File, 0o644, &a)]);
-    // an expansion bomb: 100 MiB of zeros in a few KiB, over the 64 MiB object limit
-    let bomb = zero_bomb(100 << 20);
+    // an expansion bomb: 100 MiB of spaces in a few KiB, over the 64 MiB object limit. Spaces,
+    // not zeros: JSON allows leading whitespace, so only the size limit can stop it (zeros are
+    // refused at the first byte by a parser that reads as it decompresses).
+    let bomb = bomb_of(b' ', 100 << 20);
     assert!(bomb.len() < 64 << 10);
     // a frame whose header declares about 4 GiB of content, followed by one tiny raw block
     let mut big = vec![0x28, 0xb5, 0x2f, 0xfd, 0xa0, 0xff, 0xff, 0xff, 0xff];
@@ -691,6 +710,7 @@ fn share_case(extra: usize) -> (Env, Out) {
     let fit = i / xfer::repo::CHUNK_ENTRY_COST as usize;
     fill_index(&env, &objref(&pk, &r.pack), fit + extra - 2000);
     let out = restore(&env, &env.p("target"), &[]);
+    eprintln!("[{} MiB] share case +{extra}", out.rss >> 20);
     assert!(
         out.rss < RSS_MAX,
         "peak RSS {} MiB: {}",

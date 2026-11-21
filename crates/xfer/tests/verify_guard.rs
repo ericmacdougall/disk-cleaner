@@ -91,7 +91,8 @@ fn a_failed_index_put_gives_no_receipt_and_a_rerun_adopts_the_packs() {
 
 #[test]
 fn a_failed_file_table_put_gives_no_receipt_and_a_rerun_reuses_the_packs() {
-    // the .idx was verified, so the rerun finds the packs through it, not as orphans
+    // the .idx was verified, so the rerun finds the packs it lists through it and adopts only
+    // the rest as orphans
     failed_commit_put("v1/files/", false);
 }
 
@@ -122,14 +123,22 @@ fn failed_commit_put(prefix: &str, orphans: bool) {
     // Exactly the packs no committed .idx lists are orphans to adopt. How many that is depends
     // on timing (a pack can be sealed after the .idx and before the failing .files put stops
     // the run), so it is read from the store before the rerun, not assumed.
+    // The first commit can come before any pack is verified (on a slow runner), so its .idx
+    // may list no packs: what is fixed is whether an .idx was stored at all.
     let store = env.local();
+    let idx_objs = store.list("v1/index").expect("list index");
     let mut indexed = std::collections::HashSet::new();
-    for o in store.list("v1/index").expect("list index") {
+    for o in &idx_objs {
         let obj: xfer::repo::IdxObj =
             xfer::repo::decode(&store.get(&o.key, o.size).expect("get idx")).expect("idx");
         indexed.extend(obj.packs.into_iter().map(|p| p.key));
     }
-    assert_eq!(indexed.is_empty(), orphans, "{prefix}: indexed {indexed:?}");
+    assert_eq!(
+        idx_objs.is_empty(),
+        orphans,
+        "{prefix}: {} .idx objects stored, listing {indexed:?}",
+        idx_objs.len()
+    );
     let orphan_packs = packs_first - indexed.len();
 
     // rerun on a healthy transport: the verified packs are adopted, not uploaded again

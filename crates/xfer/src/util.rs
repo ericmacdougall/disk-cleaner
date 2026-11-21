@@ -150,6 +150,28 @@ pub fn tune_allocator() {
     }
 }
 
+/// Hand freed heap memory back to the system now. macOS's allocator keeps freed blocks of the
+/// sizes a decoded commit object uses resident until memory pressure, so without this every
+/// object decoded while loading would add to the peak (CI measured 320 MiB on macOS where Linux
+/// peaks at 150 MiB for the same restore). Linux needs nothing: blocks over the 1 MiB mmap
+/// threshold set by [`tune_allocator`] go back on free.
+pub fn release_free_memory() {
+    #[cfg(target_os = "macos")]
+    if !cfg!(feature = "broken-mem-plan") {
+        extern "C" {
+            fn malloc_zone_pressure_relief(
+                zone: *mut libc::c_void,
+                goal: libc::size_t,
+            ) -> libc::size_t;
+        }
+        // SAFETY: a null zone means every zone, and goal 0 asks for as much as possible; the
+        // call only returns free pages to the system.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+}
+
 /// Resident set size of a process in bytes, from /proc (Linux; None elsewhere or when gone).
 pub fn rss_of(pid: u32) -> Option<u64> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;

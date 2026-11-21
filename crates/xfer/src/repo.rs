@@ -34,6 +34,24 @@ pub const FETCH_PARALLEL: usize = 8;
 /// Compressed bytes of commit objects fetched at once (a larger single object is fetched alone).
 pub const FETCH_BYTES: u64 = 16 << 20;
 
+/// Consecutive ranges of `objs` to fetch at once: at most `FETCH_PARALLEL` objects and
+/// `FETCH_BYTES` listed bytes each, except that an object larger than that is a batch alone.
+pub fn fetch_batches(objs: &[crate::transport::RemoteObject]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < objs.len() {
+        let mut j = i + 1;
+        let mut bytes = objs[i].size;
+        while j < objs.len() && j - i < FETCH_PARALLEL && bytes + objs[j].size <= FETCH_BYTES {
+            bytes += objs[j].size;
+            j += 1;
+        }
+        out.push(i..j);
+        i = j;
+    }
+    out
+}
+
 /// Crate version plus build commit: recorded in every commit object and receipt.
 pub fn engine() -> String {
     format!(
@@ -266,6 +284,9 @@ pub fn encode<T: Serialize + for<'de> Deserialize<'de>>(v: &T) -> Result<Vec<u8>
     Ok(z)
 }
 
+/// Decode one zstd JSON commit object, parsing as it decompresses: the JSON text is never held
+/// whole, so the transient cost of an object is its decoded value plus small buffers. More than
+/// `OBJECT_JSON_MAX` decoded bytes (leading whitespace included) is refused.
 pub fn decode<T: for<'de> Deserialize<'de>>(z: &[u8]) -> Result<T> {
     // the broken-restore-guards variant lifts the object limit (failing-first evidence only)
     let limit = if cfg!(feature = "broken-restore-guards") {
@@ -273,8 +294,50 @@ pub fn decode<T: for<'de> Deserialize<'de>>(z: &[u8]) -> Result<T> {
     } else {
         OBJECT_JSON_MAX
     };
-    let json = bounded_zstd(z, limit)?;
-    serde_json::from_slice(&json).map_err(|e| Error::corrupt(format!("commit object: {e}")))
+    if cfg!(feature = "broken-mem-plan") {
+        let json = bounded_zstd(z, limit)?;
+        return serde_json::from_slice(&json)
+            .map_err(|e| Error::corrupt(format!("commit object: {e}")));
+    }
+    let over = std::cell::Cell::new(false);
+    let dec =
+        zstd::stream::read::Decoder::new(z).map_err(|e| Error::corrupt(format!("zstd: {e}")))?;
+    let capped = Capped {
+        inner: dec,
+        left: limit as u64,
+        over: &over,
+    };
+    let mut de =
+        serde_json::Deserializer::from_reader(std::io::BufReader::with_capacity(64 << 10, capped));
+    let v = T::deserialize(&mut de).and_then(|v| de.end().map(|()| v));
+    v.map_err(|e| {
+        if over.get() {
+            Error::corrupt(format!("decoded data exceeds the {limit} byte limit"))
+        } else if e.is_io() {
+            Error::corrupt(format!("zstd: {e}"))
+        } else {
+            Error::corrupt(format!("commit object: {e}"))
+        }
+    })
+}
+
+/// A reader that fails once more than `left` bytes have come through it.
+struct Capped<'a, R> {
+    inner: R,
+    left: u64,
+    over: &'a std::cell::Cell<bool>,
+}
+
+impl<R: std::io::Read> std::io::Read for Capped<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n as u64 > self.left {
+            self.over.set(true);
+            return Err(std::io::Error::other("decoded data over the limit"));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -540,15 +603,8 @@ impl Repo {
     /// previous one completed, so at most one batch of bodies is held beyond what was returned.
     pub fn fetch_each(&self, objs: &[RemoteObject], cache: Option<&Cache>) -> Vec<Result<Vec<u8>>> {
         let mut out = Vec::with_capacity(objs.len());
-        let mut i = 0;
-        while i < objs.len() {
-            let mut j = i + 1;
-            let mut bytes = objs[i].size;
-            while j < objs.len() && j - i < FETCH_PARALLEL && bytes + objs[j].size <= FETCH_BYTES {
-                bytes += objs[j].size;
-                j += 1;
-            }
-            let batch = &objs[i..j];
+        for r in fetch_batches(objs) {
+            let batch = &objs[r];
             if batch.len() == 1 || cfg!(feature = "broken-serial-load") {
                 out.extend(batch.iter().map(|o| self.fetch(o, cache)));
             } else {
@@ -563,7 +619,6 @@ impl Repo {
                     }));
                 });
             }
-            i = j;
         }
         out
     }
@@ -640,11 +695,15 @@ impl Repo {
                 crate::util::human(meter.limit)
             )));
         }
-        // fetched in parallel batches, decoded and charged one at a time in listing order
-        for group in idx.chunks(FETCH_PARALLEL) {
+        // fetched in parallel batches, decoded and charged one at a time in listing order; a
+        // batch is decoded before the next is fetched, so at most one batch of bodies is held
+        for r in fetch_batches(idx) {
+            let group = &idx[r];
             let bodies = self.fetch_many(group, cache)?;
             for (o, b) in group.iter().zip(bodies) {
                 self.add_index(o, &b, packs, meter, &mut map, &mut referenced)?;
+                drop(b);
+                crate::util::release_free_memory();
             }
         }
         Ok((map, idx.len(), referenced))
@@ -773,11 +832,14 @@ impl Repo {
         cache: Option<&Cache>,
     ) -> Result<Vec<(RemoteObject, FilesObj)>> {
         let mut out = Vec::new();
-        for group in objs.chunks(FETCH_PARALLEL) {
-            let listed: Vec<RemoteObject> = group.iter().map(|(_, o)| o.clone()).collect();
-            let bodies = self.fetch_many(&listed, cache)?;
+        let all: Vec<RemoteObject> = objs.iter().map(|(_, o)| o.clone()).collect();
+        for r in fetch_batches(&all) {
+            let (group, listed) = (&objs[r.clone()], &all[r]);
+            let bodies = self.fetch_many(listed, cache)?;
             for ((seq, o), b) in group.iter().zip(bodies) {
                 let f: FilesObj = decode(&b)?;
+                drop(b);
+                crate::util::release_free_memory();
                 if f.v != 1 || f.run != run || f.seq != *seq {
                     return Err(Error::corrupt(format!(
                         "{}: header does not match its key",
