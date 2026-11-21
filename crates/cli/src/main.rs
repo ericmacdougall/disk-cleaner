@@ -391,6 +391,7 @@ fn apply_exit_code(
         Err(ApplyError::Plan(_)) => 2,
         Err(ApplyError::Locked(_)) => 3,
         Err(_) => 1,
+        Ok(rep) if rep.mirror_failed.is_some() => 6,
         Ok(rep) if !rep.shards_failed.is_empty() => 4,
         Ok(rep) if !rep.rescan_needed.is_empty() => 5,
         Ok(_) => 0,
@@ -458,7 +459,15 @@ mod tests {
             shards_failed: vec!["s".into()],
             ..stale
         };
-        assert_eq!(apply_exit_code(&Ok(both)), 4);
+        assert_eq!(apply_exit_code(&Ok(both.clone())), 4);
+        // A manifest copy in storage that is behind outranks both.
+        let behind = ApplyReport {
+            mirror_failed: Some("rcat failed".into()),
+            ..both
+        };
+        assert_eq!(apply_exit_code(&Ok(behind.clone())), 6);
+        let s = super::report::apply_summary(&behind);
+        assert!(s.contains("run apply again to store it"), "{s}");
     }
 
     #[test]

@@ -155,6 +155,11 @@ pub(crate) struct Ctx<'a> {
     pub procs: crate::ProcessCheck,
     /// (dev, ino) of entries unlinked in this run (hard-link ctime drift).
     pub unlinked_inodes: std::collections::BTreeSet<(u64, u64)>,
+    /// Every row line known to be in a committed manifest segment in storage (read at the
+    /// start, plus the segments this run committed).
+    pub committed_lines: BTreeSet<String>,
+    /// Interrupted segment uploads found at the start, not yet retired (name, bytes).
+    pub orphans: Vec<(String, Vec<u8>)>,
     pub report: ApplyReport,
 }
 
@@ -236,6 +241,8 @@ pub fn apply(
         group_cache: BTreeMap::new(),
         procs: (opts.process)(),
         unlinked_inodes: Default::default(),
+        committed_lines: BTreeSet::new(),
+        orphans: Vec::new(),
         report: ApplyReport {
             dry_run: !opts.act,
             run: run.clone(),
@@ -426,9 +433,13 @@ pub fn apply(
         ready.push(pr);
     }
     let result = remove_phase(&mut ctx, ready);
-    // Closing mirror, whatever happened (revision 2c, finding 4).
-    let _ = mirror(&mut ctx);
+    // Closing mirror, whatever happened (revision 2c, finding 4). After a run that otherwise
+    // finished, a failure is reported, not dropped (Codex plan review r8, F1).
+    let closing = mirror(&mut ctx);
     result?;
+    if let Err(e) = closing {
+        ctx.report.mirror_failed = Some(e.to_string());
+    }
     mark_rescan(&mut ctx.report);
     Ok(ctx.report)
 }
@@ -688,19 +699,7 @@ fn prepare_noise(ctx: &Ctx, p: &PlanPiece, en: &recheck::Enumerated) -> Result<P
             if item.action != "remove-regenerable" || !p.path.starts_with(&item.path) {
                 return Err("the evidence's plan item does not remove this directory".into());
             }
-            let base = item.path.parent().unwrap_or(&item.path);
-            for m in markers {
-                let mp = Path::new(m);
-                let found = if mp.is_absolute() {
-                    mp.symlink_metadata().is_ok()
-                } else {
-                    base.ancestors()
-                        .any(|a| a.join(m).symlink_metadata().is_ok())
-                };
-                if !found {
-                    return Err(format!("the marker {m} is gone"));
-                }
-            }
+            noise_proof(ctx, p)?;
             extra.push(Row::Regenerable {
                 plan_piece: p.id,
                 path: p.path.clone(),
@@ -730,31 +729,8 @@ fn prepare_noise(ctx: &Ctx, p: &PlanPiece, en: &recheck::Enumerated) -> Result<P
                         .into(),
                 );
             }
-            let kept_ok = retained_piece
-                .and_then(|k| ctx.inputs.pieces.get(k))
-                .is_some_and(|rp| rp.lane == Lane::Keep && retained_copy.starts_with(&rp.path));
-            if !kept_ok {
-                return Err("the retained copy is not in a kept piece".into());
-            }
-            let rmd = retained_copy
-                .symlink_metadata()
-                .map_err(|_| "the retained copy is gone")?;
-            if !rmd.file_type().is_file() || rmd.len() != *size {
-                return Err(
-                    "the retained copy is not a regular file of the recorded length".into(),
-                );
-            }
-            let parent = retained_copy
-                .parent()
-                .ok_or("retained copy has no parent")?;
-            let leaf = retained_copy
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or("retained name is not UTF-8")?;
-            let (rsha, _) = shard::hash_file(parent, leaf)?;
-            if rsha != *sha256 {
-                return Err("the retained copy no longer has the recorded content".into());
-            }
+            let _ = retained_piece;
+            noise_proof(ctx, p)?;
             extra.push(Row::Retains {
                 plan_piece: p.id,
                 path: me,
@@ -786,6 +762,83 @@ fn prepare_noise(ctx: &Ctx, p: &PlanPiece, en: &recheck::Enumerated) -> Result<P
         reason: String::new(),
         git: None,
     })
+}
+
+/// The facts outside the piece that a noise piece's evidence relies on, checked now: the
+/// rule's markers exist, or the duplicate's retained copy is still a regular file of the
+/// recorded length and sha256 inside a kept piece. One choke point (Codex plan review r8, F2),
+/// called when the piece is prepared, in the batch re-check before its rows are written, and
+/// again just before its removal, fresh or resumed: the upload and the manifest mirror take
+/// time, and a marker or a retained copy can go in between.
+fn noise_proof(ctx: &Ctx, p: &PlanPiece) -> Result<(), String> {
+    match p.evidence.as_ref().ok_or("noise without evidence")? {
+        Evidence::Rule { markers, node, .. } => {
+            let item = ctx
+                .inputs
+                .items
+                .iter()
+                .find(|i| i.node == *node)
+                .ok_or("the evidence names a node without a plan item")?;
+            let base = item.path.parent().unwrap_or(&item.path);
+            for m in markers {
+                let mp = Path::new(m);
+                let found = if mp.is_absolute() {
+                    mp.symlink_metadata().is_ok()
+                } else {
+                    base.ancestors()
+                        .any(|a| a.join(m).symlink_metadata().is_ok())
+                };
+                if !found {
+                    return Err(format!("the marker {m} is gone"));
+                }
+            }
+            Ok(())
+        }
+        Evidence::Duplicate {
+            sha256,
+            size,
+            retained_copy,
+            retained_piece,
+        } => {
+            let kept_ok = retained_piece
+                .and_then(|k| ctx.inputs.pieces.get(k))
+                .is_some_and(|rp| rp.lane == Lane::Keep && retained_copy.starts_with(&rp.path));
+            if !kept_ok {
+                return Err("the retained copy is not in a kept piece".into());
+            }
+            let rmd = retained_copy
+                .symlink_metadata()
+                .map_err(|_| "the retained copy is gone")?;
+            if !rmd.file_type().is_file() || rmd.len() != *size {
+                return Err(
+                    "the retained copy is not a regular file of the recorded length".into(),
+                );
+            }
+            let parent = retained_copy
+                .parent()
+                .ok_or("retained copy has no parent")?;
+            let leaf = retained_copy
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("retained name is not UTF-8")?;
+            let (rsha, _) = shard::hash_file(parent, leaf)?;
+            if rsha != *sha256 {
+                return Err("the retained copy no longer has the recorded content".into());
+            }
+            Ok(())
+        }
+        Evidence::Archive { .. } => Err("archive evidence is not produced by plan; kept".into()),
+    }
+}
+
+/// Whether a prepared piece removes members on the strength of its noise evidence alone (no
+/// archived blob): those need `noise_proof` again before removal.
+fn relies_on_noise_evidence(ctx: &Ctx, pr: &Prepared) -> bool {
+    ctx.inputs.pieces[pr.piece].lane == Lane::Noise
+        && pr
+            .members
+            .iter()
+            .any(|m| matches!(m.content, Content::Noise))
 }
 
 /// A begun piece (remove-begin without remove-done): continue from its file rows (I-4 resume).
@@ -975,24 +1028,97 @@ fn upload_phase(ctx: &mut Ctx, prepared: &[Prepared]) -> Result<BTreeSet<String>
 /// Queue for mirroring every local row the remote copy lacks (a run that stopped before its
 /// mirror leaves rows only in the local file). Rows naming another remote stay local.
 fn seed_unmirrored(ctx: &mut Ctx) -> Result<(), ApplyError> {
-    // Rows of a segment that fails its checks count as absent here: they are mirrored again.
-    let (remote_rows, _rejected) = super::restore::rows_from_remote(&ctx.rc, &ctx.opts.label)?;
+    // Rows of a segment that is not committed count as absent here: they are mirrored again.
+    let remote = super::restore::remote_manifest(&ctx.rc, &ctx.opts.label)?;
     let line = |e: &super::manifest::Envelope| serde_json::to_string(e).unwrap_or_default();
-    let have: std::collections::BTreeSet<String> = remote_rows.iter().map(line).collect();
+    ctx.committed_lines = remote.rows.iter().map(line).collect();
+    ctx.orphans = remote.interrupted;
     for e in &ctx.manifest.rows {
         let other_remote = match &e.row {
             Row::Shard { remote, .. } | Row::Blob { remote, .. } => remote != &ctx.opts.remote,
             _ => false,
         };
         let l = line(e);
-        if !other_remote && !have.contains(&l) {
+        if !other_remote && !ctx.committed_lines.contains(&l) {
             ctx.manifest.unmirrored.push(l);
         }
     }
+    // An earlier run may have stored an orphan's rows again and stopped before retiring it.
+    retire_orphans(ctx);
     Ok(())
 }
 
-/// Upload the manifest rows not yet mirrored as a new immutable object, verified.
+/// Upload `bytes` as `name` and verify it by hash.
+fn upload_verified(rc: &Rclone, name: &str, bytes: &[u8]) -> Result<(), ApplyError> {
+    use sha1::Sha1;
+    let b2 = bytes.to_vec();
+    rc.rcat(name, bytes.len() as u64, move |w| {
+        w.write_all(&b2).map_err(|e| e.to_string())
+    })
+    .map_err(ApplyError::Storage)?;
+    shard::verify(
+        rc,
+        name,
+        bytes.len() as u64,
+        &hex::encode(Sha1::digest(bytes)),
+        &hex::encode(md5::Md5::digest(bytes)),
+        &hex::encode(Sha256::digest(bytes)),
+        &UploadHooks::default(),
+    )
+    .map(|_| ())
+    .map_err(ApplyError::Storage)
+}
+
+/// Retire each interrupted segment upload whose rows are all in committed segments (Codex plan
+/// review r8, F1): a `.abandoned` record bound to its exact sha256 and size tells restore to
+/// skip it. Every complete line must be a committed row line, and an unterminated last line
+/// (an upload cut mid-row) must be the start of one. Judged against verified storage only,
+/// never the local manifest, so a crash before the rows are stored again retires nothing. A
+/// segment that is not retired stays rejected, and restore --from-remote refuses the history
+/// until it is (or `--accept-partial`). Failures here are not errors: they retire nothing.
+fn retire_orphans(ctx: &mut Ctx) {
+    let committed = &ctx.committed_lines;
+    let covered = |b: &[u8]| -> bool {
+        let Ok(text) = std::str::from_utf8(b) else {
+            return false;
+        };
+        let (whole, tail) = match text.rfind('\n') {
+            Some(i) => (&text[..i], &text[i + 1..]),
+            None => ("", text),
+        };
+        let lines_ok = whole
+            .split('\n')
+            .filter(|l| !l.is_empty())
+            .all(|l| committed.contains(l));
+        let tail_ok = tail.is_empty()
+            || committed
+                .range(tail.to_string()..)
+                .next()
+                .is_some_and(|l| l.starts_with(tail));
+        lines_ok && tail_ok
+    };
+    let mut keep = Vec::new();
+    for (name, bytes) in std::mem::take(&mut ctx.orphans) {
+        if !covered(&bytes) {
+            keep.push((name, bytes));
+            continue;
+        }
+        let rec = format!(
+            "abandoned {} {}\n",
+            hex::encode(Sha256::digest(&bytes)),
+            bytes.len()
+        );
+        let at = format!("manifests/{}/{name}.abandoned", ctx.opts.label);
+        if upload_verified(&ctx.rc, &at, rec.as_bytes()).is_err() {
+            keep.push((name, bytes));
+        }
+    }
+    ctx.orphans = keep;
+}
+
+/// Upload the manifest rows not yet mirrored as a new immutable segment. A segment is committed
+/// history only once its checksum sidecar is stored and verified; then any interrupted segment
+/// whose rows are now all in committed segments is retired.
 fn mirror(ctx: &mut Ctx) -> Result<(), ApplyError> {
     if ctx.manifest.unmirrored.is_empty() {
         return Ok(());
@@ -1005,47 +1131,15 @@ fn mirror(ctx: &mut Ctx) -> Result<(), ApplyError> {
         ctx.opts.label, ctx.manifest.run, seq
     );
     let bytes = text.into_bytes();
-    let b2 = bytes.clone();
-    ctx.rc
-        .rcat(&name, bytes.len() as u64, move |w| {
-            w.write_all(&b2).map_err(|e| e.to_string())
-        })
-        .map_err(ApplyError::Storage)?;
-    use sha1::Sha1;
-    let sha1 = hex::encode(Sha1::digest(&bytes));
-    let md5 = hex::encode(md5::Md5::digest(&bytes));
-    let sha256 = hex::encode(Sha256::digest(&bytes));
-    shard::verify(
-        &ctx.rc,
-        &name,
-        bytes.len() as u64,
-        &sha1,
-        &md5,
-        &sha256,
-        &UploadHooks::default(),
-    )
-    .map_err(ApplyError::Storage)?;
+    upload_verified(&ctx.rc, &name, &bytes)?;
+    ctx.opts.crash(CrashPoint::AfterSegmentUpload)?;
     // The checksum sidecar, written only after the segment verified: restore --from-remote
-    // refuses a segment without a matching one (a stopped run's segment is mirrored again).
-    let sum = format!("{sha256} {}\n", bytes.len()).into_bytes();
-    let sum_name = format!("{name}.sum");
-    let s2 = sum.clone();
-    ctx.rc
-        .rcat(&sum_name, sum.len() as u64, move |w| {
-            w.write_all(&s2).map_err(|e| e.to_string())
-        })
-        .map_err(ApplyError::Storage)?;
-    shard::verify(
-        &ctx.rc,
-        &sum_name,
-        sum.len() as u64,
-        &hex::encode(Sha1::digest(&sum)),
-        &hex::encode(md5::Md5::digest(&sum)),
-        &hex::encode(Sha256::digest(&sum)),
-        &UploadHooks::default(),
-    )
-    .map_err(ApplyError::Storage)?;
-    ctx.manifest.unmirrored.clear();
+    // treats a segment without a well-formed one as an interrupted upload, not as history.
+    let sum = format!("{} {}\n", hex::encode(Sha256::digest(&bytes)), bytes.len());
+    upload_verified(&ctx.rc, &format!("{name}.sum"), sum.as_bytes())?;
+    let done = std::mem::take(&mut ctx.manifest.unmirrored);
+    ctx.committed_lines.extend(done);
+    retire_orphans(ctx);
     Ok(())
 }
 
@@ -1129,6 +1223,17 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
                     );
                     continue;
                 }
+                if relies_on_noise_evidence(ctx, pr) {
+                    if let Err(why) = noise_proof(ctx, p) {
+                        set_outcome(
+                            &mut ctx.report,
+                            pr.piece,
+                            "kept",
+                            &format!("its evidence changed during the backup: {why}"),
+                        );
+                        continue;
+                    }
+                }
                 for m in &pr.members {
                     rows.push(file_row(p, pr, m, &linked));
                 }
@@ -1163,6 +1268,30 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
         mirror(ctx)?;
         opts.crash(CrashPoint::AfterMirror)?;
         for pr in go {
+            // The last check of noise evidence, after the mirror upload, fresh or resumed. A
+            // piece kept here already has its remove-begin row, so the removal is closed with a
+            // kept row and remove-done: nothing more is removed, and a later plan for the same
+            // path is not blocked as an open removal of another plan.
+            if relies_on_noise_evidence(ctx, pr) {
+                let p = &ctx.inputs.pieces[pr.piece];
+                if let Err(why) = noise_proof(ctx, p) {
+                    let why = format!("its evidence no longer holds just before removal: {why}");
+                    let rows = vec![
+                        Row::Kept {
+                            plan_piece: p.id,
+                            path: p.path.clone(),
+                            reason: why.clone(),
+                        },
+                        Row::RemoveDone {
+                            plan_piece: p.id,
+                            path: p.path.clone(),
+                        },
+                    ];
+                    ctx.manifest.append(opts.now, rows)?;
+                    set_outcome(&mut ctx.report, pr.piece, "kept", &why);
+                    continue;
+                }
+            }
             unlink_piece(ctx, pr)?;
         }
     }

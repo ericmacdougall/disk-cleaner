@@ -94,6 +94,9 @@ Run `scan` again and make a new plan.
 | 3 | Another `apply` is running (its lock was still held after a 0.5 s wait). |
 | 4 | A shard failed; the pieces that depend on it were kept. |
 | 5 | Some pieces were kept because an earlier apply run changed their folder; scan again. |
+| 6 | The run finished, but the manifest copy in storage could not be updated; run `apply` again to store it. |
+
+When more than one applies, 6 is reported before 4, and 4 before 5.
 
 ### Getting files back
 
@@ -101,7 +104,9 @@ Run `scan` again and make a new plan.
 back byte for byte, with their mode, modification time, symlinks and hard links. It never overwrites:
 a different file already at the path is reported as a conflict and left alone. If the local manifest
 is lost, add `--from-remote` to rebuild the history from the copies in storage; a damaged copy refuses
-the restore unless you add `--accept-partial`. Add `--run <id>` (printed by `apply`) to restore an
+the restore unless you add `--accept-partial`. A copy whose upload was interrupted also refuses it
+until a later `apply --apply` run has stored its rows again; that run marks the interrupted copy as
+retired, and restore then skips it and says so. Add `--run <id>` (printed by `apply`) to restore an
 older generation of a path that was backed up more than once. Replacing or downgrading the
 `disk-cleaner` binary never brings data back; `restore` does.
 

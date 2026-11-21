@@ -70,6 +70,8 @@ pub enum CrashPoint {
     AfterRemoveBegin,
     AfterMirror,
     MidUnlink,
+    /// A manifest segment is stored and verified, its checksum sidecar not yet written.
+    AfterSegmentUpload,
 }
 
 /// Re-derives the lanes of noise and git pieces from the scan (spec revision 3, F3). Returns,
@@ -278,6 +280,7 @@ impl ApplyOptions {
                 CrashPoint::AfterRemoveBegin => "after remove-begin",
                 CrashPoint::AfterMirror => "after the manifest mirror",
                 CrashPoint::MidUnlink => "in the middle of unlinking",
+                CrashPoint::AfterSegmentUpload => "after a manifest segment, before its sidecar",
             }));
         }
         Ok(())
@@ -357,6 +360,10 @@ pub struct ApplyReport {
     /// run (or batch) of the same scan removed entries from it. The scan is stale; only a new
     /// scan lets apply continue there. The CLI exits with its own status when this is not empty.
     pub rescan_needed: Vec<usize>,
+    /// The closing manifest upload failed: the local manifest holds every row, but the copy in
+    /// storage is behind until the next acting run stores it (restore from storage alone would
+    /// miss this run). The CLI exits with its own status when this is set.
+    pub mirror_failed: Option<String>,
 }
 
 /// The reason given for a piece kept because an earlier run of the same scan changed its

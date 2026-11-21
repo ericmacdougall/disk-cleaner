@@ -381,6 +381,7 @@ fn resume_after_crash_at_every_boundary() {
         CrashPoint::AfterRemoveBegin,
         CrashPoint::AfterMirror,
         CrashPoint::MidUnlink,
+        CrashPoint::AfterSegmentUpload,
     ] {
         let fx = Fx::new();
         let (scan, plan) = dedup_fixture(&fx);

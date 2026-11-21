@@ -522,6 +522,56 @@ fn a_retained_copy_changed_since_its_duplicate_was_removed_is_kept() {
     assert_eq!(fs::read(&orig).unwrap(), edited);
 }
 
+/// Codex plan review r8, F2: the retained copy is checked again just before removal. The fake
+/// rclone changes or deletes it while the manifest segment is uploaded, which is after the
+/// batch re-check and before the unlink, so only the last check can see it. The duplicate is
+/// kept, its removal is closed (not left open), and a later run removes it once the retained
+/// copy holds the bytes again.
+#[test]
+fn a_retained_copy_changed_or_deleted_after_preparation_keeps_its_duplicate() {
+    for action in ["edit", "delete"] {
+        let fx = Fx::new();
+        let content = b"the same bytes in two places\n";
+        let orig = fx.write("keep/orig.txt", content);
+        let copy = fx.write("dups/copy.txt", content);
+        let mut piece = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
+        piece.evidence = Some(serde_json::json!({
+            "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
+            "retained_copy": orig, "retained_piece": 0
+        }));
+        let (scan, plan) = docs(
+            &[&fx.data],
+            &[P::tree(&fx.data.join("keep"), "keep"), piece],
+        );
+        let change = match action {
+            "edit" => format!("printf 'edited during the upload' > '{}'", orig.display()),
+            _ => format!("rm -f '{}'", orig.display()),
+        };
+        fx.set_fake(&format!(
+            "if [ \"$cmd\" = rcat ]; then case \"$*\" in *manifests/*.jsonl) {change};; esac; fi"
+        ));
+        let mut o = fx.opts(true);
+        o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+        let rep = apply(&scan, &plan, &o).unwrap();
+        assert_eq!(rep.pieces[1].outcome, "kept", "{action}: {rep:#?}");
+        assert!(
+            rep.pieces[1].reason.contains("just before removal")
+                && rep.pieces[1].reason.contains("retained copy"),
+            "{action}: {}",
+            rep.pieces[1].reason
+        );
+        assert_eq!(fs::read(&copy).unwrap(), content, "{action}");
+        // The removal is closed: a later run with the retained copy back removes the duplicate.
+        fx.set_fake("");
+        fs::write(&orig, content).unwrap();
+        let mut o = fx.opts(true);
+        o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+        let rep = apply(&scan, &plan, &o).unwrap();
+        assert_eq!(rep.pieces[1].outcome, "removed", "{action}: {rep:#?}");
+        assert!(!copy.exists(), "{action}");
+    }
+}
+
 #[test]
 fn a_retained_copy_with_a_secret_name_is_kept() {
     // The fallback to the backup lane uses the backup lane's secret rule: a retained copy whose

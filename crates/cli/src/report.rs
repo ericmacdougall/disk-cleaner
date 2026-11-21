@@ -368,6 +368,12 @@ pub fn apply_summary(r: &disk_cleaner_core::apply::ApplyReport) -> String {
             r.removed_entries
         );
     }
+    if let Some(e) = &r.mirror_failed {
+        let _ = writeln!(
+            o,
+            "Manifest copy in storage is behind: {e}. The local manifest has every row; run apply again to store it (restore --from-remote does not see this run until then)."
+        );
+    }
     if !r.rescan_needed.is_empty() {
         let _ = writeln!(
             o,
@@ -407,6 +413,12 @@ pub fn restore_summary(r: &disk_cleaner_core::apply::restore::RestoreReport) -> 
         let _ = writeln!(
             o,
             "  manifest segment skipped (history may be incomplete): {seg}: {why}"
+        );
+    }
+    for seg in &r.abandoned_segments {
+        let _ = writeln!(
+            o,
+            "  manifest segment skipped (an interrupted upload whose rows are stored again): {seg}"
         );
     }
     o

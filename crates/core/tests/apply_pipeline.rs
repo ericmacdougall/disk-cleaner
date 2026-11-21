@@ -156,6 +156,51 @@ fn a_rule_noise_piece_whose_marker_is_gone_is_backed_up() {
     assert_eq!(apply_common::tree_digest(&nm), before);
 }
 
+/// Codex plan review r8, F2: the marker is checked again just before removal. The fake rclone
+/// deletes `package.json` while the manifest segment is uploaded (after the batch re-check,
+/// before the unlink): node_modules is kept, nothing in it is removed, and its removal is
+/// closed rather than left open.
+#[test]
+fn a_marker_removed_after_preparation_keeps_the_noise_piece() {
+    let w = world();
+    let nm = w.proj.join("node_modules");
+    let before = apply_common::tree_digest(&nm);
+    let fx = Fx::new();
+    fx.set_fake(&format!(
+        "if [ \"$cmd\" = rcat ]; then case \"$*\" in *manifests/*.jsonl) rm -f '{}';; esac; fi",
+        w.proj.join("package.json").display()
+    ));
+    let mut o = fx.opts(true);
+    o.oracle = core_oracle();
+    let rep = apply(&w.scan, &w.plan, &o).unwrap();
+    let mine: Vec<_> = rep
+        .pieces
+        .iter()
+        .filter(|p| p.path.starts_with(&nm))
+        .collect();
+    assert!(!mine.is_empty(), "{rep:#?}");
+    for p in &mine {
+        assert_eq!(p.outcome, "kept", "{}: {}", p.path.display(), p.reason);
+        assert!(
+            p.reason.contains("just before removal") && p.reason.contains("marker"),
+            "{}: {}",
+            p.path.display(),
+            p.reason
+        );
+    }
+    assert!(!w.proj.join("package.json").exists(), "the fake removed it");
+    assert_eq!(
+        apply_common::tree_digest(&nm),
+        before,
+        "nothing was removed"
+    );
+    let m = disk_cleaner_core::apply::manifest::Manifest::load(&fx.manifest(), "test").unwrap();
+    assert!(
+        m.begun().keys().all(|(path, _)| !path.starts_with(&nm)),
+        "the kept removal is closed"
+    );
+}
+
 /// `tree_digest` for a single file or a directory.
 fn tree_digest(p: &Path) -> String {
     if p.is_dir() {

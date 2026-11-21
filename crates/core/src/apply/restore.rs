@@ -41,52 +41,125 @@ pub struct RestoreReport {
     pub failed: Vec<(PathBuf, String)>,
     /// Remote manifest segments that failed their checks (only with `accept_partial`).
     pub rejected_segments: Vec<(String, String)>,
+    /// Interrupted manifest uploads that a later acting run stored again and retired (their
+    /// rows are in committed segments, so they are skipped without loss).
+    pub abandoned_segments: Vec<String>,
 }
 
-/// One segment, checked against its `.sum` sidecar (`<sha256> <size>`), then parsed strictly.
-fn verified_segment(rc: &Rclone, dir: &str, name: &str) -> Result<Vec<Envelope>, String> {
-    let sum = rc
-        .cat(&format!("{dir}/{name}.sum"))
-        .map_err(|e| format!("its checksum file cannot be read: {e}"))?;
-    let sum = String::from_utf8_lossy(&sum).to_string();
-    let mut it = sum.split_whitespace();
-    let (Some(want_sha), Some(want_len)) =
-        (it.next(), it.next().and_then(|s| s.parse::<u64>().ok()))
-    else {
-        return Err("its checksum file is malformed".into());
+/// `<sha256> <size>`, as a `.sum` sidecar and (after `abandoned `) a `.abandoned` record hold it.
+fn parse_sum(text: &str) -> Option<(String, u64)> {
+    let mut it = text.split_whitespace();
+    let sha = it.next()?;
+    let len = it.next()?.parse::<u64>().ok()?;
+    if it.next().is_some() || sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((sha.to_ascii_lowercase(), len))
+}
+
+/// What a remote manifest segment is (Codex plan review r8, F1).
+enum SegState {
+    /// Its sidecar is well formed and matches: committed history.
+    Committed(Vec<Envelope>),
+    /// Its sidecar is well formed and does not match: damaged committed history (rejected).
+    Damaged(String),
+    /// No well-formed sidecar: the run that uploaded it stopped before committing it. Its
+    /// bytes, for `retire_orphans`.
+    Interrupted(Vec<u8>),
+    /// Interrupted, and a later acting run recorded (`.abandoned`, bound to these exact bytes)
+    /// that every row in it is stored again in committed segments.
+    Abandoned,
+}
+
+fn segment_state(rc: &Rclone, dir: &str, name: &str, names: &BTreeSet<String>) -> SegState {
+    let read = |n: &str| rc.cat(&format!("{dir}/{n}"));
+    let sum_name = format!("{name}.sum");
+    let sidecar = if names.contains(&sum_name) {
+        match read(&sum_name) {
+            Ok(b) => parse_sum(&String::from_utf8_lossy(&b)),
+            Err(e) => return SegState::Damaged(format!("its checksum file cannot be read: {e}")),
+        }
+    } else {
+        None
     };
-    let b = rc.cat(&format!("{dir}/{name}"))?;
+    let b = match read(name) {
+        Ok(b) => b,
+        Err(e) => return SegState::Damaged(e),
+    };
+    let Some((want_sha, want_len)) = sidecar else {
+        let ab = format!("{name}.abandoned");
+        if names.contains(&ab) {
+            if let Ok(rec) = read(&ab) {
+                let rec = String::from_utf8_lossy(&rec);
+                let bound = rec
+                    .strip_prefix("abandoned ")
+                    .and_then(parse_sum)
+                    .is_some_and(|(sha, len)| {
+                        len == b.len() as u64 && sha == hex::encode(Sha256::digest(&b))
+                    });
+                if bound {
+                    return SegState::Abandoned;
+                }
+            }
+        }
+        return SegState::Interrupted(b);
+    };
     if b.len() as u64 != want_len {
-        return Err(format!(
+        return SegState::Damaged(format!(
             "it is {} bytes, its checksum file says {want_len}",
             b.len()
         ));
     }
     if hex::encode(Sha256::digest(&b)) != want_sha {
-        return Err("its sha256 differs from its checksum file".into());
+        return SegState::Damaged("its sha256 differs from its checksum file".into());
     }
-    let text = String::from_utf8(b).map_err(|_| "it is not UTF-8".to_string())?;
-    manifest::parse_segment(&text)
+    let text = match String::from_utf8(b) {
+        Ok(t) => t,
+        Err(_) => return SegState::Damaged("it is not UTF-8".into()),
+    };
+    match manifest::parse_segment(&text) {
+        Ok(rows) => SegState::Committed(rows),
+        Err(e) => SegState::Damaged(e),
+    }
 }
 
-/// Rows from verified segments, and the segments that failed their checks (name, why).
-pub(crate) type RemoteRows = (Vec<Envelope>, Vec<(String, String)>);
+/// The manifest history this host's label holds in storage.
+#[derive(Default)]
+pub(crate) struct RemoteManifest {
+    /// Rows of every committed segment, merged.
+    pub rows: Vec<Envelope>,
+    /// Segments that are not committed history and are not known to be stored again: damaged
+    /// ones, and interrupted ones not yet retired (name, why).
+    pub rejected: Vec<(String, String)>,
+    /// Interrupted uploads, with their bytes (they are also in `rejected`).
+    pub interrupted: Vec<(String, Vec<u8>)>,
+    /// Interrupted uploads that a later acting run retired.
+    pub abandoned: Vec<String>,
+}
 
-/// The mirrored manifest rows in storage, every segment verified. Returns the rows and the
-/// segments that failed, with why.
-pub(crate) fn rows_from_remote(rc: &Rclone, label: &str) -> Result<RemoteRows, ApplyError> {
+const INTERRUPTED: &str = "its upload was interrupted before its checksum file was written; the next acting apply run stores its rows again and retires it";
+
+/// Every manifest segment in storage, classified; only committed segments give rows.
+pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest, ApplyError> {
     let dir = format!("manifests/{label}");
     let mut names = rc.list(&dir).map_err(ApplyError::Storage)?;
     names.sort();
+    let set: BTreeSet<String> = names.iter().cloned().collect();
     let mut good = Vec::new();
-    let mut rejected = Vec::new();
+    let mut out = RemoteManifest::default();
     for n in names.iter().filter(|n| n.ends_with(".jsonl")) {
-        match verified_segment(rc, &dir, n) {
-            Ok(rows) => good.push(rows),
-            Err(why) => rejected.push((n.clone(), why)),
+        match segment_state(rc, &dir, n, &set) {
+            SegState::Committed(rows) => good.push(rows),
+            SegState::Damaged(why) => out.rejected.push((n.clone(), why)),
+            SegState::Interrupted(b) => {
+                out.rejected.push((n.clone(), INTERRUPTED.into()));
+                out.interrupted.push((n.clone(), b));
+            }
+            SegState::Abandoned => out.abandoned.push(n.clone()),
         }
     }
-    Ok((manifest::merge_segments(good), rejected))
+    out.rows = manifest::merge_segments(good);
+    Ok(out)
 }
 
 fn run_start(run: &str) -> i64 {
@@ -104,8 +177,11 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
         timeout: opts.timeout,
     };
     let mut rejected_segments = Vec::new();
+    let mut abandoned_segments = Vec::new();
     let rows: Vec<Envelope> = if opts.from_remote {
-        let (rows, rejected) = rows_from_remote(&rc, &opts.label)?;
+        let m = remote_manifest(&rc, &opts.label)?;
+        abandoned_segments = m.abandoned;
+        let (rows, rejected) = (m.rows, m.rejected);
         if !rejected.is_empty() && !opts.accept_partial {
             let list: Vec<String> = rejected.iter().map(|(n, w)| format!("{n}: {w}")).collect();
             return Err(ApplyError::Manifest(format!(
@@ -236,6 +312,7 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
     let mut rep = RestoreReport {
         regenerate: regen,
         rejected_segments,
+        abandoned_segments,
         ..Default::default()
     };
     let root = fsops::open_dir_abs(Path::new("/")).map_err(|e| ApplyError::Io(e.to_string()))?;
