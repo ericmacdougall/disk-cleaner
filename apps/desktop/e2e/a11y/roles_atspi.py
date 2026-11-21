@@ -3,20 +3,29 @@
 
 The webview sends each element's role to the accessibility bus as a number from AT-SPI's role
 list (AtspiRole); the screen reader turns it back into a name with the host's libatspi. A webview
-that numbers the list differently from AT-SPI shifts every role after the difference: WebKitGTK
-2.50.0 to 2.50.4 left Footer out of its copy of the list (WebKit bug 300090), so a heading
-arrives as "document frame", a paragraph as "footer", a link as "form".
+that numbers the list differently from AT-SPI shifts the roles after the difference: WebKitGTK
+2.49 to 2.50.4 left Footer out of its copy of the list (WebKit bug 300090), so a heading arrives
+as "document frame", a paragraph as "footer", a link as "form".
 
 WebKit also gives each object its ARIA role as a string ("computed-role": heading, paragraph,
 link, button, checkbox ...). This compares the number each object reports with the number the
 host's libatspi has for that role's AT-SPI role, over the whole tree of the app's window.
 
-usage: roles_atspi.py check APP [--timeout S]   exit 0 when every checked object has its role,
-                                                1 when any is wrong or the page has none checked
+usage: roles_atspi.py check APP [--timeout S] [--expect-shift N]
        roles_atspi.py dump APP [--timeout S]    print number, role name, tag, name, attributes
 
-The check also needs at least one heading, one button and one check box with the right number,
-so a page that never loaded, or a tree read through a different bus, cannot pass.
+Exit codes of check:
+  0  every checked object has its role, and a heading, a button and a check box were among them
+  4  wrong roles: at least one object reported a number other than the expected one; each is
+     printed as a "roles: WRONG <tag> <computed-role> ...: reported R (...), must be E (...)" line
+  3  could not check: no such application on the bus, the page never showed a heading, or no
+     object with a known computed-role (nothing was judged, so nothing passed or failed)
+  2  bad usage
+Any other code (a Python traceback exits 1) is a crash of the probe.
+
+--expect-shift N adds N to every expected role number before comparing, for the standing control
+in CI: on a build whose roles are right, a shift of 1 must give exit 4 with a WRONG line for every
+checked object (a probe that cannot see a wrong number would pass it instead).
 """
 import sys
 import time
@@ -44,7 +53,8 @@ EXPECTED = {
     "textbox": R.ENTRY,
     "radio": R.RADIO_BUTTON,
 }
-REQUIRED = {"heading": R.HEADING, "button": BUTTON, "checkbox": R.CHECK_BOX}
+REQUIRED = ("heading", "button", "checkbox")
+WRONG, CANNOT, USAGE = 4, 3, 2
 
 
 def app_named(name):
@@ -84,50 +94,75 @@ def loaded(app):
     return any(info(o)[3].get("computed-role") == "heading" for o in walk(app))
 
 
+def role_label(n):
+    try:
+        return Atspi.role_get_name(Atspi.Role(n))
+    except Exception:
+        return "not an AT-SPI role"
+
+
+def option(argv, flag, default, kind):
+    if flag not in argv:
+        return default
+    try:
+        return kind(argv[argv.index(flag) + 1])
+    except (IndexError, ValueError):
+        print(f"roles: bad value for {flag}", file=sys.stderr)
+        sys.exit(USAGE)
+
+
 def main(argv):
     if len(argv) < 3 or argv[1] not in ("check", "dump"):
         print(__doc__, file=sys.stderr)
-        return 2
+        return USAGE
     mode, app_name = argv[1], argv[2]
-    timeout = float(argv[argv.index("--timeout") + 1]) if "--timeout" in argv else 60
+    timeout = option(argv, "--timeout", 60.0, float)
+    shift = option(argv, "--expect-shift", 0, int)
     end = time.time() + timeout
-    app = None
+    app = ready = None
     while time.time() < end:
         app = app_named(app_name)
         if app is not None and loaded(app):
+            ready = app
             break
         time.sleep(1)
-    if app is None:
-        print(f"roles: FAIL: no accessible application named like {app_name!r}")
-        return 1
+    if ready is None:
+        why = "no accessible application" if app is None else "no heading on the page of the application"
+        print(f"roles: CANNOT CHECK: {why} named like {app_name!r} after {timeout:.0f} s")
+        return CANNOT
     if mode == "dump":
-        for o in walk(app):
+        for o in walk(ready):
             num, rname, name, attrs = info(o)
             print(f"{num:4d} {rname!r:28} tag={attrs.get('tag', '')!r:10} {name[:50]!r} {attrs}")
         return 0
     wrong, checked = [], 0
-    seen = {k: 0 for k in REQUIRED}
-    for o in walk(app):
+    right = {k: 0 for k in REQUIRED}
+    for o in walk(ready):
         num, rname, name, attrs = info(o)
         aria = attrs.get("computed-role", "")
-        want = EXPECTED.get(aria)
-        if want is None:
+        if aria not in EXPECTED:
             continue
+        want = int(EXPECTED[aria]) + shift
         checked += 1
-        if num != int(want):
+        if num != want:
             wrong.append(f"<{attrs.get('tag', '?')}> {aria} {name[:50]!r}: reported {num} ({rname}), "
-                         f"must be {int(want)} ({Atspi.role_get_name(want)})")
-        elif aria in seen:
-            seen[aria] += 1
-    print(f"roles: {checked} objects checked, {len(wrong)} wrong; with the right role: "
-          + ", ".join(f"{k} {v}" for k, v in seen.items()))
+                         f"must be {want} ({role_label(want)})")
+        elif aria in right:
+            right[aria] += 1
+    shifted = f" (expected roles shifted by {shift})" if shift else ""
+    print(f"roles: {checked} objects checked{shifted}, {len(wrong)} wrong; with the right role: "
+          + ", ".join(f"{k} {v}" for k, v in right.items()))
     for w in wrong:
         print("roles: WRONG " + w)
-    missing = [k for k, v in seen.items() if v == 0]
+    if checked == 0:
+        print("roles: CANNOT CHECK: no object with a known computed-role")
+        return CANNOT
+    if wrong:
+        return WRONG
+    missing = [k for k, v in right.items() if v == 0]
     if missing:
-        print("roles: FAIL: no " + ", ".join(missing) + " with its right role on the page")
-    if wrong or missing or checked == 0:
-        return 1
+        print("roles: CANNOT CHECK: no " + ", ".join(missing) + " on the page")
+        return CANNOT
     print("roles: every checked element has its role")
     return 0
 

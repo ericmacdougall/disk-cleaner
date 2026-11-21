@@ -15,8 +15,23 @@ follows.
            - Left on a collapsed child moves to its parent row
            - focus stays on the selected row while the mouse wheel scrolls it far out of the
              rendered window and back, and Down then moves to the next row
+           - each focused object's AT-SPI role number is the one its computed-role maps to
 
-usage: treegrid_atspi.py report|check [--app prunedisk] [--rows 6]
+usage: treegrid_atspi.py report|check [--app prunedisk] [--rows 6] [--expect-shift N]
+
+Exit codes of check:
+  0  every check passed ("RESULT: PASS")
+  4  wrong roles only: every finding is a role finding, printed as
+     "  FAIL: <step>: a <computed-role> reaches the reader as '<name>' (R), expected E"
+  1  other findings (keys, focus, attributes, names), with or without role findings
+  3  could not check: no such application on the bus, or no tree table (open the Size tree
+     tab after a scan); "CANNOT CHECK: ..." is printed
+  2  bad usage (argparse)
+A Python traceback also exits 1, so a crash can never look like exit 4.
+
+--expect-shift N adds N to every expected role number, for the standing control in CI: on a build
+whose roles are right, a shift of 1 must give exit 4 (the keyboard checks still pass, every role
+check fails), which shows the role comparison can fail.
 """
 import argparse
 import json
@@ -31,7 +46,15 @@ p = argparse.ArgumentParser()
 p.add_argument("mode", choices=["report", "check"])
 p.add_argument("--app", default="prunedisk")
 p.add_argument("--rows", type=int, default=6, help="rows to print in the report")
+p.add_argument("--expect-shift", type=int, default=0, help="add N to every expected role (CI control)")
 a = p.parse_args()
+WRONG_ONLY, CANNOT = 4, 3
+ROLE_FINDING = "reaches the reader as"
+
+
+def cannot(msg):
+    print("CANNOT CHECK:", msg)
+    sys.exit(CANNOT)
 
 # What a screen reader is told: Orca follows focus and active-descendant events, not a polled state.
 EVENTS = []
@@ -135,13 +158,13 @@ def app():
         x = d.getChildAtIndex(i)
         if x is not None and a.app in (x.name or "").lower():
             return x
-    sys.exit("no accessible application like %r" % a.app)
+    cannot("no accessible application like %r" % a.app)
 
 
 def grid():
     g = find(app(), lambda o: o.getRole() == pyatspi.ROLE_TREE_TABLE)
     if g is None:
-        sys.exit("no tree table: open the Size tree tab after a scan")
+        cannot("no tree table: open the Size tree tab after a scan")
     return g
 
 
@@ -254,7 +277,9 @@ def open_path(g, names):
     for n in names:
         row = next((r for r in grid_rows(g) if cell_text(r, 0).lstrip("▸▾@ ").strip() == n), None)
         if row is None:
-            sys.exit(f"no rendered row named {n!r}")
+            print("RESULT: FAIL")
+            print(f"  FAIL: no rendered row named {n!r}")
+            sys.exit(1)
         x, y, w, h = row.getChildAtIndex(0).queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
         xdo("mousemove", str(x + 20), str(y + h // 2))
         xdo("click", "1")
@@ -334,15 +359,17 @@ def check():
                 missing = [k for k in ("rowindex", "level", "posinset", "setsize") if k not in i["attrs"]]
             if missing:
                 fails.append(f"{label}: focused object lacks {missing}")
-            # The role number must be the one the page's role maps to (Core-AAM). WebKitGTK 2.50.0
-            # to 2.50.4 sends roles from Paragraph (73) on one too low (WebKit bug 300090): a row
-            # then reaches the reader as "input method window". Judged against computed-role, not
-            # against hard-coded numbers, so it holds on any libatspi.
+            # The role number must be the one the page's role maps to (Core-AAM). WebKitGTK 2.49
+            # to 2.50.4 sends roles 73 (Paragraph) to 115 one too low (WebKit bug 300090, measured)
+            # and, by its role list, those from 116 on one too high: a row (90) then reaches the
+            # reader as "input method window" (89). Judged against computed-role, not
+            # against hard-coded numbers, so it holds on any libatspi. --expect-shift moves the
+            # expected number (the CI control); nothing else in the probe uses it.
             computed = attrs(f).get("computed-role")
             want = EXPECTED_ROLE.get(computed)
-            if want is not None and f.getRole() != want:
-                fails.append(f"{label}: a {computed} reaches the reader as {i['role_name']!r} ({i['role']}),"
-                             f" expected {int(want)}")
+            if want is not None and int(f.getRole()) != int(want) + a.expect_shift:
+                fails.append(f"{label}: a {computed} {ROLE_FINDING} {i['role_name']!r} ({i['role']}),"
+                             f" expected {int(want) + a.expect_shift}")
             if not (i["name"] or i["text"]):
                 fails.append(f"{label}: focused object has no name or text")
         return i
@@ -398,10 +425,15 @@ def check():
     after = step("Down after wheel", "Down")
     if want and (not after or after["attrs"].get("rowindex") != str(int(want) + 1)):
         fails.append("Down after the wheel did not move to the next row")
+    roles = [f for f in fails if ROLE_FINDING in f]
+    shifted = f" (expected roles shifted by {a.expect_shift})" if a.expect_shift else ""
     print("RESULT:", "PASS" if not fails else "FAIL")
+    print(f"SUMMARY: {len(fails)} findings, {len(roles)} of them wrong roles{shifted}")
     for f in fails:
         print("  FAIL:", f)
-    sys.exit(1 if fails else 0)
+    if not fails:
+        sys.exit(0)
+    sys.exit(WRONG_ONLY if len(roles) == len(fails) else 1)
 
 
 report() if a.mode == "report" else check()
