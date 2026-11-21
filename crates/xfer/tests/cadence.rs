@@ -46,3 +46,40 @@ fn receipts_arrive_while_packs_are_still_uploading() {
         rep.wall_ms
     );
 }
+
+/// Large files read by parallel readers must not be interleaved across every pack: then each
+/// file completes only with the last pack, and nothing is freeable until the end of the run.
+#[test]
+fn large_files_complete_one_after_another() {
+    let env = Env::new();
+    let src = env.p("src");
+    for i in 0..8u64 {
+        write(
+            &src.join(format!("big{i}.bin")),
+            &rand_bytes(200 + i, 8 << 20),
+        );
+    }
+    let slow = Faulty::new(
+        env.local(),
+        FaultConfig {
+            put_delay: Some(Duration::from_millis(1200)),
+            slow_prefix: "v1/packs/".into(),
+            ..Default::default()
+        },
+    );
+    let mut o = opts(&src, &env.p("receipts.jsonl"));
+    o.readers = 4;
+    o.streams = Some(1);
+    o.commit_every = Duration::from_secs(600);
+    o.commit_bytes = 1 << 40;
+    let rep = xfer::backup::backup(Arc::new(slow), &o).expect("backup");
+    assert_eq!(rep.exit_code, 0, "{rep:#?}");
+    assert!(rep.packs >= 4, "expected several packs, got {}", rep.packs);
+    let t50 = rep.t50_ms.expect("t50");
+    assert!(
+        (t50 as f64) < 0.7 * rep.wall_ms as f64,
+        "half the freeable bytes were receipted at {t50} ms of {} ms ({} commits) {rep:#?}",
+        rep.wall_ms,
+        rep.commits
+    );
+}

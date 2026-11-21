@@ -124,6 +124,11 @@ pub struct Report {
     pub freeable_bytes: u64,
     pub t50_ms: Option<u64>,
     pub k_trace: Vec<(u64, usize, u64)>,
+    /// (ms since start, allocated bytes receipted so far, entries in this commit) per commit:
+    /// the freed-space curve.
+    pub commit_trace: Vec<(u64, u64, u64)>,
+    /// ms since start at which each pack was verified.
+    pub pack_trace: Vec<u64>,
     pub level_histogram: Vec<(i32, u64)>,
     pub throttles: u64,
     pub peak_rss: u64,
@@ -435,8 +440,16 @@ fn read_one(c: &ReadCtx, i: usize, last_try: bool) -> ReadOutcome {
 
 /// Groups small chunks of one extension into segments of up to 4 MiB; large or incompressible
 /// chunks become their own segment.
+/// An open segment is emitted once this many bytes of later chunks have passed it, so a small
+/// chunk (a large file's tail, say) is never held back behind much later data. Packs then fill
+/// in read order, and a file completes with its own packs (freed space first).
+const SEG_AGE: u64 = 2 << 20;
+
 fn segmenter(rx: Receiver<ChunkMsg>, tx: Sender<RawSeg>) {
     let mut open: HashMap<(Vec<u8>, Class), RawSeg> = HashMap::new();
+    // bytes seen so far, and the count at which each open segment took its first chunk
+    let mut through = 0u64;
+    let mut opened: HashMap<(Vec<u8>, Class), u64> = HashMap::new();
     let mut buffered = 0usize;
     let emit = |s: RawSeg, tx: &Sender<RawSeg>| {
         let _ = tx.send(s);
@@ -444,6 +457,19 @@ fn segmenter(rx: Receiver<ChunkMsg>, tx: Sender<RawSeg>) {
     loop {
         match rx.recv_timeout(Duration::from_millis(300)) {
             Ok(m) => {
+                through += m.data.len() as u64;
+                let stale: Vec<_> = opened
+                    .iter()
+                    .filter(|(_, &at)| through - at > SEG_AGE)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in stale {
+                    opened.remove(&k);
+                    if let Some(s) = open.remove(&k) {
+                        buffered -= s.data.len();
+                        emit(s, &tx);
+                    }
+                }
                 if m.class == Class::Incompressible || m.data.len() >= 512 << 10 {
                     let len = m.data.len() as u32;
                     emit(
@@ -457,6 +483,7 @@ fn segmenter(rx: Receiver<ChunkMsg>, tx: Sender<RawSeg>) {
                     continue;
                 }
                 let k = (m.group, m.class);
+                opened.entry(k.clone()).or_insert(through);
                 let seg = open.entry(k.clone()).or_insert_with(|| RawSeg {
                     chunks: Vec::new(),
                     data: Vec::new(),
@@ -473,6 +500,7 @@ fn segmenter(rx: Receiver<ChunkMsg>, tx: Sender<RawSeg>) {
                     );
                     buffered -= full.data.len();
                     emit(full, &tx);
+                    opened.insert(k.clone(), through);
                 }
                 let seg = open.get_mut(&k).expect("segment");
                 let off = seg.data.len() as u32;
@@ -485,6 +513,7 @@ fn segmenter(rx: Receiver<ChunkMsg>, tx: Sender<RawSeg>) {
                         .max_by_key(|(_, s)| s.data.len())
                         .map(|(k, _)| k.clone());
                     if let Some(k) = big {
+                        opened.remove(&k);
                         if let Some(s) = open.remove(&k) {
                             buffered -= s.data.len();
                             emit(s, &tx);
@@ -496,6 +525,7 @@ fn segmenter(rx: Receiver<ChunkMsg>, tx: Sender<RawSeg>) {
                 for (_, s) in open.drain() {
                     emit(s, &tx);
                 }
+                opened.clear();
                 buffered = 0;
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -965,11 +995,18 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
             sc.spawn(move || {
                 let next = AtomicUsize::new(0);
                 let retry: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+                // Large files are read one at a time, in schedule order, so their chunks fill
+                // packs file after file and each file completes (and frees space) as its own
+                // packs verify. Interleaved, every file would finish only with the last pack.
+                // Small files still read in parallel; reading is far faster than the uplink.
+                let serial = Mutex::new(());
                 std::thread::scope(|rs| {
                     for _ in 0..readers {
                         rs.spawn(|| loop {
                             let j = next.fetch_add(1, Ordering::Relaxed);
                             let Some(&i) = order.get(j) else { break };
+                            let _one = (ctx.nodes[i].stat.id.size >= SERIAL_READ)
+                                .then(|| serial.lock().expect("serial read lock"));
                             if let ReadOutcome::Changed = read_one(&ctx, i, false) {
                                 retry.lock().expect("retry").push(i);
                             }
@@ -1073,6 +1110,9 @@ struct Committer<'a> {
     rep: &'a mut Report,
 }
 
+/// Files at least this large are read one at a time (see the reader loop).
+const SERIAL_READ: u64 = 4 << 20;
+
 /// Entries per `.files` object (keeps each object well under the 64 MiB decode limit).
 const FILES_PER_COMMIT: usize = 100_000;
 
@@ -1097,6 +1137,9 @@ impl Committer<'_> {
                     self.rep.skipped.push((shown(&self.nodes[i].rel), why))
                 }
                 Ok(Event::Uploaded(p, cs)) => {
+                    self.rep
+                        .pack_trace
+                        .push(self.t0.elapsed().as_millis() as u64);
                     self.rep.packs += 1;
                     self.rep.pack_bytes += p.size;
                     self.pending_pack_bytes += p.size;
@@ -1317,6 +1360,11 @@ impl Committer<'_> {
                         _ => {}
                     }
                 }
+                self.rep.commit_trace.push((
+                    self.t0.elapsed().as_millis() as u64,
+                    self.receipted_alloc,
+                    files.entries.len() as u64,
+                ));
                 if self.rep.t50_ms.is_none()
                     && self.freeable > 0
                     && self.receipted_alloc * 2 >= self.freeable
