@@ -1,8 +1,9 @@
 name: macdiag
 
-# TEMPORARY (branch diag/apply-lock-macos only): failing-first evidence on macOS for the apply.lock
-# fix at ed00006 on feat/apply-lanes. The guard tests must pass at ed00006 and fail with the
-# controlled broken variant lock-settle-zero (no wait). Never merged.
+# TEMPORARY (branch diag/apply-lock-macos only): six single-shot macOS runs of the exact CI test
+# command on the diagnostic tree 682d7c3, whose take_lock waits up to 3 s on EWOULDBLOCK and logs
+# every wait (and how long it took to clear) to $PD_LOCK_LOG. Cleared waits in runs that pass
+# link the measured race to the pre-fix CI failures; their maximum sizes LOCK_SETTLE. Never merged.
 on:
   push:
     branches: ["diag/**"]
@@ -11,20 +12,26 @@ permissions:
   contents: read
 
 jobs:
-  guard:
+  single:
+    strategy:
+      fail-fast: false
+      matrix:
+        shot: [1, 2, 3, 4, 5, 6]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ed00006ab2e53000e42e77cebe5ed43c2ee1baee
+          ref: 682d7c3f638202111e769ced0ffdd15012963606
       - uses: dtolnay/rust-toolchain@stable
-      - name: Guard tests at ed00006 (must pass)
-        run: cargo test -p disk-cleaner-core --locked --test apply_lock 2>&1 | grep -E "^test |test result|takes after"
-      - name: Guard tests with lock-settle-zero (must fail)
+      - run: git --version
+      - run: brew install rclone && rclone version
+      - name: Test (the CI command), lock waits logged
+        env:
+          PD_LOCK_LOG: ${{ github.workspace }}/lock.log
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: Lock waits
+        if: always()
         run: |
-          perl -0777 -pi -e 's/std::time::Duration::from_millis\(500\);/std::time::Duration::from_millis(0);/ or die "pattern did not apply\n"' crates/core/src/apply/run.rs
-          grep -n "from_millis(0);" crates/core/src/apply/run.rs
-          if cargo test -p disk-cleaner-core --locked --test apply_lock > mut.log 2>&1; then
-            echo "SURVIVED"; grep -E "^test |test result" mut.log; exit 1
-          fi
-          echo "KILLED"; grep -E "^test |test result|takes after" mut.log
+          echo "cleared waits: $(grep -c cleared_ms lock.log 2>/dev/null || echo 0)"
+          echo "gave up: $(grep -c gave_up lock.log 2>/dev/null || echo 0)"
+          cat lock.log 2>/dev/null || true
