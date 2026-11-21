@@ -119,23 +119,30 @@ fn failed_commit_put(prefix: &str, orphans: bool) {
         .filter(|k| k.starts_with("v1/packs/"))
         .count();
     assert!(packs_first > 0);
+    // Exactly the packs no committed .idx lists are orphans to adopt. How many that is depends
+    // on timing (a pack can be sealed after the .idx and before the failing .files put stops
+    // the run), so it is read from the store before the rerun, not assumed.
+    let store = env.local();
+    let mut indexed = std::collections::HashSet::new();
+    for o in store.list("v1/index").expect("list index") {
+        let obj: xfer::repo::IdxObj =
+            xfer::repo::decode(&store.get(&o.key, o.size).expect("get idx")).expect("idx");
+        indexed.extend(obj.packs.into_iter().map(|p| p.key));
+    }
+    assert_eq!(indexed.is_empty(), orphans, "{prefix}: indexed {indexed:?}");
+    let orphan_packs = packs_first - indexed.len();
 
     // rerun on a healthy transport: the verified packs are adopted, not uploaded again
     std::fs::remove_file(env.p("receipts.jsonl")).ok();
     let again = faulty(&env, FaultConfig::default());
     let (rep2, rs2) = run_with(&env, again.clone());
     assert_eq!(rep2.exit_code, 0, "{rep2:#?}");
-    if orphans {
-        // no .idx was committed, so every pack is an orphan the rerun must adopt
-        assert!(rep2.adopted_packs > 0, "{prefix}: {rep2:#?}");
-    } else {
-        // the committed .idx covers its packs; only a pack sealed after it (a slow runner can
-        // have one in flight when the .files put fails) is an orphan to adopt
-        assert!(
-            (rep2.adopted_packs as usize) < packs_first,
-            "{prefix}: all {packs_first} packs adopted although an .idx was committed {rep2:#?}"
-        );
-    }
+    assert_eq!(
+        rep2.adopted_packs as usize,
+        orphan_packs,
+        "{prefix}: {packs_first} packs, {} indexed {rep2:#?}",
+        indexed.len()
+    );
     let packs_again = again
         .put_keys
         .lock()

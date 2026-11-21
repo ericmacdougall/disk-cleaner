@@ -39,11 +39,18 @@ fn receipts_arrive_while_packs_are_still_uploading() {
         "receipts were committed only {} time(s): nothing was freeable before the end",
         rep.commits
     );
-    let t50 = rep.t50_ms.expect("t50");
+    // Structural, not a wall-time ratio (which a slow CI runner moves): half the freeable bytes
+    // are receipted before the final commit.
+    let freed_before_last = rep
+        .commit_trace
+        .iter()
+        .rev()
+        .nth(1)
+        .map_or(0, |&(_, freed, _)| freed);
     assert!(
-        (t50 as f64) < 0.75 * rep.wall_ms as f64,
-        "half the freeable bytes were receipted at {t50} ms of {} ms",
-        rep.wall_ms
+        freed_before_last * 2 >= rep.freeable_bytes,
+        "only {freed_before_last} of {} freeable bytes were receipted before the final commit",
+        rep.freeable_bytes
     );
 }
 
@@ -89,12 +96,5 @@ fn large_files_complete_one_after_another() {
         freed_before_last * 2 >= rep.freeable_bytes,
         "only {freed_before_last} of {} freeable bytes were receipted before the final commit {rep:#?}",
         rep.freeable_bytes
-    );
-    let t50 = rep.t50_ms.expect("t50");
-    assert!(
-        (t50 as f64) < 0.85 * rep.wall_ms as f64,
-        "half the freeable bytes were receipted at {t50} ms of {} ms ({} commits)",
-        rep.wall_ms,
-        rep.commits
     );
 }
