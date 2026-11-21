@@ -620,10 +620,13 @@ in ms, the ubuntu-22.04 job "end-to-end"):
 | the same | 2752d36 (job 136799767817) | 34/36 |
 | every call stops | 9e97d44 (run 44895185802) | 43/50, a pass only at the limit |
 | every call stops | 5d0c2ce (run 44896444434) | 55/62, a fail |
+| every call stops | c693e86 (job 136835154183) | 43/51, a fail |
+| every call stops | b24536e (job 136844173674) | 41/46, a pass |
 
-Under the full trace the number measures strace as much as the app. In run 44896444434 the
-main session ran every other step under the full trace within the suite's existing timeouts,
-so no timeout was raised. The one-million-row traced launch has not yet run under the full
+Under the full trace the number measures strace as much as the app: the app and the strace
+options are the same in the last three rows, and their scroll p95 ranges from 46 to 62 ms. In runs 44896444434, 44900471982 and 44903468366 the main session
+ran every other step under the full trace within the suite's existing timeouts, so no timeout
+was raised. The one-million-row traced launch has not yet run under the full
 trace (that run predates the AC-9 sessions); if it needs more time, only the traced launch's
 timeouts are raised, and this section says so. The switch is honoured only by the CI wrapper and
 only for an e2e build (below, "The untraced switch"); a release build holds no
