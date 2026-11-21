@@ -33,8 +33,20 @@ fn excluded(rel: &str, excludes: &[String]) -> bool {
     })
 }
 
+/// A macOS dataless placeholder keeps its piece (I-6, NEG-9; acceptance-2 B).
+fn refuse_dataless(root: &rustix::fd::OwnedFd, rel: &str) -> Result<(), Drift> {
+    match fsops::is_dataless_rel(root, rel) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(Drift(format!(
+            "{rel} is a dataless placeholder (not downloaded by its file provider)"
+        ))),
+        Err(e) => Err(Drift(format!("{rel}: {e}"))),
+    }
+}
+
 /// Enumerate the members of a piece (`kind`, `path`, `files`, `excludes`) as they are now.
-/// A name that is not valid UTF-8, an unreadable directory or a symlinked ancestor is an error.
+/// A name that is not valid UTF-8, an unreadable directory, a symlinked ancestor or a macOS
+/// dataless placeholder is an error.
 pub fn enumerate(
     kind: PieceKind,
     path: &Path,
@@ -48,7 +60,10 @@ pub fn enumerate(
         PieceKind::Files => {
             for f in files {
                 match fsops::lstat_rel(&root, f) {
-                    Ok(id) if id.kind != 'd' => out.members.push(Member { rel: f.clone(), id }),
+                    Ok(id) if id.kind != 'd' => {
+                        refuse_dataless(&root, f)?;
+                        out.members.push(Member { rel: f.clone(), id })
+                    }
                     Ok(_) => return Err(Drift(format!("{f} is now a directory"))),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(Drift(format!("{f}: {e}"))),
@@ -88,6 +103,7 @@ pub fn enumerate(
                     }
                     let id =
                         fsops::lstat_rel(&root, &rel).map_err(|e| Drift(format!("{rel}: {e}")))?;
+                    refuse_dataless(&root, &rel)?;
                     if id.kind == 'd' {
                         out.dirs.push(rel.clone());
                         stack.push(rel);

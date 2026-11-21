@@ -1,13 +1,15 @@
 //! The append-only manifest (DESIGN 7; spec I-4, revision 3 F1). One JSON object per line, each
 //! with `v`, `run` and `t`. Every append is followed by fsync; a failure stops the run before any
-//! unlink. A torn last line is ignored; a corrupt line elsewhere refuses the manifest.
+//! unlink. A torn last line (also one that is not UTF-8) is ignored by `load` and cut, with a
+//! saved copy, by `open_for_append` before an acting run appends; a corrupt line elsewhere
+//! refuses the manifest.
 
 use super::fsops::Ident;
 use super::ApplyError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const MANIFEST_VERSION: u32 = 1;
@@ -232,18 +234,23 @@ impl Manifest {
     pub fn load(path: &Path, run: &str) -> Result<Manifest, ApplyError> {
         let mut rows = Vec::new();
         if path.exists() {
-            let f = File::open(path)
+            // Split on bytes, not `lines()`: a tail torn inside a multi-byte character, or
+            // padded with NULs after a power loss, is not UTF-8, and must be treated as the torn
+            // last line it is rather than refuse the whole manifest (r6b F2).
+            let bytes = std::fs::read(path)
                 .map_err(|e| ApplyError::Manifest(format!("{}: {e}", path.display())))?;
-            let lines: Vec<String> = BufReader::new(f)
-                .lines()
-                .collect::<Result<_, _>>()
-                .map_err(|e| ApplyError::Manifest(format!("{}: {e}", path.display())))?;
+            let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+            let lines: Vec<&[u8]> = if body.is_empty() {
+                Vec::new()
+            } else {
+                body.split(|b| *b == b'\n').collect()
+            };
             let n = lines.len();
             for (i, l) in lines.iter().enumerate() {
-                if l.trim().is_empty() {
+                if l.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                match serde_json::from_str::<Envelope>(l) {
+                match serde_json::from_slice::<Envelope>(l) {
                     Ok(env) if env.v == MANIFEST_VERSION => rows.push(env),
                     Ok(env) => {
                         return Err(ApplyError::Manifest(format!(

@@ -1,10 +1,16 @@
 //! Apply repairs after plan review r6b and the acceptance review (goodqa#16529). One guard test
 //! per defect class, each at its choke point:
-//! - removal binds the unlink to the checked inode (`fsops::remove_member`, r6b F1);
-//! - the manifest's torn tail is repaired before an acting run appends (r6b F2);
-//! - the retention index keeps a retained copy from being removed without a backup (N4);
-//! - an archived shard is reused only when its stored hash still matches (I-1, NEG-8);
-//! - noise whose evidence fails is backed up instead (AC-7, NEG-7).
+//! - removal binds the unlink to the checked inode, and a failure past the quarantine move puts
+//!   the member back (`fsops::remove_member`, r6b F1);
+//! - the manifest's torn tail, also one that is not UTF-8, is repaired before an acting run
+//!   appends (`manifest::open_for_append` and `Manifest::load`, r6b F2);
+//! - the retention index backs up a retained copy before any lane removes it (`protect_retained`,
+//!   N4);
+//! - an archived shard is reused only when its stored hash still matches
+//!   (`shard::shard_still_verified`, I-1, NEG-8);
+//! - noise whose evidence fails is backed up instead, under the backup lane's secret rule (AC-7,
+//!   NEG-7);
+//! - the tests the spec named but lacked (acceptance finding 4).
 #![cfg(unix)]
 
 mod apply_common;
@@ -170,7 +176,86 @@ fn a_crash_after_the_quarantine_move_resumes_cleanly() {
     assert_eq!(tree_digest(&fx.data.join("p")), digest);
 }
 
+#[test]
+fn a_failed_unlink_after_the_quarantine_move_puts_the_member_back() {
+    // An error past the move (here the unlink) must never leave the file under its hidden
+    // quarantine name while the manifest says it was kept at its own name.
+    let fx = Fx::new();
+    let f = fx.write("g/f.txt", b"original");
+    let root = fsops::open_dir_abs(&fx.data.join("g")).unwrap();
+    let id = fsops::lstat_rel(&root, "f.txt").unwrap();
+    set_hook(|stage, _| {
+        if stage == RemoveStage::Unlink {
+            return Err(std::io::Error::from_raw_os_error(1)); // EPERM
+        }
+        Ok(())
+    });
+    let r = fsops::remove_member(&root, "f.txt", &id, false);
+    clear_hook();
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(fs::read(&f).unwrap(), b"original");
+    assert!(leftovers(&fx.data).is_empty(), "{:?}", leftovers(&fx.data));
+
+    // Through a real apply: the piece is partial, the member is back where it was.
+    let p1 = fx.write("p/f1.txt", b"one");
+    let p2 = fx.write("p/f2.txt", b"two");
+    let (scan, plan) = docs(&[&fx.data], &[P::tree(&fx.data.join("p"), "backup")]);
+    set_hook(|stage, rel| {
+        if stage == RemoveStage::Unlink && rel == "f1.txt" {
+            return Err(std::io::Error::from_raw_os_error(1));
+        }
+        Ok(())
+    });
+    let rep = apply(&scan, &plan, &fx.opts(true));
+    clear_hook();
+    let rep = rep.unwrap();
+    assert_eq!(rep.pieces[0].outcome, "partial", "{rep:?}");
+    assert_eq!(fs::read(&p1).unwrap(), b"one");
+    assert!(!p2.exists(), "{rep:?}");
+    assert!(leftovers(&fx.data).is_empty(), "{:?}", leftovers(&fx.data));
+}
+
 // ---- Class 2: the manifest's torn tail is repaired before an acting run appends (r6b F2) ----
+
+#[test]
+fn a_torn_tail_that_is_not_utf8_is_repaired_not_refused() {
+    // A tail cut inside a multi-byte character, and NUL padding after a power loss: neither is
+    // UTF-8, and neither may make the manifest unloadable.
+    for (case, tail) in [
+        (
+            "cut inside a character",
+            b"{\"v\":1,\"run\":\"c\",\"path\":\"caf\xc3".to_vec(),
+        ),
+        ("NUL padding", vec![0u8; 4096]),
+    ] {
+        let fx = Fx::new();
+        let (a, b) = two_pieces(&fx);
+        let db = tree_digest(&fx.data.join("b"));
+        apply(&a.0, &a.1, &fx.opts(true)).unwrap();
+        let mut bytes = fs::read(fx.manifest()).unwrap();
+        bytes.extend_from_slice(&tail);
+        fs::write(fx.manifest(), &bytes).unwrap();
+        // A dry run reads it (and changes nothing).
+        let dry = apply(&b.0, &b.1, &fx.opts(false));
+        assert!(dry.is_ok(), "{case}: {dry:?}");
+        assert_eq!(
+            fs::read(fx.manifest()).unwrap(),
+            bytes,
+            "{case}: dry run wrote"
+        );
+        let rep = apply(&b.0, &b.1, &fx.opts(true)).unwrap();
+        assert_eq!(rep.pieces[0].outcome, "removed", "{case}: {rep:?}");
+        let m = Manifest::load(&fx.manifest(), "check").expect("the repaired manifest loads");
+        assert!(!m.rows.is_empty(), "{case}");
+        assert!(!fs::read(fx.manifest()).unwrap().contains(&0u8), "{case}");
+        let r = restore(&fx.data.join("b"), &ropts(&fx)).unwrap();
+        assert!(
+            r.failed.is_empty() && r.conflicts.is_empty(),
+            "{case}: {r:?}"
+        );
+        assert_eq!(tree_digest(&fx.data.join("b")), db, "{case}");
+    }
+}
 
 fn two_pieces(fx: &Fx) -> ((String, String), (String, String)) {
     fx.write("a/x.txt", b"alpha bytes");
@@ -228,15 +313,27 @@ fn a_whole_last_row_without_its_newline_is_kept() {
     let fx = Fx::new();
     let (a, b) = two_pieces(&fx);
     apply(&a.0, &a.1, &fx.opts(true)).unwrap();
-    let before = Manifest::load(&fx.manifest(), "check").unwrap().rows.len();
+    let m0 = Manifest::load(&fx.manifest(), "check").unwrap();
+    let run_a = m0.rows[0].run.clone();
+    let rows_a = m0.rows.iter().filter(|e| e.run == run_a).count();
     let mut bytes = fs::read(fx.manifest()).unwrap();
     assert_eq!(bytes.pop(), Some(b'\n'));
     fs::write(fx.manifest(), &bytes).unwrap();
-    apply(&b.0, &b.1, &fx.opts(true)).unwrap();
+    let rep = apply(&b.0, &b.1, &fx.opts(true)).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
     let m = Manifest::load(&fx.manifest(), "check").expect("loads");
-    assert!(m.rows.len() > before, "the unterminated row was kept");
-    let first = Manifest::load(&fx.manifest(), "check").unwrap();
-    assert_eq!(first.rows.len(), m.rows.len());
+    assert_eq!(
+        m.rows.iter().filter(|e| e.run == run_a).count(),
+        rows_a,
+        "every row of the first run is kept, its unterminated last row included"
+    );
+    assert!(m.rows.iter().any(|e| e.run != run_a));
+    let side = fs::read_dir(&fx.state)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".torn-"))
+        .count();
+    assert_eq!(side, 0, "a whole row is not torn");
 }
 
 #[test]
@@ -293,15 +390,72 @@ fn retained_copy_protected_in_later_run() {
         &[&fx.data],
         &[P::tree(&fx.data.join("other"), "keep"), piece],
     );
+    // A dry run says the retained copy would be backed up, and counts its bytes.
+    let mut o = fx.opts(false);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let dry = apply(&scan, &plan, &o).unwrap();
+    assert!(dry.pieces[1].outcome.contains("back up"), "{dry:?}");
+    assert!(dry.uploaded_bytes >= content.len() as u64, "{dry:?}");
+    let before = fx.shard_total();
+    let mut o = fx.opts(true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    // Spec N4: the piece holding a retained copy is backed up before removal, never removed as
+    // noise without an archived copy.
+    assert_eq!(rep.pieces[1].outcome, "removed", "{rep:?}");
+    assert!(rep.pieces[1].reason.contains("retained copy"), "{rep:?}");
+    assert!(rep.pieces[1].reason.contains("backed up"), "{rep:?}");
+    assert!(fx.shard_total() > before, "the retained copy was archived");
+    assert!(!orig.exists());
+    // Both come back from storage, with nothing left of the retained copy on disk.
+    let r = restore(&dup, &ropts(&fx)).unwrap();
+    assert!(r.failed.is_empty(), "{r:?}");
+    assert_eq!(fs::read(&dup).unwrap(), content);
+    let r = restore(&orig, &ropts(&fx)).unwrap();
+    assert!(r.failed.is_empty(), "{r:?}");
+    assert_eq!(fs::read(&orig).unwrap(), content);
+}
+
+#[test]
+fn a_retained_copy_with_a_secret_name_is_kept() {
+    // The fallback to the backup lane uses the backup lane's secret rule: a retained copy whose
+    // name is secret-like is never uploaded by default, so its piece is kept.
+    let fx = Fx::new();
+    let content = b"bytes kept under a secret-like name\n";
+    let orig = fx.write("keep/api_token_notes.txt", content);
+    fx.write("dups/copy.txt", content);
+    let third = fx.write("other/third.txt", content);
+    let mut piece = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
+    piece.evidence = Some(serde_json::json!({
+        "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
+        "retained_copy": orig, "retained_piece": 0
+    }));
+    let (scan, plan) = docs(
+        &[&fx.data],
+        &[P::tree(&fx.data.join("keep"), "keep"), piece],
+    );
+    let mut o = fx.opts(true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    assert_eq!(
+        apply(&scan, &plan, &o).unwrap().pieces[1].outcome,
+        "removed"
+    );
+    let mut piece = P::files(&fx.data.join("keep"), &["api_token_notes.txt"], "noise");
+    piece.evidence = Some(serde_json::json!({
+        "kind": "duplicate", "sha256": sha(&third), "size": content.len(),
+        "retained_copy": third, "retained_piece": 0
+    }));
+    let (scan, plan) = docs(
+        &[&fx.data],
+        &[P::tree(&fx.data.join("other"), "keep"), piece],
+    );
     let mut o = fx.opts(true);
     o.oracle = Box::new(agreeing_oracle(&scan, &plan));
     let rep = apply(&scan, &plan, &o).unwrap();
     assert_eq!(rep.pieces[1].outcome, "kept", "{rep:?}");
     assert!(rep.pieces[1].reason.contains("retained copy"), "{rep:?}");
+    assert!(rep.pieces[1].reason.contains("secret name"), "{rep:?}");
     assert!(orig.exists());
-    let r = restore(&dup, &ropts(&fx)).unwrap();
-    assert!(r.failed.is_empty(), "{r:?}");
-    assert_eq!(fs::read(&dup).unwrap(), content);
 }
 
 // ---- Class 4: an archived shard is reused only when its stored hash matches (NEG-8) ----
@@ -373,6 +527,26 @@ fn an_intact_shard_is_reused_without_upload() {
     let a = docs(&[&fx.data], &[P::tree(&fx.data.join("a"), "backup")]);
     let b = docs(&[&fx.data], &[P::tree(&fx.data.join("b"), "backup")]);
     apply(&a.0, &a.1, &fx.opts(true)).unwrap();
+    let rep = apply(&b.0, &b.1, &fx.opts(true)).unwrap();
+    assert_eq!(rep.shards_uploaded, 0, "{rep:?}");
+    assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
+}
+
+#[test]
+fn an_intact_readback_only_shard_is_reused_after_reading_it_back() {
+    // Decision (Revision 6): a shard whose backend reported no hash was verified by reading it
+    // back; reuse reads it back again and compares sha256, rather than uploading it again.
+    let fx = Fx::new();
+    let content = vec![7u8; 200_000];
+    fx.write("a/x.bin", &content);
+    fx.write("b/y.bin", &content);
+    let a = docs(&[&fx.data], &[P::tree(&fx.data.join("a"), "backup")]);
+    let b = docs(&[&fx.data], &[P::tree(&fx.data.join("b"), "backup")]);
+    let mut o = fx.opts(true);
+    o.hooks.force_readback = true;
+    apply(&a.0, &a.1, &o).unwrap();
+    let manifest = fs::read_to_string(fx.manifest()).unwrap();
+    assert!(manifest.contains("readback-sha256:"), "{manifest}");
     let rep = apply(&b.0, &b.1, &fx.opts(true)).unwrap();
     assert_eq!(rep.shards_uploaded, 0, "{rep:?}");
     assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
@@ -454,4 +628,86 @@ fn a_dry_run_says_failed_noise_would_be_backed_up() {
     let rep = apply(&scan, &plan, &o).unwrap();
     assert!(rep.pieces[1].outcome.contains("back up"), "{rep:?}");
     assert!(rep.uploaded_bytes > 0, "{rep:?}");
+}
+
+#[test]
+fn failed_noise_with_a_secret_like_name_is_kept_not_uploaded() {
+    // The fallback to backup applies the backup lane's (wider) secret rule: a duplicate whose
+    // proof fails and whose name is secret-like is kept, never uploaded by default.
+    let fx = Fx::new();
+    let content = b"FALLBACK-SECRET-CANARY-2b9c\n";
+    let orig = fx.write("keep/orig.txt", content);
+    let dup = fx.write("dups/my_token.txt", content);
+    let want = sha(&orig);
+    fs::write(&orig, b"changed after the plan").unwrap();
+    let mut piece = P::files(&fx.data.join("dups"), &["my_token.txt"], "noise");
+    piece.evidence = Some(serde_json::json!({
+        "kind": "duplicate", "sha256": want, "size": content.len(),
+        "retained_copy": orig, "retained_piece": 0
+    }));
+    let (scan, plan) = docs(
+        &[&fx.data],
+        &[P::tree(&fx.data.join("keep"), "keep"), piece],
+    );
+    let mut o = fx.opts(true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    assert_eq!(rep.pieces[1].outcome, "kept", "{rep:?}");
+    assert!(rep.pieces[1].reason.contains("secret name"), "{rep:?}");
+    assert_eq!(fs::read(&dup).unwrap(), content);
+    assert!(!fx
+        .all_shard_bytes()
+        .windows(content.len())
+        .any(|w| w == content));
+}
+
+// ---- Named tests the spec promised (acceptance finding 4) ----
+
+/// Spec "Upload once": when the piece holding the first copy is skipped, the mapped copy in
+/// another piece is uploaded from itself after re-hashing, and restores.
+#[test]
+fn mapped_copy_uploaded_when_primary_skipped() {
+    let fx = Fx::new();
+    let content = b"MAPPED-COPY-CANARY-4d1e the same bytes in two pieces\n";
+    fx.write("a/x.bin", content);
+    let y = fx.write("b/y.bin", content);
+    let (scan, plan) = docs(
+        &[&fx.data],
+        &[
+            P::tree(&fx.data.join("a"), "backup"),
+            P::tree(&fx.data.join("b"), "backup"),
+        ],
+    );
+    // The first piece changes after the scan, so it is skipped.
+    std::thread::sleep(Duration::from_millis(20));
+    fx.write("a/new-after-scan.txt", b"new");
+    let rep = apply(&scan, &plan, &fx.opts(true)).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "kept", "{rep:?}");
+    assert_eq!(rep.pieces[1].outcome, "removed", "{rep:?}");
+    assert!(fx.data.join("a/x.bin").exists());
+    let shards = fx.all_shard_bytes();
+    assert!(shards.windows(content.len()).any(|w| w == content));
+    let r = restore(&y, &ropts(&fx)).unwrap();
+    assert!(r.failed.is_empty(), "{r:?}");
+    assert_eq!(fs::read(&y).unwrap(), content);
+}
+
+/// NEG-9: an unreadable file inside a piece keeps the whole piece.
+#[test]
+fn unreadable_file_keeps_piece() {
+    let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        eprintln!("skipped: root reads mode-000 files");
+        return;
+    }
+    let fx = Fx::new();
+    let ok = fx.write("p/ok.txt", b"readable");
+    let locked = fx.write("p/locked.txt", b"UNREADABLE-CANARY");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let (scan, plan) = docs(&[&fx.data], &[P::tree(&fx.data.join("p"), "backup")]);
+    let rep = apply(&scan, &plan, &fx.opts(true)).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "kept", "{rep:?}");
+    assert!(ok.exists() && locked.exists());
+    assert_eq!(fs::read(&locked).unwrap(), b"UNREADABLE-CANARY");
 }

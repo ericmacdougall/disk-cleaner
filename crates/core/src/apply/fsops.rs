@@ -122,6 +122,26 @@ pub fn lstat_rel(base: &OwnedFd, rel: &str) -> io::Result<Ident> {
     Ok(ident_of(&st))
 }
 
+/// Is `rel` below `base` a macOS dataless placeholder (`SF_DATALESS`: a file or directory a
+/// file provider such as iCloud Drive has not downloaded)? Reading one would download it, and
+/// what restore gives back is then not what was on disk, so a piece holding one is kept (spec
+/// I-6, NEG-9). Always false elsewhere.
+#[cfg(target_os = "macos")]
+pub fn is_dataless_rel(base: &OwnedFd, rel: &str) -> io::Result<bool> {
+    const SF_DATALESS: u32 = 0x4000_0000;
+    let (dir, leaf) = split_rel(rel);
+    let d = open_dir_rel(base, dir)?;
+    let st = fs::statat(&d, OsStr::new(leaf), AtFlags::SYMLINK_NOFOLLOW).map_err(e)?;
+    #[allow(clippy::unnecessary_cast)]
+    Ok((st.st_flags as u32) & SF_DATALESS != 0)
+}
+
+/// Is `rel` a macOS dataless placeholder? Never, off macOS.
+#[cfg(not(target_os = "macos"))]
+pub fn is_dataless_rel(_base: &OwnedFd, _rel: &str) -> io::Result<bool> {
+    Ok(false)
+}
+
 /// Read a symlink's target bytes below `base`.
 pub fn readlink_rel(base: &OwnedFd, rel: &str) -> io::Result<Vec<u8>> {
     let (dir, leaf) = split_rel(rel);
@@ -173,6 +193,9 @@ pub enum RemoveStage {
     BeforeQuarantine,
     /// After the move, before the moved entry is checked and unlinked.
     AfterQuarantine,
+    /// After the moved entry passed its check, just before the unlink. An error here stands
+    /// for a failed unlink (not a crash): the entry must go back under its own name.
+    Unlink,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -251,12 +274,19 @@ fn rel_with_leaf(dir: &str, leaf: &str) -> String {
 /// 2. rename it, replacing nothing, to its quarantine name in the same directory;
 /// 3. lstat the quarantined entry: it must be the inode of step 1 with the same kind, size and
 ///    mtime (a rename moves ctime, so ctime is not compared here);
-/// 4. unlink it. On a mismatch the entry is renamed back; if its name was taken meanwhile, it
-///    stays under the quarantine name and is reported, never removed.
+/// 4. unlink it. On a mismatch, or when the stat or unlink of step 3 or 4 fails, the entry is
+///    renamed back; if its name was taken meanwhile, it stays under the quarantine name and is
+///    reported (`Displaced`), never removed.
 ///
 /// A run interrupted between 2 and 4 leaves the quarantine name. A resumed run finds it when
 /// the leaf is absent and finishes (same identity) or leaves it (anything else). Never follows
 /// a symlink: a symlink member is removed itself.
+///
+/// Residual race (disclosed in spec Revision 6): POSIX has no unlink-by-inode, so between the
+/// check of step 3 and the unlink of step 4 a process that renames another file onto the
+/// quarantine name itself would lose that file. The name is private to this run's removal
+/// (`.pd-rm-<hash of the leaf>`), so ordinary writers such as editors' atomic saves, which
+/// target the member's own name, cannot hit it; that is the race r6b F1 described.
 pub fn remove_member(
     base: &OwnedFd,
     rel: &str,
@@ -278,8 +308,10 @@ pub fn remove_member(
                 Ok(qst) => {
                     let qid = ident_of(&qst);
                     if qid.same_loose(expect) && qid.kind != 'd' {
-                        fs::unlinkat(&d, OsStr::new(&q), AtFlags::empty()).map_err(e)?;
-                        Ok(Unlinked::Done)
+                        match fs::unlinkat(&d, OsStr::new(&q), AtFlags::empty()) {
+                            Ok(()) => Ok(Unlinked::Done),
+                            Err(err) => put_back(&d, dir, &q, leaf, e(err)),
+                        }
                     } else {
                         Ok(Unlinked::Displaced(rel_with_leaf(dir, &q)))
                     }
@@ -305,16 +337,38 @@ pub fn remove_member(
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Unlinked::Absent),
         Err(err) => return Err(err),
     }
+    // A hook error simulates a crash here: nothing is cleaned up, as after a real crash.
     hook(RemoveStage::AfterQuarantine, rel)?;
-    let moved = ident_of(&fs::statat(&d, OsStr::new(&q), AtFlags::SYMLINK_NOFOLLOW).map_err(e)?);
+    let moved = match fs::statat(&d, OsStr::new(&q), AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => ident_of(&st),
+        Err(err) => return put_back(&d, dir, &q, leaf, e(err)),
+    };
     if moved.same_loose(&now) && moved.kind != 'd' {
-        fs::unlinkat(&d, OsStr::new(&q), AtFlags::empty()).map_err(e)?;
-        return Ok(Unlinked::Done);
+        if let Err(err) = hook(RemoveStage::Unlink, rel) {
+            return put_back(&d, dir, &q, leaf, err);
+        }
+        return match fs::unlinkat(&d, OsStr::new(&q), AtFlags::empty()) {
+            Ok(()) => Ok(Unlinked::Done),
+            Err(err) => put_back(&d, dir, &q, leaf, e(err)),
+        };
     }
     // Not the entry that was checked: put it back, never over something else.
     match rename_noreplace(&d, &q, leaf) {
         Ok(()) => Ok(Unlinked::Changed(moved)),
         Err(_) => Ok(Unlinked::Displaced(rel_with_leaf(dir, &q))),
+    }
+}
+
+/// After a failure past the quarantine move, put the entry back under its own name (never over
+/// another entry) and return `err`; if it cannot go back, report where it is instead, so no
+/// caller ever records a member at a path it is not at.
+fn put_back(d: &OwnedFd, dir: &str, q: &str, leaf: &str, err: io::Error) -> io::Result<Unlinked> {
+    match rename_noreplace(d, q, leaf) {
+        Ok(()) => Err(err),
+        Err(_) => match fs::statat(d, OsStr::new(q), AtFlags::SYMLINK_NOFOLLOW) {
+            Err(Errno::NOENT) => Err(err),
+            _ => Ok(Unlinked::Displaced(rel_with_leaf(dir, q))),
+        },
     }
 }
 

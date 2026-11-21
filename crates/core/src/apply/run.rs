@@ -292,33 +292,36 @@ pub fn apply(
         ctx.report.pieces.push(rep);
     }
 
-    // 1b. The retention index (N4, acceptance finding 1): a file kept as the retained copy of
-    // a duplicate removed by any earlier run is the only copy of that duplicate's bytes. A piece
-    // that would remove it without archiving its content (noise, a git HEAD blob, another
-    // duplicate) is kept, whatever its lane. Backed-up members are archived, so restore can use
-    // the archived blob instead.
+    // 1b. The retention index (N4, acceptance finding 1).
     let retained = ctx.manifest.retained_paths();
-    prepared.retain(|pr| {
-        let p = &inputs.pieces[pr.piece];
-        let hit = pr.members.iter().find(|m| {
-            !matches!(m.content, Content::Blob { .. })
-                && retained.contains(&rel_join(&p.path, &m.rel))
-        });
-        match hit {
-            None => true,
-            Some(m) => {
-                set_outcome(
-                    &mut ctx.report,
-                    pr.piece,
-                    "kept",
-                    &format!(
-                        "{} is the retained copy of a duplicate removed earlier; it is never \
-                         removed without a backup",
-                        rel_join(&p.path, &m.rel).display()
-                    ),
-                );
-                false
-            }
+    let mut retention_notes: BTreeMap<usize, String> = BTreeMap::new();
+    prepared.retain_mut(|pr| match protect_retained(&ctx, &retained, pr) {
+        Ok(None) => true,
+        Ok(Some(note)) => {
+            retention_notes.insert(pr.piece, note.clone());
+            let outcome = if opts.act {
+                "pending"
+            } else {
+                dry_word(Lane::Backup)
+            };
+            let before = ctx
+                .report
+                .pieces
+                .iter()
+                .find(|r| r.id == pr.piece)
+                .map(|r| r.reason.clone())
+                .unwrap_or_default();
+            let reason = if before.is_empty() {
+                note
+            } else {
+                format!("{before}; {note}")
+            };
+            set_outcome(&mut ctx.report, pr.piece, outcome, &reason);
+            true
+        }
+        Err(why) => {
+            set_outcome(&mut ctx.report, pr.piece, "kept", &why);
+            false
         }
     });
 
@@ -354,7 +357,12 @@ pub fn apply(
                 if let Some(row) = r.row {
                     ctx.manifest.append(opts.now, vec![row])?;
                 }
-                set_outcome(&mut ctx.report, pr.piece, "pending", &r.note);
+                let note = match retention_notes.get(&pr.piece) {
+                    Some(n) if !r.note.is_empty() => format!("{}; {n}", r.note),
+                    Some(n) => n.clone(),
+                    None => r.note.clone(),
+                };
+                set_outcome(&mut ctx.report, pr.piece, "pending", &note);
                 recovered.push(pr);
             }
             Err(why) => set_outcome(
@@ -393,6 +401,63 @@ pub fn apply(
     let _ = mirror(&mut ctx);
     result?;
     Ok(ctx.report)
+}
+
+/// The retention index (N4, acceptance finding 1), consulted for every removing piece of every
+/// lane. A file that is the retained copy of a duplicate removed by an earlier run is the only
+/// local copy of that duplicate's bytes, and restore of the duplicate finds them by sha256. So a
+/// member that is such a copy is never removed without its own archived blob: a member the
+/// piece would remove without one (noise, a git HEAD blob restored from the object store) is
+/// re-hashed and backed up like the backup lane, under the backup lane's secret rule. Returns
+/// a note when members were moved to the backup, or `Err` (keep the piece) when that is not
+/// possible: a resumed removal, a secret name, or a member that changed.
+fn protect_retained(
+    ctx: &Ctx,
+    retained: &BTreeSet<PathBuf>,
+    pr: &mut Prepared,
+) -> Result<Option<String>, String> {
+    let p = &ctx.inputs.pieces[pr.piece];
+    let mut moved = Vec::new();
+    for m in pr.members.iter_mut() {
+        if matches!(m.content, Content::Blob { .. }) {
+            continue;
+        }
+        let path = rel_join(&p.path, &m.rel);
+        if !retained.contains(&path) {
+            continue;
+        }
+        let keep = |why: &str| {
+            Err(format!(
+                "{} is the retained copy of a duplicate removed earlier, and {why}",
+                path.display()
+            ))
+        };
+        if pr.reason == "resuming an interrupted removal" {
+            return keep("this interrupted removal recorded no archived copy of it");
+        }
+        if m.id.kind != 'f' {
+            return keep("it is no longer a regular file");
+        }
+        if !ctx.opts.secrets_upload && names::rel_is_secret(&m.rel) {
+            return keep(
+                "it has a secret name, so it stays local (upload only with --secrets upload)",
+            );
+        }
+        let (sha, id) = shard::hash_file(&p.path, &m.rel)?;
+        if !id.same_strict(&m.id) {
+            return keep("it changed while it was being checked");
+        }
+        m.content = Content::Blob { sha256: sha };
+        moved.push(path.display().to_string());
+    }
+    Ok((!moved.is_empty()).then(|| {
+        format!(
+            "{} {} the retained copy of a duplicate removed earlier, so it is backed up and \
+             verified before removal",
+            moved.join(", "),
+            if moved.len() == 1 { "is" } else { "are" }
+        )
+    }))
 }
 
 /// Nothing of the piece is left on disk (a re-run after a completed removal).
@@ -930,10 +995,14 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
     let opts = ctx.opts;
     // Deepest first, and files pieces before the tree at the same path, so a residual tree or a
     // parent with excluded child pieces finds its directory empty when it removes it.
+    // Plan pieces of one scan piece share its path, so they are kept together (stream A's
+    // re-check, 6f927f2, treats a changed directory status-change time as drift, so a sibling
+    // removed in an earlier batch would fail the second re-check of the rest).
     ready.sort_by_key(|pr| {
         let p = &ctx.inputs.pieces[pr.piece];
         (
             std::cmp::Reverse(p.path.components().count()),
+            p.scan_piece,
             p.kind != PieceKind::Files,
             p.id,
         )
@@ -952,7 +1021,7 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
         .filter(|(_, n)| *n > 1)
         .map(|(k, _)| k)
         .collect();
-    for batch in ready.chunks(64) {
+    for batch in removal_batches(&ctx.inputs.pieces, &ready, 64) {
         let mut go: Vec<&Prepared> = Vec::new();
         let mut rows = Vec::new();
         let begun_now = ctx.manifest.begun();
@@ -1040,6 +1109,28 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
         }
     }
     Ok(())
+}
+
+/// Split `ready` (sorted so the plan pieces of one scan piece are adjacent) into batches of about
+/// `size` pieces, never splitting the plan pieces of one scan piece across two batches: every
+/// sibling is re-checked before the first of them is removed.
+fn removal_batches<'a>(
+    pieces: &[PlanPiece],
+    ready: &'a [Prepared],
+    size: usize,
+) -> Vec<&'a [Prepared]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for i in 1..=ready.len() {
+        let cut = i == ready.len()
+            || (i - start >= size
+                && pieces[ready[i].piece].scan_piece != pieces[ready[i - 1].piece].scan_piece);
+        if cut {
+            out.push(&ready[start..i]);
+            start = i;
+        }
+    }
+    out
 }
 
 fn file_row(p: &PlanPiece, pr: &Prepared, m: &PMember, linked: &BTreeSet<(u64, u64)>) -> Row {

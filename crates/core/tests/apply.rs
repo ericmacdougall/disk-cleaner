@@ -915,6 +915,27 @@ fn many_derived_pieces_cross_the_batch_boundary() {
     assert_eq!(fs::read_dir(&s).unwrap().count(), 0);
 }
 
+/// More than one removal batch of separate scan pieces: every piece is removed, and the plan
+/// pieces of one scan piece are never split across batches (see the test above, which with
+/// stream A's directory status-change re-check fails when siblings are split).
+#[test]
+fn many_scan_pieces_cross_the_batch_boundary() {
+    let fx = Fx::new();
+    let mut specs = Vec::new();
+    for k in 0..70 {
+        let d = fx.data.join(format!("d{k:02}"));
+        fx.write(&format!("d{k:02}/f.txt"), format!("content {k}").as_bytes());
+        specs.push(P::tree(&d, "backup"));
+    }
+    let (scan, plan) = docs(&[&fx.data], &specs);
+    let rep = apply(&scan, &plan, &fx.opts(true)).unwrap();
+    assert_eq!(
+        rep.pieces.iter().filter(|p| p.outcome == "removed").count(),
+        70,
+        "{rep:#?}"
+    );
+}
+
 #[test]
 fn hostile_rev5_bindings_are_refused() {
     let fx = Fx::new();

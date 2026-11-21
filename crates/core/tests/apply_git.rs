@@ -717,6 +717,108 @@ fn an_existing_recovery_ref_is_never_forced() {
     );
 }
 
+/// N4 (acceptance finding 1) in the vcs lane: an unchanged tracked file normally restores from
+/// the git object store, not from an archived blob, which the duplicate's restore cannot use.
+/// So a file that is the retained copy of a duplicate removed earlier is uploaded raw before
+/// its repository is removed, and both restore with the remote gone.
+#[test]
+fn retained_copy_in_a_git_piece_is_archived_raw() {
+    let fx = Fx::new();
+    let r = repo(&fx);
+    let retained = r.dir.join("src/lib.rs");
+    let dup = fx.write("dups/lib-copy.rs", UNCHANGED);
+    let mut piece = P::files(&fx.data.join("dups"), &["lib-copy.rs"], "noise");
+    piece.evidence = Some(json!({
+        "kind": "duplicate", "sha256": sha(&retained), "size": UNCHANGED.len(),
+        "retained_copy": retained, "retained_piece": 0
+    }));
+    let (scan, plan) = docs(&[&fx.data], &[P::tree(&r.dir, "keep"), piece]);
+    let mut o = gopts(&fx, true, true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    assert_eq!(outcome(&rep, 1).0, "removed", "{rep:#?}");
+    assert!(!dup.exists());
+
+    let (scan, plan) = docs(&[&fx.data], &[P::git(&r.dir, &[".env"], bundle_block())]);
+    let mut o = gopts(&fx, true, true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    let (out, why) = outcome(&rep, 0);
+    assert_eq!(out, "removed", "{why}");
+    assert!(why.contains("retained copy"), "{why}");
+    assert!(!retained.exists());
+    let shards = fx.all_shard_bytes();
+    assert!(
+        shards.windows(UNCHANGED.len()).any(|w| w == UNCHANGED),
+        "the retained copy was uploaded raw"
+    );
+    let manifest = fs::read_to_string(fx.manifest()).unwrap();
+    let row = manifest
+        .lines()
+        .find(|l| l.contains("\"t\":\"file\"") && l.contains("src/lib.rs"))
+        .expect("a file row for src/lib.rs");
+    assert!(!row.contains("git_oid"), "{row}");
+    // The duplicate restores from the archived blob, with its retained copy gone.
+    let rr = restore(&dup, &ropts(&fx)).unwrap();
+    assert!(rr.failed.is_empty(), "{rr:?}");
+    assert_eq!(fs::read(&dup).unwrap(), UNCHANGED);
+    fs::remove_dir_all(&r.bare).unwrap();
+    let rr = restore(&r.dir, &ropts(&fx)).unwrap();
+    assert!(rr.failed.is_empty() && rr.conflicts.is_empty(), "{rr:?}");
+    assert_eq!(fs::read(&retained).unwrap(), UNCHANGED);
+}
+
+/// Contract rule 2 (docs/SCAN-FORMAT.md "Pieces and lanes", stream A 677f88f): a scan piece
+/// the scan marks `incomplete` is never acted on, in any lane, whatever the plan says. Stream A
+/// adds `incomplete` reasons (pieces inside a git directory, git admin files no longer exempt);
+/// apply needs no change only if every such piece is kept, which this pins.
+#[test]
+fn incomplete_scan_pieces_are_kept_in_every_lane() {
+    let fx = Fx::new();
+    let r = repo(&fx);
+    let content = b"duplicate bytes for the incomplete case\n";
+    let orig = fx.write("keep/orig.txt", content);
+    fx.write("dups/copy.txt", content);
+    fx.write("b/x.txt", b"backup piece");
+    let mut dup = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
+    dup.evidence = Some(json!({
+        "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
+        "retained_copy": orig, "retained_piece": 0
+    }));
+    let (scan, plan) = docs(
+        &[&fx.data],
+        &[
+            P::tree(&fx.data.join("keep"), "keep"),
+            dup,
+            P::tree(&fx.data.join("b"), "backup"),
+            P::git(&r.dir, &[".env"], bundle_block()),
+        ],
+    );
+    let mut sv: Value = serde_json::from_str(&scan).unwrap();
+    for k in 1..4 {
+        sv["pieces"]["pieces"][k]["incomplete"] = json!("it lies inside a git directory");
+    }
+    let scan = sv.to_string();
+    let plan = rebind(&scan, &plan);
+    let before = tree_digest(&fx.data);
+    for act in [false, true] {
+        let mut o = gopts(&fx, act, true);
+        o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+        let rep = apply(&scan, &plan, &o).unwrap();
+        for id in 1..4 {
+            let (out, why) = outcome(&rep, id);
+            assert_eq!(out, "kept", "act={act} piece {id}: {why}");
+            assert!(
+                why.contains("could not judge it whole"),
+                "piece {id}: {why}"
+            );
+        }
+        assert_eq!(rep.removed_entries, 0, "{rep:#?}");
+    }
+    assert_eq!(tree_digest(&fx.data), before);
+    assert_eq!(fx.shard_total(), 0);
+}
+
 #[test]
 fn token_in_git_config_keeps_repo() {
     for (name, setup) in [

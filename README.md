@@ -47,7 +47,9 @@ on this disk unless you pass `--secrets upload` yourself.
 - **backup:** uploaded, verified, then removed (below).
 - **noise:** removed only while its evidence holds: a dependency or build folder next to its marker
   file (restore lists it to regenerate), or a duplicate whose kept copy still has the same content
-  (restore copies it back from there).
+  (restore copies it back from there). Noise whose evidence no longer holds is backed up like the
+  backup lane instead (a secret-like name keeps it). A file kept as the copy of a duplicate removed
+  earlier is itself backed up before any later run removes it.
 - **git:** a repository is removed only after its `.git` directory and every file that differs from
   the last commit are backed up; unchanged files come back from the backed-up history. Unsaved work
   (unpushed commits, plus a snapshot of changed and new files, never secret-named, ignored or very
@@ -63,8 +65,17 @@ on this disk unless you pass `--secrets upload` yourself.
 Each distinct file content is uploaded once, in shards of
 `--shard-mib` (default 64) through `--jobs` (default 4) rclone uploads at a time, streamed with no
 local copy. A shard is verified in storage by size and hash before any file in it is removed, and a
-shard that fails removes nothing. Every removal is written first to a manifest
-(`~/.disk-cleaner/prunedisk/<host>.jsonl`), which is also copied, with a checksum, to the remote.
+shard that fails removes nothing. Content already in storage is reused only after its shard is
+confirmed again by size and hash (a shard whose backend reports no hash is read back). Every removal
+is written first to a manifest (`~/.disk-cleaner/prunedisk/<host>.jsonl`), which is also copied,
+with a checksum, to the remote. If a crash left a torn last line in the manifest, the next `apply
+--apply` saves it beside the manifest as `<manifest>.torn-<time>` and cuts it before writing.
+
+Each file is removed by first renaming it to a hidden name in its own folder
+(`.pd-rm-<hash>`), checking that it is still the file that was backed up, then deleting it; anything
+else is put back. A crash between those steps can leave such a name behind, and the next run
+finishes it. One that is reported as "left at" a `.pd-rm-` path is a different file that took the
+name and was not removed.
 
 ### Getting files back
 
