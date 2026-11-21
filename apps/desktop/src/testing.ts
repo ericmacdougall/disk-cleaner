@@ -20,6 +20,9 @@ export function row(id: number, name: string, extra: Partial<Row> = {}): Row {
     hardlink_duplicate: false,
     summary: false,
     tag: null,
+    parent_row: null,
+    posinset: id + 1,
+    setsize: id + 1,
     ...extra,
   };
 }
@@ -31,7 +34,7 @@ export function syntheticPage(view: number, total: number, offset: number, limit
     view,
     total,
     offset,
-    rows: Array.from({ length: n }, (_, i) => row(offset + i, name(offset + i))),
+    rows: Array.from({ length: n }, (_, i) => row(offset + i, name(offset + i), { setsize: total })),
     sort: { key: "allocated", descending: true },
     focus: null,
     breadcrumb: [],

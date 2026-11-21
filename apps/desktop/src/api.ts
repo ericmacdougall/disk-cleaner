@@ -62,6 +62,11 @@ export interface Row {
   hardlink_duplicate: boolean;
   summary: boolean;
   tag: string | null;
+  /** Row index of the parent's row; null at depth 0. */
+  parent_row: number | null;
+  /** 1-based place among its siblings, and the sibling count (aria-posinset, aria-setsize). */
+  posinset: number;
+  setsize: number;
 }
 
 export interface Crumb {
