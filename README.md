@@ -5,7 +5,8 @@ safe to remove. It is planned to become a cleaner for Windows, macOS and Linux. 
 PruneDisk; the repository and the command are still called disk-cleaner.
 
 > **Status: early, read-only.** The `scan` and `plan` commands are on the main branch. There is no
-> tagged release, installer or download page yet, so you build it from source. (Continuous
+> installer. Prebuilt archives exist only for a published release (see "Download a release");
+> otherwise you build it from source. (Continuous
 > integration also builds unsigned binaries for each platform and keeps them as workflow artifacts
 > for 14 days; they are test builds, not releases.) No command removes, moves or changes anything:
 > the only file it writes is the one you name with `scan --out`.
@@ -38,6 +39,31 @@ nothing applies it yet.
 The scan and plan formats, every fact and every rule are described in
 [docs/SCAN-FORMAT.md](docs/SCAN-FORMAT.md). The overall design is in [docs/DESIGN.md](docs/DESIGN.md).
 
+## Download a release
+
+Once the maintainer publishes a release, prebuilt programs are on the
+[releases page](https://github.com/ericmacdougall/disk-cleaner/releases). Each published release
+carries one archive for each of Linux (x86-64), macOS (Apple Silicon and Intel) and Windows (x86-64),
+plus a `SHA256SUMS` file. Tagging a version only prepares a draft, which the maintainer reads and then
+publishes by hand. If that page lists no release yet, there is nothing to download: build from source
+(next section).
+
+The programs are **not code-signed or notarized**, so macOS Gatekeeper and Windows SmartScreen can warn
+when you first run one; the release notes say what to do. Check a download before you run it. Put the
+release's version, for example `v0.1.0`, in place of `vX.Y.Z`:
+
+```
+sha256sum -c --ignore-missing SHA256SUMS
+gh attestation verify <archive file name> --repo ericmacdougall/disk-cleaner --signer-workflow ericmacdougall/disk-cleaner/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
+```
+
+The first (Linux; the release notes give the macOS and Windows forms) shows the file matches the
+release's checksum list. The second shows the file was built on a GitHub-hosted runner by this
+repository's release workflow for that version's tag. It does not show the code is free of bugs or
+that anyone reviewed it; that rests on the repository's tag and branch rules and on the maintainer's
+publish step. How a release is made, and what is and is not checked, is in
+[docs/RELEASING.md](docs/RELEASING.md).
+
 ## Build from source
 
 You need a stable Rust toolchain (with `cargo`) and `git` on the `PATH`; the scanner runs `git` to
@@ -61,7 +87,7 @@ None of this exists yet:
 - detection and backup of coding-agent sessions and logs, and age and size policies for caches and
   outputs;
 - a desktop app with outline, sunburst, treemap and biggest-files views;
-- installers and releases;
+- installers;
 - renaming the repository and the command to `prunedisk`.
 
 ## Safety model in one paragraph

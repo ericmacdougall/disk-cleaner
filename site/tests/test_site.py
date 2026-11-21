@@ -18,6 +18,7 @@ ROOT_README = ROOT / "README.md"
 CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 PAGES_YML = ROOT / ".github" / "workflows" / "pages.yml"
 SITE_YML = ROOT / ".github" / "workflows" / "site.yml"
+RELEASE_YML = ROOT / ".github" / "workflows" / "release.yml"
 ALLOWED_LINK_PREFIX = "https://github.com/ericmacdougall/"
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
 UNIT_CMD = "python3 -m unittest discover -s site/tests -v"
@@ -121,6 +122,25 @@ def external_refs(markup):
 def forbidden_hits(text, words):
     low = text.lower()
     return [w for w in words if w.lower() in low]
+
+
+OVERCLAIM = re.compile(
+    r"(secret|\.env|credential|key file)[^.;]{0,60}\b(never|not|isn't|is not|are not)\b[^.;]{0,20}\b(read|opened)\b"
+    r"|\bnever (reads|opens)\b[^.;]{0,40}(secret|\.env|credential|any file|your files)"
+    r"|\bno file is ever (read|opened)\b"
+    # Absolute redaction promises: only some parts of a remote address are removed (redact.rs).
+    r"|\b(any|all|every)\b[^.;]{0,30}\b(passwords?|tokens?|credentials?|secrets?)\b[^.;]{0,30}"
+    r"\b(stripped|removed|redacted|hidden|never stored|never recorded)\b"
+    r"|\b(stripped|removed|redacted|cleaned) of (any|all|every)\b"
+    r"|\bnever (contains?|includes?|stores?|records?|keeps?) (a |an |any )?(passwords?|tokens?|credentials?|secrets?)\b"
+    r"|\b(no|never a) (passwords?|tokens?|credentials?|secrets?) (ever )?(reaches|reach|is stored|are stored|ends up)",
+    re.I)
+
+
+def overclaims(text):
+    """Sentences promising more than the scanner does: that secret files are never read (it runs git, which
+    reads tracked files), or that every password or token is removed from what it records."""
+    return [m.group(0) for m in OVERCLAIM.finditer(text)]
 
 
 def top_level_permissions(yml):
@@ -376,6 +396,18 @@ class TestDetectorsAreNotVacuous(unittest.TestCase):
                          ["prunedisk.com", "fastest"])
         self.assertEqual(forbidden_hits("nothing here", ["fastest"]), [])
 
+    def test_overclaim_detector_fires(self):
+        for bad in ("Secret files are never read.", "PruneDisk never reads your .env file.",
+                    "It never opens a secret file.", "No file is ever read.", "it never reads any file"):
+            self.assertTrue(overclaims(bad), bad)
+        for bad in ("remote names and addresses with any password or token stripped",
+                    "All credentials are removed from the scan.", "addresses stripped of any secrets",
+                    "The scan file never contains a token.", "No token ever reaches the scan file.",
+                    "every secret is redacted"):
+            self.assertTrue(overclaims(bad), bad)
+        self.assertEqual(overclaims("git reads the files it tracks, a tracked .env included"), [])
+        self.assertEqual(overclaims("it removes the user and password part and any query or fragment"), [])
+
     def test_structure_detector_fires(self):
         c = Collector()
         c.feed('<div id="a"><p id="a"></div>')
@@ -540,7 +572,31 @@ class TestContent(unittest.TestCase):
         self.assertIn("It deletes nothing", flat)
         self.assertRegex(flat, r"read-only")
         self.assertIn("merged into the main branch", flat)
-        self.assertIn("not released", flat)
+        self.assertIn("releases page", flat)
+
+    def test_reading_promise_is_no_stronger_than_the_scanner(self):
+        # The scanner runs git, and git reads the files a repository tracks (a tracked .env included).
+        # The page must say so, and must not promise that secret files are never read.
+        flat = re.sub(r"\s+", " ", self.text)
+        self.assertIn("git reads the files it tracks, as it always does, a tracked .env included", flat)
+        self.assertEqual(overclaims(flat), [])
+
+    def test_remote_redaction_is_described_as_built(self):
+        # crates/core/src/redact.rs: for scheme:// addresses the userinfo up to the last '@' goes
+        # (a plain ssh user name stays) and so do the query and fragment; names, paths and other
+        # address forms are stored as they are. The page must say exactly that, and say to keep
+        # a scan file private.
+        flat = re.sub(r"\s+", " ", self.text)
+        flat = re.sub(r"\(\s+", "(", re.sub(r"\s+([,;)])", r"\1", flat))  # tag gaps around <code>
+        self.assertEqual(overclaims(flat), [])
+        for part in ("it removes the user and password part (everything between :// and the last @",
+                     "a plain user name on an ssh address, such as ssh://git@host/…, is kept",
+                     "and any query (?…) or fragment (#…)",
+                     "Everything else is recorded as it is: the remote's name, the host and path of its address, "
+                     "and addresses in other forms, such as git@host:owner/repo.git or a local path",
+                     "A token put in a remote's name or in the path of its address stays in the scan file",
+                     "treat a scan file as private"):
+            self.assertIn(part, flat)
 
     def test_no_stale_review_claims(self):
         # The scanner and planner were merged into main; copy written while they were on a draft pull
@@ -562,7 +618,7 @@ class TestContent(unittest.TestCase):
 
     def test_no_download_button_or_install_claim(self):
         self.assertNotRegex(self.html, r'(?i)<a[^>]*class="btn[^"]*"[^>]*>[^<]*download')
-        self.assertIn("nothing to install yet", re.sub(r"\s+", " ", self.text))
+        self.assertIn("no installer", re.sub(r"\s+", " ", self.text))
 
     def test_repo_and_command_still_disk_cleaner(self):
         flat = re.sub(r"\s+", " ", self.text)
@@ -663,11 +719,15 @@ class TestContent(unittest.TestCase):
 
     def test_download_wording_matches_ci(self):
         flat = re.sub(r"\s+", " ", self.text)
-        # CI keeps unsigned binaries as workflow artifacts, so "no download" is not quite true; there is
-        # no release and no download page.
-        self.assertNotIn("no release or download yet", flat)
-        self.assertNotIn("Nothing to download yet", flat)
-        self.assertIn("no release or download page", flat)
+        # Written to be true before and after the first release exists: it points at the releases page
+        # and says what to do when that page lists nothing.
+        self.assertNotIn("no release or download page", flat)
+        self.assertNotIn("Merged, not released", flat)
+        self.assertIn("lists no release yet", flat)
+        for needed in ("not code-signed or notarized", "SHA256SUMS", "gh attestation verify",
+                       "Gatekeeper", "SmartScreen", "build from source"):
+            self.assertIn(needed, flat)
+        self.assertIn("https://github.com/ericmacdougall/disk-cleaner/releases", self.html)
         days = re.search(r"retention-days:\s*(\d+)", read(CI_YML)).group(1)
         readme = re.sub(r"\s+", " ", read(ROOT_README))
         self.assertNotIn("no tagged release, installer or download yet", readme)
@@ -906,6 +966,165 @@ def load_gate():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def load_release_meta():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("release_meta", ROOT / ".github" / "scripts" / "release_meta.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestReleaseWorkflow(unittest.TestCase):
+    """release.yml: pinned, least privilege, never publishes by itself, one place for the binary name."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.y = read(RELEASE_YML)
+        cls.notes = read(ROOT / ".github" / "release-notes.md")
+
+    def test_actions_pinned(self):
+        refs = action_refs(self.y)
+        self.assertTrue(refs)
+        for r in refs:
+            self.assertRegex(r, r"^[\w./-]+@[0-9a-f]{40}$", f"release.yml: {r} is not pinned to a SHA")
+
+    def test_top_level_permissions_read_only(self):
+        self.assertEqual(top_level_permissions(self.y), {"contents": "read"})
+
+    def test_only_the_draft_job_can_write_contents(self):
+        writers = re.findall(r"^\s+contents: write", self.y, re.M)
+        self.assertEqual(len(writers), 1)
+        draft = self.y[self.y.index("  draft-release:"):self.y.index("  crates-dry-run:")]
+        self.assertIn("contents: write", draft)
+        self.assertIn("needs.meta.outputs.publish == 'true'", draft)
+        # The release is made only by release_meta.py create-draft, which always posts draft: true
+        # (tested in .github/scripts/test_release_meta.py, TestCreateDraft).
+        self.assertIn("release_meta.py create-draft", draft)
+        self.assertNotRegex(self.y, r"\bgh release (create|delete|edit)\b")
+
+    def test_rehearsal_never_publishes(self):
+        self.assertIn("workflow_dispatch:", self.y)
+        self.assertNotIn("--draft=false", self.y)
+        self.assertNotIn("cargo publish\n", self.y)
+        self.assertNotRegex(self.y, r"cargo publish(?! --dry-run)")
+
+    def test_guards_are_behaviour_not_strings(self):
+        # The guards themselves are tested by .github/scripts/test_release_meta.py (real git, every
+        # refusal case). Here: the workflow still calls them in a form that can fail the job.
+        gate = load_release_meta()
+        self.assertEqual(gate.lint_workflow(self.y), [])
+        self.assertNotEqual(gate.lint_workflow(self.y.replace("release_meta.py meta\n", "release_meta.py meta || true\n")), [])
+
+    def test_builds_locked_for_the_four_targets(self):
+        self.assertIn("cargo build --release --locked", self.y)
+        for t in ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"):
+            self.assertIn(f"target: {t}", self.y)
+            self.assertIn(t, self.notes)
+
+    def test_binary_name_is_set_in_one_place(self):
+        self.assertEqual(len(re.findall(r"^\s+BIN_NAME:", self.y, re.M)), 1)
+        self.assertEqual(len(re.findall(r"^\s+CLI_PACKAGE:", self.y, re.M)), 1)
+        # the name is not typed anywhere else in the file
+        rest = re.sub(r"^\s+(BIN_NAME|CLI_PACKAGE):.*$", "", self.y, flags=re.M)
+        rest = "\n".join(l for l in rest.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn("disk-cleaner", rest)
+
+    def test_attests_and_checksums(self):
+        self.assertIn("SHA256SUMS", self.y)
+        self.assertIn("actions/attest@", self.y)
+        for perm in ("id-token: write", "attestations: write"):
+            self.assertIn(perm, self.y)
+
+    def test_notes_say_unsigned_and_how_to_verify(self):
+        flat = re.sub(r"\s+", " ", self.notes)
+        for needed in ("not code-signed or notarized", "Gatekeeper", "SmartScreen", "SHA256SUMS",
+                       "gh attestation verify", "com.apple.quarantine"):
+            self.assertIn(needed, flat)
+        self.assertTrue(set(re.findall(r"@([A-Z]+)@", self.notes)) <= {"BIN", "TAG", "VERSION", "REPO", "SHA"})
+
+    def test_notes_use_the_brand_name_and_say_the_command_will_be_renamed(self):
+        # BRAND.md section 1: display name PruneDisk; copyable names stay disk-cleaner, with one short
+        # line saying the command will be renamed.
+        first = self.notes.splitlines()[0]
+        self.assertIn("PruneDisk", first)
+        flat = re.sub(r"\s+", " ", self.notes)
+        self.assertRegex(flat, r"still called `@BIN@`; it will be renamed to `prunedisk`")
+        self.assertEqual(load_release_meta().RELEASE_TITLE % "v1.2.3", "PruneDisk v1.2.3")
+
+    def test_notes_say_what_the_attestation_does_not_prove(self):
+        flat = re.sub(r"\s+", " ", self.notes)
+        self.assertIn("It does not show", flat)
+        self.assertIn("Every file listed in `SHA256SUMS` is attested", flat)
+
+    def test_desktop_extension_point_is_marked(self):
+        self.assertIn("EXTENSION POINT (desktop bundles)", self.y)
+        # The claim that every published file type is attested holds only if the attest step reads
+        # SHA256SUMS rather than a list of extensions.
+        self.assertIn("subject-checksums: dist/SHA256SUMS", self.y)
+        self.assertNotRegex(self.y, r"subject-path:")
+
+
+class TestReleaseWording(unittest.TestCase):
+    """README, site and notes must read true before the first release exists and after one is
+    published. A tag push only makes a draft that nobody else sees, so no copy may say a tag puts
+    files on the releases page, and nothing that needs a release may be written in the present tense."""
+
+    TAG_MAKES_RELEASE = re.compile(
+        r"(?i)(when|once|after) a version is tagged|appear on the releases page once|"
+        r"attached to [^.]*releases page[^.]* when a version is tagged|releases page carries")
+    PRESENT_TENSE_DOWNLOAD = re.compile(
+        r"(?i)the program is a single file you unpack and run|"
+        r"(?<!, )\bprebuilt (command-line )?programs are (published|attached|available)")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.texts = {
+            "README.md": re.sub(r"\s+", " ", read(ROOT_README)),
+            "site/index.html": re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", read(INDEX))),
+            ".github/release-notes.md": re.sub(r"\s+", " ", read(ROOT / ".github" / "release-notes.md")),
+        }
+
+    def test_a_tag_is_not_called_a_release(self):
+        for name, flat in self.texts.items():
+            self.assertNotRegex(flat, self.TAG_MAKES_RELEASE, name)
+            self.assertNotRegex(flat, self.PRESENT_TENSE_DOWNLOAD, name)
+
+    # Sentences that are false inside a published release (the README is packaged in every archive).
+    STALE_IN_A_RELEASE = re.compile(
+        r"(?i)(?<!lists )\bno (tagged )?release\b|download page yet|installers and releases|not released")
+
+    def packaged_files(self):
+        y = read(RELEASE_YML)
+        m = re.search(r'^\s*cp "target/\$TARGET/release/\$\{BIN_NAME\}\$\{EXT\}" (.+) "dist/\$name/"\s*$', y, re.M)
+        self.assertIsNotNone(m, "release.yml: the staging cp line changed; update this test")
+        return m.group(1).split()
+
+    def test_everything_packaged_reads_true_in_a_release(self):
+        files = self.packaged_files()
+        self.assertIn("README.md", files)
+        for rel in files:
+            flat = re.sub(r"\s+", " ", read(ROOT / rel))
+            self.assertNotRegex(flat, self.STALE_IN_A_RELEASE, rel + " is packaged in every release archive")
+
+    def test_readme_and_site_say_a_tag_makes_a_draft(self):
+        for name in ("README.md", "site/index.html"):
+            flat = self.texts[name]
+            self.assertIn("Tagging a version only prepares a draft", flat, name)
+            self.assertIn("Once the maintainer publishes a release, prebuilt", flat, name)
+            self.assertIn("lists no release yet", flat, name)
+
+    def test_verification_is_not_oversold(self):
+        for name in ("README.md", "site/index.html"):
+            flat = self.texts[name]
+            self.assertNotIn("shows which repository and workflow built", flat, name)
+            self.assertIn("It does not show the code is free of bugs", flat, name)
+
+    def test_site_lists_the_same_platforms(self):
+        flat = re.sub(r"\s+", " ", read(INDEX))
+        for p in ("Linux (x86-64)", "macOS (Apple Silicon and Intel)", "Windows (x86-64)"):
+            self.assertIn(p, flat)
 
 
 class TestPagesGate(unittest.TestCase):

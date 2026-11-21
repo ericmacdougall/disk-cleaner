@@ -242,6 +242,7 @@ pre code { background: none; padding: 0; font: inherit; }
         <li><a href="#problem">Problem</a></li>
         <li><a href="#safety">Safety</a></li>
         <li><a href="#status">Status</a></li>
+        <li><a href="#download">Download</a></li>
         <li><a href="#example">Example</a></li>
         <li><a href="#follow">Follow along</a></li>
       </ul>
@@ -252,7 +253,7 @@ pre code { background: none; padding: 0; font: inherit; }
 <main id="main">
   <section class="hero" aria-labelledby="h-hero">
     <div class="wrap">
-      <p class="status-note"><strong>Early.</strong> Only a read-only command-line scanner and planner exists. It is merged into the main branch but not released. It deletes nothing. Its command and the repository are still called <code>disk-cleaner</code>. There is no desktop app, installer or store listing yet.</p>
+      <p class="status-note"><strong>Early.</strong> Only a read-only command-line scanner and planner exists. It is merged into the main branch; if the <a href="https://github.com/ericmacdougall/disk-cleaner/releases">releases page</a> lists no release yet, you build it from source (see <a href="#download">Download</a>). It deletes nothing. Its command and the repository are still called <code>disk-cleaner</code>. There is no desktop app, installer or store listing yet.</p>
       <h1 id="h-hero">Know what is safe to remove.</h1>
       <p class="lede">PruneDisk is a free, open-source disk analyzer for developer machines. Today a read-only command-line tool scans a disk, works out what each folder is (a git repo, a worktree, a rebuildable folder, a cache) and plans what could be removed, backed up first, or left alone. It deletes nothing. It is being built into a cleaner for Windows, macOS and Linux, which are the target platforms: the project's automated build and tests run on all three.</p>
       <div class="cta-row">
@@ -358,6 +359,7 @@ pre code { background: none; padding: 0; font: inherit; }
         <li>The git directory holds nothing of its own, such as a custom hook or a setting only this copy has.</li>
       </ul>
       <p>For an idle repo the plan proposes <code>backup-then-remove</code> when all eleven are yes: back up its git directory, then remove it. When some facts are no and none is unknown, it proposes <code>recover-backup-then-remove</code>: recover the missing work first, then back up and remove. When any fact is unknown, or the repo has dependents, an unusual layout or files of its own in its git directory, it asks you (<code>ask</code>). It also asks when git is told to hide edits to some files (skip-worktree or assume-unchanged), even if every fact is yes. It always says why. Remote facts come from local remote-tracking refs, which can be stale, so the plan marks them unverified. Re-checking them against the live remote at the moment of removal is planned for the step that applies a plan.</p>
+      <p id="what-it-reads">PruneDisk uploads nothing and removes nothing. To learn a repository's state it runs <code>git</code>, and in an ordinary repository git reads the files it tracks, as it always does, a tracked <code>.env</code> included. The scan records facts, paths, sizes and commit ids, and each remote's name and address. From an address written as <code>scheme://…</code> it removes the user and password part (everything between <code>://</code> and the last <code>@</code>; a plain user name on an ssh address, such as <code>ssh://git@host/…</code>, is kept) and any query (<code>?…</code>) or fragment (<code>#…</code>). Everything else is recorded as it is: the remote's name, the host and path of its address, and addresses in other forms, such as <code>git@host:owner/repo.git</code> or a local path. A token put in a remote's name or in the path of its address stays in the scan file, and folder paths can be revealing too, so treat a scan file as private. Apart from those remote details, the scan does not copy what your files contain.</p>
 
       <div class="grid two">
         <div class="card"><h3>Plan, then apply</h3><p>Scanning and planning are read-only. Today the plan is printed, as a summary or as JSON with <code>--json</code>, which you can save and read. In the design a plan is a file you edit and approve, and apply, when it exists, will do exactly that plan.</p></div>
@@ -376,13 +378,31 @@ pre code { background: none; padding: 0; font: inherit; }
           <thead role="rowgroup"><tr role="row"><th scope="col" role="columnheader">Part</th><th scope="col" role="columnheader">Status</th><th scope="col" role="columnheader">Notes</th></tr></thead>
           <tbody role="rowgroup">
             <tr role="row"><th scope="row" role="rowheader">Design</th><td role="cell" data-label="Status"><span class="badge">Written</span></td><td role="cell" data-label="Notes">Draft design document in the repository.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader">CLI: scan and plan</th><td role="cell" data-label="Status"><span class="badge">Merged, not released</span></td><td role="cell" data-label="Notes">Read-only. On the main branch; no release or download page yet. Produces JSON and a readable summary. Deletes nothing.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">CLI: scan and plan</th><td role="cell" data-label="Status"><span class="badge">Merged</span></td><td role="cell" data-label="Notes">Read-only. On the main branch. Prebuilt programs are on the releases page only once the maintainer publishes a release (see Download). Produces JSON and a readable summary. Deletes nothing.</td></tr>
             <tr role="row"><th scope="row" role="rowheader">Recovery, backup, apply, restore</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Recovery branches, rclone backup connectors, removal with a manifest, restore. Nothing of it is on the main branch yet.</td></tr>
             <tr role="row"><th scope="row" role="rowheader">Desktop app</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Sunburst, treemap and outline views. Nothing of it is on the main branch yet.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader">App stores and installers</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">No installer, release or store listing yet.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">App stores and installers</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">No installer or store listing yet. Binary archives, unsigned, are the only form of release.</td></tr>
           </tbody>
         </table>
       </div>
+    </div>
+  </section>
+
+  <section id="download" aria-labelledby="h-download">
+    <div class="wrap">
+      <h2 id="h-download">Download or build it</h2>
+      <p>Once the maintainer publishes a release, prebuilt command-line programs are on the project's <a href="https://github.com/ericmacdougall/disk-cleaner/releases">releases page</a>. Each published release has one archive each for Linux (x86-64), macOS (Apple Silicon and Intel) and Windows (x86-64), plus a <code>SHA256SUMS</code> file. Tagging a version only prepares a draft, which the maintainer reads and then publishes by hand. If that page lists no release yet, there is nothing to download; build from source instead.</p>
+      <h3>The programs are not signed</h3>
+      <p>The archives are not code-signed or notarized. On macOS, Gatekeeper can refuse a program downloaded in a browser until you remove its quarantine mark. On Windows, SmartScreen can warn before it runs. Check the download first, as below, then follow the steps in the release notes.</p>
+      <h3>Check what you downloaded</h3>
+<pre tabindex="0" role="region" aria-label="Commands that check a downloaded release"><code># the file matches the checksum list (Linux)
+sha256sum -c --ignore-missing SHA256SUMS
+
+# the file was built by this repository's release workflow for the tag vX.Y.Z
+gh attestation verify &lt;archive file name&gt; --repo ericmacdougall/disk-cleaner --signer-workflow ericmacdougall/disk-cleaner/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners</code></pre>
+      <p>Put the release's version, for example <code>v0.1.0</code>, in place of <code>vX.Y.Z</code>. A checksum shows the download is complete and matches the release page. The attestation, checked with the GitHub command-line tool, shows the file was built on a GitHub-hosted runner by this repository's release workflow for that version's tag. It does not show the code is free of bugs or that anyone reviewed it; that rests on the repository's rules and on the maintainer's publish step.</p>
+      <h3>Build from source</h3>
+      <p>You need a stable Rust toolchain and <code>git</code>. The <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/README.md">README</a> has the commands. The command is still called <code>disk-cleaner</code> until the planned rename.</p>
     </div>
   </section>
 
@@ -446,7 +466,7 @@ Items:
   <section id="follow" aria-labelledby="h-follow">
     <div class="wrap">
       <h2 id="h-follow">Follow along</h2>
-      <p>The project is developed in the open. The best way to follow it is the repository: the design document, the scanner's source and its scan format documentation, and the issue tracker. The repository is still named disk-cleaner; renaming the repository and the command to prunedisk is planned, not done. There is no mailing list, no account to create and nothing to install yet.</p>
+      <p>The project is developed in the open. The best way to follow it is the repository: the design document, the scanner's source and its scan format documentation, and the issue tracker. The repository is still named disk-cleaner; renaming the repository and the command to prunedisk is planned, not done. There is no mailing list, no account to create and no installer yet. Until a release is published you build the program from source; a published release is an archive holding the program, to unpack and run.</p>
       <p><a class="btn" href="https://github.com/ericmacdougall/disk-cleaner">github.com/ericmacdougall/disk-cleaner</a></p>
       <h3>License</h3>
       <p>MIT. Free to use, change and share. See the <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/LICENSE">license file</a>.</p>
