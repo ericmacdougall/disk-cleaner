@@ -497,6 +497,9 @@ try {
     let shown = 0;
     await run.check("launch.synth_1m", async () => {
       app2 = await App.open("http://127.0.0.1:4446", a.app);
+      // The drivers' default script timeout is 30 s (variant run 44877270665 hit it); a slow
+      // run must end in its measured p95, not in a timeout.
+      await app2.s.cmd("POST", "/timeouts", { script: 600_000 });
       shown = await app2.s.until(
         "const s = document.querySelector('.tg-scroll'); return s && document.getElementById('tg-row-0') ? Number(s.getAttribute('aria-rowcount')) - 1 : 0;",
         120_000,
