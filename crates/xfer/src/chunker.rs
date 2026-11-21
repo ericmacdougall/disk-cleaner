@@ -54,10 +54,41 @@ pub fn chunk_stream<R: Read>(
     chunk_cdc(r, on_chunk)
 }
 
+/// The broken variant (cargo feature broken-fixed-chunks, failing-first evidence only): fixed
+/// 1 MiB blocks, which lose every later match after an insertion.
+fn chunk_fixed<R: Read>(
+    mut r: R,
+    mut on_chunk: impl FnMut(ChunkId, Vec<u8>) -> Result<()>,
+) -> Result<ChunkedFile> {
+    let mut whole = blake3::Hasher::new();
+    let mut chunks = Vec::new();
+    let mut bytes = 0u64;
+    loop {
+        let mut b = Vec::with_capacity(CDC_AVG as usize);
+        (&mut r).take(u64::from(CDC_AVG)).read_to_end(&mut b)?;
+        if b.is_empty() {
+            break;
+        }
+        whole.update(&b);
+        bytes += b.len() as u64;
+        let id = ChunkId::of(&b);
+        chunks.push((id, b.len() as u32));
+        on_chunk(id, b)?;
+    }
+    Ok(ChunkedFile {
+        chunks,
+        blake3: *whole.finalize().as_bytes(),
+        bytes,
+    })
+}
+
 fn chunk_cdc<R: Read>(
     r: R,
     mut on_chunk: impl FnMut(ChunkId, Vec<u8>) -> Result<()>,
 ) -> Result<ChunkedFile> {
+    if cfg!(feature = "broken-fixed-chunks") {
+        return chunk_fixed(r, on_chunk);
+    }
     let mut whole = blake3::Hasher::new();
     let mut chunks = Vec::new();
     let mut bytes = 0u64;
