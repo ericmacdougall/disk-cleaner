@@ -1104,7 +1104,8 @@ entry is **never hashed** and never appears in `blobs`. The list:
 Over-matching (a `tokenizer.py` in loose code) keeps a file on disk, the safe side. **Known
 limit:** secrets are found by name only. A secret under an ordinary name (a copied `.env` saved as
 `settings.txt`, a token inside a script) is not detected and is treated like any other file.
-The scan never reads content to look for secrets.
+The scan never reads content to look for secrets (a content scan is tracked as GoodQA
+goodqa#16530).
 
 **Blobs.** Content is grouped in two steps: regular, non-secret files of at least
 `min_dup_bytes` (logical) are bucketed by length, one entry per inode; each bucket with more than
