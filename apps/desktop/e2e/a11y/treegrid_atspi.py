@@ -297,13 +297,23 @@ def check():
     xdo("click", "1")
     g = grid()
 
-    def step(label, *keys):
+    def step(label, *keys, expect=None, moves=True):
+        """Press keys; judge the object the reader was told about (or, when focus stayed put and
+        no event came, the polled focus). `expect` is the rowindex it must be on."""
         EVENTS.clear()
         for k in keys:
             xdo("key", k)
         kind, f = reported()
+        # Polled too: which row is selected, and what is focused, whatever the events said.
+        sel_rows = [row_index(r) for r in grid_rows(grid()) if r.getState().contains(pyatspi.STATE_SELECTED)]
+        pf = focused()
+        if f is None and not moves:
+            kind, f = "polled", pf
         i = dict(info(f), event=kind) if f is not None else None
-        print(label.ljust(22), json.dumps(i, ensure_ascii=False))
+        print(label.ljust(22), json.dumps(i, ensure_ascii=False), "| selected rows", sel_rows,
+              "| polled focus", pf and (info(pf)["role_name"], row_index(pf)))
+        if expect is not None and row_index(f) != expect:
+            fails.append(f"{label}: on row {row_index(f)}, expected {expect}")
         if f is None:
             fails.append(f"{label}: no focus or active-descendant event reached the reader")
         elif not inside(f, g):
@@ -321,21 +331,26 @@ def check():
                 fails.append(f"{label}: focused object has no name or text")
         return i
 
-    step("Down", "Down")
-    step("Home", "Home")
-    step("Up", "Up")
-    step("Right (expand)", "Right")
-    step("Right (to cell)", "Right")
-    step("Right (next cell)", "Right")
-    step("Left (prev cell)", "Left")
-    step("Left (back to row)", "Left")
-    step("Down into child", "Down")
-    up = step("Left (to parent)", "Left")
-    if not up or up["attrs"].get("rowindex") != "2":
-        fails.append("Left on a collapsed child did not move to its parent row (rowindex 2)")
-    step("Left (collapse)", "Left")
+    # Rows: 2 is "/" (open at start), 3 is its first child.
+    step("Down", "Down", expect="3")
+    step("Up", "Up", expect="2")
+    step("Left (close /)", "Left", expect="2", moves=False)
+    step("Right (open /)", "Right", expect="2", moves=False)
+    step("Right (to cell 1)", "Right", expect="2")
+    step("Right (cell 2)", "Right", expect="2")
+    step("Left (cell 1)", "Left", expect="2")
+    step("Left (back to row)", "Left", expect="2")
+    step("Down (child)", "Down", expect="3")
+    step("Right (open child)", "Right", expect="3", moves=False)
+    step("Down (grandchild)", "Down", expect="4")
+    step("Left (to parent)", "Left", expect="3")
+    step("Left (close child)", "Left", expect="3", moves=False)
     step("End", "End")
-    step("Home again", "Home")
+    step("Home", "Home", expect="2")
+    step("Ctrl+End", "ctrl+End")
+    step("Ctrl+Home", "ctrl+Home", expect="2")
+    step("PageDown", "Next")
+    step("PageUp", "Prior", expect="2")
     # A folder with 5,000 children: open it, then wheel its row far out of the rendered window.
     g = grid()
     open_path(g, ["/", "home", "tester", "tree", "wide"])
