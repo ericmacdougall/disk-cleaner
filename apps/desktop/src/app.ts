@@ -11,6 +11,7 @@ import { DevView } from "./views/dev";
 import { SettingsForm } from "./views/settings";
 import { TreeGrid } from "./views/tree";
 import { Treemap } from "./views/treemap";
+import { TAGLINE } from "./writes";
 
 type Tab = "tree" | "treemap" | "top" | "dev" | "settings";
 const TABS: [Tab, string][] = [
@@ -45,7 +46,7 @@ export class App {
       "div",
       { class: "shell" },
       h("a", { href: "#main", class: "skip" }, "Skip to content"),
-      h("header", {}, h("h1", {}, "PruneDisk"), h("p", { class: "tagline" }, "Read-only disk view: nothing here deletes, moves or backs up anything.")),
+      h("header", {}, h("h1", {}, "PruneDisk"), h("p", { class: "tagline" }, TAGLINE)),
       this.main,
       this.live,
     );

@@ -225,6 +225,17 @@ class Contract(unittest.TestCase):
         for call in trace_report.CALLS:
             self.assertIn(call, listed)
 
+    def test_every_path_the_shipped_check_declares_is_in_the_apps_own_list(self):
+        # e2e/idle-launch.sh may allow only what src/writes.ts (shown in Settings and repeated in
+        # docs/DESKTOP.md) tells the user the app writes.
+        here = Path(__file__).resolve().parent
+        script = (here / "idle-launch.sh").read_text()
+        listed = (here.parent / "src" / "writes.ts").read_text()
+        declared = re.findall(r'--declared "\$(?:D|SB/cache|RUNTIME)/([^"]+)"', script)
+        self.assertGreaterEqual(len(declared), 9, declared)
+        for tail in declared:
+            self.assertIn(tail.removesuffix("-journal"), listed, f"idle-launch.sh declares {tail}; src/writes.ts does not list it")
+
     def test_the_scripts_take_the_call_list_from_the_observer_and_gate_on_it(self):
         here = Path(__file__).resolve().parent
         for script in ("check.sh", "idle-launch.sh"):

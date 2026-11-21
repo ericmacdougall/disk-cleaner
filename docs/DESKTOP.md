@@ -90,16 +90,56 @@ npx tauri dev
 
 ### Files the desktop app writes
 
-Its own files are in core's config folder, which follows `HOME` (macOS:
-`~/Library/Application Support/disk-cleaner/`), `APPDATA` (Windows: `%APPDATA%\disk-cleaner\`)
-or `XDG_CONFIG_HOME` (Linux: `$XDG_CONFIG_HOME/disk-cleaner/`, else `~/.config/disk-cleaner/`):
+The app never deletes, moves or backs up a scanned file. The window's tagline says: "Read-only
+disk view: nothing here deletes, moves or backs up anything. What it writes is listed in
+Settings." Settings, under "What this app writes", shows the list below, from
+`apps/desktop/src/writes.ts`; `src/writes.test.ts` fails when this section and that file
+differ. Outside the folders it scans, the app writes only this:
 
-- `prunedisk-app.json`, the app's scan settings;
-- on an explicit Save of the plan settings: `config.toml` (only `active_window_days` and
-  `max_git_admin_bytes` change), `config.toml.bak` (the text Settings loaded),
-  `config.toml.lock` (the save lock; it stays, empty, by design) and, during the save, a temp
-  file that is renamed over `config.toml` or removed;
-- a plan export, always a new file, in the folder chosen for it.
+**Every system, only when you ask**
+
+- `disk-cleaner/config.toml (with config.toml.bak and config.toml.lock)`: on Save of the plan settings: the two plan settings you changed, a copy of the text loaded and the save lock. In ~/.config (Linux), ~/Library/Application Support (macOS) or %APPDATA% (Windows).
+- `disk-cleaner/prunedisk-app.json`: on Save: the app's own scan settings, in the same folder.
+- `the plan file you export`: on Export: a new file in the folder you choose; never an existing file.
+
+**Linux, by the system libraries the window uses**
+
+- `~/.local/share/io.github.ericmacdougall.prunedisk/`: the web view's private session still stores random salts (storage/salt, mediakeys/v1/salt, CacheStorage/salt, WebKitCache/Version 17/salt), an empty WebKitCache/Version 17/Blobs folder and its HTTPS policy store (hsts-storage.sqlite). No browsing data: the app shows only its own page.
+- `~/.cache/mesa_shader_cache/`: the graphics driver's shader cache, as for any program that draws with Mesa.
+- `~/.cache/fontconfig/`: the font cache, when the system's is out of date.
+- `$XDG_RUNTIME_DIR/dconf/user`: the settings system's change flag, in memory, not on disk.
+- `~/.local/share/recently-used.xbel`: the file dialog (GTK) adds the folders and files you pick in it to your recent files, as in every GTK app.
+- `dconf: org.gtk.Settings.FileChooser`: the file dialog saves its own size and view settings when it closes. Not yet observed by the app's checks.
+- `~/.dbus/session-bus/ and /tmp/dbus-*`: only on a system with no desktop session bus, where the system library starts one.
+
+**macOS**
+
+- `~/Library/WebKit/io.github.ericmacdougall.prunedisk and ~/Library/Caches/io.github.ericmacdougall.prunedisk`: none: the web view's session is kept in memory (checked after every build).
+
+**Windows**
+
+- `%LOCALAPPDATA%\io.github.ericmacdougall.prunedisk\EBWebView\`: the web view's (WebView2) data folder, created by the runtime; the private session keeps browsing data out of it. Not yet observed file by file.
+
+Details. Core's config folder follows `HOME` (macOS: `~/Library/Application Support/disk-cleaner/`),
+`APPDATA` (Windows) or `XDG_CONFIG_HOME` (Linux, else `~/.config/disk-cleaner/`). On Save only
+`active_window_days` and `max_git_admin_bytes` change in `config.toml`; `config.toml.bak` holds
+the text Settings loaded; `config.toml.lock` stays, empty, by design; during the save a temp
+file is renamed over `config.toml` or removed.
+
+Recent files (Linux). GTK has a setting that turns its recent-files list off, but with it off
+the next dialog accept rewrites the account's `recently-used.xbel` empty: the user's existing
+list is erased (measured with GTK 3.24.41: a real file dialog accepted through its Open
+button, with one entry already in the list). So the app leaves the setting alone and lists the
+entry above. ASSUMPTION, not confirmed by the owner: that listing it is the chosen behaviour;
+the alternatives are removing the app's own entries after each dialog, or the desktop portal.
+
+How the Linux list is checked. `e2e/idle-launch.sh` runs the shipped build (the release binary
+in the end-to-end job) idle for 20 s in a sandbox, with a session bus, under strace, and
+`e2e/trace_report.py` fails on any write outside the declared salts, Blobs folder, HTTPS policy
+store, Mesa and fontconfig caches and dconf flag. In the owner's run of the 682a0ff AppImage
+(Docker on Ubuntu 24.04, not a click-test) that was every write; without a session bus the same
+launch also wrote `~/.dbus/session-bus/` and `/tmp/dbus-*`. The file dialog's writes come only
+from a dialog accepted by a person (the end-to-end suite picks folders through a test hook).
 
 Webview data. The window is the system webview, which keeps data in folders named after the
 bundle id `io.github.ericmacdougall.prunedisk`. These do not follow `HOME`: WebKit uses the
@@ -122,11 +162,11 @@ account's home folder. The app runs the webview in incognito mode (`"incognito":
 - Windows (not observed here): WebView2 keeps a user data folder,
   `%LOCALAPPDATA%\io.github.ericmacdougall.prunedisk\EBWebView\`; incognito runs it InPrivate,
   which keeps browsing data out of it, but the runtime still creates the folder.
-- Linux (not observed here): incognito gives webkit2gtk an ephemeral data manager, so no
-  browsing data should be written under `~/.local/share/io.github.ericmacdougall.prunedisk/`
-  or `~/.cache/io.github.ericmacdougall.prunedisk/`. With Mesa graphics drivers, the webview's
-  GPU process writes the driver's shader cache to `~/.cache/mesa_shader_cache/`, as any
-  program drawing with Mesa does (seen in the end-to-end job, below).
+- Linux: incognito gives webkit2gtk an ephemeral data manager, so no browsing data is
+  written, but it still creates the salts, Blobs folder and HTTPS policy store listed above
+  under `~/.local/share/io.github.ericmacdougall.prunedisk/` (observed; this section said
+  "not observed" until PR gate F10). With Mesa graphics drivers, the webview's GPU process
+  writes the driver's shader cache, as any program drawing with Mesa does.
 
 What Tauri 2 offers here: `incognito` (every desktop platform; a non-persistent store),
 `dataDirectory` (Windows and Linux only; it moves the data, it does not turn it off) and
@@ -257,9 +297,16 @@ No-write proof:
   data folders and, on Linux, the graphics driver's shader cache (below).
 - On Windows the real `%LOCALAPPDATA%\<bundle id>` and `%APPDATA%\disk-cleaner` folders are
   watched too.
-- On Linux the app and its child processes also run under strace (writes only, via
-  seccomp-bpf), and `e2e/trace_report.py` lists every path written anywhere, including outside
-  the sandbox. That list is a report, not a gate.
+- On Linux the app and its child processes also run under strace (`-f -y`, the calls
+  `e2e/trace_report.py --strace-calls` names, via seccomp-bpf; one log per launch), and
+  `e2e/trace_report.py` judges every path written anywhere, including outside the sandbox. It
+  is a gate (PR gate F10): a write outside the declared paths (OTHER), a relative path or
+  descriptor it cannot place (UNRESOLVED), io_uring (UNOBSERVABLE) or a traced call it cannot
+  read (UNPARSED) fails the check, and so does a log with no traced call. Declared outside the
+  sandbox: only dconf's flag file. Ignored: only `/dev/null`. Not covered: writes through a
+  memory map of a file opened read-write (the open itself is judged), and the macOS window.
+- The same job runs `e2e/idle-launch.sh` on the release binary: the shipped config, idle,
+  under the same gate, with the list in "Files the desktop app writes".
 
 Graphics driver cache (Linux): the webview's GPU process writes Mesa's shader cache to
 `$XDG_CACHE_HOME/mesa_shader_cache/` (else `~/.cache/mesa_shader_cache/`). Any program drawing
@@ -297,7 +344,9 @@ guarantee, and `e2e/expect_variant.py` passes only when the check written for it
 | `planted-write.patch` | writes a file into the first scan root | manifest: an UNDECLARED addition |
 | `offered-check-removed.patch` | Start no longer checks that a root was offered | `ipc.refused.root_not_offered`, `ipc.refused.subfolder_of_offered_root` |
 | `capability-broadened.patch` | grants `core:path:default` | `ipc.refused.not_in_capabilities.path` |
-| `focus-broken.patch` | the shorten question no longer takes focus | `settings.save_confirm_keep_escape` |
+| `focus-broken.patch` | the shorten question gives first focus to Shorten | `settings.save_confirm_keep_escape` |
+| `modal-trap-removed.patch` | the question opens non-modally: no inert background, no Tab trap | `settings.confirm_focus_contained` |
+| `planted-outside.patch` | writes `/tmp/prunedisk-planted-outside`, outside every snapshot root | trace: `OTHER openat: /tmp/prunedisk-planted-outside` (and the manifest must not see it) |
 
 macOS: no WebDriver exists for an app's WKWebView. Apple's safaridriver drives Safari only,
 and tauri-driver supports Linux and Windows only. On macOS the app is covered by:

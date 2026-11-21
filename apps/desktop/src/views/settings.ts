@@ -10,6 +10,25 @@ import { errorKind, errorMessage } from "../api";
 import { h, replace } from "../dom";
 import { formatBytes } from "../format";
 import { showModal } from "../modal";
+import { WRITES } from "../writes";
+
+/** "What this app writes": the list in src/writes.ts, which docs/DESKTOP.md repeats. */
+function writesSection(): HTMLElement {
+  return h(
+    "section",
+    { class: "writes", "aria-labelledby": "writes-title" },
+    h("h3", { id: "writes-title" }, "What this app writes"),
+    h("p", {}, "It never deletes, moves or backs up a scanned file. Outside the folders it scans, it writes only this:"),
+    ...WRITES.map((g) =>
+      h(
+        "div",
+        { class: "writes-group" },
+        h("h4", {}, g.title),
+        h("ul", {}, ...g.writes.map((w) => h("li", {}, h("code", {}, w.path), `: ${w.what}`))),
+      ),
+    ),
+  );
+}
 
 const MIB = 1024 * 1024;
 
@@ -106,7 +125,7 @@ export class SettingsForm {
       h("button", { type: "submit", class: "primary" }, "Save"),
     );
     this.form = h("form", { "aria-label": "Settings", onsubmit: (e) => { e.preventDefault(); void this.save(false); } }, this.fields);
-    this.el = h("section", { class: "settings", "aria-label": "Settings" }, h("h2", {}, "Settings"), this.form, this.message, this.facts);
+    this.el = h("section", { class: "settings", "aria-label": "Settings" }, h("h2", {}, "Settings"), this.form, this.message, this.facts, writesSection());
   }
 
   draft(): Draft {
