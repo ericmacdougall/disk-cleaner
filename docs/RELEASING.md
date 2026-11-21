@@ -95,25 +95,46 @@ The `crates-dry-run` job in the same run is the crates.io check (below). It does
    that commit succeeded; and the tag on GitHub still points at that commit (lightweight and
    annotated tags are both peeled to the commit). Every later job checks out that commit, and the
    draft job checks again, just before and just after creating the draft, that the tag still points
-   at it. If it moved, the job fails, and it deletes only the release it created, found by the id it
-   recorded, and only while that release is still an unchanged draft. A release that was published,
-   edited or replaced meanwhile is never deleted; the job fails and says so.
+   at it. The draft job refuses to create a release if any release (draft or published) already
+   carries the tag, and checks every file against `SHA256SUMS` before uploading it. Nothing in the
+   workflow or its script ever edits, publishes or deletes a release: if anything fails after the
+   draft exists (an upload, or the tag moved), the job fails, leaves the draft, and prints its id and
+   address in the log and on the run's summary page (see "A draft left by a failed run").
 4. The workflow creates a **draft** release with the archives, `SHA256SUMS` and the notes, titled
-   `PruneDisk vX.Y.Z`. Nothing is public yet. Read it: the notes name the commit; check it is the one
-   you meant (`git rev-parse vX.Y.Z^{commit}`). Download one archive and verify it:
+   `PruneDisk vX.Y.Z`. Nothing is public yet. Before publishing, check all of this:
+   - the run that made it succeeded, and its summary names no draft left behind;
+   - find the draft's id, and make sure there is exactly one release for the tag:
+     `gh api repos/ericmacdougall/disk-cleaner/releases --jq '.[] | select(.tag_name=="vX.Y.Z") | {id, draft, assets: [.assets[].name]}'`;
+   - `draft` is `true`, and the assets are every archive listed in `SHA256SUMS` plus `SHA256SUMS`
+     itself (it is uploaded last, so a draft without it is incomplete);
+   - the notes name the commit you meant (`git rev-parse vX.Y.Z^{commit}`);
+   - one downloaded archive verifies:
 
    ```
    gh attestation verify <archive file name> --repo ericmacdougall/disk-cleaner --signer-workflow ericmacdougall/disk-cleaner/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
    ```
 
-   Then publish: `gh release edit vX.Y.Z --draft=false`. From then on its tag and assets are locked.
+   Then publish that release by its id:
+   `gh api -X PATCH repos/ericmacdougall/disk-cleaner/releases/<id> -F draft=false`. From then on its
+   tag and assets are locked.
 5. Update the status wording in `README.md` and `site/index.html` only if it no longer reads true
    (the download text is written to be true with or without a release).
 
-Rollback: before publishing, first check it is still a draft
-(`gh release view vX.Y.Z --json isDraft` must say `true`), then delete it
-(`gh release delete vX.Y.Z`, without `--cleanup-tag`; the tag cannot be deleted anyway). Never
-delete a published release to roll back. After publishing, the assets and the tag cannot be changed or
+### A draft left by a failed run
+
+The workflow never removes a release. When a run fails after creating its draft, the error and the
+run's summary page name that release's id. Remove it by hand, by id, never by tag name (two releases
+can share a tag name while one of them is a draft):
+
+1. `gh api repos/ericmacdougall/disk-cleaner/releases/<id> --jq '{draft, tag_name}'` must show
+   `"draft": true` and the tag you expect. If it says `false`, stop: that release is published.
+2. `gh api -X DELETE repos/ericmacdougall/disk-cleaner/releases/<id>`.
+3. Re-run the failed jobs. A re-run refuses to create a second draft while any release for the tag
+   exists, so remove the old draft first.
+
+Rollback: before publishing, remove the draft as in "A draft left by a failed run" (by id, after
+checking `draft` is `true`; the tag cannot be deleted anyway). Never delete a published release to
+roll back. After publishing, the assets and the tag cannot be changed or
 removed: supersede the release with a new patch version (fix on `main`, bump, tag `vX.Y.(Z+1)`), say
 in the new notes what was wrong with the old one, and edit the old release's notes to point at the
 new one (or mark it a pre-release). Attestations stay; they are history.
@@ -228,3 +249,16 @@ the name the file was built under.
   whole workflow.
 - The `main` ruleset does not require status checks; "CI passed" is checked only by the workflow
   guard. (The guard does reject pull_request-only runs.)
+- Token reach: in the draft job, `GH_TOKEN` (contents: write, valid for the job) is given only to
+  the create-draft step, but `actions/checkout` and `actions/download-artifact` in that job also
+  receive the job token by default. Both are pinned by commit, and checkout does not keep it
+  (`persist-credentials: false`). `gh attestation verify` in the package job gets a read token; how
+  `gh` treats credentials on a redirect is gh's own and was not verified here. `release_meta.py`
+  never follows a redirect.
+- Artifact handoff: the draft job checks every file against `SHA256SUMS` from the same artifact, so
+  a file changed after packaging is refused. It does not re-check attestations; someone able to
+  replace both a file and `SHA256SUMS` inside the run would not be caught by the workflow. The
+  maintainer's verification before publishing (step 4) is that check.
+- Two runs for the same tag at the same moment could both pass the "no release for this tag yet"
+  check (GitHub has no lock for it). One tag push starts one run, and a re-run cannot start while
+  its run is going, so this needs two manual starts at once.

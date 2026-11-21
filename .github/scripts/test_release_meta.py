@@ -95,12 +95,12 @@ def tag_env(tag, sha):
 
 
 class FakeGitHub:
-    """In-memory releases API with real state: create, read, upload, delete; like REST v3."""
+    """In-memory releases API with real state, like REST v3: list, create, read, upload. It answers
+    any other verb too (PATCH, DELETE) so a test sees it if the script ever sends one."""
 
     def __init__(self, fail_upload=None):
         self.releases = {}
         self.calls = []
-        self.deletes = []
         self.next_id = 1000
         self.fail_upload = fail_upload
 
@@ -112,9 +112,13 @@ class FakeGitHub:
         rid = self.next_id
         rel = dict(body, id=rid, node_id="RE_%d" % rid, created_at="2026-11-21T00:00:%02dZ" % (rid % 60),
                    author={"login": "github-actions[bot]"}, assets=[],
+                   html_url="https://github.com/%s/releases/tag/untagged-%d" % (REPO, rid),
                    upload_url="https://uploads.github.com/repos/%s/releases/%d/assets{?name,label}" % (REPO, rid))
         self.releases[rid] = rel
         return rel
+
+    def verbs(self):
+        return sorted(set(m for m, _ in self.calls))
 
     def transport(self, method, url, data, headers):
         import json as _j
@@ -135,6 +139,11 @@ class FakeGitHub:
             return 201, _j.dumps(asset).encode()
         if u.hostname != "api.github.com":
             return 404, b"{}"
+        if method == "GET" and rid is None:
+            page = int(up.parse_qs(u.query).get("page", ["1"])[0])
+            per = int(up.parse_qs(u.query).get("per_page", ["30"])[0])
+            rels = sorted(self.releases.values(), key=lambda r: -r["id"])[(page - 1) * per:page * per]
+            return 200, _j.dumps(rels).encode()
         if method == "POST" and rid is None:
             return 201, _j.dumps(self.create(_j.loads(data.decode()))).encode()
         if rid not in self.releases:
@@ -142,9 +151,11 @@ class FakeGitHub:
         if method == "GET":
             return 200, _j.dumps(self.releases[rid]).encode()
         if method == "DELETE":
-            self.deletes.append(rid)
             del self.releases[rid]
             return 204, b""
+        if method == "PATCH":
+            self.releases[rid].update(_j.loads(data.decode()))
+            return 200, _j.dumps(self.releases[rid]).encode()
         return 405, b"{}"
 
 
@@ -167,50 +178,55 @@ class TestCreateDraft(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.d, True)
         self.dist, self.notes = make_dist(self.d)
         self.ident = os.path.join(self.d, "identity.json")
+        self.summary = os.path.join(self.d, "summary.md")
         self.out = io.StringIO()
+
+    def create(self, gh, tag="v0.1.0"):
+        return rm.create_draft(gh.api(), REPO, tag, self.dist, self.notes, self.ident, out=self.out,
+                               summary=self.summary)
+
+    def refused(self, gh, text, tag="v0.1.0"):
+        with self.assertRaises(rm.GuardError) as cm:
+            self.create(gh, tag)
+        self.assertIn(text, str(cm.exception))
+        self.assertNotIn("DELETE", gh.verbs())
+        self.assertNotIn("PATCH", gh.verbs())
+        return str(cm.exception)
 
     def test_creates_a_draft_with_every_file_and_records_its_identity(self):
         gh = FakeGitHub()
-        identity = rm.create_draft(gh.api(), REPO, "v0.1.0", self.dist, self.notes, self.ident, out=self.out)
+        identity = self.create(gh)
         rel = gh.releases[identity["id"]]
         self.assertIs(rel["draft"], True)
         self.assertIs(rel["prerelease"], False)
         self.assertEqual(rel["name"], "PruneDisk v0.1.0")
         self.assertEqual(sorted(a["name"] for a in rel["assets"]), sorted(os.listdir(self.dist)))
+        self.assertEqual(rel["assets"][-1]["name"], "SHA256SUMS")  # last: its presence marks a complete upload
         with open(self.ident) as f:
             import json as _j
             self.assertEqual(_j.load(f), identity)
         self.assertEqual(set(identity), set(rm.IDENTITY_KEYS))
+        self.assertEqual(gh.verbs(), ["GET", "POST"])
 
     def test_suffix_makes_a_prerelease(self):
         gh = FakeGitHub()
-        identity = rm.create_draft(gh.api(), REPO, "v0.1.0-rc.1", self.dist, self.notes, self.ident, out=self.out)
+        identity = self.create(gh, "v0.1.0-rc.1")
         self.assertIs(gh.releases[identity["id"]]["prerelease"], True)
 
-    def test_failed_upload_removes_only_this_draft_and_fails(self):
+    def test_failed_upload_leaves_the_draft_names_it_and_fails(self):
         gh = FakeGitHub(fail_upload="SHA256SUMS")
         keep = gh.create({"tag_name": "v0.0.9", "name": "old", "body": "", "draft": False, "prerelease": False})
-        with self.assertRaises(rm.GuardError) as cm:
-            rm.create_draft(gh.api(), REPO, "v0.1.0", self.dist, self.notes, self.ident, out=self.out)
-        self.assertIn("uploading SHA256SUMS failed", str(cm.exception))
-        self.assertEqual(list(gh.releases), [keep["id"]])
-        self.assertEqual(len(gh.deletes), 1)
+        msg = self.refused(gh, "uploading SHA256SUMS failed")
+        made = [r for r in gh.releases.values() if r["tag_name"] == "v0.1.0"]
+        self.assertEqual(len(made), 1)
+        self.assertIn(keep["id"], gh.releases)
+        self.assertIn("release %d (%s) is a draft this run created" % (made[0]["id"], made[0]["html_url"]), msg)
+        # The archives went up first; the draft lacks SHA256SUMS, which marks it incomplete.
+        self.assertEqual(sorted(a["name"] for a in made[0]["assets"]),
+                         sorted(n for n in os.listdir(self.dist) if n != "SHA256SUMS"))
+        self.assertIn(msg, read(self.summary))
 
-    def test_failed_upload_of_a_draft_published_meanwhile_is_not_deleted(self):
-        gh = FakeGitHub(fail_upload="SHA256SUMS")
-        orig = gh.create
-
-        def create_then_publish(body):
-            rel = orig(body)
-            rel["draft"] = False
-            return dict(rel, draft=True)  # the create response still says draft
-        gh.create = create_then_publish
-        with self.assertRaises(rm.GuardError) as cm:
-            rm.create_draft(gh.api(), REPO, "v0.1.0", self.dist, self.notes, self.ident, out=self.out)
-        self.assertEqual(gh.deletes, [])
-        self.assertIn("no longer a draft", str(cm.exception))
-
-    def test_an_upload_that_did_not_land_fails_and_removes_the_draft(self):
+    def test_an_upload_that_did_not_land_fails_and_leaves_the_draft(self):
         # The upload answers 201 but the release does not hold the file when it is read back.
         gh = FakeGitHub()
         orig = gh.transport
@@ -222,11 +238,39 @@ class TestCreateDraft(unittest.TestCase):
                     rel["assets"] = [a for a in rel["assets"] if a["name"] != "SHA256SUMS"]
             return status, body
         gh.transport = lose_sums
-        with self.assertRaises(rm.GuardError) as cm:
-            rm.create_draft(gh.api(), REPO, "v0.1.0", self.dist, self.notes, self.ident, out=self.out)
-        self.assertIn("does not hold exactly the files built", str(cm.exception))
-        self.assertEqual(gh.releases, {})
-        self.assertEqual(len(gh.deletes), 1)
+        self.refused(gh, "does not hold exactly the files built")
+        self.assertEqual(len(gh.releases), 1)
+
+    def test_a_release_for_the_tag_already_exists(self):
+        # A re-run of a failed run, or a published release: never a second release for the tag.
+        for draft in (True, False):
+            with self.subTest(draft=draft):
+                gh = FakeGitHub()
+                for i in range(150):  # the existing release is on the second page
+                    gh.create({"tag_name": "v0.0.%d" % i, "name": "", "body": "", "draft": False, "prerelease": False})
+                old = gh.create({"tag_name": "v0.1.0", "name": "", "body": "", "draft": draft, "prerelease": False})
+                for i in range(150):
+                    gh.create({"tag_name": "v0.2.%d" % i, "name": "", "body": "", "draft": False, "prerelease": False})
+                n = len(gh.releases)
+                self.refused(gh, "a release for v0.1.0 already exists (id %d, %s)"
+                             % (old["id"], "draft" if draft else "published"))
+                self.assertEqual(len(gh.releases), n)
+                self.assertEqual([m for m, _ in gh.calls], ["GET"] * 4)
+
+    def test_a_file_changed_after_packaging_is_not_uploaded(self):
+        name = [n for n in sorted(os.listdir(self.dist)) if n != "SHA256SUMS"][0]
+        with open(os.path.join(self.dist, name), "ab") as f:
+            f.write(b"tampered")
+        gh = FakeGitHub()
+        self.refused(gh, "does not match its line in SHA256SUMS")
+        self.assertEqual(gh.calls, [])
+
+    def test_sums_must_list_exactly_the_files(self):
+        with open(os.path.join(self.dist, "extra.tar.gz"), "wb") as f:
+            f.write(b"x")
+        gh = FakeGitHub()
+        self.refused(gh, "SHA256SUMS lists")
+        self.assertEqual(gh.calls, [])
 
     def test_token_never_goes_to_another_host(self):
         gh = FakeGitHub()
@@ -237,19 +281,96 @@ class TestCreateDraft(unittest.TestCase):
             rel["upload_url"] = "https://uploads.example.invalid/x{?name}"
             return rel
         gh.create = evil
-        with self.assertRaises(rm.GuardError) as cm:
-            rm.create_draft(gh.api(), REPO, "v0.1.0", self.dist, self.notes, self.ident, out=self.out)
-        self.assertIn("refusing to send the token", str(cm.exception))
+        self.refused(gh, "refusing to send the token")
         self.assertFalse(any("example.invalid" in u for _, u in gh.calls))
 
     def test_refuses_stray_files(self):
         os.mkdir(os.path.join(self.dist, "dist"))
         with self.assertRaises(rm.GuardError):
-            rm.create_draft(FakeGitHub().api(), REPO, "v0.1.0", self.dist, self.notes, self.ident, out=self.out)
+            self.create(FakeGitHub())
 
-    def test_cleanup_needs_a_recorded_id(self):
-        with self.assertRaises(rm.GuardError):
-            rm.cleanup_draft(FakeGitHub().api(), REPO, {"tag_name": "v0.1.0"})
+
+class TestHTTPClient(unittest.TestCase):
+    """The one HTTP client: GET and POST only, HTTPS only, allowed hosts only, no redirects."""
+
+    def test_only_get_and_post(self):
+        gh = FakeGitHub()
+        for verb in ("DELETE", "PATCH", "PUT"):
+            with self.assertRaises(rm.GuardError) as cm:
+                gh.api().call(verb, "/repos/%s/releases/1" % REPO)
+            self.assertIn("never edits, publishes or deletes", str(cm.exception))
+        self.assertEqual(gh.calls, [])
+
+    def test_https_and_allowed_hosts_only(self):
+        gh = FakeGitHub()
+        for url in ("http://api.github.com/x", "https://example.invalid/x", "https://api.github.com.example.invalid/x"):
+            with self.assertRaises(rm.GuardError):
+                gh.api().call("GET", url)
+        self.assertEqual(gh.calls, [])
+
+    def redirected(self, location):
+        """Real urllib opener; the network layer is replaced by one that answers 302 once."""
+        import email.message
+        import urllib.request
+        import urllib.response
+        seen = []
+
+        def https_open(handler, req):
+            seen.append((req.full_url, req.get_header("Authorization")))
+            hdrs = email.message.Message()
+            first = len(seen) == 1
+            if first:
+                hdrs["Location"] = location
+            resp = urllib.response.addinfourl(io.BytesIO(b"{}"), hdrs, req.full_url, 302 if first else 200)
+            resp.msg = "Found" if first else "OK"
+            return resp
+        orig = urllib.request.HTTPSHandler.https_open
+        urllib.request.HTTPSHandler.https_open = https_open
+        try:
+            with self.assertRaises(rm.GuardError) as cm:
+                rm.GitHubAPI("secret-token").call("GET", "/repos/%s/releases?page=1" % REPO)
+        finally:
+            urllib.request.HTTPSHandler.https_open = orig
+        return str(cm.exception), seen
+
+    def test_a_redirect_to_another_host_is_not_followed(self):
+        msg, seen = self.redirected("https://storage.example.invalid/x")
+        self.assertIn("HTTP 302 redirect to storage.example.invalid refused", msg)
+        self.assertNotIn("secret-token", msg)
+        self.assertEqual([u for u, _ in seen], ["https://api.github.com/repos/%s/releases?page=1" % REPO])
+
+    def test_a_redirect_on_an_allowed_host_is_not_followed_either(self):
+        msg, seen = self.redirected("https://uploads.github.com/x")
+        self.assertIn("redirect to uploads.github.com refused", msg)
+        self.assertEqual(len(seen), 1)
+
+    def test_ci_runs_lookup_uses_the_same_client(self):
+        import urllib.request
+        sent = []
+
+        def https_open(handler, req):
+            import urllib.response
+            sent.append(req.get_header("Authorization"))
+            resp = urllib.response.addinfourl(io.BytesIO(b'{"workflow_runs": []}'), {}, req.full_url, 200)
+            resp.msg = "OK"
+            return resp
+        orig = urllib.request.HTTPSHandler.https_open
+        urllib.request.HTTPSHandler.https_open = https_open
+        try:
+            self.assertEqual(rm.fetch_ci_runs(REPO, "a" * 40, "tok"), [])
+        finally:
+            urllib.request.HTTPSHandler.https_open = orig
+        self.assertEqual(sent, ["Bearer tok"])
+        # An error answer is an error, not "no runs".
+        rm_api = rm.GitHubAPI
+        try:
+            rm.GitHubAPI = lambda token, api: type("E", (), {"call": lambda self, m, u: (500, {"message": "x"})})()
+            with self.assertRaises(rm.GuardError):
+                rm.fetch_ci_runs(REPO, "a" * 40, "tok")
+        finally:
+            rm.GitHubAPI = rm_api
+        # The token is attached in exactly one place in the script.
+        self.assertEqual(read(os.path.join(HERE, "release_meta.py")).count('"Authorization"'), 1)
 
 
 class TestValidation(unittest.TestCase):
@@ -434,12 +555,6 @@ class TestBinding(unittest.TestCase):
         with self.assertRaises(rm.GuardError):
             rm.check_binding("v0.1.0", self.r.A, cwd=self.r.work, out=self.out)
 
-    def after_create(self, gh, identity_path):
-        with self.assertRaises(rm.GuardError) as cm:
-            rm.check_binding("v0.1.0", self.r.A, cwd=self.r.work, after_create=True, api=gh.api(), repo=REPO,
-                             identity_path=identity_path, out=self.out)
-        return str(cm.exception)
-
     def made_draft(self):
         d = tempfile.mkdtemp(prefix="release-draft-")
         self.addCleanup(shutil.rmtree, d, True)
@@ -447,50 +562,43 @@ class TestBinding(unittest.TestCase):
         dist, notes = make_dist(d)
         ident = os.path.join(d, "identity.json")
         identity = rm.create_draft(gh.api(), REPO, "v0.1.0", dist, notes, identity_path=ident, out=self.out)
-        return gh, ident, identity
+        return gh, ident, identity, os.path.join(d, "summary.md")
 
-    def test_after_create_deletes_this_runs_draft_when_the_tag_moved(self):
-        gh, ident, identity = self.made_draft()
-        self.r.tag("v0.1.0", self.r.B)
-        msg = self.after_create(gh, ident)
-        self.assertNotIn(identity["id"], gh.releases)
-        self.assertIn("was deleted; the tag is untouched", msg)
+    def test_after_create_leaves_the_draft_names_it_and_fails(self):
+        # Whatever happened to the draft meanwhile (untouched, edited, published, replaced), the
+        # check only reads the tag: it makes no API call, so it cannot delete or change anything.
+        for change in ("none", "edited", "published", "replaced"):
+            with self.subTest(change=change):
+                gh, ident, identity, summary = self.made_draft()
+                rel = gh.releases[identity["id"]]
+                if change == "edited":
+                    rel.update(name="edited", body="edited", prerelease=True, assets=rel["assets"][:1])
+                elif change == "published":
+                    rel["draft"] = False
+                elif change == "replaced":
+                    del gh.releases[identity["id"]]
+                    gh.create({"tag_name": "v0.1.0", "name": "x", "body": "", "draft": True, "prerelease": False})
+                before = dict((k, dict(v)) for k, v in gh.releases.items())
+                n = len(gh.calls)
+                if change == "none":
+                    self.r.tag("v0.1.0", self.r.B)
+                with self.assertRaises(rm.GuardError) as cm:
+                    rm.check_binding("v0.1.0", self.r.A, cwd=self.r.work, after_create=True, repo=REPO,
+                                     identity_path=ident, out=self.out, summary=summary)
+                msg = str(cm.exception)
+                self.assertEqual(len(gh.calls), n)
+                self.assertEqual(gh.releases, before)
+                self.assertIn("release %d (%s)" % (identity["id"], identity["html_url"]), msg)
+                self.assertIn("left in place and nothing was deleted", msg)
+                self.assertIn("repos/%s/releases/%d --jq .draft" % (REPO, identity["id"]), msg)
+                self.assertIn(msg, read(summary))
 
-    def test_after_create_never_deletes_a_published_release(self):
-        gh, ident, identity = self.made_draft()
-        gh.releases[identity["id"]]["draft"] = False  # a maintainer published it meanwhile
-        self.r.tag("v0.1.0", self.r.B)
-        msg = self.after_create(gh, ident)
-        self.assertIn(identity["id"], gh.releases)
-        self.assertIn("no longer a draft", msg)
-        self.assertEqual(gh.deletes, [])
-
-    def test_after_create_never_deletes_a_replacement(self):
-        gh, ident, identity = self.made_draft()
-        # Someone removed this run's draft and made another release for the same tag.
-        del gh.releases[identity["id"]]
-        other = gh.create({"tag_name": "v0.1.0", "name": "x", "body": "", "draft": True, "prerelease": False})
-        self.r.tag("v0.1.0", self.r.B)
-        msg = self.after_create(gh, ident)
-        self.assertIn(other["id"], gh.releases)
-        self.assertEqual(gh.deletes, [])
-        self.assertIn("nothing deleted", msg)
-
-    def test_after_create_never_deletes_a_changed_release(self):
-        gh, ident, identity = self.made_draft()
-        gh.releases[identity["id"]]["tag_name"] = "v0.1.1"
-        self.r.tag("v0.1.0", self.r.B)
-        msg = self.after_create(gh, ident)
-        self.assertEqual(gh.deletes, [])
-        self.assertIn("changed (tag_name)", msg)
-
-    def test_after_create_with_the_tag_in_place_touches_nothing(self):
-        gh, ident, _ = self.made_draft()
+    def test_after_create_with_the_tag_in_place_passes(self):
+        gh, ident, _, summary = self.made_draft()
         self.r.tag("v0.1.0", self.r.A)
-        n = len(gh.calls)
-        rm.check_binding("v0.1.0", self.r.A, cwd=self.r.work, after_create=True, api=gh.api(), repo=REPO,
-                         identity_path=ident, out=self.out)
-        self.assertEqual(len(gh.calls), n)
+        rm.check_binding("v0.1.0", self.r.A, cwd=self.r.work, after_create=True, repo=REPO,
+                         identity_path=ident, out=self.out, summary=summary)
+        self.assertFalse(os.path.exists(summary))
 
     def test_invalid_inputs_never_reach_git(self):
         for tag, sha in (("v0.1.0-';id;#", "a" * 40), ("v0.1.0", "HEAD"), ("v0.1.0", "-a" * 20)):
@@ -630,6 +738,13 @@ class TestWorkflow(unittest.TestCase):
         ("release deleted by name", "run: python3 -I .github/scripts/release_meta.py check-binding --after-create\n",
          "run: python3 -I .github/scripts/release_meta.py check-binding --after-create\n"
          "      - name: cleanup\n        run: gh release delete \"$TAG\" --yes\n"),
+        ("token given to the after-create check", "      - name: The tag did not move while the draft was made\n"
+         "        env:\n", "      - name: The tag did not move while the draft was made\n        env:\n"
+         "          GH_TOKEN: ${{ github.token }}\n"),
+        ("release deleted by id through the API",
+         "run: python3 -I .github/scripts/release_meta.py check-binding --after-create\n",
+         "run: python3 -I .github/scripts/release_meta.py check-binding --after-create\n"
+         "      - name: cleanup\n        run: curl -X DELETE \"$API/repos/$REPO/releases/$ID\"\n"),
         ("release created with gh", "run: python3 -I .github/scripts/release_meta.py create-draft\n",
          "run: gh release create \"$TAG\" --draft out/dist/*\n"),
         ("PowerShell command string", "Compress-Archive -LiteralPath $name",
