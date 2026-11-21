@@ -89,10 +89,11 @@ mod tests {
                 assert!(!c.contains(word), "{} uses {word}", p.display());
             }
         }
-        let commands = std::fs::read_to_string(src.join("commands.rs")).unwrap();
+        // A Windows checkout has CRLF line ends.
+        let commands = std::fs::read_to_string(src.join("commands.rs")).unwrap().replace("\r\n", "\n");
         let c = code(&commands);
         let export = &c[c.find("fn pick_export_folder").expect("the export folder dialog")..];
-        let export = &export[..export.find("\n}\n").unwrap()];
+        let export = &export[..export.find("\n}\n").expect("the end of pick_export_folder")];
         assert!(export.contains(".blocking_pick_folder()"), "{export}");
         assert!(c.contains("export_to_dir(&dir"), "the app names the exported file");
     }
