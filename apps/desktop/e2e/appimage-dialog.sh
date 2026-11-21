@@ -10,8 +10,9 @@
 # Fedora and Debian (and derivatives) are supported. Steps:
 #   1. installs only a display, a session and accessibility bus, AT-SPI's Python binding,
 #      strace, and the libraries every desktop has that an AppImage leaves to the host (GL,
-#      fontconfig, freetype, harfbuzz, fribidi, libgpg-error, one font);
-#   2. fails (exit 2) unless the host is bare: no /usr/share/mime, no Adwaita or hicolor
+#      fontconfig, freetype, harfbuzz, fribidi, libgpg-error, com_err, one font; linuxdeploy's
+#      exclude list leaves these to the host);
+#   2. fails (exit 2) unless the host is bare: no compiled mime database in /usr/share/mime, no Adwaita or hicolor
 #      index.theme, no gdk-pixbuf loader folder, no libgtk-3, no GTK file-chooser schema;
 #   3. extracts the AppImage and starts its AppRun through e2e/idle-launch.sh (the write
 #      observer, PR gate F10) under Xvfb and dbus-run-session, from a folder named
@@ -24,7 +25,9 @@
 # Three verdicts are printed, the dialog check (CT-F1), the write observer (F10) and the screen
 # reader roles of the start screen (e2e/a11y/roles_atspi.py, written to roles.txt; it does not
 # change the exit code). Exit 0 when the first two pass, 1 when the dialog check fails, 3 when
-# only the write observer fails, 2 on a host that is not bare or bad usage. The first argument may also be an extracted AppImage (AppDir).
+# only the write observer fails, 2 on a host that is not bare or bad usage.
+# With a third argument --unsupported (a host older than the AppImage's glibc floor), steps 3 to 5
+# are replaced by: the program must exit at once with the loader's "GLIBC_2.x not found" message. The first argument may also be an extracted AppImage (AppDir).
 set -euo pipefail
 
 if [ "${1:-}" = --driver ]; then
@@ -91,7 +94,7 @@ case " $ID ${ID_LIKE:-} " in
     { apt-get update && apt-get install -y --no-install-recommends \
       xvfb xauth xdotool dbus dbus-bin at-spi2-core python3 python3-gi gir1.2-atspi-2.0 strace procps \
       libgl1 libegl1 libgles2 libgl1-mesa-dri libfontconfig1 libfreetype6 libharfbuzz0b fonts-dejavu-core \
-      libfribidi0 libgpg-error0; } \
+      libfribidi0 libgpg-error0 libcom-err2; } \
       > "$RESULT/install.log" 2>&1 || { tail -30 "$RESULT/install.log"; exit 2; }
     dpkg-query -W -f '${Package} ${Version}\n' | sort > "$RESULT/packages.txt"
     ;;
@@ -101,7 +104,9 @@ esac
 
 echo "== the host has none of what the dialog needs"
 present=()
-for p in /usr/share/mime /usr/share/icons/Adwaita/index.theme /usr/share/icons/hicolor/index.theme \
+# A compiled mime database, not the folder: Debian 13's systemd ships one XML source in
+# /usr/share/mime/packages, which GIO does not read.
+for p in /usr/share/mime/mime.cache /usr/share/mime/globs2 /usr/share/mime/magic /usr/share/icons/Adwaita/index.theme /usr/share/icons/hicolor/index.theme \
   /usr/share/glib-2.0/schemas/org.gtk.Settings.FileChooser.gschema.xml; do
   [ -e "$p" ] && present+=("$p")
 done
@@ -111,6 +116,21 @@ if [ "${#present[@]}" -gt 0 ]; then
   printf '::error::not a bare host, it has %s\n' "${present[@]}"; exit 2
 fi
 echo "none present"
+
+if [ "${3:-}" = --unsupported ]; then
+  # A host whose glibc is older than the AppImage needs (Debian 12, Ubuntu 22.04; docs/DESKTOP.md,
+  # "Linux AppImage"): the program must refuse to start with the loader's message naming the
+  # glibc version it needs, and exit, not crash or hang. No display: it never gets that far.
+  F=/tmp/appimage-floor; rm -rf "$F"; mkdir -p "$F"; cd "$F"
+  if [ -d "$APPIMAGE" ]; then cp -a "$APPIMAGE" squashfs-root; else "$APPIMAGE" --appimage-extract > /dev/null; fi
+  set +e; timeout 60 ./squashfs-root/AppRun > "$RESULT/unsupported.log" 2>&1; code=$?; set -e
+  head -3 "$RESULT/unsupported.log"
+  echo "== verdict"
+  if [ "$code" -ge 1 ] && [ "$code" -lt 124 ] && grep -qE "version .GLIBC_2\.[0-9]+' not found" "$RESULT/unsupported.log"; then
+    echo "unsupported host ($(ldd --version | head -1)): PASS, exit $code with the loader naming the glibc it needs"; exit 0
+  fi
+  echo "::error::unsupported host: FAIL, exit $code (124 is a hang, 128 and up a signal) without the loader's glibc message"; exit 1
+fi
 
 id -u tester > /dev/null 2>&1 || useradd -m tester
 # A desktop session has a private runtime folder; dconf and the accessibility bus use it.

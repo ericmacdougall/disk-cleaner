@@ -57,6 +57,27 @@ before running an unsigned installer.
 
 ### Linux AppImage
 
+The two Linux packages are built on different hosts:
+
+- the `.deb` (artifact `prunedisk-linux-x64-unsigned`) on Ubuntu 22.04. It uses the host's
+  WebKitGTK and GTK and needs glibc 2.35 or later (Ubuntu 22.04, Debian 12 and later).
+- the AppImage (artifact `prunedisk-linux-x64-appimage-unsigned`) on Ubuntu 24.04. It carries
+  that host's WebKitGTK and needs glibc 2.39 or later: Ubuntu 24.04, Debian 13, Fedora 40 and
+  later. On an older glibc (Debian 12, Ubuntu 22.04) it does not start; the loader prints
+  ``version `GLIBC_2.39' not found`` and the program exits. Use the `.deb` there.
+
+Why: the AppImage gives screen readers the roles of the WebKitGTK it carries, and WebKitGTK
+2.49.x to 2.50.4 send every AT-SPI role from paragraph on one number too low. A screen reader
+(Orca) then reads a heading as "document frame", a paragraph as "footer", a link as "form"
+and a table row as "input method window". WebKit dropped Footer from its copy of AT-SPI's
+role list ([bug 300090](https://bugs.webkit.org/show_bug.cgi?id=300090)); 2.50.5 and 2.52
+have the fix. Ubuntu 22.04 has stayed at 2.50.4 since January 2026, with no security updates
+since; Ubuntu 24.04 ships 2.52. The bundle job records the bundled WebKitGTK and the glibc the
+AppImage needs (`LINUX-APPIMAGE.txt` in the artifact and the job summary,
+`src-tauri/appimage/check-webkit.sh`), and fails on a WebKitGTK in that range. The `.deb` gets
+the host's WebKitGTK, so on a host whose WebKitGTK is 2.50.0 to 2.50.4 (Ubuntu 22.04 today) it
+has the same wrong roles; the app cannot correct them there.
+
 The AppImage carries GTK, gdk-pixbuf and its loaders, and its AppRun hook (written by
 linuxdeploy's GTK plugin, which Tauri embeds) points `XDG_DATA_DIRS`,
 `GDK_PIXBUF_MODULE_FILE`, `GSETTINGS_SCHEMA_DIR`, `GIO_MODULE_DIR` and `GTK_PATH` inside
@@ -68,7 +89,8 @@ from the build host by `src-tauri/appimage/stage-data.mjs`, Tauri's
 - the compiled shared-mime-info database (`usr/share/mime`). Ubuntu's gdk-pixbuf chooses an
   image loader by content-type sniffing, which reads this database. Without it, even GTK's
   built-in fallback icon is an "Unrecognized image file format".
-- Adwaita without its sizes above 48 px and without `icon-theme.cache`, plus hicolor's
+- Adwaita without its sizes above 48 px and without `icon-theme.cache` (its symbolic icons are
+  in `symbolic/` from adwaita-icon-theme 46, in `scalable/` before), plus hicolor's
   `index.theme`. Without an icon theme, the folder dialog falls back to that fallback icon.
 - each package's copyright file (`usr/share/doc`).
 
@@ -78,12 +100,17 @@ image-missing.png: Unrecognized image file format") on any host without
 these files.
 
 The job "AppImage without host GTK" runs the shipped AppImage in bare `fedora:41` and
-`debian:bookworm-slim` containers (`e2e/appimage-dialog.sh`). The containers have no GTK,
-gdk-pixbuf, mime database or icon theme; the script refuses a host that has any of them. The
-test opens the dialog through the accessibility tree, picks a folder by path and requires the
-folder in the app with the app alive. It fails on a GTK error, critical or missing icon. It
-runs under `e2e/idle-launch.sh`, so the write observer sees the dialog's writes. A control
-leg deletes the added data from the same AppImage and requires the check to fail.
+`debian:trixie-slim` containers (`e2e/appimage-dialog.sh`). The containers have no GTK,
+gdk-pixbuf, compiled mime database or icon theme; the script refuses a host that has any of
+them. The test opens the dialog through the accessibility tree, picks a folder by path and
+requires the folder in the app with the app alive. It fails on a GTK error, critical or
+missing icon. It runs under `e2e/idle-launch.sh`, so the write observer sees the dialog's
+writes. A control leg deletes the added data from the same AppImage and requires the check to
+fail. Before the dialog, `e2e/a11y/roles_atspi.py` reads the start screen's accessibility
+tree and requires every object's AT-SPI role number to match the role WebKit computed for it
+(heading, paragraph, link, button, check box and others), with at least one heading, button
+and check box right; it has its own step. A `debian:bookworm-slim` leg requires the clear
+loader error above on a glibc below the AppImage's.
 
 The `.deb` needs none of this: it depends on `libgtk-3-0`, which brings shared-mime-info,
 Adwaita and hicolor even without recommended packages. On Debian 12 with

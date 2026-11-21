@@ -417,10 +417,18 @@ jobs:
             os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: msi,nsis
+          # The .deb uses the host's WebKitGTK and GTK, so it is built on the oldest supported
+          # Ubuntu (glibc 2.35: Ubuntu 22.04, Debian 12). The AppImage bundles the build host's
+          # WebKitGTK, so it is built where that WebKitGTK is maintained and numbers screen reader
+          # roles correctly: Ubuntu 24.04 (glibc 2.39). docs/DESKTOP.md, "Linux AppImage".
           - name: linux-x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            bundles: appimage,deb
+            bundles: deb
+          - name: linux-x64-appimage
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -430,7 +438,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: apps/desktop/src-tauri
-          key: ${{ matrix.target }}
+          # Per runner image too: build scripts compiled against Ubuntu 24.04's glibc do not run
+          # on 22.04.
+          key: ${{ matrix.target }}-${{ matrix.os }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -460,7 +470,7 @@ jobs:
         shell: bash
         run: bash e2e/check-shipped.sh "src-tauri/target/${{ matrix.target }}/release/bundle" "$RUNNER_TEMP/shipped"
       - name: The AppImage carries the folder dialog's data (CT-F1, docs/DESKTOP.md)
-        if: runner.os == 'Linux'
+        if: contains(matrix.bundles, 'appimage')
         shell: bash
         run: |
           set -euo pipefail
@@ -470,10 +480,15 @@ jobs:
           s="$d/squashfs-root/usr/share"
           missing=0
           for f in mime/mime.cache mime/magic mime/globs2 mime/subclasses mime/aliases \
-            icons/Adwaita/index.theme icons/Adwaita/scalable/places/user-home-symbolic.svg \
-            icons/Adwaita/scalable/places/folder-symbolic.svg icons/hicolor/index.theme \
+            icons/Adwaita/index.theme icons/hicolor/index.theme \
             doc/shared-mime-info/copyright doc/adwaita-icon-theme/copyright doc/hicolor-icon-theme/copyright; do
             [ -s "$s/$f" ] || { echo "::error::the AppImage has no $f"; missing=1; }
+          done
+          # The dialog's first icons: in symbolic/ from adwaita-icon-theme 46 (Ubuntu 24.04), in
+          # scalable/ before.
+          for i in user-home-symbolic folder-symbolic; do
+            [ -s "$s/icons/Adwaita/symbolic/places/$i.svg" ] || [ -s "$s/icons/Adwaita/scalable/places/$i.svg" ] ||
+              { echo "::error::the AppImage has no Adwaita $i icon"; missing=1; }
           done
           if [ -e "$s/icons/Adwaita/icon-theme.cache" ]; then
             echo "::error::the AppImage's Adwaita has an icon-theme.cache that does not match its files"; missing=1
@@ -485,6 +500,18 @@ jobs:
           du -sh "$s/mime" "$s/icons/Adwaita"
           rm -rf "$d"
           exit "$missing"
+      - name: The AppImage's WebKitGTK gives screen readers the right roles (docs/DESKTOP.md)
+        # Records the bundled WebKitGTK and the glibc the AppImage needs (LINUX-APPIMAGE.txt in the
+        # artifact and the job summary), and fails on a WebKitGTK that sends wrong roles.
+        if: contains(matrix.bundles, 'appimage')
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist-bundles"
+          app=$(ls src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage)
+          bash src-tauri/appimage/check-webkit.sh "$app" "$GITHUB_WORKSPACE/dist-bundles/LINUX-APPIMAGE.txt"
+          { echo '### Linux AppImage'; sed 's/^/- /' "$GITHUB_WORKSPACE/dist-bundles/LINUX-APPIMAGE.txt"; } >> "$GITHUB_STEP_SUMMARY"
       - name: Stage bundles and checksums
         shell: bash
         run: |
@@ -543,6 +570,9 @@ jobs:
     # icon theme (CT-F1, GoodQA #16452): the GTK folder dialog must open and return a folder,
     # and the app must keep running. e2e/appimage-dialog.sh says what it installs and checks.
     # The control leg removes the dialog's data from the same AppImage; the check must fail it.
+    # The same legs read the screen reader roles of the start screen. Debian 13 is the oldest
+    # Debian the AppImage runs on (glibc 2.39, docs/DESKTOP.md "Linux AppImage"); the Debian 12
+    # leg requires the clear loader error, not a crash, on a glibc below that.
     name: AppImage without host GTK (${{ matrix.name }})
     needs: bundles
     runs-on: ubuntu-22.04
@@ -554,17 +584,24 @@ jobs:
           - name: fedora-41
             image: fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d
             control: false
-          - name: debian-12-slim
-            image: debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+            unsupported: false
+          - name: debian-13-slim
+            image: debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
             control: false
+            unsupported: false
           - name: fedora-41 without the dialog data (control)
             image: fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d
             control: true
+            unsupported: false
+          - name: debian-12-slim, glibc below the AppImage's (unsupported)
+            image: debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+            control: false
+            unsupported: true
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: prunedisk-linux-x64-unsigned
+          name: prunedisk-linux-x64-appimage-unsigned
           path: ${{ runner.temp }}/bundle
       - name: The program under test
         id: prog
@@ -591,11 +628,18 @@ jobs:
           docker run --rm --cap-add SYS_PTRACE \
             -v "${{ steps.prog.outputs.path }}:${{ steps.prog.outputs.target }}:ro" \
             -v "$GITHUB_WORKSPACE/apps/desktop/e2e:/e2e:ro" -v "$RUNNER_TEMP/out:/out" \
-            "${{ matrix.image }}" bash /e2e/appimage-dialog.sh "${{ steps.prog.outputs.target }}" /out
+            "${{ matrix.image }}" bash /e2e/appimage-dialog.sh "${{ steps.prog.outputs.target }}" /out \
+            ${{ matrix.unsupported && '--unsupported' || '' }}
           code=$?
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "appimage-dialog.sh exit $code (0 pass, 1 dialog check failed, 3 only the write observer failed, 2 host not bare)"
+      - name: The AppImage refuses an older glibc with a clear error
+        if: ${{ matrix.unsupported }}
+        shell: bash
+        run: |
+          [ "${{ steps.run.outputs.code }}" = 0 ] || { echo "::error::no clear refusal on an unsupported glibc (unsupported.log in the artifact)"; exit 1; }
       - name: Dialog check (CT-F1)
+        if: ${{ !matrix.unsupported }}
         shell: bash
         run: |
           code=${{ steps.run.outputs.code }}
@@ -610,7 +654,7 @@ jobs:
             [ "$code" = 0 ] || [ "$code" = 3 ] || { echo "::error::dialog check failed (exit $code)"; exit 1; }
           fi
       - name: Write observer through the dialog (F10)
-        if: ${{ !matrix.control }}
+        if: ${{ !matrix.control && !matrix.unsupported }}
         shell: bash
         run: |
           [ "${{ steps.run.outputs.code }}" = 0 ] || { echo "::error::undeclared writes: trace.txt in the artifact"; exit 1; }
@@ -618,7 +662,7 @@ jobs:
         # Each element of the start screen must reach the host's accessibility bus with the AT-SPI
         # role of its tag (a heading as heading, not document frame). WebKitGTK 2.50.0 to 2.50.4
         # number every role from paragraph on one too low (docs/DESKTOP.md, "Linux AppImage").
-        if: ${{ !matrix.control }}
+        if: ${{ !matrix.control && !matrix.unsupported }}
         shell: bash
         run: |
           cat "$RUNNER_TEMP/out/roles.txt" 2> /dev/null || true

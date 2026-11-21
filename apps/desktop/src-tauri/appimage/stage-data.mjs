@@ -28,7 +28,9 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const out = path.join(here, "..", "gen", "appimage-data");
 const root = process.env.PRUNEDISK_APPIMAGE_DATA_ROOT || "/";
 const share = path.join(root, "usr", "share");
-const ADWAITA_DIRS = ["scalable", "scalable-up-to-32", "8x8", "16x16", "22x22", "24x24", "32x32", "48x48"];
+// adwaita-icon-theme 46 and later (Ubuntu 24.04) keep the symbolic icons the dialog uses in
+// symbolic/ and symbolic-up-to-32/; earlier ones (Ubuntu 22.04) in scalable/.
+const ADWAITA_DIRS = ["scalable", "scalable-up-to-32", "symbolic", "symbolic-up-to-32", "8x8", "16x16", "22x22", "24x24", "32x32", "48x48"];
 const DOCS = ["shared-mime-info", "adwaita-icon-theme", "hicolor-icon-theme"];
 
 function fail(msg) {
