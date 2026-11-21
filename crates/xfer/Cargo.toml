@@ -27,6 +27,7 @@ broken-read-guard = []    # reads follow symlinks and skip the before/after iden
 broken-deep = []          # verify --deep stops at the shallow listing check
 broken-meta = []          # metadata capture records no xattrs and never flags incomplete
 broken-restore-guards = [] # restore trusts paths, links, pack ranges, object sizes, shares and setid
+broken-read-order = []    # large files read in parallel and segment tails held back
 broken-repo-guards = []   # no format, object-cap or cache checks; every cache tmp file removed
 
 [dependencies]

@@ -462,7 +462,9 @@ fn segmenter(rx: Receiver<ChunkMsg>, tx: Sender<RawSeg>) {
                 through += m.data.len() as u64;
                 let stale: Vec<_> = opened
                     .iter()
-                    .filter(|(_, &at)| through - at > SEG_AGE)
+                    .filter(|(_, &at)| {
+                        through - at > SEG_AGE && !cfg!(feature = "broken-read-order")
+                    })
                     .map(|(k, _)| k.clone())
                     .collect();
                 for k in stale {
@@ -1007,8 +1009,12 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
                         rs.spawn(|| loop {
                             let j = next.fetch_add(1, Ordering::Relaxed);
                             let Some(&i) = order.get(j) else { break };
-                            let _one = (ctx.nodes[i].stat.id.size >= SERIAL_READ)
-                                .then(|| serial.lock().expect("serial read lock"));
+                            // the broken-read-order variant reads large files in parallel and
+                            // interleaves them (failing-first evidence only)
+                            let one_at_a_time = ctx.nodes[i].stat.id.size >= SERIAL_READ
+                                && !cfg!(feature = "broken-read-order");
+                            let _one =
+                                one_at_a_time.then(|| serial.lock().expect("serial read lock"));
                             if let ReadOutcome::Changed = read_one(&ctx, i, false) {
                                 retry.lock().expect("retry").push(i);
                             }

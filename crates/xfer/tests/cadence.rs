@@ -75,10 +75,25 @@ fn large_files_complete_one_after_another() {
     let rep = xfer::backup::backup(Arc::new(slow), &o).expect("backup");
     assert_eq!(rep.exit_code, 0, "{rep:#?}");
     assert!(rep.packs >= 4, "expected several packs, got {}", rep.packs);
+    // Interleaved files complete only with the last pack, so everything is freed by the final
+    // commit. Files read one after another free half the bytes before it. (A wall-time ratio is
+    // not used: on a slow CI runner the debug build is CPU-bound and paces packs evenly, which
+    // moves t50 towards 0.7 of wall without any interleaving.)
+    let freed_before_last = rep
+        .commit_trace
+        .iter()
+        .rev()
+        .nth(1)
+        .map_or(0, |&(_, freed, _)| freed);
+    assert!(
+        freed_before_last * 2 >= rep.freeable_bytes,
+        "only {freed_before_last} of {} freeable bytes were receipted before the final commit {rep:#?}",
+        rep.freeable_bytes
+    );
     let t50 = rep.t50_ms.expect("t50");
     assert!(
-        (t50 as f64) < 0.7 * rep.wall_ms as f64,
-        "half the freeable bytes were receipted at {t50} ms of {} ms ({} commits) {rep:#?}",
+        (t50 as f64) < 0.85 * rep.wall_ms as f64,
+        "half the freeable bytes were receipted at {t50} ms of {} ms ({} commits)",
         rep.wall_ms,
         rep.commits
     );
