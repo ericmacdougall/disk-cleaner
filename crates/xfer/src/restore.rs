@@ -44,6 +44,10 @@ pub struct RestoreReport {
     pub peak_rss: u64,
 }
 
+/// The broken-restore-guards variant drops the path, link and structure checks of the loader
+/// (failing-first evidence only).
+const BROKEN: bool = cfg!(feature = "broken-restore-guards");
+
 /// One planned chunk write: (file index, offset in the file, chunk id, length).
 type Write = (usize, u64, ChunkId, u32);
 
@@ -91,8 +95,10 @@ fn load(repo: &Repo, run: Option<&str>, b: &Budget) -> Result<Loaded> {
     for (_, f) in &files {
         for e in &f.entries {
             let rel = e.rel()?;
-            validate_rel(&rel)?;
-            if !seen.insert(rel.clone()) {
+            if !BROKEN {
+                validate_rel(&rel)?;
+            }
+            if !seen.insert(rel.clone()) && !BROKEN {
                 return Err(Error::corrupt(format!(
                     "{} appears twice in run {run}",
                     String::from_utf8_lossy(&rel)
@@ -136,8 +142,10 @@ fn load(repo: &Repo, run: Option<&str>, b: &Budget) -> Result<Loaded> {
             let t =
                 it.e.target_bytes()?
                     .ok_or_else(|| Error::corrupt("hard link without a target"))?;
-            validate_rel(&t)?;
-            if kinds.get(&t) != Some(&Kind::File) {
+            if !BROKEN {
+                validate_rel(&t)?;
+            }
+            if kinds.get(&t) != Some(&Kind::File) && !BROKEN {
                 return Err(Error::corrupt(format!(
                     "hard link {} points to a missing or non-file member",
                     String::from_utf8_lossy(&it.rel)
@@ -151,7 +159,7 @@ fn load(repo: &Repo, run: Option<&str>, b: &Budget) -> Result<Loaded> {
         let comps: Vec<&[u8]> = it.rel.split(|&b| b == b'/').collect();
         for i in 1..comps.len() {
             let d = comps[..i].join(&b'/');
-            if kinds.get(&d) != Some(&Kind::Dir) {
+            if kinds.get(&d) != Some(&Kind::Dir) && !BROKEN {
                 return Err(Error::corrupt(format!(
                     "{}: ancestor {} is not a directory of this run",
                     String::from_utf8_lossy(&it.rel),
@@ -297,16 +305,18 @@ pub fn restore(t: Arc<dyn Transport>, o: &RestoreOpts) -> Result<RestoreReport> 
                             })?;
                             let c = tr.chunks[ci];
                             if cur.as_ref().map(|x| x.0) != Some(c.seg) {
-                                cur = Some((
-                                    c.seg,
-                                    decode_segment(&b, &tr.segments[c.seg as usize])?,
-                                ));
+                                let seg = decode_segment(&b, &tr.segments[c.seg as usize])
+                                    .map_err(|e| {
+                                        Error::corrupt(format!("{} segment {}: {e}", pr.key, c.seg))
+                                    })?;
+                                cur = Some((c.seg, seg));
                             }
                             let seg = &cur.as_ref().expect("segment").1;
                             let slice = &seg[c.off as usize..(c.off + c.len) as usize];
                             if c.len != len || ChunkId::of(slice) != id {
                                 return Err(Error::corrupt(format!(
-                                    "chunk {id:?} does not match its id"
+                                    "chunk {id:?} in {} does not match its id",
+                                    pr.key
                                 )));
                             }
                             let f = std::fs::OpenOptions::new()

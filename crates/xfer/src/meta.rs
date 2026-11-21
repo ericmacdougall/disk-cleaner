@@ -311,7 +311,8 @@ pub fn apply(
     let shown = path.display();
     if kind != Kind::Symlink {
         let mut m = mode & 0o7777;
-        if !keep_setid && m & 0o6000 != 0 {
+        let strip = !keep_setid && !cfg!(feature = "broken-restore-guards");
+        if strip && m & 0o6000 != 0 {
             w.push(format!("{shown}: setuid/setgid bits stripped"));
             m &= !0o6000;
         }

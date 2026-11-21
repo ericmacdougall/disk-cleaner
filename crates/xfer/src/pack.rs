@@ -211,6 +211,10 @@ pub fn parse_pack(bytes: &[u8]) -> Result<Trailer> {
     if t.v != 1 {
         return Err(Error::corrupt(format!("unknown pack version {}", t.v)));
     }
+    if cfg!(feature = "broken-restore-guards") {
+        // the broken variant trusts the trailer's ranges (failing-first evidence only)
+        return Ok(t);
+    }
     for s in &t.segments {
         let end = s
             .off

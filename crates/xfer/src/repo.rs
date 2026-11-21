@@ -263,7 +263,13 @@ pub fn encode<T: Serialize + for<'de> Deserialize<'de>>(v: &T) -> Result<Vec<u8>
 }
 
 pub fn decode<T: for<'de> Deserialize<'de>>(z: &[u8]) -> Result<T> {
-    let json = bounded_zstd(z, OBJECT_JSON_MAX)?;
+    // the broken-restore-guards variant lifts the object limit (failing-first evidence only)
+    let limit = if cfg!(feature = "broken-restore-guards") {
+        8 * OBJECT_JSON_MAX
+    } else {
+        OBJECT_JSON_MAX
+    };
+    let json = bounded_zstd(z, limit)?;
     serde_json::from_slice(&json).map_err(|e| Error::corrupt(format!("commit object: {e}")))
 }
 
@@ -350,7 +356,7 @@ impl Meter {
     }
     pub fn charge(&mut self, n: u64) -> Result<()> {
         self.used = self.used.saturating_add(n);
-        if self.used > self.limit {
+        if self.used > self.limit && !cfg!(feature = "broken-restore-guards") {
             return Err(Error::Budget(format!(
                 "{} needs more than its {} share of --mem-budget",
                 self.what,
