@@ -138,6 +138,22 @@ enum Cmd {
         #[arg(long)]
         dir: PathBuf,
     },
+    /// Bench only: write a synthetic chunk map of CHUNKS chunks in packs of PER_PACK, in the
+    /// store's layout under DIR, to copy into a repository so a load meets that many packs.
+    #[command(hide = true)]
+    GenIndex {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        chunks: usize,
+        #[arg(long, default_value_t = 16)]
+        per_pack: usize,
+        /// The store's checksum: sha1 (B2) or md5 (S3).
+        #[arg(long, default_value = "sha1")]
+        hash: String,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     /// Apply the second-run change (W4) to a generated workload.
     Mutate {
         #[arg(long)]
@@ -334,6 +350,22 @@ fn run(cli: Cli) -> Result<i32, String> {
             let total = size(&sz, "--size")?;
             let n = xfer::gen::generate(&dir, w, total, seed).map_err(|e| e.to_string())?;
             println!("{{\"command\":\"gen\",\"files\":{n}}}");
+            Ok(0)
+        }
+        Cmd::GenIndex {
+            dir,
+            chunks,
+            per_pack,
+            hash,
+            seed,
+        } => {
+            let kind = xfer::hash::HashKind::parse(&hash)
+                .ok_or_else(|| format!("unknown --hash {hash:?}"))?;
+            let (objects, packs) = xfer::gen::index_fixture(&dir, chunks, per_pack, kind, seed)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "{{\"command\":\"gen-index\",\"chunks\":{chunks},\"objects\":{objects},\"packs\":{packs}}}"
+            );
             Ok(0)
         }
         Cmd::Mutate { dir, seed } => {

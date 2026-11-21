@@ -137,16 +137,24 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p disk-cleaner-cli
+      - name: Build release xfer binary (the bench and Mac runs use this exact build)
+        shell: bash
+        env:
+          XFER_BUILD_COMMIT: ${{ github.sha }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p disk-cleaner-xfer --bin prunedisk-xfer
       - name: Stage binary and checksum
         shell: bash
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.exe }}" dist/
+          x=prunedisk-xfer
+          [[ "${{ matrix.exe }}" == *.exe ]] && x=prunedisk-xfer.exe
+          cp "target/${{ matrix.target }}/release/$x" dist/
           cd dist
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${{ matrix.exe }}" > SHA256SUMS
+            sha256sum "${{ matrix.exe }}" "$x" > SHA256SUMS
           else
-            shasum -a 256 "${{ matrix.exe }}" > SHA256SUMS
+            shasum -a 256 "${{ matrix.exe }}" "$x" > SHA256SUMS
           fi
           cat SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

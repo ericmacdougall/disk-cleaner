@@ -328,9 +328,101 @@ pub fn mutate(dir: &Path, seed: u64) -> Result<()> {
     Ok(())
 }
 
+/// Chunks in one fixture index object (each stays well inside one fetch batch).
+const FIXTURE_PER_OBJECT: usize = 200_000;
+
+/// Bench fixture (AC-8 on the Mac): a synthetic chunk map of `chunks` chunks in packs of
+/// `per_pack` chunks, written under `dir` in the store's own layout for `rclone copy` into an
+/// existing repository. It is `v1/index/rfixture<seed>-<n>/000000.idx` objects of at most 200k
+/// chunks each, and one one-byte object per pack. Every pack is listed with its real size and
+/// `kind` checksum, so a load keeps every pack and every chunk, exactly as a repository of
+/// that many packs would cost it. No fixture chunk is ever read: a restore reads only the
+/// chunks of the run it restores. Returns (index objects, packs).
+pub fn index_fixture(
+    dir: &Path,
+    chunks: usize,
+    per_pack: usize,
+    kind: crate::hash::HashKind,
+    seed: u64,
+) -> Result<(usize, usize)> {
+    use crate::hash::ChunkId;
+    use crate::repo::{ChunkRef, IdxObj, ObjRef};
+    let per_pack = per_pack.max(1);
+    let per_obj = (FIXTURE_PER_OBJECT / per_pack).max(1) * per_pack;
+    let body = b"p";
+    let hash = kind.digest(body);
+    let (mut objects, mut packs, mut lo) = (0usize, 0usize, 0usize);
+    while lo < chunks {
+        let hi = (lo + per_obj).min(chunks);
+        let refs: Vec<ObjRef> = (0..(hi - lo).div_ceil(per_pack))
+            .map(|_| {
+                let h = blake3::hash(format!("fixture {seed} pack {packs}").as_bytes()).to_hex();
+                packs += 1;
+                ObjRef {
+                    key: format!("v1/packs/{}/{h}.pack", &h[..2]),
+                    size: body.len() as u64,
+                    hash: hash.clone(),
+                }
+            })
+            .collect();
+        for r in &refs {
+            let p = dir.join(&r.key);
+            fs::create_dir_all(p.parent().expect("a pack key has a parent"))?;
+            fs::write(&p, body)?;
+        }
+        let run = format!("rfixture{seed:x}-{objects:05}");
+        let idx = IdxObj {
+            v: 1,
+            engine: crate::repo::engine(),
+            run: run.clone(),
+            seq: 0,
+            root: "fixture".into(),
+            hash_kind: kind,
+            packs: refs,
+            chunks: (lo..hi)
+                .map(|i| ChunkRef {
+                    id: ChunkId::of(format!("fixture {seed} chunk {i}").as_bytes()),
+                    p: ((i - lo) / per_pack) as u32,
+                    len: 1,
+                })
+                .collect(),
+        };
+        let p = dir.join(crate::repo::idx_key(&run, 0));
+        fs::create_dir_all(p.parent().expect("an index key has a parent"))?;
+        fs::write(&p, crate::repo::encode(&idx)?)?;
+        objects += 1;
+        lo = hi;
+    }
+    Ok((objects, packs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_index_fixture_loads_whole_with_every_pack_kept() {
+        use crate::hash::HashKind;
+        use crate::repo::{Meter, Repo};
+        use crate::transport::local::LocalDir;
+        use crate::transport::RetryPolicy;
+        let d = tempfile::tempdir().expect("tempdir");
+        // 1000 chunks a pack: 200k-chunk objects, so three objects and 411 packs
+        let (objs, packs) =
+            index_fixture(d.path(), 410_017, 1000, HashKind::Sha1, 7).expect("fixture");
+        assert_eq!((objs, packs), (3, 411));
+        let t = std::sync::Arc::new(LocalDir::new(d.path(), HashKind::Sha1).expect("local"));
+        let repo = Repo::new(t, 100_001, RetryPolicy::fast()).expect("repo");
+        let idx = repo.list_index().expect("list index");
+        let listed = repo.list_packs().expect("list packs");
+        assert_eq!((idx.len(), listed.len()), (objs, packs));
+        let mut m = Meter::new("test", 256 << 20);
+        let (map, n, referenced) = repo
+            .load_chunk_map(&idx, &listed, &mut m, None)
+            .expect("load");
+        assert_eq!((map.len(), n, referenced.len()), (410_017, objs, 0));
+        assert_eq!(map.packs.len(), packs);
+    }
     #[test]
     fn deterministic() {
         let (mut a, mut b) = (Rng::new(1), Rng::new(1));
