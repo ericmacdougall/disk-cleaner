@@ -31,6 +31,16 @@ pub fn real_rclone() -> PathBuf {
             return PathBuf::from(c);
         }
     }
+    // Fail loudly instead of reporting every shard as failed (CI installs rclone).
+    let on_path = std::process::Command::new("rclone")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(
+        on_path,
+        "the apply tests need rclone (a local directory remote, no network); install it"
+    );
     PathBuf::from("rclone")
 }
 

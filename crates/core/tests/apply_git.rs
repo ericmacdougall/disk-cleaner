@@ -641,6 +641,53 @@ fn unpushed_commit_with_a_secret_is_not_pushed() {
     assert!(!objs.contains(".env"));
 }
 
+/// C2 (plan review r5 F1): a secret-named file already tracked in HEAD and already on the remote
+/// never appears in the new WIP tree; its history stays in the `.git` backup.
+#[test]
+fn secret_tracked_in_head_is_not_in_the_wip_tree() {
+    let fx = Fx::new();
+    let r = repo(&fx);
+    // Commit .env and push it with everything else, so no unpushed commit holds it.
+    git(&r.dir, &["add", "-f", ".env"]);
+    git(&r.dir, &["commit", "-q", "-m", "tracked secret"]);
+    git(&r.dir, &["push", "-q", "origin", "main"]);
+    // An unrelated local change, so a WIP commit is built on top of HEAD.
+    fx.write("repo/README.md", b"local edit\n");
+    let head = git(&r.dir, &["rev-parse", "HEAD"]);
+    let (scan, plan) = docs(
+        &[&fx.data],
+        &[P::git(&r.dir, &[".env"], push_block(&r.url))],
+    );
+    let mut o = gopts(&fx, true, false);
+    o.private_remotes = vec![r.url.clone()];
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    let (out, why) = outcome(&rep, 0);
+    assert_eq!(out, "removed", "{why}");
+    let date = disk_cleaner_core::apply::utc_date(o.now);
+    let wip_ref = format!("refs/recovery/testhost/{date}/wip/main");
+    let refs = recovery_refs(&r.bare);
+    let wip = refs
+        .iter()
+        .find(|(n, _)| *n == wip_ref)
+        .unwrap_or_else(|| panic!("no WIP ref: {refs:?}"))
+        .1
+        .clone();
+    assert_eq!(git(&r.bare, &["rev-parse", &format!("{wip}^")]), head);
+    let files = git(&r.bare, &["ls-tree", "-r", "--name-only", &wip]);
+    assert!(
+        !files.lines().any(|f| f == ".env"),
+        "the WIP tree holds .env: {files}"
+    );
+    assert!(files.lines().any(|f| f == "README.md"), "{files}");
+    assert_eq!(
+        git(&r.bare, &["show", &format!("{wip}:README.md")]),
+        "local edit"
+    );
+    // The excluded secret stays on disk.
+    assert!(r.dir.join(".env").exists());
+}
+
 #[test]
 fn token_in_git_config_keeps_repo() {
     for (name, setup) in [

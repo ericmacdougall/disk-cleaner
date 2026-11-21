@@ -4,11 +4,13 @@ A disk analyzer for developer machines that understands what each folder is, so 
 safe to remove. It is planned to become a cleaner for Windows, macOS and Linux. The product name is
 PruneDisk; the repository and the command are still called disk-cleaner.
 
-> **Status: early, read-only.** The `scan` and `plan` commands are on the main branch. There is no
-> tagged release, installer or download page yet, so you build it from source. (Continuous
-> integration also builds unsigned binaries for each platform and keeps them as workflow artifacts
-> for 14 days; they are test builds, not releases.) No command removes, moves or changes anything:
-> the only file it writes is the one you name with `scan --out`.
+> **Status: early and experimental.** There is no tagged release, installer or download page yet,
+> so you build it from source. (Continuous integration also builds unsigned binaries for each
+> platform and keeps them as workflow artifacts for 14 days; they are test builds, not releases.)
+> `scan` and `plan` only read: the one file they write is the one you name with `--out`. `apply`
+> is a dry run unless you add `--apply`; with `--apply` it backs up, pushes recovery refs and
+> removes on macOS and Linux (not yet on Windows), and keeps a manifest. `restore` writes the
+> files it brings back and never overwrites an existing one.
 
 ## What it does today
 

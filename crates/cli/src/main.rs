@@ -379,6 +379,12 @@ fn run_apply(a: ApplyArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn run_restore(_a: RestoreArgs) -> Result<()> {
+    anyhow::bail!("restore is not supported on this platform yet")
+}
+
+#[cfg(unix)]
 fn run_restore(a: RestoreArgs) -> Result<()> {
     use disk_cleaner_core::apply::restore::{restore, RestoreOptions};
     use disk_cleaner_core::apply::short_hostname;

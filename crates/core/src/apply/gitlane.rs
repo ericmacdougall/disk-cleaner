@@ -1239,10 +1239,42 @@ fn recover_in(
                 &["update-index", "-z", "--index-info"],
                 Some(info.into_bytes()),
             )?;
+            // C2: no secret-named path in the WIP tree, also one inherited from HEAD (its history
+            // stays in the `.git` backup, never in a new pushed tree).
+            let secret_paths = |names: &[u8]| -> Vec<String> {
+                names
+                    .split(|b| *b == 0)
+                    .filter(|r| !r.is_empty())
+                    .map(|r| String::from_utf8_lossy(r).to_string())
+                    .filter(|r| names::rel_is_secret(r))
+                    .collect()
+            };
+            let inherited = secret_paths(&qidx(&["ls-files", "-z", "--cached"], None)?);
+            if !inherited.is_empty() {
+                // Mode 0 removes an entry; it needs no work tree (the quarantine repo is bare).
+                let mut del = String::new();
+                for r in &inherited {
+                    del.push_str(&format!("0 {}\t{r}\0", "0".repeat(40)));
+                }
+                qidx(
+                    &["update-index", "-z", "--index-info"],
+                    Some(del.into_bytes()),
+                )?;
+            }
             let tree = lines(&qidx(&["write-tree"], None)?)
                 .into_iter()
                 .next()
                 .ok_or("git write-tree printed nothing")?;
+            let left = secret_paths(&qgit(
+                &["ls-tree", "-r", "-z", "--name-only", tree.as_str()],
+                None,
+            )?);
+            if let Some(s) = left.first() {
+                return Err(format!(
+                    "the recovery tree would hold the secret-named {}",
+                    diag(s)
+                ));
+            }
             let mut c = git_command(opts, &q, Some(&global), &hooks);
             let when = format!("{} +0000", opts.now);
             c.env("GIT_AUTHOR_NAME", "disk-cleaner")

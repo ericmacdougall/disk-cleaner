@@ -51,6 +51,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: git version
         run: git --version
+      # The apply tests drive a real rclone against a local directory remote (no network).
+      - name: Install rclone (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q rclone && rclone version
+      - name: Install rclone (macOS)
+        if: runner.os == 'macOS'
+        run: brew install rclone && rclone version
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
       - name: Show whether the wrong-case guard ran

@@ -372,6 +372,7 @@ pub fn apply_summary(r: &disk_cleaner_core::apply::ApplyReport) -> String {
 }
 
 /// Human summary of a restore.
+#[cfg(unix)]
 pub fn restore_summary(r: &disk_cleaner_core::apply::restore::RestoreReport) -> String {
     let mut o = String::new();
     let _ = writeln!(
