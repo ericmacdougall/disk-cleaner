@@ -3,12 +3,10 @@ name: Pages
 # Publishes the static site in site/ to GitHub Pages. Pages must be enabled in the
 # repository settings (Source: GitHub Actions) by a maintainer; this file does not do that.
 # Until then the gate job finds Pages off and the deploy job is skipped, so the run stays green.
+# The automatic push trigger was removed so this no longer consumes
+# GitHub-hosted Actions minutes. Deploy by hand when minutes are available:
+#   gh workflow run pages.yml
 on:
-  push:
-    branches: [main]
-    paths:
-      - "site/**"
-      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:

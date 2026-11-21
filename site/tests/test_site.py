@@ -805,19 +805,25 @@ class TestWorkflows(unittest.TestCase):
 
     def test_site_ci_triggers_and_command(self):
         y = read(SITE_YML)
-        for needle in ("push:", "pull_request:", '"site/**"', ".github/workflows/site.yml",
-                       ".github/workflows/pages.yml", "ubuntu-latest", UNIT_CMD):
-            self.assertIn(needle, y, needle)
+        self.assertIn("workflow_dispatch:", y)
+        self.assertNotIn("push:", y)
+        self.assertNotIn("pull_request:", y)
+        self.assertIn("ubuntu-latest", y)
+        self.assertIn(UNIT_CMD, y)
+        # Day-to-day replacement for the old push/pull_request triggers.
+        script = read(ROOT / "scripts" / "local-ci.sh")
+        self.assertIn(UNIT_CMD, script)
 
     def test_site_ci_runs_when_a_checked_source_changes(self):
-        # These tests read the root README, ci.yml and the core's model and plan sources, so a change to
-        # any of them must run them, on push and on pull requests alike.
-        y = read(SITE_YML)
-        for trigger in ("push", "pull_request"):
-            block = re.search(rf"^  {trigger}:\s*\n((?:    .*\n)+)", y, re.M).group(1)
-            for path in ("README.md", ".github/workflows/ci.yml", "crates/core/src/model.rs",
-                         "crates/core/src/plan.rs", "crates/core/src/facts.rs", "crates/cli/src/report.rs"):
-                self.assertIn(f'- "{path}"', block, f"{trigger}: {path}")
+        # These tests still read the root README, ci.yml and the core's model and plan sources.
+        # GitHub no longer starts this workflow on those paths; local-ci.sh is what must be run.
+        script = read(ROOT / "scripts" / "local-ci.sh")
+        self.assertIn(UNIT_CMD, script)
+        docs = read(ROOT / "docs" / "LOCAL-CI.md")
+        self.assertIn("scripts/local-ci.sh", docs)
+        for path in ("README.md", ".github/workflows/ci.yml", "crates/core/src/model.rs",
+                     "crates/core/src/plan.rs", "crates/core/src/facts.rs", "crates/cli/src/report.rs"):
+            self.assertTrue((ROOT / path).is_file(), path)
 
     def test_pages_runs_tests_before_upload(self):
         y = read(PAGES_YML)
@@ -873,7 +879,8 @@ class TestWorkflows(unittest.TestCase):
     def test_pages_does_not_deploy_on_pull_requests(self):
         y = read(PAGES_YML)
         self.assertNotIn("pull_request", y)
-        self.assertIn("branches: [main]", y)
+        self.assertNotIn("push:", y)
+        self.assertIn("workflow_dispatch:", y)
 
 
 GATE_CMD = "python3 -I site/tools/pages_gate.py"
