@@ -1,0 +1,16 @@
+# AC-14, NEG-11: without identity (device and inode 0) the union merges nothing.
+rule: no identity (AC-14)
+mutant: the union merges on identity (0, 0)
+killing-test: lib context
+assertion: assertion failed: !c.add(Some((0, 0))
+--- a/crates/core/src/context.rs
++++ b/crates/core/src/context.rs
+@@ -50,7 +50,7 @@
+     /// nothing is merged. Returns whether it was new.
+     pub fn add(&mut self, id: Option<(u64, u64)>, kind: &str) -> bool {
+         match id {
+-            Some(id) if id != NO_IDENTITY && !self.ids.contains_key(&id) => {
++            Some(id) if !self.ids.contains_key(&id) => {
+                 self.ids.insert(id, kind.to_string());
+                 true
+             }

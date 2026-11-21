@@ -7,6 +7,7 @@
 //! of their names, so the result (which name owns a hard-linked inode, the order of pieces) does
 //! not depend on the order the file system returns entries.
 
+use crate::context::SecretContext;
 use crate::model::{Class, Node};
 use crate::rules::RuleSet;
 use rayon::prelude::*;
@@ -28,6 +29,15 @@ pub const DEFAULT_MIN_DUP_BYTES: u64 = 64 * 1024;
 /// Why every piece is incomplete on a platform without file identity.
 pub const NO_IDENTITY: &str = "this platform does not report file identity and change time, so a \
                                change after the scan cannot be detected";
+
+/// Why every piece below a scan root whose real path could not be established is incomplete.
+const UNRESOLVED_ROOT: &str = "the real path of its scan root could not be established, so where \
+                               it physically lies, and whether a secret directory or a \
+                               repository holds it, is unknown; kept";
+
+/// Why every piece is incomplete when the walk saw more secret-named symlinks than it records.
+const CONTEXT_OVERFLOW: &str = "the scan saw more secret-named symbolic links than it records, so \
+                                what they protect is not fully known; kept";
 
 /// Options of the survey, recorded in the scan file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +275,29 @@ fn has_identity() -> bool {
     cfg!(unix)
 }
 
+/// The identity of what `p` names, symlinks followed (`None` when it cannot be read).
+fn dir_id(p: &Path) -> Option<(u64, u64)> {
+    let m = meta(&std::fs::metadata(p).ok()?);
+    Some((m.dev, m.ino))
+}
+
+/// The secret kind the names of `path`'s components give, as a scan root's spelling gives it
+/// ([`Place::of_names`]): what the main scan asks about a symlink's directory and a root's
+/// spellings.
+pub(crate) fn secret_by_names(path: &Path, rules: &RuleSet) -> Option<String> {
+    Place::of_names(path, rules).secret_dir
+}
+
+/// What the main scan tells the survey about its roots beyond their walked paths.
+pub(crate) struct RootContext<'a> {
+    /// Per walked root, every spelling the user gave that names it (`RootPlan::spellings`).
+    pub spellings: &'a [Vec<PathBuf>],
+    /// The secret context by identity, closed after the main walk.
+    pub secret: &'a SecretContext,
+    /// Walked roots whose real path could not be established.
+    pub unresolved: &'a [PathBuf],
+}
+
 // ----------------------------------------------------------------------------------------------
 // The in-memory tree.
 
@@ -307,6 +340,10 @@ struct DirRec {
     secret_top: bool,
     /// Its whole path is valid UTF-8, as spelled and as real (`Place::exact`).
     exact: bool,
+    /// Its identity (device, inode), as listed (the root's: of the directory it names).
+    id: (u64, u64),
+    /// It lies below a scan root whose real path could not be established.
+    unresolved: bool,
 }
 
 #[derive(Debug)]
@@ -341,8 +378,9 @@ fn utf8(name: &OsStr) -> bool {
 
 /// Read every root into memory. Directories that are other scan roots are not entered here
 /// (they are walked on their own); with `one_file_system`, directories on another device than
-/// their root are not entered.
-fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
+/// their root are not entered. `unresolved` are the roots whose real path could not be
+/// established.
+fn read_tree(roots: &[PathBuf], unresolved: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
     let node_at: HashMap<PathBuf, usize> = nodes
         .iter()
         .enumerate()
@@ -390,11 +428,14 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
             secret_dir: None,
             secret_top: false,
             exact: true,
+            id: (md.dev, md.ino),
+            unresolved: unresolved.contains(root),
         });
         t.roots.push(idx);
         let mut stack = vec![idx];
         while let Some(d) = stack.pop() {
             let path = t.dirs[d].path.clone();
+            let in_unresolved = t.dirs[d].unresolved;
             let mut names: Vec<OsString> = Vec::new();
             match std::fs::read_dir(&path) {
                 Ok(rd) => {
@@ -440,6 +481,8 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
                             secret_dir: None,
                             secret_top: false,
                             exact: true,
+                            id: (m.dev, m.ino),
+                            unresolved: in_unresolved,
                         });
                         t.dirs[d].children.push(Child::Dir(ci));
                         if !mount && !other {
@@ -634,9 +677,31 @@ impl Place {
         }
     }
 
+    /// The place a path's names alone give: `step` folded over its components from the top, with
+    /// no facts on disk and no nodes. It is what a spelling adds to a scan root's place, and what
+    /// the directory names above a symlink say about the link (on the raw names, CT-A1).
+    fn of_names(path: &Path, rules: &RuleSet) -> Place {
+        let mut place = Place::top();
+        let names: Vec<&Path> = path.ancestors().collect();
+        for a in names.iter().rev() {
+            place = place.step(
+                &DirFacts {
+                    name: a.file_name(),
+                    node: None,
+                    has_head: false,
+                    has_objects_and_refs: false,
+                },
+                &[],
+                rules,
+            );
+        }
+        place
+    }
+
     /// The place of a scan root: `step` folded over every component of its real path, down to
     /// and including the root itself, with the facts on disk (symlinks not followed below the
-    /// real path) and the scan's nodes by real path. Its spelling is folded too, by names only;
+    /// real path) and the scan's nodes by real path; a component whose identity is in secret
+    /// context (`secret`) is a secret directory. Its spelling is folded too, by names only;
     /// secrecy, git-directory context and inexactness found there are added, never taken away.
     fn of_root(
         root: &Path,
@@ -645,6 +710,7 @@ impl Place {
         real_nodes: &HashMap<PathBuf, usize>,
         nodes: &[Node],
         rules: &RuleSet,
+        secret: &SecretContext,
     ) -> Place {
         let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let lstat_is = |p: &Path, want_dir: bool| {
@@ -671,22 +737,14 @@ impl Place {
                 nodes,
                 rules,
             );
+            if place.secret_dir.is_none() {
+                if let Some(k) = dir_id(a).and_then(|id| secret.kind_of(id)) {
+                    place.secret_dir = Some(k.to_string());
+                }
+            }
         }
         for spelling in std::iter::once(root).chain(spellings.iter().map(PathBuf::as_path)) {
-            let mut spelled = Place::top();
-            let names: Vec<&Path> = spelling.ancestors().collect();
-            for a in names.iter().rev() {
-                spelled = spelled.step(
-                    &DirFacts {
-                        name: a.file_name(),
-                        node: None,
-                        has_head: false,
-                        has_objects_and_refs: false,
-                    },
-                    nodes,
-                    rules,
-                );
-            }
+            let spelled = Place::of_names(spelling, rules);
             if place.secret_dir.is_none() {
                 place.secret_dir = spelled.secret_dir;
             }
@@ -756,11 +814,12 @@ fn real_node_paths(roots: &[PathBuf], nodes: &[Node]) -> HashMap<PathBuf, usize>
 }
 
 /// Fill every directory's place (`Place`), top down, and every entry's git-directory and secret
-/// status from its directory's place and its own name.
+/// status from its directory's place and its own name. A directory or entry whose identity is
+/// in secret context (`rc.secret`) is secret however it was reached.
 fn annotate(
     t: &mut Tree,
     roots: &[PathBuf],
-    spellings: &[Vec<PathBuf>],
+    rc: &RootContext,
     nodes: &[Node],
     rules: &RuleSet,
     order: &[usize],
@@ -769,7 +828,7 @@ fn annotate(
     let names_of = |p: &Path| -> Vec<PathBuf> {
         let mut v = vec![p.to_path_buf()];
         if let Some(k) = roots.iter().position(|r| r == p) {
-            for s in spellings.get(k).into_iter().flatten() {
+            for s in rc.spellings.get(k).into_iter().flatten() {
                 if !v.contains(s) {
                     v.push(s.clone());
                 }
@@ -787,7 +846,7 @@ fn annotate(
         })
     };
     for &d in order {
-        let place = match t.dirs[d].parent {
+        let mut place = match t.dirs[d].parent {
             Some(p) => {
                 // A directory that is another scan root is not entered here: its facts come from
                 // its own walk, and its context from `Place::of_root` there.
@@ -817,9 +876,17 @@ fn annotate(
                     &real_nodes,
                     nodes,
                     rules,
+                    rc.secret,
                 )
             }
         };
+        // Context by identity: a root spelling or a symlink in secret context named this
+        // directory (it passes on to everything below, through `step`).
+        if place.secret_dir.is_none() {
+            if let Some(k) = rc.secret.kind_of(t.dirs[d].id) {
+                place.secret_dir = Some(k.to_string());
+            }
+        }
         place.apply(&mut t.dirs[d]);
         // Where a secret piece starts: the topmost secret directory, or a scan root inside one
         // (a root always starts its own pieces). Inside a git directory nothing is cut out (the
@@ -840,10 +907,20 @@ fn annotate(
         // Git's own bookkeeping names (refs, reflogs, packed-refs) are branch names.
         let git_named = in_gitdir
             && (dir.git_named || (dir.git_top && t.ents[e].name == OsStr::new("packed-refs")));
+        // A symlink in secret context named this file (its own identity; a symlink entry's is
+        // the link's own).
+        let m = t.ents[e].m;
+        let by_id = if t.ents[e].ok {
+            rc.secret.kind_of((m.dev, m.ino))
+        } else {
+            None
+        };
         let secret = if in_gitdir {
             None
         } else if let Some(k) = &dir.secret_dir {
             Some(k.clone())
+        } else if let Some(k) = by_id {
+            Some(k.to_string())
         } else {
             // On the raw name, never on a conversion that can fail (CT-A1).
             rules
@@ -852,6 +929,7 @@ fn annotate(
         };
         t.ents[e].gitdir_secret = in_gitdir
             && (dir.secret_dir.is_some()
+                || by_id.is_some()
                 || (!git_named && rules.secret_file(&t.ents[e].name, false).is_some()));
         t.ents[e].in_gitdir = in_gitdir;
         t.ents[e].secret = secret;
@@ -929,6 +1007,9 @@ struct Cutter<'a> {
     dir_overhead: u64,
     /// Per directory: logical bytes and member count of its region (Normal context).
     agg: Vec<(u64, u64)>,
+    /// The secret context may be missing what some secret-named links protect
+    /// ([`SecretContext::overflow`]): every piece is incomplete.
+    secret_overflow: bool,
 }
 
 impl<'a> Cutter<'a> {
@@ -1084,6 +1165,10 @@ impl<'a> Cutter<'a> {
                  would back up",
                 self.rel(anchor, er.dir, Some(&er.name))
             ))
+        } else if a.unresolved {
+            Some(UNRESOLVED_ROOT.to_string())
+        } else if self.secret_overflow {
+            Some(CONTEXT_OVERFLOW.to_string())
         } else if !has_identity() {
             Some(NO_IDENTITY.to_string())
         } else {
@@ -1478,10 +1563,14 @@ fn blobs(
     opts: &PieceOptions,
     totals: &mut PieceTotals,
 ) -> Vec<Blob> {
-    // A name whose path is valid UTF-8 throughout, as spelled and as real. A file reachable by
-    // any other name is never read: its name may be a secret the rules cannot fully see, and its
-    // path cannot be written into the scan file and read back (CT-A1).
-    let exact_name = |e: usize| t.ents[e].utf8 && t.dirs[t.ents[e].dir].exact;
+    // A name whose path is valid UTF-8 throughout, as spelled and as real, below a root whose
+    // real path is known. A file reachable by any other name is never read: its name may be a
+    // secret the rules cannot fully see, its path cannot be written into the scan file and read
+    // back (CT-A1), or where it lies is unknown.
+    let exact_name = |e: usize| {
+        let dir = &t.dirs[t.ents[e].dir];
+        t.ents[e].utf8 && dir.exact && !dir.unresolved
+    };
     let every_name_exact = |e: usize| {
         let m = t.ents[e].m;
         exact_name(e)
@@ -1636,15 +1725,22 @@ pub fn survey(
     opts: &PieceOptions,
 ) -> PieceSurvey {
     let spellings: Vec<Vec<PathBuf>> = roots.iter().map(|r| vec![r.clone()]).collect();
-    survey_named(roots, &spellings, nodes, one_file_system, rules, opts)
+    let secret = SecretContext::default();
+    let rc = RootContext {
+        spellings: &spellings,
+        secret: &secret,
+        unresolved: &[],
+    };
+    survey_named(roots, &rc, nodes, one_file_system, rules, opts)
 }
 
-/// [`survey`] with, per root, every spelling the user gave for it (the scan's normalised roots):
-/// each one's names add context (secrecy, git directory, inexactness) to its root, never take it
-/// away.
+/// [`survey`] with what the main scan knows about its roots (`rc`): per root, every spelling the
+/// user gave for it, whose names add context (secrecy, git directory, inexactness) to its root,
+/// never take it away; the secret context by identity; and the roots whose real path could not
+/// be established, whose pieces are kept and whose files are never read.
 pub(crate) fn survey_named(
     roots: &[PathBuf],
-    spellings: &[Vec<PathBuf>],
+    rc: &RootContext,
     nodes: &[Node],
     one_file_system: bool,
     rules: &RuleSet,
@@ -1652,10 +1748,10 @@ pub(crate) fn survey_named(
 ) -> PieceSurvey {
     let walked_at = unix_now();
     let mut totals = PieceTotals::default();
-    let mut t = read_tree(roots, one_file_system, nodes);
+    let mut t = read_tree(roots, rc.unresolved, one_file_system, nodes);
     let dirs_order = preorder_dirs(&t);
     let ents_order = preorder_ents(&t);
-    annotate(&mut t, roots, spellings, nodes, rules, &dirs_order);
+    annotate(&mut t, roots, rc, nodes, rules, &dirs_order);
     let names = own_inodes(&mut t, &ents_order, &mut totals);
 
     let mut cutter = Cutter {
@@ -1668,6 +1764,7 @@ pub(crate) fn survey_named(
         keys: Vec::new(),
         dir_overhead: 0,
         agg: Vec::new(),
+        secret_overflow: rc.secret.overflow,
     };
     cutter.compute_agg(&dirs_order);
     cutter.cut_all(&dirs_order);

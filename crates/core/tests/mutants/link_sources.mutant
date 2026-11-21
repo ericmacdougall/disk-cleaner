@@ -1,0 +1,17 @@
+# AC-1, NEG-2: a symlink whose own name is secret protects what it names.
+rule: secret-named symlink source
+mutant: symlinks are never context sources (the walk records none)
+killing-test: rescue n1
+assertion: vault/aws/x.bin was opened
+--- a/crates/core/src/scan.rs
++++ b/crates/core/src/scan.rs
+@@ -298,6 +298,9 @@
+             // Dangling, or no identity: it names nothing the union could reach.
+             return;
+         };
++        if target != (0, 0) {
++            return;
++        }
+         let named_kind = match own_secret(name, rules) {
+             Some(k) => Some(k),
+             None => {

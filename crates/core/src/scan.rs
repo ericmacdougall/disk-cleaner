@@ -5,6 +5,7 @@
 //! directories, assigns each to its innermost classified ancestor and rolls sizes up. Phase 3
 //! gathers git facts for the repos found. Nothing here writes, moves or deletes anything.
 
+use crate::context::{SecretContext, SeenLink};
 use crate::error::{Error, Result};
 use crate::facts::{collect_repo_info, FactsConfig, RepoCheck};
 use crate::gitshape;
@@ -80,6 +81,10 @@ struct EntryMeta {
     pruned_root: Option<usize>,
     /// For a symlink: where it leads, read with `readlink` and resolved as a path.
     link_target: Option<LinkTarget>,
+    /// For a symlink: the identity of what it names, followed with `stat` (never opened), and
+    /// whether that is a directory. `None` when it dangles or there is no identity.
+    link_id: Option<(u64, u64)>,
+    link_dir: bool,
 }
 
 /// Where a symlink leads. The link is read with `readlink` and its target resolved as a path
@@ -107,6 +112,8 @@ fn meta_from(md: &Metadata) -> EntryMeta {
         mount_skipped: false,
         pruned_root: None,
         link_target: None,
+        link_id: None,
+        link_dir: false,
     }
 }
 
@@ -131,12 +138,16 @@ fn meta_from(md: &Metadata) -> EntryMeta {
         mount_skipped: false,
         pruned_root: None,
         link_target: None,
+        link_id: None,
+        link_dir: false,
     }
 }
 
 /// What the walk learns about one directory.
 #[derive(Default)]
 struct DirAgg {
+    /// Its identity (device, inode); a root's is that of the directory it names.
+    id: (u64, u64),
     /// Allocated bytes of the directory entry itself plus its direct non-directory entries.
     bytes: u64,
     files: u64,
@@ -263,6 +274,66 @@ struct Walk {
     unreadable_dirs: HashSet<PathBuf>,
     /// Where the walk could not look (counts and examples; `complete` is set at the end).
     coverage: Coverage,
+    /// Symlinks for the secret context ([`crate::context`]), kept apart so that the bound on
+    /// ordinary links never drops one that gives context.
+    ctx: ContextLinks,
+}
+
+/// Symlinks the walk saw, for the secret context: those whose own name or a directory name
+/// above them is secret (they seed the union), and the others with a target (they carry it).
+#[derive(Default)]
+struct ContextLinks {
+    named: Vec<SeenLink>,
+    named_overflow: bool,
+    ordinary: Vec<SeenLink>,
+    ordinary_overflow: bool,
+    /// The last directory asked about, and the secret kind its names give (entries of one
+    /// directory come together).
+    last_dir: Option<(PathBuf, Option<String>)>,
+}
+
+impl ContextLinks {
+    fn note(&mut self, path: &Path, name: &OsStr, dir: &Path, meta: &EntryMeta, rules: &RuleSet) {
+        let Some(target) = meta.link_id else {
+            // Dangling, or no identity: it names nothing the union could reach.
+            return;
+        };
+        let named_kind = match own_secret(name, rules) {
+            Some(k) => Some(k),
+            None => {
+                if self.last_dir.as_ref().map(|(d, _)| d.as_path()) != Some(dir) {
+                    let kind = crate::pieces::secret_by_names(dir, rules);
+                    self.last_dir = Some((dir.to_path_buf(), kind));
+                }
+                self.last_dir.as_ref().and_then(|(_, k)| k.clone())
+            }
+        };
+        let link = SeenLink {
+            path: path.to_path_buf(),
+            target: Some(target),
+            target_is_dir: meta.link_dir,
+            named_kind,
+        };
+        let (list, overflow) = if link.named_kind.is_some() {
+            (&mut self.named, &mut self.named_overflow)
+        } else {
+            (&mut self.ordinary, &mut self.ordinary_overflow)
+        };
+        if list.len() < MAX_LINKS {
+            list.push(link);
+        } else {
+            *overflow = true;
+        }
+    }
+}
+
+/// The secret kind a symlink's own name gives: a secret directory name or a secret file name
+/// (outside an artifact, the stricter reading), on the raw name.
+fn own_secret(name: &OsStr, rules: &RuleSet) -> Option<String> {
+    rules
+        .secret_dir(name)
+        .or_else(|| rules.secret_file(name, false))
+        .map(str::to_string)
 }
 
 const MAX_ISSUE_PATHS: usize = 100_000;
@@ -367,7 +438,7 @@ impl Walk {
         if ft.is_dir() || root_is_dir {
             if entry.depth == 0 && self.pruned_hit.contains(&root) {
                 // An enclosing root's walk counted this directory and stopped at it.
-                self.aggs.entry(path).or_default();
+                self.aggs.entry(path).or_default().id = (meta.dev, meta.ino);
                 return;
             }
             if let Some(r) = meta.pruned_root {
@@ -394,6 +465,7 @@ impl Walk {
             }
             let agg = self.aggs.entry(path.clone()).or_default();
             agg.bytes += meta.alloc;
+            agg.id = (meta.dev, meta.ino);
             if entry.depth > 0 {
                 let parent = parent_agg(&mut self.aggs, entry.parent_path());
                 parent.note_entry(&name, true, rules);
@@ -425,6 +497,9 @@ impl Walk {
             if let Some(t) = &meta.link_target {
                 self.note_link(&path, t);
             }
+            // On the raw name, never the lossy one (CT-A1).
+            self.ctx
+                .note(&path, &entry.file_name, entry.parent_path(), meta, rules);
         }
         if (name == "alternates" || name == "http-alternates") && in_objects_info(&path) {
             if self.refs.alternates.len() < MAX_ALTERNATES {
@@ -1090,6 +1165,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         refs: Refs::default(),
         unreadable_dirs: HashSet::new(),
         coverage: Coverage::default(),
+        ctx: ContextLinks::default(),
     };
     if opts.one_file_system && !cfg!(unix) {
         warnings.push("--one-file-system is not supported on this platform and was ignored".into());
@@ -1133,6 +1209,14 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                                     }
                                     Err(_) => LinkTarget::Unreadable,
                                 });
+                                // What it names, by identity: `stat` follows it, nothing is
+                                // opened.
+                                if let Ok(t) = std::fs::metadata(&path) {
+                                    let tm = meta_from(&t);
+                                    m.link_id =
+                                        (tm.dev != 0 || tm.ino != 0).then_some((tm.dev, tm.ino));
+                                    m.link_dir = t.is_dir();
+                                }
                             }
                             entry.client_state = m;
                         }
@@ -1171,6 +1255,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         skipped_overflow,
         refs,
         mut coverage,
+        ctx: ctx_links,
         ..
     } = walk;
     issues.truncate(MAX_ISSUES);
@@ -1185,6 +1270,15 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     // Phase 2: classification.
     let mut dirs: Vec<(PathBuf, DirAgg)> = aggs.into_iter().collect();
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    // The secret context, closed now: after the walk, before any git process.
+    let secret = secret_context(&plan_r, &dirs, ctx_links, &opts.rules);
+    // Walked roots whose real path could not be established: everything in them is kept.
+    let unresolved_roots: Vec<PathBuf> = plan_r
+        .unresolved
+        .iter()
+        .map(|(r, _)| r.clone())
+        .filter(|r| roots.contains(r))
+        .collect();
     let root_set: HashSet<PathBuf> = roots.iter().cloned().collect();
     let mut odd_dirs: Vec<PathBuf> = Vec::new();
     let names = RootNames(
@@ -1197,6 +1291,12 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             .collect(),
     );
     let mut builds = classify(&mut dirs, &opts.rules, &root_set, &names, &mut odd_dirs);
+    ask_inside_unresolved_roots(
+        &mut builds,
+        &plan_r.unresolved,
+        &unresolved_roots,
+        &mut warnings,
+    );
     if roots.len() > 1 && !plan_r.unresolved.is_empty() {
         for (r, err) in &plan_r.unresolved {
             warnings.push(diag(&format!(
@@ -1395,6 +1495,32 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         })
         .collect();
     let mut unverified: Vec<(usize, PathBuf, String)> = Vec::new();
+    // A repo below a scan root whose real path could not be established: where it lies is
+    // unknown (it may be in a secret place), so git is not run there; every fact is unknown.
+    let (unplaced_tasks, tasks): (Vec<_>, Vec<_>) = tasks
+        .into_iter()
+        .partition(|t| unresolved_roots.iter().any(|r| t.1.starts_with(r)));
+    for (i, _, _, regen) in &unplaced_tasks {
+        let why = "the real path of its scan root could not be established, so no git command \
+                   was run here";
+        infos.insert(
+            *i,
+            RepoInfo {
+                notes: vec![why.to_string()],
+                layout_issue: Some(why.to_string()),
+                ..RepoInfo::default()
+            },
+        );
+        for p in regen {
+            unverified.push((
+                *i,
+                p.clone(),
+                "lies below a scan root whose real path could not be established, so git was not \
+                 asked whether it is ignored"
+                    .to_string(),
+            ));
+        }
+    }
     // A repo whose `.git` is a symlink or special file: git is not run through it, every fact is
     // unknown and the artifacts inside ask.
     let (odd_tasks, tasks): (Vec<_>, Vec<_>) = tasks.into_iter().partition(|t| builds[t.0].git_odd);
@@ -1529,14 +1655,12 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     let nodes: Vec<Node> = builds.into_iter().map(|b| b.node).collect();
     // The second, read-only walk behind plan lanes (docs/SCAN-FORMAT.md, "Pieces and lanes").
     let pieces = opts.lanes.as_ref().map(|po| {
-        crate::pieces::survey_named(
-            &roots,
-            &plan_r.spellings,
-            &nodes,
-            opts.one_file_system,
-            &opts.rules,
-            po,
-        )
+        let rc = crate::pieces::RootContext {
+            spellings: &plan_r.spellings,
+            secret: &secret,
+            unresolved: &unresolved_roots,
+        };
+        crate::pieces::survey_named(&roots, &rc, &nodes, opts.one_file_system, &opts.rules, po)
     });
 
     Ok(ScanResult {
@@ -1817,7 +1941,15 @@ struct RootPlan {
     /// Walked roots whose real path could not be established, with the error: which directories
     /// of the other walks enclose them is unknown.
     unresolved: Vec<(PathBuf, String)>,
+    /// Every root as given, whatever became of it (walked, merged with another by identity,
+    /// dropped inside another, unresolved). Its names give the secret context to the directory
+    /// it names, wherever the walk meets it.
+    given: Vec<GivenRoot>,
 }
+
+/// A root as given: its spelling, its real path (the spelling when that could not be
+/// established) and the identity of the directory it names.
+type GivenRoot = (PathBuf, PathBuf, Option<(u64, u64)>);
 
 /// Normalise the scan roots. Each is compared by its real path: a root that is the same directory
 /// as an earlier one is dropped; a root inside another root is dropped when that root's walk
@@ -1837,6 +1969,7 @@ fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -
     type Root = (PathBuf, PathBuf, Option<(u64, u64)>, Vec<PathBuf>);
     let mut uniq: Vec<Root> = Vec::new();
     let mut unresolved: Vec<(PathBuf, String)> = Vec::new();
+    let mut given: Vec<GivenRoot> = Vec::new();
     for s in spelled {
         let c = match std::fs::canonicalize(&s) {
             Ok(c) => c,
@@ -1850,6 +1983,7 @@ fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -
         // Two roots are one directory when they have one identity (a symlinked spelling, a
         // firmlink or bind mount spelling, `dir/..`); without identity, when one real path.
         let id = dir_identity(&c);
+        given.push((s.clone(), c.clone(), id));
         let same = uniq.iter_mut().find(|(_, k, kid, _)| match (id, *kid) {
             (Some(a), Some(b)) => a == b,
             _ => *k == c,
@@ -1975,6 +2109,7 @@ fn plan_roots(spelled: Vec<PathBuf>, one_fs: bool, warnings: &mut Vec<String>) -
             .map(|&i| pos(i))
             .collect(),
         unresolved,
+        given,
     }
 }
 
@@ -1999,6 +2134,153 @@ fn ask_for_unresolved_roots(builds: &mut [Build], unresolved: &[(PathBuf, String
             b.node.ask_reason.get_or_insert_with(|| why.clone());
         }
     }
+}
+
+/// Everything inside a walked scan root whose real path could not be established asks, whatever
+/// the number of roots: where it physically lies (inside a secret directory or a repository, say)
+/// is unknown, so nothing in it is removed. Its pieces are kept and never read (the survey) and
+/// no git runs there (phase 3).
+fn ask_inside_unresolved_roots(
+    builds: &mut [Build],
+    unresolved: &[(PathBuf, String)],
+    walked: &[PathBuf],
+    warnings: &mut Vec<String>,
+) {
+    for r in walked {
+        let err = unresolved
+            .iter()
+            .find(|(u, _)| u == r)
+            .map(|(_, e)| e.as_str())
+            .unwrap_or("unknown error");
+        warnings.push(diag(&format!(
+            "scan root {} could not be resolved to its real path ({err}); everything in it is \
+             kept and nothing in it is read",
+            r.display()
+        )));
+        let why = diag(&format!(
+            "its scan root {} could not be resolved to its real path ({err}), so where it lies, \
+             and whether a secret directory or a repository holds it, is unknown; scan it by \
+             its real path",
+            r.display()
+        ));
+        for b in builds.iter_mut().filter(|b| b.path.starts_with(r)) {
+            b.node.ask_reason.get_or_insert_with(|| why.clone());
+        }
+    }
+}
+
+/// Build and close the secret context ([`crate::context`]) from what the walk saw, after the
+/// walk and before any git process: every root as given whose spelling or real path has a
+/// secret-named component gives the directory it names that context; every recorded symlink
+/// with a secret name, or below a secret-named directory, gives what it names; and context
+/// passes on through the symlinks below each directory that gains it (listed again, inside the
+/// scan only, when the walk saw more ordinary links than it records).
+fn secret_context(
+    plan: &RootPlan,
+    dirs: &[(PathBuf, DirAgg)],
+    links: ContextLinks,
+    rules: &RuleSet,
+) -> SecretContext {
+    let mut ctx = SecretContext::default();
+    ctx.overflow = links.named_overflow;
+    for (spelled, real, id) in &plan.given {
+        let kind = crate::pieces::secret_by_names(spelled, rules)
+            .or_else(|| crate::pieces::secret_by_names(real, rules));
+        if let Some(k) = kind {
+            ctx.add(*id, &k);
+        }
+    }
+    let relist_needed = links.ordinary_overflow;
+    let mut all = links.named;
+    all.extend(links.ordinary);
+    // The walked paths of each directory context may reach: what a link or a root spelling
+    // names, and every ancestor of a walked root (a link may name one, `.aws -> ..`), whose path
+    // is a prefix of that root's walked paths.
+    let mut wanted: HashSet<(u64, u64)> = all
+        .iter()
+        .filter(|l| l.target_is_dir)
+        .filter_map(|l| l.target)
+        .collect();
+    wanted.extend(ctx.ids().copied());
+    let mut dir_paths: HashMap<(u64, u64), Vec<PathBuf>> = HashMap::new();
+    for (p, agg) in dirs {
+        if wanted.contains(&agg.id) {
+            dir_paths.entry(agg.id).or_default().push(p.clone());
+        }
+    }
+    for r in &plan.roots {
+        for a in r.ancestors().skip(1) {
+            if let Some(id) = dir_identity(a) {
+                let v = dir_paths.entry(id).or_default();
+                if !v.iter().any(|p| p == a) {
+                    v.push(a.to_path_buf());
+                }
+            }
+        }
+    }
+    let roots = &plan.roots;
+    let mut relist = |dir: &Path| -> Vec<SeenLink> {
+        let mut out = Vec::new();
+        for r in roots {
+            if dir.starts_with(r) {
+                out.extend(links_below(dir, rules));
+                break;
+            }
+            if r.starts_with(dir) {
+                out.extend(links_below(r, rules));
+            }
+        }
+        out
+    };
+    let relist: Option<crate::context::Relist> = if relist_needed {
+        Some(&mut relist)
+    } else {
+        None
+    };
+    ctx.close(&mut all, &dir_paths, relist);
+    ctx
+}
+
+/// Every symlink below `dir` that names something with identity, listed again for the secret
+/// context: directories are listed, entries `lstat`ed and links followed with `stat` only;
+/// nothing is opened.
+fn links_below(dir: &Path, rules: &RuleSet) -> Vec<SeenLink> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        let dir_kind = crate::pieces::secret_by_names(&d, rules);
+        for e in rd.flatten() {
+            let p = e.path();
+            let Ok(md) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if md.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if !md.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(t) = std::fs::metadata(&p) else {
+                continue;
+            };
+            let tm = meta_from(&t);
+            if tm.dev == 0 && tm.ino == 0 {
+                continue;
+            }
+            let named_kind = own_secret(&e.file_name(), rules).or_else(|| dir_kind.clone());
+            out.push(SeenLink {
+                path: p,
+                target: Some((tm.dev, tm.ino)),
+                target_is_dir: t.is_dir(),
+                named_kind,
+            });
+        }
+    }
+    out
 }
 
 /// Does the walk of the root `anc` reach `desc` (both real paths, `desc` strictly inside)? Every

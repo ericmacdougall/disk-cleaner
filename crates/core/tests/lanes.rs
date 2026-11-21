@@ -681,6 +681,7 @@ fn neg1_secrets_are_kept_and_excluded_everywhere() {
     write(&loose.join("api_token.txt"), "x\n");
     write(&loose.join(".ssh").join("config"), "Host x\n");
     write(&loose.join("plain.txt"), "hello\n");
+    write(&loose.join("notes.txt"), "hello\n");
     let repo = pushed_repo(&root, &remotes, "app");
     write(&repo.join("id_rsa"), "key\n");
     #[cfg(unix)]
@@ -702,6 +703,9 @@ fn neg1_secrets_are_kept_and_excluded_everywhere() {
     ];
     if cfg!(unix) {
         secrets.push(loose.join("db_password"));
+        // What a secret-named symlink names is secret too (rescue AC-1, NEG-2; this assertion
+        // changed from "plain.txt is not secret" with the context union, AC-9).
+        secrets.push(loose.join("plain.txt"));
     }
     for s in &secrets {
         let lp = the_piece(&res, l, s);
@@ -709,7 +713,7 @@ fn neg1_secrets_are_kept_and_excluded_everywhere() {
         assert!(lp.secret.is_some(), "{}", s.display());
         assert!(lp.reason.contains("stays local"), "{}", lp.reason);
     }
-    for s in [loose.join(".env.example"), loose.join("plain.txt")] {
+    for s in [loose.join(".env.example"), loose.join("notes.txt")] {
         assert!(the_piece(&res, l, &s).secret.is_none(), "{}", s.display());
     }
     assert!(

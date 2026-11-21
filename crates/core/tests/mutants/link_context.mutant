@@ -1,0 +1,16 @@
+# AC-1, NEG-12: a symlink with an ordinary name inside a secret directory protects what it names.
+rule: context through symlinks in secret context
+mutant: only a symlink's own name counts (a secret-named directory above it gives nothing)
+killing-test: rescue n1
+assertion: vault/work/x.bin was opened
+--- a/crates/core/src/scan.rs
++++ b/crates/core/src/scan.rs
+@@ -305,7 +305,7 @@
+                     let kind = crate::pieces::secret_by_names(dir, rules);
+                     self.last_dir = Some((dir.to_path_buf(), kind));
+                 }
+-                self.last_dir.as_ref().and_then(|(_, k)| k.clone())
++                None
+             }
+         };
+         let link = SeenLink {

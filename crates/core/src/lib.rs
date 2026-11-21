@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+mod context;
 pub mod error;
 pub mod facts;
 pub mod git;

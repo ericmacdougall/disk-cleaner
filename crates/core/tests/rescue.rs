@@ -26,6 +26,9 @@ use std::time::Duration;
 const KIB: usize = 1024;
 
 fn scan_roots_opts(roots: &[PathBuf], facts: FactsConfig, po: PieceOptions) -> ScanResult {
+    // Every content open the library attempts is recorded (process-wide; each test tells its
+    // own apart by its temporary directory).
+    disk_cleaner_core::testing::record_opens();
     // Status-change times at or after the survey's start count as "changed after the scan".
     std::thread::sleep(Duration::from_millis(1100));
     let mut opts = ScanOptions::new(roots.to_vec());
@@ -83,6 +86,12 @@ fn real(p: &Path) -> PathBuf {
     fs::canonicalize(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
 }
 
+/// The real path of a path the scan recorded, or the path itself when it has none that can be
+/// established (a root the scan could not resolve records its spelling).
+fn real_or_recorded(p: &Path) -> PathBuf {
+    fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Every (real path of a member, plan piece) pair of the plan.
 fn members<'a>(res: &ScanResult, p: &'a Plan) -> Vec<(PathBuf, &'a LanePiece)> {
     let survey = res.pieces.as_ref().expect("pieces");
@@ -90,7 +99,7 @@ fn members<'a>(res: &ScanResult, p: &'a Plan) -> Vec<(PathBuf, &'a LanePiece)> {
     let mut out = Vec::new();
     for lp in &lanes.pieces {
         let sp = &survey.pieces[lp.scan_piece];
-        let base = real(Path::new(&sp.path));
+        let base = real_or_recorded(Path::new(&sp.path));
         let names: Vec<String> = match &lp.member {
             Some(m) => vec![m.clone()],
             None => sp
@@ -136,7 +145,7 @@ fn hashed_under(res: &ScanResult, dir: &Path) -> Vec<String> {
         .filter(|c| {
             let p = Path::new(&c.path);
             let r = match (p.parent(), p.file_name()) {
-                (Some(d), Some(n)) => real(d).join(n),
+                (Some(d), Some(n)) => real_or_recorded(d).join(n),
                 _ => p.to_path_buf(),
             };
             r.starts_with(&dir)
@@ -165,8 +174,16 @@ fn expect_kept(bad: &mut Vec<String>, label: &str, res: &ScanResult, p: &Plan, d
     }
 }
 
-/// `dir` holds members, none of them hashed, each in a secret `keep` piece.
+/// Content opens the library attempted under `dir` (by real path), with [`scan_roots_opts`].
+fn opened_under(dir: &Path) -> Vec<PathBuf> {
+    disk_cleaner_core::testing::opens_under(&real(dir))
+}
+
+/// `dir` holds members, none of them hashed or opened, each in a secret `keep` piece.
 fn expect_secret(bad: &mut Vec<String>, label: &str, res: &ScanResult, p: &Plan, dir: &Path) {
+    for o in opened_under(dir) {
+        bad.push(format!("{label}: {} was opened", o.display()));
+    }
     let under = pieces_under(res, p, dir);
     if under.is_empty() {
         bad.push(format!(
@@ -341,7 +358,6 @@ fn cta3_a_symlinked_root_counts_and_classifies_exactly_as_its_target() {
 // PR review a3-3 F1: context of a root spelling that root de-duplication drops.
 
 #[test]
-#[ignore = "red at df5d6df; enabled by the context-union slice (goodqa#16529)"]
 fn a3f1_an_alias_root_with_a_secret_name_protects_in_every_order() {
     let mut bad = Vec::new();
     for name in ["secrets", ".aws"] {
@@ -496,20 +512,41 @@ fn a3f3_a_directory_that_git_data_refers_to_is_kept() {
 }
 
 // ----------------------------------------------------------------------------------------------
-// N1: a symbolic link whose own name is a secret name protects what it names.
+// N1: a symbolic link whose own name is a secret name protects what it names (NEG-2), and so does
+// a link with an ordinary name in secret context, a link to a directory above it (NEG-12), a hard
+// link to a secret-named file, and secret names in another case (NEG-18).
 
 #[test]
-#[ignore = "red at df5d6df; enabled by the context-union slice (goodqa#16529)"]
 fn n1_a_secret_named_symlink_protects_what_it_names() {
     let tmp = tempfile::tempdir().unwrap();
     let root = real(tmp.path()).join("root");
     let vault = root.join("vault");
     content(&vault.join("aws"));
-    write(&vault.join("settings.txt"), "k=v\n");
+    // As long as the content files, so that it would be hashed if it were not secret.
+    write_bytes(&vault.join("settings.txt"), 100 * KIB);
+    content(&vault.join("work"));
     let home = root.join("home");
-    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(home.join(".ssh")).unwrap();
     symlink("../vault/aws", home.join(".aws")).unwrap();
     symlink("../vault/settings.txt", home.join(".env")).unwrap();
+    // NEG-12: an ordinary name inside a secret directory, and a secret name naming its own parent.
+    symlink("../../vault/work", home.join(".ssh").join("work")).unwrap();
+    // `up/inner/.aws -> ..` names `up`, the directory above the link (the whole of `up`).
+    let up = root.join("up");
+    content(&up);
+    fs::create_dir_all(up.join("inner")).unwrap();
+    symlink("..", up.join("inner").join(".aws")).unwrap();
+    // NEG-18: a secret-named file hard-linked under an ordinary name, and secret names in
+    // another case.
+    write_bytes(&root.join("cfg").join(".env"), 100 * KIB);
+    fs::create_dir_all(root.join("plain")).unwrap();
+    fs::hard_link(
+        root.join("cfg").join(".env"),
+        root.join("plain").join("settings.bak"),
+    )
+    .unwrap();
+    write_bytes(&root.join("caps").join(".ENV"), 100 * KIB);
+    write_bytes(&root.join("caps").join(".Ssh").join("id"), 100 * KIB);
     let ctl = root.join("ctl");
     content(&ctl);
     let res = scan_roots(std::slice::from_ref(&root));
@@ -517,7 +554,161 @@ fn n1_a_secret_named_symlink_protects_what_it_names() {
     let mut bad = Vec::new();
     expect_secret(&mut bad, ".aws", &res, &p, &vault.join("aws"));
     expect_secret(&mut bad, ".env", &res, &p, &vault.join("settings.txt"));
+    expect_secret(&mut bad, ".ssh/work", &res, &p, &vault.join("work"));
+    expect_secret(&mut bad, ".aws -> ..", &res, &p, &up);
+    expect_secret(
+        &mut bad,
+        "hard link",
+        &res,
+        &p,
+        &root.join("plain").join("settings.bak"),
+    );
+    expect_secret(&mut bad, ".ENV", &res, &p, &root.join("caps").join(".ENV"));
+    expect_secret(&mut bad, ".Ssh", &res, &p, &root.join("caps").join(".Ssh"));
     expect_control(&mut bad, "control", &res, &p, &ctl);
+    verdict(bad);
+}
+
+// ----------------------------------------------------------------------------------------------
+// NEG-13 (AC-1): a scan root whose real path cannot be established keeps its own pieces, opens
+// nothing and runs no git there; a control in another root still reclaims.
+
+/// A directory reached through `hops` relative symlink hops, each adding a 200-byte component,
+/// so its real path is longer than PATH_MAX (4096 on Linux, 1024 on macOS) while the spelling
+/// stays short: canonicalize fails, listing and stat work. Returns the spelling.
+fn too_long_to_resolve(base: &Path, hops: usize) -> PathBuf {
+    let long = "d".repeat(200);
+    fs::create_dir_all(base.join("h0")).unwrap();
+    for i in 0..hops {
+        // `base/h{i}` is short to spell; the kernel resolves it.
+        fs::create_dir(base.join(format!("h{i}")).join(&long)).unwrap();
+        symlink(format!("h{i}/{long}"), base.join(format!("h{}", i + 1))).unwrap();
+    }
+    base.join(format!("h{hops}"))
+}
+
+#[test]
+fn unresolved_root_keeps_its_own_pieces_and_another_root_still_reclaims() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = real(tmp.path());
+    let spelled = too_long_to_resolve(&base.join("deep"), 25);
+    // Vacuous unless the real path really cannot be established.
+    assert!(
+        fs::canonicalize(&spelled).is_err(),
+        "the fixture must not resolve: {}",
+        spelled.display()
+    );
+    content(&spelled.join("loose"));
+    let nm = spelled.join("app").join("node_modules");
+    write(&spelled.join("app").join("package.json"), "{}\n");
+    write(&nm.join("pkg").join("package.json"), "{}\n");
+    write(&nm.join("pkg").join("index.js"), "x\n");
+    // Git cannot be relied on in a directory whose path it may not get (getcwd), so the
+    // repository is laid out by hand, with everything the facts' layout check needs before it
+    // runs git: the scan finds it and would run git there (the recorder logs the attempt).
+    let repo = spelled.join("repo");
+    write(&repo.join("README.md"), "hello\n");
+    let gd = repo.join(".git");
+    write(&gd.join("HEAD"), "ref: refs/heads/main\n");
+    write(
+        &gd.join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+    );
+    for d in ["objects/info", "objects/pack", "refs/heads", "refs/tags"] {
+        fs::create_dir_all(gd.join(d)).unwrap();
+    }
+    let ctl = base.join("ctl");
+    content(&ctl.join("c"));
+    let ok = ctl.join("ok");
+    init_repo(&ok);
+
+    let log = base.join("git.log");
+    let real_git = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    // Records the working directory's real path, or UNRESOLVABLE where it has none that fits
+    // (only below the deep root).
+    let wrapper = script(
+        &base,
+        "git-recorder",
+        &format!(
+            "#!/bin/sh\nprintf '%s %s\\n' \"$(pwd -P 2>/dev/null || echo UNRESOLVABLE)\" \"$*\" \
+             >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real_git
+        ),
+    );
+    let facts = || network_everywhere().with_git(Git::new(&wrapper, Duration::from_secs(60)));
+    let mut bad = Vec::new();
+    for roots in [vec![spelled.clone()], vec![spelled.clone(), ctl.clone()]] {
+        let label = format!("{} roots", roots.len());
+        let _ = fs::remove_file(&log);
+        let res = scan_roots_with(&roots, facts());
+        let p = idle_plan(&res);
+        let survey = res.pieces.as_ref().expect("pieces");
+        let lanes = p.lanes.as_ref().expect("lanes");
+        let mine: Vec<&LanePiece> = lanes
+            .pieces
+            .iter()
+            .filter(|lp| Path::new(&survey.pieces[lp.scan_piece].path).starts_with(&spelled))
+            .collect();
+        if mine.is_empty() {
+            bad.push(format!("{label}: vacuous, no piece under the root"));
+        }
+        for lp in mine.iter().filter(|lp| lp.lane.removes()) {
+            bad.push(format!(
+                "{label}: {} is {:?}: {}",
+                lp.path, lp.lane, lp.reason
+            ));
+        }
+        for it in p
+            .items
+            .iter()
+            .filter(|i| Path::new(&i.path).starts_with(&spelled))
+        {
+            if !matches!(it.action, Action::Ask | Action::Keep) {
+                bad.push(format!(
+                    "{label}: item {} is {:?}: {}",
+                    it.path, it.action, it.reason
+                ));
+            }
+        }
+        for c in survey.blobs.iter().flat_map(|b| b.copies.iter()) {
+            if Path::new(&c.path).starts_with(&spelled) {
+                bad.push(format!("{label}: {} was hashed", c.path));
+            }
+        }
+        for o in disk_cleaner_core::testing::opens_under(&spelled) {
+            bad.push(format!("{label}: {} was opened", o.display()));
+        }
+        let ran = fs::read_to_string(&log).unwrap_or_default();
+        let deep = base.join("deep").display().to_string();
+        for l in ran
+            .lines()
+            .filter(|l| l.starts_with("UNRESOLVABLE") || l.starts_with(&deep))
+        {
+            bad.push(format!("{label}: git ran under the root: {l}"));
+        }
+        if roots.len() == 2 {
+            expect_control(&mut bad, &label, &res, &p, &ctl.join("c"));
+            if !ran
+                .lines()
+                .any(|l| l.starts_with(&ok.display().to_string()))
+            {
+                bad.push(format!(
+                    "{label}: control: git did not run for {}",
+                    ok.display()
+                ));
+            }
+        }
+    }
     verdict(bad);
 }
 

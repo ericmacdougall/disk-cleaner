@@ -1,0 +1,16 @@
+# AC-1, NEG-13: a root whose real path cannot be established keeps its own pieces, opens nothing and runs no git there.
+rule: an unresolved root keeps
+mutant: an unresolved root is treated as resolved (no root is marked unresolved after the walk)
+killing-test: rescue unresolved_root
+assertion: loose/x.bin was hashed
+--- a/crates/core/src/scan.rs
++++ b/crates/core/src/scan.rs
+@@ -1277,7 +1277,7 @@
+         .unresolved
+         .iter()
+         .map(|(r, _)| r.clone())
+-        .filter(|r| roots.contains(r))
++        .filter(|r| roots.contains(r) && false)
+         .collect();
+     let root_set: HashSet<PathBuf> = roots.iter().cloned().collect();
+     let mut odd_dirs: Vec<PathBuf> = Vec::new();

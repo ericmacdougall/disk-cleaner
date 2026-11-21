@@ -1,0 +1,17 @@
+# AC-1, NEG-1: every root spelling gives the context, including one de-duplication drops.
+rule: union over root spellings
+mutant: only the spellings of walked roots seed the union (a nested alias root that is dropped gives nothing)
+killing-test: rescue a3f1
+assertion: nested=true alias_first=false
+--- a/crates/core/src/scan.rs
++++ b/crates/core/src/scan.rs
+@@ -2183,7 +2183,8 @@
+ ) -> SecretContext {
+     let mut ctx = SecretContext::default();
+     ctx.overflow = links.named_overflow;
+-    for (spelled, real, id) in &plan.given {
++    let kept: Vec<&PathBuf> = plan.spellings.iter().flatten().collect();
++    for (spelled, real, id) in plan.given.iter().filter(|g| kept.contains(&&g.0)) {
+         let kind = crate::pieces::secret_by_names(spelled, rules)
+             .or_else(|| crate::pieces::secret_by_names(real, rules));
+         if let Some(k) = kind {
