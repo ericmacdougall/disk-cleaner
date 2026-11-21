@@ -89,6 +89,21 @@ The `.deb` needs none of this: it depends on `libgtk-3-0`, which brings shared-m
 Adwaita and hicolor even without recommended packages. On Debian 12 with
 `--no-install-recommends`, the 682a0ff `.deb` opened the dialog and returned a folder.
 
+### Screen readers on Linux (known limit)
+
+WebKitGTK 2.50.0 to 2.50.4 send screen readers the wrong role for every element from
+"paragraph" on in AT-SPI's list: headings are read as "document frame", paragraphs as
+"footer", links as "form" and the size tree's rows as "input method window". WebKit's own
+copy of AT-SPI's role list lost an entry (fixed upstream in WebKitGTK 2.50.5, WebKit bug
+300090). The app cannot correct it.
+- The `.deb` uses the system's WebKitGTK, so it has this fault on any host that still has one
+  of those versions. Ubuntu 22.04 ships 2.50.4.
+- The AppImage built on Ubuntu 22.04 carries 2.50.4 itself, so it has the fault on every
+  host: 7 of 27 roles were wrong on Debian 12, Fedora 41 and Ubuntu 24.04. The same binary
+  on a system WebKitGTK 2.52.6 had none wrong.
+- Moving the AppImage build to a maintained WebKitGTK also moves the oldest Linux it starts
+  on. That decision is open (GoodQA #16452).
+
 To run from source (needs Rust, Node 22 and the Tauri system libraries):
 
 ```
