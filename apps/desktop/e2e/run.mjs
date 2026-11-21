@@ -323,6 +323,13 @@ try {
 
   // Settings: lengthen and save; shorten and Escape; shorten and Keep; shorten and confirm.
   await run.check("settings.save_confirm_keep_escape", async () => {
+    // This check compares the sentence settings.ts writes after Keep; fail at once if the two
+    // disagree (a run.mjs that still expects the old wording, or a settings.ts that changed it).
+    const settingsPath = new URL("../src/views/settings.ts", import.meta.url);
+    const settingsSrc = existsSync(settingsPath) ? readFileSync(settingsPath, "utf8") : null;
+    if (settingsSrc !== null && !settingsSrc.includes("Not saved: the active window in the file is still ${file} days; the field keeps your unsaved ${typed}.")) {
+      throw new Error("settings.ts no longer writes the Keep sentence this check expects (click-test N6)");
+    }
     await tab("Settings");
     await app.s.until("return document.getElementById('set-window')?.value !== ''", 15_000);
     const setWindow = (v) =>
@@ -346,6 +353,9 @@ try {
     await app.s.keys(KEY.escape);
     await app.s.until("return !document.querySelector('[role=alertdialog]')", 10_000);
     steps.escape = await message();
+    // Click-test N6: Escape keeps the user's unsaved edit in the field, and the sentence says so.
+    steps.fieldAfterEscape = await app.s.exec("return document.getElementById('set-window').value");
+    if (steps.fieldAfterEscape !== "10") throw new Error(`the field after Escape: ${steps.fieldAfterEscape}`);
     const afterEscape = await active();
     if (afterEscape?.id !== "set-window") throw new Error(`focus after Escape: ${JSON.stringify(afterEscape)}`);
     let saved = await app.invoke("get_settings");
@@ -362,7 +372,9 @@ try {
     await app.s.clickText("Shorten to 10 days", "[role=alertdialog] button");
     await app.s.until("const t = document.querySelector('#panel .message')?.textContent ?? ''; return t.startsWith('Saved') || t.startsWith('Plan settings saved') ? t : null;", 30_000);
     steps.shorten = await message();
-    if (steps.escape !== "Not saved: the active window was kept." || steps.keep !== steps.escape) throw new Error(JSON.stringify(steps));
+    // Click-test N6 wording (settings.ts keptMessage). The old sentence read as if the field went back.
+    const kept = "Not saved: the active window in the file is still 30 days; the field keeps your unsaved 10.";
+    if (!steps.escape.startsWith(kept) || !steps.keep.startsWith(kept)) throw new Error(JSON.stringify(steps));
     saved = await app.invoke("get_settings");
     if (saved.value?.core?.active_window_days !== 10) throw new Error(`after Shorten: ${JSON.stringify(saved)}`);
     steps.activeWindowDays = 10;
@@ -375,6 +387,8 @@ try {
     await app.s.exec(
       `const i = document.getElementById('set-window'); i.value = '5'; i.dispatchEvent(new Event('input', { bubbles: true }));`,
     );
+    // A spacer so the page behind the question can scroll (removed after the question closes).
+    await app.s.exec("const s = document.createElement('div'); s.id = 'e2e-spacer'; s.style.height = '4000px'; document.getElementById('panel').append(s);");
     await app.s.clickText("Save", "#panel form button");
     await app.s.until("return !!document.querySelector('[role=alertdialog]')", 15_000);
     const inside = () => app.s.exec("const d = document.querySelector('[role=alertdialog]'); return !!d && d.contains(document.activeElement);");
@@ -389,6 +403,46 @@ try {
       seen.push((await active())?.text ?? null);
       if (!(await inside())) throw new Error(`Shift+Tab ${i + 1} left the question: ${JSON.stringify(seen)}`);
     }
+    // Click-test N1: focus is always on one of the question's buttons (never the dialog box or
+    // nowhere), and nothing behind it scrolls: many Shift+Tab and Tab, scroll keys on a button,
+    // focus lost to nowhere, and the wheel. A tall spacer makes sure the page behind can scroll.
+    const onButton = () =>
+      app.s.exec("const d = document.querySelector('[role=alertdialog]'); const e = document.activeElement; return !!d && !!e && e.tagName === 'BUTTON' && d.contains(e);");
+    const scroll = () =>
+      app.s.exec(
+        "const s = document.scrollingElement; return [s.scrollTop, s.scrollLeft, ...[...document.querySelectorAll('body *')].filter((e) => e.scrollHeight > e.clientHeight + 1).map((e) => e.scrollTop)].join(',');",
+      );
+    const canScroll = await app.s.exec("const s = document.scrollingElement; return s.scrollHeight > s.clientHeight + 50;");
+    if (!canScroll) throw new Error("precondition: the page behind the question cannot scroll, so the scroll checks would prove nothing");
+    const still = await scroll();
+    for (let i = 0; i < 16; i++) {
+      await app.s.chord(KEY.shift, KEY.tab);
+      if (!(await onButton())) throw new Error(`Shift+Tab ${i + 1} (long run) left the buttons: ${JSON.stringify(await active())}`);
+    }
+    for (let i = 0; i < 16; i++) {
+      await app.s.keys(KEY.tab);
+      if (!(await onButton())) throw new Error(`Tab ${i + 1} (long run) left the buttons: ${JSON.stringify(await active())}`);
+    }
+    for (const [name, k] of [["Down", KEY.down], ["Up", KEY.up], ["End", KEY.end], ["Home", KEY.home], ["Page Down", "\uE00F"], ["Right", KEY.right], ["Left", KEY.left]]) {
+      await app.s.keys(k);
+      if (!(await app.s.exec("return !!document.querySelector('[role=alertdialog]')"))) throw new Error(`${name} closed the question`);
+      if (!(await onButton())) throw new Error(`${name} moved focus off the buttons`);
+      const now = await scroll();
+      if (now !== still) throw new Error(`${name} scrolled the page behind the question: ${still} -> ${now}`);
+    }
+    await app.s.exec("document.activeElement?.blur();");
+    await new Promise((r) => setTimeout(r, 200));
+    if (!(await onButton())) throw new Error(`focus lost to nowhere did not come back: ${JSON.stringify(await active())}`);
+    let wheel = "scrolled nothing";
+    try {
+      await app.s.cmd("POST", "/actions", {
+        actions: [{ type: "wheel", id: "wheel", actions: [{ type: "scroll", x: 20, y: 20, deltaX: 0, deltaY: 800, origin: "viewport" }] }],
+      });
+    } catch (e) {
+      wheel = `not supported by this driver: ${String(e?.message ?? e).slice(0, 120)}`;
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    if ((await scroll()) !== still) throw new Error(`the wheel scrolled the page behind the question`);
     // A click on New scan behind the question must do nothing (it is inert).
     const before = await state();
     try {
@@ -405,9 +459,12 @@ try {
     await app.s.until("return !document.querySelector('[role=alertdialog]')", 10_000);
     const leftInert = await app.s.exec("return document.querySelectorAll('[inert]').length");
     if (leftInert !== 0) throw new Error(`${leftInert} elements left inert`);
+    const overflow = await app.s.exec("return [document.documentElement.style.overflow, document.body.style.overflow].join(',')");
+    if (overflow !== ",") throw new Error(`the page's scroll lock was left on: ${overflow}`);
+    await app.s.exec("document.getElementById('e2e-spacer')?.remove();");
     const saved = await app.invoke("get_settings");
     if (saved.value?.core?.active_window_days !== 10) throw new Error(`after Escape: ${JSON.stringify(saved)}`);
-    return { tabCycle: seen };
+    return { tabCycle: seen, wheel };
   });
 
   await run.check("flow.export_plan", async () => {
