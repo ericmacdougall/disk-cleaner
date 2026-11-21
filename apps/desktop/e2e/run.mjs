@@ -560,7 +560,25 @@ try {
       });
     }
 
-    // The empty-frame floor (informational), just before the scroll steps, same session.
+    // (2) Running-app scroll, Linux and Windows: 10 warm-up steps, then 200 steps of 10 rows.
+    await run.check("timing.synth_1m.scroll_p95", async () => {
+      ready();
+      const r = await app2.s.execAsync(
+        `const [o, done] = arguments;
+         (${measureScroll.toString()})(o).then(done, (e) => done({ error: String(e), samples: [] }));`,
+        600_000,
+        scrollOptions(),
+      );
+      if (r && Array.isArray(r.samples) && r.samples.length) run.measure({ ...judge("synth_1m_scroll_partial", r.samples, AC9.scrollP95Ms), partial: !!r.error });
+      const m = { ...scrollVerdict("synth_1m_scroll_rows_shown", r), rows };
+      // The raw samples, in step order, so drift within a run shows.
+      run.measure({ ...m, samples: r.samples });
+      if (!m.pass) throw new Error(`p95 ${m.p95.toFixed(1)} ms, not under ${AC9.scrollP95Ms} ms`);
+      return m;
+    });
+
+    // The empty-frame floor (informational). After the gated steps: at 0588a6e it ran just before
+    // them, and the gated Linux samples moved on both runner classes (docs/DESKTOP.md).
     await info("info.synth_1m.frame_floor", async () => {
       ready();
       const r = await app2.s.execAsync(
@@ -573,22 +591,6 @@ try {
       const f = judge("frame_floor", r.samples, AC9.scrollP95Ms);
       const iv = r.intervals.length ? { n: r.intervals.length, p50: rank(r.intervals, 0.5), p95: rank(r.intervals, 0.95), max: Math.max(...r.intervals) } : null;
       return { n: f.n, p50: f.p50, p95: f.p95, max: f.max, rafInterval: iv, screen: r.screen, scrollerHeight: r.scrollerHeight, gate: false };
-    });
-
-    // (2) Running-app scroll, Linux and Windows: 10 warm-up steps, then 200 steps of 10 rows.
-    await run.check("timing.synth_1m.scroll_p95", async () => {
-      ready();
-      const r = await app2.s.execAsync(
-        `const [o, done] = arguments;
-         (${measureScroll.toString()})(o).then(done, (e) => done({ error: String(e), samples: [] }));`,
-        600_000,
-        scrollOptions(),
-      );
-      if (r && Array.isArray(r.samples) && r.samples.length) run.measure({ ...judge("synth_1m_scroll_partial", r.samples, AC9.scrollP95Ms), partial: !!r.error });
-      const m = { ...scrollVerdict("synth_1m_scroll_rows_shown", r), rows };
-      run.measure(m);
-      if (!m.pass) throw new Error(`p95 ${m.p95.toFixed(1)} ms, not under ${AC9.scrollP95Ms} ms`);
-      return m;
     });
 
     // The same steps again, split into slices (informational; after the gated samples, so the

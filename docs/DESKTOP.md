@@ -435,7 +435,11 @@ The suite now also records, in the same one-million-row session and never as a p
 The Playwright job records the floor and the profile too.
 
 First results with these probes (commit 0588a6e): workflow "desktop" run 44881694359 and the
-seven jobs of "e2e-variants" run 44881704164. Every runner had 4 logical CPUs. Milliseconds,
+seven jobs of "e2e-variants" run 44881704164. At that commit the floor ran just before the
+gated steps, and the gated Linux scroll moved on both runner classes against earlier runs: p50
+about 33 rose to 39 to 41 ms, and p50 about 46 rose to 85 to 88 ms. Windows and the 5,000-row
+check did not move. These gated samples may be affected by the probe. The next commit
+restores the registered order: IPC, the gated steps, then the floor, then the profile. Every runner had 4 logical CPUs. Milliseconds,
 p50/p95. Floor is the empty frame. Load runs from the scroll event to the DOM holding the
 target row (IPC included). Stop runs from that point to the stop (the next frame and the
 post-paint task). The profile runs after the gated steps, further down the tree.
@@ -470,17 +474,25 @@ What the numbers show:
 - The Linux time follows the CPU model: EPYC 9V45 was fastest and EPYC 7763 slowest.
 - Within a session the cost grows. On the desktop Linux job the profile's stop slice rose from
   107 to 149 ms (median per 40 steps) over its 200 steps.
-- Every Linux job missed at this commit, including those on CPUs like the earlier passing
-  runs. The earlier runs did not record their CPU, so the change cannot be placed. One
-  difference is the 200-frame floor now measured just before the gated steps.
+- The profile pass is not a decomposition of the gated samples. On Linux it took about 1.5
+  times the gated p50 (137 against 85 ms, 58 against 39 ms); on Windows the two were equal.
+  The slices describe the profile pass.
+- Unchanged frames are already irregular on the EPYC 7763 runners (floor p95 57 to 60 ms).
+- The profile does not separate the grid's DOM work from software rendering or strace. A run of
+  the one-million-row session without the strace wrapper would; it has not been run.
 - The cause of the slow Linux frame is not established. One candidate is WebKitGTK compositing
   and painting through Mesa's software renderer under Xvfb (the shader cache shows Mesa). That
   would fit the CPU dependence. Another is the strace wrapper, which also traces the
   `ftruncate` of WebKit's shared-memory buffers (`/memfd:WebKitSharedMemory`).
 
-Running-app scroll tally through these runs: Windows 4 of 4 passed. Linux 4 of 16 passed:
-four desktop runs, and 12 variant jobs whose patch leaves the size tree untouched (the
-row-cap variant is left out, as it fails by design).
+Running-app scroll tally:
+
+- Windows: 4 of 4 passed.
+- Linux, in the registered order (before 0588a6e): 4 of 9 passed (three desktop runs and six
+  tree-neutral variant jobs).
+- Linux at 0588a6e, with the floor ahead of the gated steps: 0 of 7 passed. Kept apart from
+  the tally above, because the procedure differed.
+- The row-cap variant is left out of every count, as it fails by design.
 
 Both builds showed 1,000,001 rows before measuring in both runs. Linux's WebDriver clock ticks in whole
 milliseconds. The variant run is workflow "e2e-variants" run 44877270665 at 86fafdc. In it,
