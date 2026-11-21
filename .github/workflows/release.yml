@@ -5,9 +5,16 @@ name: release
 #
 #   * Push a tag like v0.1.0: builds, then creates a draft release. A maintainer reads it and
 #     publishes it by hand (see docs/RELEASING.md). Nothing is published automatically.
-#   * Run it by hand from the Actions tab ("Run workflow"): the rehearsal. It builds, packages and
-#     attests exactly as a tag does, then keeps the files as workflow artifacts. It never creates a
+#   * Run it by hand from the Actions tab ("Run workflow") on a branch: the rehearsal. It builds,
+#     packages and attests exactly as a tag does, checks that its attestations do NOT pass the
+#     published verification command, and keeps the files as workflow artifacts. It never creates a
 #     release or a tag.
+#
+# The guards live in .github/scripts/release_meta.py and are tested there. Rules for this file
+# (checked by `release_meta.py lint-workflow` in the tests): no ${{ }} inside any run script (values
+# reach scripts through env only); every guard is a step whose whole script is one call to the guard
+# script; every job after meta checks out the commit meta checked. These guards are hygiene: the
+# repository settings and the maintainer's publish step are the real control (docs/RELEASING.md).
 #
 # The binaries are not code-signed or notarized. The release notes say so.
 
@@ -19,6 +26,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
   # The binary and package names live here and nowhere else in this file. The planned rename from
@@ -28,7 +39,7 @@ env:
   CLI_PACKAGE: disk-cleaner-cli
 
 jobs:
-  # Decides the tag and version, and refuses a release that should not happen.
+  # Decides the tag, version and commit, and refuses a release that should not happen.
   meta:
     runs-on: ubuntu-latest
     permissions:
@@ -37,52 +48,24 @@ jobs:
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
+      sha: ${{ steps.meta.outputs.sha }}
       publish: ${{ steps.meta.outputs.publish }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Test the guards at this commit
+        run: python3 -I -m unittest discover -s .github/scripts -p 'test_*.py'
       - id: meta
-        name: Work out the tag and check it
+        name: Check the tag and record the commit
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
-        run: |
-          set -euo pipefail
-          # The workspace version, from the [workspace.package] table of Cargo.toml.
-          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p;}' Cargo.toml | head -n1)
-          if [ -z "$version" ]; then echo "::error::could not read the workspace version from Cargo.toml"; exit 1; fi
-          if [ "$EVENT" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
-            tag="$REF_NAME"
-            case "$tag" in
-              "v$version"|"v$version"-*) ;;
-              *) echo "::error::tag $tag does not match the workspace version $version in Cargo.toml; bump the version first"; exit 1 ;;
-            esac
-            # A release comes from main, never from a side branch.
-            git fetch --no-tags origin main
-            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-              echo "::error::tag $tag points at $GITHUB_SHA, which is not on main"; exit 1
-            fi
-            # And from a commit whose CI passed.
-            ok=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" \
-                   --status success --json conclusion --jq 'length')
-            if [ "$ok" -lt 1 ]; then
-              echo "::error::no successful ci.yml run for $GITHUB_SHA; fix or re-run CI first"; exit 1
-            fi
-            publish=true
-          else
-            tag="v${version}-rehearsal-${GITHUB_RUN_ID}"
-            publish=false
-          fi
-          {
-            echo "tag=$tag"
-            echo "version=$version"
-            echo "publish=$publish"
-          } >> "$GITHUB_OUTPUT"
-          echo "tag=$tag version=$version publish=$publish"
+          RUN_ID: ${{ github.run_id }}
+        run: python3 -I .github/scripts/release_meta.py meta
 
   build:
     name: build (${{ matrix.target }})
@@ -112,21 +95,31 @@ jobs:
             archive: zip
           # EXTENSION POINT (desktop bundles): the desktop app is built by its own jobs (see the
           # bundle jobs on the feat/desktop branch's ci.yml). When they are added here, each one
-          # packages its installers and uploads them as an artifact named release-desktop-<target>
-          # containing only the files to publish. The package job below collects every artifact
-          # named release-*, writes SHA256SUMS over them and attests them with no other change.
+          # checks out needs.meta.outputs.sha and uploads its installers as an artifact named
+          # release-desktop-<target> containing only the files to publish. The package job puts every
+          # file of every release-* artifact into SHA256SUMS and attests every file SHA256SUMS lists,
+          # whatever its type (.dmg, .msi, .AppImage, .deb included). Signing is a separate decision.
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ needs.meta.outputs.sha }}
           persist-credentials: false
+      - name: The checkout is the commit meta checked
+        env:
+          SHA: ${{ needs.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$SHA" ]; then echo "::error::checked out $head, expected $SHA"; exit 1; fi
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.CLI_PACKAGE }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET" -p "$CLI_PACKAGE"
       - name: Smoke test the binary
-        shell: bash
         env:
           TARGET: ${{ matrix.target }}
           EXT: ${{ matrix.ext }}
@@ -147,26 +140,41 @@ jobs:
           echo hello > smoke/proj/README.md
           "$exe" scan smoke --out smoke.json
           test -s smoke.json
-      - name: Package
-        shell: bash
+      - name: Stage the files
         env:
           TARGET: ${{ matrix.target }}
           EXT: ${{ matrix.ext }}
-          ARCHIVE: ${{ matrix.archive }}
           TAG: ${{ needs.meta.outputs.tag }}
         run: |
           set -euo pipefail
           name="${BIN_NAME}-${TAG}-${TARGET}"
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/${BIN_NAME}${EXT}" LICENSE README.md "dist/$name/"
+      - name: Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          name="${BIN_NAME}-${TAG}-${TARGET}"
           cd dist
-          if [ "$ARCHIVE" = zip ]; then
-            powershell -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
-          else
-            tar -czf "$name.tar.gz" "$name"
-          fi
-          rm -rf "$name"
+          tar -czf "$name.tar.gz" -- "$name"
+          rm -rf -- "$name"
           ls -l
+      - name: Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        # The name is read from the environment and used as a literal path, never parsed as code.
+        run: |
+          $name = "$($env:BIN_NAME)-$($env:TAG)-$($env:TARGET)"
+          Set-Location -LiteralPath dist
+          Compress-Archive -LiteralPath $name -DestinationPath "$name.zip"
+          Remove-Item -LiteralPath $name -Recurse -Force
+          Get-ChildItem
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.target }}
@@ -175,7 +183,8 @@ jobs:
           if-no-files-found: error
 
   # Checksums, release notes and build-provenance attestation over everything the build jobs made.
-  # Runs for the rehearsal too, so attestation is proved before a real tag.
+  # Runs for the rehearsal too, so attestation is proved before a real tag, and the rehearsal checks
+  # that its own attestations fail the published verification command.
   package:
     needs: [meta, build]
     runs-on: ubuntu-latest
@@ -187,6 +196,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ needs.meta.outputs.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -197,26 +207,21 @@ jobs:
         env:
           TAG: ${{ needs.meta.outputs.tag }}
           VERSION: ${{ needs.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          cd dist
-          ls -l
-          # Only the files to publish are in dist/. Sorted, so the file is stable.
-          sha256sum $(ls | grep -v '^SHA256SUMS$' | LC_ALL=C sort) > SHA256SUMS
-          cat SHA256SUMS
-          cd ..
-          sed -e "s|@TAG@|$TAG|g" -e "s|@VERSION@|$VERSION|g" -e "s|@BIN@|$BIN_NAME|g" \
-              -e "s|@REPO@|$GITHUB_REPOSITORY|g" \
-              .github/release-notes.md > dist-notes.md
-          if grep -q '@[A-Z]*@' dist-notes.md; then echo "::error::unfilled placeholder in the release notes"; exit 1; fi
-          cat dist-notes.md
+          SHA: ${{ needs.meta.outputs.sha }}
+        run: python3 -I .github/scripts/release_meta.py package
       - name: Attest build provenance
-        # actions/attest v4.2.2. Public repository: signed through the public Sigstore instance, no secret.
+        # actions/attest v4.2.2. Public repository: signed through the public Sigstore instance, no
+        # secret. One subject per line of SHA256SUMS, so every published file except SHA256SUMS
+        # itself is attested.
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
         with:
-          subject-path: |
-            dist/*.tar.gz
-            dist/*.zip
+          subject-checksums: dist/SHA256SUMS
+      - name: Check the published verification command
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          PUBLISH: ${{ needs.meta.outputs.publish }}
+        run: python3 -I .github/scripts/release_meta.py check-attestations
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-files
@@ -234,22 +239,37 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.meta.outputs.sha }}
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-files
           path: out
+      - name: The tag still points at the built commit
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          SHA: ${{ needs.meta.outputs.sha }}
+        run: python3 -I .github/scripts/release_meta.py check-binding
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.meta.outputs.tag }}
         run: |
           set -euo pipefail
-          args=(--repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$BIN_NAME $TAG" --notes-file out/dist-notes.md)
+          args=(--repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "PruneDisk $TAG" --notes-file out/dist-notes.md)
           case "$TAG" in *-*) args+=(--prerelease) ;; esac
           # gh fails if a release for this tag already exists; that is intended.
           gh release create "$TAG" "${args[@]}" out/dist/*
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets \
             --jq '"draft=\(.isDraft) assets=\(.assets | length)"'
+      - name: The tag did not move while the draft was made
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          SHA: ${{ needs.meta.outputs.sha }}
+        run: python3 -I .github/scripts/release_meta.py check-binding --after-create
 
   # crates.io readiness. Read-only: lists what would be packaged, checks whether each package name is
   # free on crates.io and runs `cargo publish --dry-run`. Nothing is uploaded and no registry token

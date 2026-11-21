@@ -1,4 +1,7 @@
-@BIN@ @TAG@. Early software; see the README for what this version does and does not do.
+PruneDisk @TAG@: the read-only command-line scanner and planner, built from commit @SHA@. Early
+software; see the README for what this version does and does not do. It deletes nothing.
+
+The command is still called `@BIN@`; it will be renamed to `prunedisk` (planned, not done).
 
 ## These binaries are not signed
 
@@ -28,12 +31,18 @@ grep '<archive file name>' SHA256SUMS | shasum -a 256 -c -
 ```
 
 A checksum next to the file only shows the download is complete and matches this release page.
-To also show the file was built from this repository's source by its release workflow, verify the
-build provenance attestation with the GitHub CLI:
+The build provenance attestation says more. Check it with the GitHub CLI (if it reports an unknown
+flag, update the GitHub CLI):
 
 ```
-gh attestation verify <archive file name> --repo @REPO@
+gh attestation verify <archive file name> --repo @REPO@ --signer-workflow @REPO@/.github/workflows/release.yml --source-ref refs/tags/@TAG@ --deny-self-hosted-runners
 ```
+
+When it passes, the file was built on a GitHub-hosted runner by this repository's release workflow,
+running for the tag `@TAG@`. It does not show that the code is free of bugs, that anyone reviewed it,
+or that the workflow's own checks ran unchanged: those rest on the repository's tag and branch rules
+and on the maintainer reading this draft before publishing it (see `docs/RELEASING.md`). Every file
+listed in `SHA256SUMS` is attested; `SHA256SUMS` itself is not.
 
 ## Files
 

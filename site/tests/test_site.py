@@ -913,6 +913,14 @@ def load_gate():
     return mod
 
 
+def load_release_meta():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("release_meta", ROOT / ".github" / "scripts" / "release_meta.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class TestReleaseWorkflow(unittest.TestCase):
     """release.yml: pinned, least privilege, never publishes by itself, one place for the binary name."""
 
@@ -940,16 +948,16 @@ class TestReleaseWorkflow(unittest.TestCase):
 
     def test_rehearsal_never_publishes(self):
         self.assertIn("workflow_dispatch:", self.y)
-        # publish is true only for a tag push; every other event is a rehearsal.
-        self.assertRegex(self.y, r'publish=false')
-        self.assertEqual(self.y.count("publish=true"), 1)
         self.assertNotIn("--draft=false", self.y)
         self.assertNotIn("cargo publish\n", self.y)
         self.assertNotRegex(self.y, r"cargo publish(?! --dry-run)")
 
-    def test_tag_guards_present(self):
-        for needed in ("does not match the workspace version", "is not on main", "no successful ci.yml run"):
-            self.assertIn(needed, self.y)
+    def test_guards_are_behaviour_not_strings(self):
+        # The guards themselves are tested by .github/scripts/test_release_meta.py (real git, every
+        # refusal case). Here: the workflow still calls them in a form that can fail the job.
+        gate = load_release_meta()
+        self.assertEqual(gate.lint_workflow(self.y), [])
+        self.assertNotEqual(gate.lint_workflow(self.y.replace("release_meta.py meta\n", "release_meta.py meta || true\n")), [])
 
     def test_builds_locked_for_the_four_targets(self):
         self.assertIn("cargo build --release --locked", self.y)
@@ -976,10 +984,64 @@ class TestReleaseWorkflow(unittest.TestCase):
         for needed in ("not code-signed or notarized", "Gatekeeper", "SmartScreen", "SHA256SUMS",
                        "gh attestation verify", "com.apple.quarantine"):
             self.assertIn(needed, flat)
-        self.assertTrue(set(re.findall(r"@([A-Z]+)@", self.notes)) <= {"BIN", "TAG", "VERSION", "REPO"})
+        self.assertTrue(set(re.findall(r"@([A-Z]+)@", self.notes)) <= {"BIN", "TAG", "VERSION", "REPO", "SHA"})
+
+    def test_notes_use_the_brand_name_and_say_the_command_will_be_renamed(self):
+        # BRAND.md section 1: display name PruneDisk; copyable names stay disk-cleaner, with one short
+        # line saying the command will be renamed.
+        first = self.notes.splitlines()[0]
+        self.assertIn("PruneDisk", first)
+        flat = re.sub(r"\s+", " ", self.notes)
+        self.assertRegex(flat, r"still called `@BIN@`; it will be renamed to `prunedisk`")
+        self.assertIn('--title "PruneDisk $TAG"', self.y)
+
+    def test_notes_say_what_the_attestation_does_not_prove(self):
+        flat = re.sub(r"\s+", " ", self.notes)
+        self.assertIn("It does not show", flat)
+        self.assertIn("Every file listed in `SHA256SUMS` is attested", flat)
 
     def test_desktop_extension_point_is_marked(self):
         self.assertIn("EXTENSION POINT (desktop bundles)", self.y)
+        # The claim that every published file type is attested holds only if the attest step reads
+        # SHA256SUMS rather than a list of extensions.
+        self.assertIn("subject-checksums: dist/SHA256SUMS", self.y)
+        self.assertNotRegex(self.y, r"subject-path:")
+
+
+class TestReleaseWording(unittest.TestCase):
+    """README, site and notes must read true before the first release exists and after one is
+    published. A tag push only makes a draft that nobody else sees, so no copy may say a tag puts
+    files on the releases page, and nothing that needs a release may be written in the present tense."""
+
+    TAG_MAKES_RELEASE = re.compile(
+        r"(?i)(when|once|after) a version is tagged|appear on the releases page once|"
+        r"attached to [^.]*releases page[^.]* when a version is tagged|releases page carries")
+    PRESENT_TENSE_DOWNLOAD = re.compile(r"(?i)the program is a single file you unpack and run")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.texts = {
+            "README.md": re.sub(r"\s+", " ", read(ROOT_README)),
+            "site/index.html": re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", read(INDEX))),
+            ".github/release-notes.md": re.sub(r"\s+", " ", read(ROOT / ".github" / "release-notes.md")),
+        }
+
+    def test_a_tag_is_not_called_a_release(self):
+        for name, flat in self.texts.items():
+            self.assertNotRegex(flat, self.TAG_MAKES_RELEASE, name)
+            self.assertNotRegex(flat, self.PRESENT_TENSE_DOWNLOAD, name)
+
+    def test_readme_and_site_say_a_tag_makes_a_draft(self):
+        for name in ("README.md", "site/index.html"):
+            flat = self.texts[name]
+            self.assertIn("Tagging a version only prepares a draft", flat, name)
+            self.assertIn("lists no release yet", flat, name)
+
+    def test_verification_is_not_oversold(self):
+        for name in ("README.md", "site/index.html"):
+            flat = self.texts[name]
+            self.assertNotIn("shows which repository and workflow built", flat, name)
+            self.assertIn("It does not show the code is free of bugs", flat, name)
 
     def test_site_lists_the_same_platforms(self):
         flat = re.sub(r"\s+", " ", read(INDEX))

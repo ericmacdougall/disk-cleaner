@@ -40,21 +40,28 @@ The scan and plan formats, every fact and every rule are described in
 
 ## Download a release
 
-When a version is tagged, the [releases page](https://github.com/ericmacdougall/disk-cleaner/releases)
+Prebuilt programs are published on the
+[releases page](https://github.com/ericmacdougall/disk-cleaner/releases). Each published release
 carries one archive for each of Linux (x86-64), macOS (Apple Silicon and Intel) and Windows (x86-64),
-plus a `SHA256SUMS` file. If that page lists no release yet, there is nothing to download: build from
-source (next section).
+plus a `SHA256SUMS` file. Tagging a version only prepares a draft, which the maintainer reads and then
+publishes by hand. If that page lists no release yet, there is nothing to download: build from source
+(next section).
 
 The programs are **not code-signed or notarized**, so macOS Gatekeeper and Windows SmartScreen can warn
-when you first run one; the release notes say what to do. Check a download before you run it:
+when you first run one; the release notes say what to do. Check a download before you run it. Put the
+release's version, for example `v0.1.0`, in place of `vX.Y.Z`:
 
 ```
-sha256sum -c --ignore-missing SHA256SUMS                      # Linux; see the release notes for macOS and Windows
-gh attestation verify <archive file name> --repo ericmacdougall/disk-cleaner
+sha256sum -c --ignore-missing SHA256SUMS
+gh attestation verify <archive file name> --repo ericmacdougall/disk-cleaner --signer-workflow ericmacdougall/disk-cleaner/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
 ```
 
-The first shows the file matches the release; the second shows which repository and workflow built it.
-How a release is cut is in [docs/RELEASING.md](docs/RELEASING.md).
+The first (Linux; the release notes give the macOS and Windows forms) shows the file matches the
+release's checksum list. The second shows the file was built on a GitHub-hosted runner by this
+repository's release workflow for that version's tag. It does not show the code is free of bugs or
+that anyone reviewed it; that rests on the repository's tag and branch rules and on the maintainer's
+publish step. How a release is made, and what is and is not checked, is in
+[docs/RELEASING.md](docs/RELEASING.md).
 
 ## Build from source
 

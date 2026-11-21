@@ -377,7 +377,7 @@ pre code { background: none; padding: 0; font: inherit; }
           <thead role="rowgroup"><tr role="row"><th scope="col" role="columnheader">Part</th><th scope="col" role="columnheader">Status</th><th scope="col" role="columnheader">Notes</th></tr></thead>
           <tbody role="rowgroup">
             <tr role="row"><th scope="row" role="rowheader">Design</th><td role="cell" data-label="Status"><span class="badge">Written</span></td><td role="cell" data-label="Notes">Draft design document in the repository.</td></tr>
-            <tr role="row"><th scope="row" role="rowheader">CLI: scan and plan</th><td role="cell" data-label="Status"><span class="badge">Merged</span></td><td role="cell" data-label="Notes">Read-only. On the main branch; prebuilt binaries appear on the releases page once a version is tagged (see Download). Produces JSON and a readable summary. Deletes nothing.</td></tr>
+            <tr role="row"><th scope="row" role="rowheader">CLI: scan and plan</th><td role="cell" data-label="Status"><span class="badge">Merged</span></td><td role="cell" data-label="Notes">Read-only. On the main branch. Prebuilt programs are on the releases page only once the maintainer publishes a release (see Download). Produces JSON and a readable summary. Deletes nothing.</td></tr>
             <tr role="row"><th scope="row" role="rowheader">Recovery, backup, apply, restore</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Recovery branches, rclone backup connectors, removal with a manifest, restore. Nothing of it is on the main branch yet.</td></tr>
             <tr role="row"><th scope="row" role="rowheader">Desktop app</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">Sunburst, treemap and outline views. Nothing of it is on the main branch yet.</td></tr>
             <tr role="row"><th scope="row" role="rowheader">App stores and installers</th><td role="cell" data-label="Status"><span class="badge">Planned</span></td><td role="cell" data-label="Notes">No installer or store listing yet. Binary archives, unsigned, are the only form of release.</td></tr>
@@ -390,16 +390,16 @@ pre code { background: none; padding: 0; font: inherit; }
   <section id="download" aria-labelledby="h-download">
     <div class="wrap">
       <h2 id="h-download">Download or build it</h2>
-      <p>Prebuilt command-line programs are attached to the project's <a href="https://github.com/ericmacdougall/disk-cleaner/releases">releases page</a> when a version is tagged: one archive each for Linux (x86-64), macOS (Apple Silicon and Intel) and Windows (x86-64), plus a <code>SHA256SUMS</code> file. If that page lists no release yet, there is nothing to download; build from source instead.</p>
+      <p>Prebuilt command-line programs are published on the project's <a href="https://github.com/ericmacdougall/disk-cleaner/releases">releases page</a>. Each published release has one archive each for Linux (x86-64), macOS (Apple Silicon and Intel) and Windows (x86-64), plus a <code>SHA256SUMS</code> file. Tagging a version only prepares a draft, which the maintainer reads and then publishes by hand. If that page lists no release yet, there is nothing to download; build from source instead.</p>
       <h3>The programs are not signed</h3>
       <p>The archives are not code-signed or notarized. On macOS, Gatekeeper can refuse a program downloaded in a browser until you remove its quarantine mark. On Windows, SmartScreen can warn before it runs. Check the download first, as below, then follow the steps in the release notes.</p>
       <h3>Check what you downloaded</h3>
 <pre tabindex="0" role="region" aria-label="Commands that check a downloaded release"><code># the file matches the checksum list (Linux)
 sha256sum -c --ignore-missing SHA256SUMS
 
-# the file was built from this repository by its release workflow
-gh attestation verify &lt;archive file name&gt; --repo ericmacdougall/disk-cleaner</code></pre>
-      <p>A checksum shows the download is complete and matches the release page. The attestation, checked with the GitHub command-line tool, also shows which repository and workflow built the file.</p>
+# the file was built by this repository's release workflow for the tag vX.Y.Z
+gh attestation verify &lt;archive file name&gt; --repo ericmacdougall/disk-cleaner --signer-workflow ericmacdougall/disk-cleaner/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners</code></pre>
+      <p>Put the release's version, for example <code>v0.1.0</code>, in place of <code>vX.Y.Z</code>. A checksum shows the download is complete and matches the release page. The attestation, checked with the GitHub command-line tool, shows the file was built on a GitHub-hosted runner by this repository's release workflow for that version's tag. It does not show the code is free of bugs or that anyone reviewed it; that rests on the repository's rules and on the maintainer's publish step.</p>
       <h3>Build from source</h3>
       <p>You need a stable Rust toolchain and <code>git</code>. The <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/README.md">README</a> has the commands. The command is still called <code>disk-cleaner</code> until the planned rename.</p>
     </div>
@@ -465,7 +465,7 @@ Items:
   <section id="follow" aria-labelledby="h-follow">
     <div class="wrap">
       <h2 id="h-follow">Follow along</h2>
-      <p>The project is developed in the open. The best way to follow it is the repository: the design document, the scanner's source and its scan format documentation, and the issue tracker. The repository is still named disk-cleaner; renaming the repository and the command to prunedisk is planned, not done. There is no mailing list, no account to create and no installer: the program is a single file you unpack and run.</p>
+      <p>The project is developed in the open. The best way to follow it is the repository: the design document, the scanner's source and its scan format documentation, and the issue tracker. The repository is still named disk-cleaner; renaming the repository and the command to prunedisk is planned, not done. There is no mailing list, no account to create and no installer yet. Until a release is published you build the program from source; a published release is an archive holding the program, to unpack and run.</p>
       <p><a class="btn" href="https://github.com/ericmacdougall/disk-cleaner">github.com/ericmacdougall/disk-cleaner</a></p>
       <h3>License</h3>
       <p>MIT. Free to use, change and share. See the <a href="https://github.com/ericmacdougall/disk-cleaner/blob/main/LICENSE">license file</a>.</p>

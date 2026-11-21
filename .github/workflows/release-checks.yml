@@ -1,0 +1,47 @@
+name: release checks
+
+# The release guards' behavioural tests and the site/README wording tests, on every change that can
+# affect what the release workflow does or what the published text claims. No secrets, no builds,
+# read-only token.
+on:
+  push:
+    paths:
+      - ".github/scripts/**"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/release-checks.yml"
+      - ".github/workflows/*.yml"
+      - ".github/release-notes.md"
+      - "docs/RELEASING.md"
+      - "README.md"
+      - "site/**"
+      - "Cargo.toml"
+  pull_request:
+    paths:
+      - ".github/scripts/**"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/release-checks.yml"
+      - ".github/workflows/*.yml"
+      - ".github/release-notes.md"
+      - "docs/RELEASING.md"
+      - "README.md"
+      - "site/**"
+      - "Cargo.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Release guard tests (pwsh required, for the zip step test)
+        env:
+          REQUIRE_PWSH: "1"
+        run: python3 -I -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Lint release.yml
+        run: python3 -I .github/scripts/release_meta.py lint-workflow
+      - name: Site and wording tests
+        run: python3 -m unittest discover -s site/tests -v
