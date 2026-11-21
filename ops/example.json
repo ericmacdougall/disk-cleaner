@@ -1,0 +1,23 @@
+{
+ "host": "myhost",
+ "home": "~",
+ "remote": "myremote:mybucket/prunedisk-ops",
+ "active_hours": 24,
+ "protect_names": [
+  "client-a"
+ ],
+ "keep": [
+  "important-project"
+ ],
+ "containers": [
+  ".agent-harness/work",
+  "repos",
+  "work",
+  "wt"
+ ],
+ "salvage_repo": "https://github.com/OWNER/salvage-archive.git",
+ "index_repo": "https://github.com/OWNER/salvage-archive.git",
+ "max_residue_gb": 5,
+ "max_push_mb": 300,
+ "credential_helper": "!gh auth git-credential"
+}
