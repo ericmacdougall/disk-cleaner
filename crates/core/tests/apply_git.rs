@@ -913,3 +913,24 @@ fn replace_refs_and_symlinks_in_git_dir_never_break_restore() {
     let shards = fx.all_shard_bytes();
     assert!(shards.windows(UNCHANGED.len()).any(|w| w == UNCHANGED));
 }
+
+#[test]
+fn a_plain_user_name_in_an_https_url_is_not_a_credential() {
+    let fx = Fx::new();
+    let r = repo(&fx);
+    git(
+        &r.dir,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://alice@bitbucket.org/team/r.git",
+        ],
+    );
+    let (scan, plan) = docs(&[&fx.data], &[P::git(&r.dir, &[".env"], bundle_block())]);
+    let mut o = gopts(&fx, true, true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    let (out, why) = outcome(&rep, 0);
+    assert_eq!(out, "removed", "{why}");
+}

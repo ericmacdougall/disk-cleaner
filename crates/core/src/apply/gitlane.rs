@@ -311,8 +311,36 @@ fn has_url_credential(text: &str) -> bool {
         .filter(|t| t.contains("://"))
         .any(|t| {
             let t = t.trim_end_matches([',', ';', ')']);
-            strip_url_credentials(t) != t && t.contains('@')
+            let rest = &t[t.find("://").map_or(0, |i| i + 3)..];
+            // Userinfo runs to the last '@' before the path (a password may hold '/').
+            let Some(at) = rest.rfind('@') else {
+                return false;
+            };
+            let user = &rest[..at];
+            // A password, or a user name that is itself a token (`https://ghp_x@host/r`). A plain
+            // user name (`https://alice@bitbucket.org/...`) is not a credential.
+            user.contains(':') || looks_like_token(user)
         })
+}
+
+/// A user name that is a token: a known token prefix, or a long run of letters and digits.
+fn looks_like_token(user: &str) -> bool {
+    let u = user.to_ascii_lowercase();
+    const PREFIXES: [&str; 8] = [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "glpat-",
+        "x-token-auth",
+    ];
+    if PREFIXES.iter().any(|p| u.starts_with(p)) || u.contains('%') {
+        return true;
+    }
+    let alnum = user.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+    user.len() >= 20 && alnum * 10 >= user.len() * 9 && user.chars().any(|c| c.is_ascii_digit())
 }
 
 /// A credential stored in the repository's config or small admin files (R-T, N2). Returns what
@@ -903,50 +931,67 @@ fn gh_private(opts: &ApplyOptions, owner_repo: &str) -> Result<(), String> {
     }
 }
 
-/// The isolated global config: only the user's `credential.*` keys (N3).
+/// The isolated global config: only the user's `credential.*` keys (N3), from the system config
+/// and then the global one (git's own order), so a helper such as osxkeychain set in either is
+/// used. Nothing else from those files (`insteadOf`, `include`, `sshCommand`) is loaded.
 fn isolated_global(opts: &ApplyOptions, dir: &Path) -> Result<PathBuf, String> {
+    write_credential_config(
+        &opts.git,
+        opts.home.as_deref(),
+        None,
+        &dir.join("global.gitconfig"),
+    )
+}
+
+/// Write `path` (0600, new) with the `credential.*` keys of the system config (`system`, or
+/// git's default) and of the global config under `home`.
+pub(crate) fn write_credential_config(
+    git: &Path,
+    home: Option<&Path>,
+    system: Option<&Path>,
+    path: &Path,
+) -> Result<PathBuf, String> {
     use std::os::unix::fs::OpenOptionsExt;
-    let path = dir.join("global.gitconfig");
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&path)
+        .open(path)
         .map_err(|e| format!("cannot create the isolated git config: {e}"))?;
-    let mut c = Command::new(&opts.git);
-    if let Some(h) = &opts.home {
-        c.env("HOME", h).env_remove("XDG_CONFIG_HOME");
-    }
-    c.env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_CONFIG_COUNT")
-        .args([
-            "config",
-            "--global",
-            "--null",
-            "--get-regexp",
-            "^credential\\.",
-        ]);
-    // Exit 1: no such keys.
-    let out = run_cmd_ok(c, None, LOCAL_TIMEOUT, "git config --global", &[0, 1])?;
-    for e in out.split(|b| *b == 0).filter(|e| !e.is_empty()) {
-        let s = String::from_utf8_lossy(e);
-        let Some((k, v)) = s.split_once('\n') else {
-            continue;
+    for scope in ["--system", "--global"] {
+        let mut c = Command::new(git);
+        if let Some(h) = home {
+            c.env("HOME", h).env_remove("XDG_CONFIG_HOME");
+        }
+        c.env_remove("GIT_CONFIG_NOSYSTEM")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT");
+        match system {
+            Some(f) => c.env("GIT_CONFIG_SYSTEM", f),
+            None => c.env_remove("GIT_CONFIG_SYSTEM"),
         };
-        let mut a = Command::new(&opts.git);
-        a.env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .arg("config")
-            .arg("--file")
-            .arg(&path)
-            .args(["--add", "--end-of-options"])
-            .arg(k)
-            .arg(v);
-        run_cmd(a, None, LOCAL_TIMEOUT, "git config --file")?;
+        c.args(["config", scope, "--null", "--get-regexp", "^credential\\."]);
+        // Exit 1: no such keys. A missing system file is not an error either.
+        let out = run_cmd_ok(c, None, LOCAL_TIMEOUT, "git config", &[0, 1]).unwrap_or_default();
+        for e in out.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+            let s = String::from_utf8_lossy(e);
+            let Some((k, v)) = s.split_once('\n') else {
+                continue;
+            };
+            let mut a = Command::new(git);
+            a.env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .arg("config")
+                .arg("--file")
+                .arg(path)
+                .arg("--add")
+                .arg(k)
+                .arg(v);
+            run_cmd(a, None, LOCAL_TIMEOUT, "git config --file")?;
+        }
     }
-    Ok(path)
+    Ok(path.to_path_buf())
 }
 
 fn ls_remote(
@@ -1383,6 +1428,16 @@ mod tests {
         assert!(!has_url_credential("url = ssh://git@github.com/o/r"));
         assert!(!has_url_credential("url = git@github.com:o/r.git"));
         assert!(!has_url_credential("url = https://github.com/o/r"));
+        assert!(!has_url_credential(
+            "url = https://alice@bitbucket.org/team/r.git"
+        ));
+        assert!(has_url_credential(
+            "https://github_pat_11ABCDEF@github.com/o/r"
+        ));
+        assert!(has_url_credential(
+            "https://a1b2c3d4e5f6a7b8c9d0e1f2@host/r"
+        ));
+        assert!(has_url_credential("https://x-token-auth@bitbucket.org/r"));
     }
 
     #[test]
@@ -1402,6 +1457,43 @@ mod tests {
         ] {
             assert!(!key_allowed(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn credential_helpers_from_system_and_global_only() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[credential]\n\thelper = store\n[url \"file:///decoy\"]\n\tinsteadOf = https://github.com/\n[core]\n\tsshCommand = evil\n",
+        )
+        .unwrap();
+        let system = t.path().join("system.gitconfig");
+        std::fs::write(
+            &system,
+            "[credential]\n\thelper = osxkeychain\n[include]\n\tpath = /nonexistent\n",
+        )
+        .unwrap();
+        let out = t.path().join("iso.gitconfig");
+        write_credential_config(Path::new("git"), Some(&home), Some(&system), &out).unwrap();
+        let mut c = Command::new("git");
+        c.env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["config", "--file"])
+            .arg(&out)
+            .args(["--list"]);
+        let listed = String::from_utf8(run_cmd(c, None, LOCAL_TIMEOUT, "list").unwrap()).unwrap();
+        assert_eq!(
+            listed.lines().collect::<Vec<_>>(),
+            vec!["credential.helper=osxkeychain", "credential.helper=store"],
+            "{listed}"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
