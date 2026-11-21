@@ -348,14 +348,22 @@ Controls (none lowers a threshold):
   or before the page answered, would pass there;
 - variant `row-cap-removed.patch` (below) must fail (2).
 
+The 0 ms judgement cannot pass for any samples, so it only shows that the verdict is computed,
+not fixed. No run has shown check (1) failing on its threshold. Check (2)'s failure path has
+been seen on real misses (results below). Choosing the last row fully in view as the target is
+an assumption awaiting the owner's ruling. The pre-registration says "the new rows", and the
+brief says "the target row".
+
 Demonstrations, not committed (t2-dev, docker node:22-bookworm, Playwright 1.64.1, before the
 first commit): a copy of (3) with the threshold set to 0.001 ms failed (p95 17.7 ms); with
 `row-cap-removed.patch` applied, (3) failed on the first render ("1001 .tg-row elements in the
 DOM, more than 200").
 
-Results, as measured (workflow "desktop" run 44877232202 at commit 86fafdc; the controls and
-the variant behaved as required). Milliseconds; Rows is the highest `.tg-row` count on any
-step, the header row included:
+Results, as measured. Every run is listed, and none was retried to pass. Milliseconds; Rows is
+the highest `.tg-row` count on any step, the header row included.
+
+Workflow "desktop" run 44877232202 at commit 86fafdc (the controls and the variant behaved as
+required):
 
 | Check | Where | n | p50 | p95 | max | Rows | Verdict |
 |---|---|---|---|---|---|---|---|
@@ -365,7 +373,42 @@ step, the header row included:
 | (3) mocked scroll | headless Chromium 156.0.8078.4, ubuntu-latest | 200 | 16.7 | 17.2 | 19.4 | 29 | pass |
 | (3) control: backend 100 ms late | same | 200 | 133.3 | 133.5 | 136.6 | 29 | misses 50 ms, as required |
 
-Both builds showed 1,000,001 rows before measuring. Linux's WebDriver clock ticks in whole
+Workflow "desktop" run 44879146053 at commit 0291587. The checks are the same as at 86fafdc;
+since then only the session's script timeout was raised and the docs were changed. Linux's
+running-app scroll missed:
+
+| Check | Where | n | p50 | p95 | max | Rows | Verdict |
+|---|---|---|---|---|---|---|---|
+| (1) IPC `tree_page`, limit 200 | Linux, ubuntu-22.04, under strace and Xvfb | 100 | 5 | 9 | 11 | | pass |
+| (2) running-app scroll | Linux, ubuntu-22.04, under strace and Xvfb | 200 | 46 | 69 | 80 | 29 | **fail** (p95 69 ms, not under 50 ms) |
+| (2) running-app scroll | Windows, windows-latest | 200 | 31.3 | 32.2 | 44.4 | 28 | pass |
+| (3) mocked scroll | headless Chromium 156.0.8078.4, ubuntu-latest | 200 | 16.7 | 17.0 | 17.8 | 29 | pass |
+| (3) control: backend 100 ms late | same | 200 | 133.3 | 133.6 | 134.4 | 29 | misses 50 ms, as required |
+
+In the same run, the first session's 5,000-row scroll check measured p50 33, p95 36 ms.
+
+The e2e-variants run 44877270665 at 86fafdc ran the same one-million-row session on six more
+ubuntu-22.04 runners. Six of its variants leave the size tree untouched: they change backend
+writes, the root check, the capability list or the Settings question. Their Linux scroll
+results (p95, then p50, in ms):
+
+| Variant job | IPC p50 | Scroll p50 | Scroll p95 | Verdict |
+|---|---|---|---|---|
+| planted-write | 4 | 39 | 51 | fail |
+| planted-outside | 5 | 47 | 69 | fail |
+| offered-check-removed | 5 | 46 | 70 | fail |
+| capability-broadened | 5 | 47 | 66 | fail |
+| focus-broken | 3 | 34 | 41 | pass |
+| modal-trap-removed | 3 | 34 | 42 | pass |
+
+Linux running-app scroll at one million rows, all eight runs so far: 3 passed and 5 failed, at
+both commits. The results fall into two groups. In one, scroll p95 is 41 to 42 ms with IPC p50
+of 2 to 3 ms. In the other, scroll p95 is 51 to 70 ms with IPC p50 of 4 to 5 ms. The cause of
+the split is not established. Neither the runners' hardware nor their load was recorded. On
+ubuntu-22.04 under strace, the check does not meet the 50 ms threshold reliably. The threshold
+stays at 50 ms. Windows passed both runs (p95 32.2 ms each).
+
+Both builds showed 1,000,001 rows before measuring in both runs. Linux's WebDriver clock ticks in whole
 milliseconds. The variant run is workflow "e2e-variants" run 44877270665 at 86fafdc. In it,
 `row-cap-removed` failed `timing.synth_1m.scroll_p95` on the first render ("1001 .tg-row
 elements in the DOM, more than 200"), and the other six variants were still caught.
