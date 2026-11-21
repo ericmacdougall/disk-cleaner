@@ -87,16 +87,35 @@ fn take_lock(dir: &Path) -> Result<Lock, ApplyError> {
         rustix::fs::Mode::from_raw_mode(0o600),
     )
     .map_err(|e| ApplyError::Io(format!("{}: {e}", p.display())))?;
-    // Only "held by someone else" means another apply is running; an interrupted call is
-    // retried, and any other error is reported as itself rather than as a lock.
+    // Only a lock still held after LOCK_SETTLE means another apply is running; an interrupted
+    // call is retried, and any other error is reported as itself rather than as a lock.
+    let start = std::time::Instant::now();
     loop {
         match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => return Ok(Lock { _fd: fd }),
             Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::WOULDBLOCK) if start.elapsed() < LOCK_SETTLE => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
             Err(rustix::io::Errno::WOULDBLOCK) => return Err(ApplyError::Locked(p.clone())),
             Err(e) => return Err(ApplyError::Io(format!("cannot lock {}: {e}", p.display()))),
         }
     }
+}
+
+/// How long `take_lock` waits for a lock that is held when it asks. An flock belongs to the
+/// open file description, and a child that any thread of this process spawns holds a copy of
+/// every descriptor from its fork until its exec closes the close-on-exec ones. So a lock that
+/// was just released (an earlier apply in the same process, or one that just exited while its
+/// child was starting) can stay held for a moment. Measured with four spawning threads: up to
+/// 4.2 ms on Linux and 12.1 ms on macOS (diagnostic branch diag/apply-lock-macos). A lock held
+/// longer than this is another apply.
+pub(crate) const LOCK_SETTLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Take and hold the apply lock of `state_dir`, as an acting apply does (test-hooks only).
+#[cfg(feature = "test-hooks")]
+pub fn hold_lock(state_dir: &Path) -> Result<impl std::fmt::Debug + Send, ApplyError> {
+    take_lock(state_dir).map(|l| l._fd)
 }
 
 /// Newest mtime of any non-directory entry under `dir` (not following symlinks, skipping

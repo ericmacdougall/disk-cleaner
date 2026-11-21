@@ -91,7 +91,7 @@ Run `scan` again and make a new plan.
 | 0 | Done (or the dry run was printed). |
 | 1 | Another error; read the message. |
 | 2 | The scan or plan was refused before anything was done. |
-| 3 | Another `apply` is running. |
+| 3 | Another `apply` is running (its lock was still held after a 0.5 s wait). |
 | 4 | A shard failed; the pieces that depend on it were kept. |
 | 5 | Some pieces were kept because an earlier apply run changed their folder; scan again. |
 

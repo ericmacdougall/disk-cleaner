@@ -398,3 +398,8 @@ pub fn apply(
 
 #[cfg(unix)]
 mod run;
+
+/// Take and hold the apply lock of a state directory, as an acting apply does (test-hooks
+/// only). The lock is released when the returned value is dropped.
+#[cfg(all(unix, feature = "test-hooks"))]
+pub use run::hold_lock;

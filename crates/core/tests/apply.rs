@@ -624,7 +624,7 @@ fn excludes_stay_in_place() {
 fn second_apply_refused() {
     let fx = Fx::new();
     let (scan, plan) = dedup_fixture(&fx);
-    fx.set_fake("if [ \"$cmd\" = rcat ]; then sleep 1; fi");
+    fx.set_fake("if [ \"$cmd\" = rcat ]; then sleep 3; fi");
     let o = fx.opts(true);
     std::thread::scope(|s| {
         let h = s.spawn(|| apply(&scan, &plan, &o));
