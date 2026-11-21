@@ -156,6 +156,10 @@ pub struct Extra {
 pub fn capture(path: &Path, file: Option<&std::fs::File>) -> Extra {
     use std::os::unix::ffi::OsStrExt;
     let mut ex = Extra::default();
+    if cfg!(feature = "broken-meta") {
+        // the broken variant captures nothing (failing-first evidence only)
+        return ex;
+    }
     let names: Vec<std::ffi::OsString> = match file {
         Some(f) => {
             use xattr::FileExt;
