@@ -1087,11 +1087,17 @@ fn sibling_removed_in_an_earlier_run_passes_recheck() {
     residual.moved_out = vec!["d1.bin".into(), "d2.bin".into()];
     let plan_b = plan_doc(&scan, &[residual, P::derived(&s, "d2.bin", 0, "backup")]);
     let rep = apply(&scan, &plan_b, &fx.opts(true)).unwrap();
-    assert!(
-        rep.pieces.iter().all(|p| p.outcome == "removed"),
-        "{rep:#?}"
-    );
-    assert!(!s.exists());
+    // Stream A's directory re-check: the earlier run changed this folder, so scan again.
+    for p in &rep.pieces {
+        assert_eq!(p.outcome, "kept", "{rep:#?}");
+        assert!(
+            p.reason.starts_with(disk_cleaner_core::apply::RESCAN_HINT),
+            "{}",
+            p.reason
+        );
+    }
+    assert_eq!(rep.rescan_needed.len(), rep.pieces.len(), "{rep:#?}");
+    assert_eq!(fs::read(s.join("d2.bin")).unwrap(), b"two");
 }
 
 /// Main's ruling on stream A's directory re-check: when a scan piece drifts after an earlier
