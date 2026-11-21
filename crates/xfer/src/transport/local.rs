@@ -37,8 +37,11 @@ impl LocalDir {
     }
 
     fn object(&self, key: &str, p: &Path) -> Result<RemoteObject> {
-        let mut data = Vec::new();
-        fs::File::open(p)?.read_to_end(&mut data)?;
+        // sized from its length first (see `util::read_bounded`): a listing hashes every object
+        let f = fs::File::open(p)?;
+        let len = f.metadata()?.len();
+        let mut data = Vec::with_capacity(len.min(crate::util::READ_RESERVE_MAX) as usize);
+        f.take(len).read_to_end(&mut data)?;
         Ok(RemoteObject {
             key: key.to_string(),
             size: data.len() as u64,
@@ -115,16 +118,10 @@ impl Transport for LocalDir {
 
     fn get(&self, key: &str, max: u64) -> Result<Vec<u8>> {
         check_key(key)?;
-        let mut data = Vec::new();
         let f = fs::File::open(self.path_of(key))
             .map_err(|e| Error::Transport(format!("get {key}: {e}")))?;
-        f.take(max + 1).read_to_end(&mut data)?;
-        if data.len() as u64 > max {
-            return Err(Error::corrupt(format!(
-                "{key} is larger than the {max} byte limit"
-            )));
-        }
-        Ok(data)
+        crate::util::read_bounded(f, max)?
+            .ok_or_else(|| Error::corrupt(format!("{key} is larger than the {max} byte limit")))
     }
 
     fn describe(&self) -> String {

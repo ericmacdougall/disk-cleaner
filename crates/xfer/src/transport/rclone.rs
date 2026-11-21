@@ -565,14 +565,8 @@ impl Transport for RcloneRcd {
             .set("Authorization", &self.auth)
             .call()
             .map_err(|e| self.map_err("get", e))?;
-        let mut buf = Vec::new();
-        r.into_reader().take(max + 1).read_to_end(&mut buf)?;
-        if buf.len() as u64 > max {
-            return Err(Error::corrupt(format!(
-                "{key} is larger than the {max} byte limit"
-            )));
-        }
-        Ok(buf)
+        util::read_bounded(r.into_reader(), max)?
+            .ok_or_else(|| Error::corrupt(format!("{key} is larger than the {max} byte limit")))
     }
 
     fn describe(&self) -> String {

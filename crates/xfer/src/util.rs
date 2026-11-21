@@ -136,6 +136,21 @@ pub fn human(n: u64) -> String {
     }
 }
 
+/// Most bytes [`read_bounded`] reserves up front; a larger bound grows as it reads.
+pub const READ_RESERVE_MAX: u64 = 256 << 20;
+
+/// Read all of `r`, refusing more than `max` bytes (`Ok(None)` when it is larger). The buffer
+/// is reserved for `max + 1` bytes before the first read (up to [`READ_RESERVE_MAX`]), so a
+/// body is one allocation: a doubling `read_to_end` copies it at each step, and macOS keeps
+/// every freed intermediate block resident (CI measured 7 MiB per fetch batch). Reserved pages
+/// that are never written cost address space, not memory. Every transport reads through this.
+pub fn read_bounded(r: impl std::io::Read, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut buf = Vec::with_capacity(max.saturating_add(1).min(READ_RESERVE_MAX) as usize);
+    r.take(max.saturating_add(1)).read_to_end(&mut buf)?;
+    Ok((buf.len() as u64 <= max).then_some(buf))
+}
+
 /// glibc raises its mmap threshold each time a large block is freed (up to 32 MiB), after
 /// which 4 MiB segment buffers come from the heap and stay resident once freed: on t2-dev the
 /// engine sat about 200 MiB above its live data. A fixed threshold keeps every buffer of 1 MiB

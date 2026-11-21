@@ -755,11 +755,10 @@ fn mem_trace_chunk_map_cases() {
     for l in base.text.lines().filter(|l| l.starts_with("mem-trace")) {
         eprintln!("   {l}");
     }
-    for (n, per) in [(full, 200_000), (full, 20_000), (full / 2, 200_000)] {
-        let (_e, out) = run(n, per);
+    let show = |what: String, n: usize, out: &Out| {
         let grew = out.rss.saturating_sub(base.rss);
         eprintln!(
-            "== {n} entries in objects of {per}: peak {} KiB, grew {} KiB ({:.1} bytes an entry)",
+            "== {what}: peak {} KiB, grew {} KiB ({:.1} bytes an entry)",
             out.rss >> 10,
             grew >> 10,
             grew as f64 / n as f64
@@ -767,7 +766,21 @@ fn mem_trace_chunk_map_cases() {
         for l in out.text.lines().filter(|l| l.starts_with("mem-trace")) {
             eprintln!("   {l}");
         }
+    };
+    for (n, per) in [(full, 200_000), (full, 20_000), (full / 2, 200_000)] {
+        let (_e, out) = run(n, per);
+        show(format!("{n} entries in objects of {per}"), n, &out);
     }
+    // the large-file pack ratio: 16 chunks a pack, every pack listed
+    let n = xfer::repo::map_fit(index_share(), 16) - 2000;
+    let a = rand_bytes(11, 3000);
+    let env = Env::new();
+    let r = Repo::new(&[&a], vec![entry(b"f.bin", Kind::File, 0o644, &a)]);
+    r.write(&env);
+    fill_index_packs(&env, n, 16);
+    let out = restore(&env, &env.p("target"), &[]);
+    assert_eq!(out.code, 0, "{}", out.text);
+    show(format!("{n} entries in packs of 16"), n, &out);
 }
 
 /// `extra` chunks past what the share holds (40 bytes an entry, the prefix table aside), less
