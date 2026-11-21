@@ -2,29 +2,11 @@ name: Site tests
 
 # The tests also read the root README, ci.yml, the core's model, plan and facts sources and the CLI's
 # report to check the page's claims against them, so a change to any of those runs them too.
+# Push and pull_request triggers were removed so this no longer consumes
+# GitHub-hosted Actions minutes. Run ./scripts/local-ci.sh instead.
+# Manual run: gh workflow run site.yml
 on:
-  push:
-    paths:
-      - "site/**"
-      - ".github/workflows/site.yml"
-      - ".github/workflows/pages.yml"
-      - "README.md"
-      - ".github/workflows/ci.yml"
-      - "crates/core/src/model.rs"
-      - "crates/core/src/plan.rs"
-      - "crates/core/src/facts.rs"
-      - "crates/cli/src/report.rs"
-  pull_request:
-    paths:
-      - "site/**"
-      - ".github/workflows/site.yml"
-      - ".github/workflows/pages.yml"
-      - "README.md"
-      - ".github/workflows/ci.yml"
-      - "crates/core/src/model.rs"
-      - "crates/core/src/plan.rs"
-      - "crates/core/src/facts.rs"
-      - "crates/cli/src/report.rs"
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -26,23 +26,21 @@ python3 -m unittest discover -s site/tests -v
 ```
 
 They check the page structure, accessibility basics, status wording, absence of external requests, the
-brand tokens against the CSS, and the Pages workflows. CI runs them on every change to `site/`, and the
-Pages deploy runs them first.
+brand tokens against the CSS, and the Pages workflows. Run them locally with `./scripts/local-ci.sh`
+(or `python3 -m unittest discover -s site/tests -v`). The Pages workflow also runs them first when it is started by hand.
 
 ## Publishing and rollback
 
 - **One-time setup:** a maintainer sets the Pages source to "GitHub Actions" in the repository
   settings. The workflows do not change settings.
-- **Deploy:** `.github/workflows/pages.yml` runs on every push to `main` that touches `site/**` (or by hand
-  from the Actions tab). Its `gate` job asks the GitHub API, read-only, whether Pages is enabled with
+- **Deploy:** `.github/workflows/pages.yml` is started by hand (`gh workflow run pages.yml` or the Actions tab). Its `gate` job asks the GitHub API, read-only, whether Pages is enabled with
   GitHub Actions as its source (`python3 -I site/tools/pages_gate.py`). If it is, the `deploy` job runs the
   tests, builds the publishable copy with `python3 site/tools/prepare.py _site` (no README, BRAND.md, tests
   or tools) and deploys it. If Pages is not enabled, `deploy` is skipped with a notice and the run stays
   green; if Pages publishes from a branch instead, it is skipped with a warning. Any other answer (a token
   or permission error, an outage) fails the run rather than being read as "not enabled".
-- **After enabling Pages:** nothing deploys until the next push that touches `site/**`; to publish at once,
-  run the "Pages" workflow from the Actions tab.
-- **Rehearsal:** on every pull request, the `pages-rehearsal` job in `.github/workflows/site.yml` runs the
+- **After enabling Pages:** nothing deploys until the Pages workflow is run by hand from the Actions tab.
+- **Rehearsal:** when `.github/workflows/site.yml` is started by hand, the `pages-rehearsal` job runs the
   same preparation script, packages the artifact without deploying, serves it under `/disk-cleaner/` (how a
   project Pages site is served) and smoke-tests it with curl. Both workflows call the same script, and a
   test checks that. The `pages-gate` job runs the same gate, so every change shows what the deploy would

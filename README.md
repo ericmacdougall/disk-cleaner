@@ -5,8 +5,8 @@ safe to remove. It is planned to become a cleaner for Windows, macOS and Linux. 
 PruneDisk; the repository and the command are still called disk-cleaner.
 
 > **Status: early, read-only.** The `scan` and `plan` commands are on the main branch. There is no
-> tagged release, installer or download page yet, so you build it from source. (Continuous
-> integration also builds unsigned binaries for each platform and keeps them as workflow artifacts
+> tagged release, installer or download page yet, so you build it from source. (If the GitHub Actions
+> `ci` workflow is run by hand, it also builds unsigned binaries for each platform and keeps them as workflow artifacts
 > for 14 days; they are test builds, not releases.) No command removes, moves or changes anything:
 > the only file it writes is the one you name with `scan --out`.
 
@@ -50,7 +50,16 @@ cargo build --release --locked -p disk-cleaner-cli
 ```
 
 `disk-cleaner --help`, `disk-cleaner scan --help` and `disk-cleaner plan --help` list every option.
-Continuous integration builds and tests it on Linux, macOS and Windows.
+
+## Verify locally
+
+GitHub-hosted CI is `workflow_dispatch` only (the included Actions minutes are exhausted). From the repository root, with a stable Rust toolchain and `python3`:
+
+```
+./scripts/local-ci.sh
+```
+
+That runs format, clippy, the workspace tests and the site tests. See [docs/LOCAL-CI.md](docs/LOCAL-CI.md).
 
 ## Planned
 
