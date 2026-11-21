@@ -1,0 +1,64 @@
+name: mutants
+
+# Runs the lane rescue's committed mutants (crates/core/tests/mutants/*.mutant, GoodQA goodqa#16529,
+# AC-8) on Linux and keeps the runner's logs as an artifact, so a review can read and repeat the
+# result for an exact commit. It runs on a push to a feat/ branch that changes the core crate, and
+# by hand (workflow_dispatch, which GitHub offers only once this file is on the default branch).
+# The run fails unless every mutant is KILLED and both baselines pass (run.sh exits 0).
+on:
+  push:
+    branches: ["feat/**"]
+    paths:
+      - "crates/core/**"
+      - ".github/workflows/mutants.yml"
+  workflow_dispatch:
+    inputs:
+      names:
+        description: "Mutant names separated by spaces (empty: every mutant)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# Only the newest commit of a branch is worth a run.
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  mutants:
+    name: mutants (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: git version
+        run: git --version
+      - name: Run the mutants
+        env:
+          # Validated by run.sh (letters, digits, - and _ only); globbing is off below.
+          NAMES: ${{ inputs.names }}
+          MUTANTS_WORK: ${{ runner.temp }}/dc-mutants
+        run: |
+          set -f
+          git config --global user.email t@t.invalid
+          git config --global user.name t
+          ulimit -n 65536 || ulimit -n 4096 || true
+          echo "head: $(git rev-parse HEAD)"
+          # $NAMES is split into words on purpose: each word is one mutant name.
+          # shellcheck disable=SC2086
+          sh crates/core/tests/mutants/run.sh $NAMES
+      - name: Keep the runner's logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutant-logs-${{ github.sha }}
+          path: ${{ runner.temp }}/dc-mutants/logs-*
+          retention-days: 30
+          if-no-files-found: error
