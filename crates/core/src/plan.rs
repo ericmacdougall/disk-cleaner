@@ -238,11 +238,14 @@ pub struct Plan {
     pub active: Vec<String>,
     pub totals: PlanTotals,
     pub items: Vec<PlanItem>,
+    /// What to do with each piece of the scan's survey (present when the scan has `pieces`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lanes: Option<crate::lanes::Lanes>,
 }
 
 /// Real path of `p`, without the `\\?\` prefix Windows canonicalization adds (process working
 /// directories are reported without it).
-fn canon(p: &Path) -> PathBuf {
+pub(crate) fn canon(p: &Path) -> PathBuf {
     let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let text = real.to_string_lossy();
     match text.strip_prefix(r"\\?\") {
@@ -251,7 +254,7 @@ fn canon(p: &Path) -> PathBuf {
     }
 }
 
-fn under_active(path: &Path, active: &[PathBuf]) -> Option<String> {
+pub(crate) fn under_active(path: &Path, active: &[PathBuf]) -> Option<String> {
     if active.is_empty() {
         return None;
     }
@@ -772,6 +775,16 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         }
     }
 
+    let lanes = scan.pieces.as_ref().map(|survey| {
+        let node_state: Vec<(ProjectState, String)> = (0..scan.nodes.len())
+            .map(|i| {
+                let (s, r, _) = judge(&ctx, i, opts);
+                (s, r)
+            })
+            .collect();
+        crate::lanes::build(scan, survey, &items, &node_state, opts)
+    });
+
     Plan {
         schema_version: SCHEMA_VERSION,
         dry_run: true,
@@ -799,6 +812,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             .collect(),
         totals,
         items,
+        lanes,
     }
 }
 

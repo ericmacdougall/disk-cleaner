@@ -1002,7 +1002,7 @@ worktrees and submodule git directories.
 
 ## Pieces and lanes
 
-Status: **contract for schema 16** (revision 3, after two spec reviews). Fields marked *provisional* may still change name before the
+Status: **contract for schema 16** (revision 5, after two spec reviews and the first implementation). Fields marked *provisional* may still change name before the
 first release that applies a plan; every other field and every MUST below is frozen for schema 16.
 The apply step (`crates/core/src/apply/`, `disk-cleaner apply`) codes against this section.
 
@@ -1092,6 +1092,8 @@ result does not depend on which name owns a hard-linked inode) and count members
   `max_piece_files` becomes one `tree` piece; a larger one is split: each subdirectory is cut the
   same way, and the direct files are packed in name order into `files` pieces under both bounds;
   a file larger than `max_piece_bytes` is a `files` piece of its own.
+- A scan root outside every node is always split, however small, so that no piece spans two
+  activity groups (the root's direct children, below).
 - So only a single-file piece, a `git-node` piece or a secret directory may exceed a bound.
 - A piece never crosses a node boundary: a classified directory starts new pieces, so `node` is
   the same for every member.

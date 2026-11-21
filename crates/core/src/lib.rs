@@ -11,7 +11,9 @@ pub mod error;
 pub mod facts;
 pub mod git;
 mod gitshape;
+pub mod lanes;
 pub mod model;
+pub mod pieces;
 pub mod plan;
 pub mod preserve;
 pub mod procs;
@@ -27,7 +29,11 @@ pub use config::{Config, ConfigSource, DEFAULT_ACTIVE_WINDOW_DAYS, DEFAULT_MAX_G
 pub use error::{Error, Result};
 pub use facts::{is_network_url, FactsConfig};
 pub use git::{Git, GitError};
+pub use lanes::{
+    Evidence, GitLane, Lane, LaneBlob, LaneCopy, LanePiece, LaneTotal, LaneTotals, Lanes, Recovery,
+};
 pub use model::*;
+pub use pieces::{recheck, Drift, Piece, PieceKind, PieceOptions, PieceSurvey, RecheckScope};
 pub use plan::{
     plan, resolve_active, Action, Plan, PlanItem, PlanOptions, Preserve, PreserveGitAdmin,
     PreserveObjectStore, ProjectState,
@@ -188,6 +194,33 @@ pub fn validate_scan(scan: &ScanResult) -> Result<()> {
                 format!("outputs[{j}].node"),
                 format!("index {k} is out of range ({nodes})"),
             ));
+        }
+    }
+    if let Some(survey) = &scan.pieces {
+        let np = survey.pieces.len();
+        for (i, p) in survey.pieces.iter().enumerate() {
+            if p.id != i {
+                return Err(invalid(
+                    format!("pieces.pieces[{i}].id"),
+                    format!("must equal its index {i}, not {}", p.id),
+                ));
+            }
+            if let Some(k) = p.node.filter(|k| *k >= n) {
+                return Err(invalid(
+                    format!("pieces.pieces[{i}].node"),
+                    format!("index {k} is out of range ({nodes})"),
+                ));
+            }
+        }
+        for (j, b) in survey.blobs.iter().enumerate() {
+            for (c, copy) in b.copies.iter().enumerate() {
+                if copy.piece >= np {
+                    return Err(invalid(
+                        format!("pieces.blobs[{j}].copies[{c}].piece"),
+                        format!("index {} is out of range ({np} pieces)", copy.piece),
+                    ));
+                }
+            }
         }
     }
     // Cycles: 0 unseen, 1 on the current walk, 2 finished.

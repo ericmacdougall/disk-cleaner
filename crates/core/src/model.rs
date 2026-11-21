@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -482,6 +482,10 @@ pub struct ScanResult {
     pub scope: String,
     /// Where the walk could not look (required: a scan without it is not trusted as complete).
     pub coverage: Coverage,
+    /// The partition behind plan lanes, present with `scan --lanes` (docs/SCAN-FORMAT.md,
+    /// "Pieces and lanes").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pieces: Option<crate::pieces::PieceSurvey>,
 }
 
 pub fn default_scope() -> String {

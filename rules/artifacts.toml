@@ -517,3 +517,147 @@ source_extensions = [
     "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "kt", "c", "cc", "cpp", "h", "hpp",
     "cs", "rb", "php", "swift", "m", "scala", "sh", "lua", "ex", "exs", "dart", "zig",
 ]
+
+# [[secret_name]] and [[secret_dir]] are names that mark a secret (docs/SCAN-FORMAT.md, "Secret
+# names"). With `scan --lanes`, a matching entry is always its own `keep` piece. It is never
+# hashed, and it is never backed up, pushed or removed unless the user explicitly opts in.
+# Patterns are `name`, `*suffix`, `prefix*` or `*substring*`, compared ignoring case. A substring
+# pattern applies only outside regenerable and cache directories. Matching uses names only, so a
+# secret stored under an ordinary name is not detected (goodqa#16530).
+
+[[secret_name]]
+pattern = ".env"
+kind = "environment settings (.env)"
+
+[[secret_name]]
+pattern = ".env.*"
+kind = "environment settings (.env)"
+except = [".env.example", ".env.sample", ".env.template", ".env.dist"]
+
+[[secret_name]]
+pattern = ".netrc"
+kind = "network login credentials (.netrc)"
+
+[[secret_name]]
+pattern = "_netrc"
+kind = "network login credentials (.netrc)"
+
+[[secret_name]]
+pattern = ".pgpass"
+kind = "a PostgreSQL password file"
+
+[[secret_name]]
+pattern = ".git-credentials"
+kind = "stored git credentials"
+
+[[secret_name]]
+pattern = ".npmrc"
+kind = "npm settings that can hold a token"
+
+[[secret_name]]
+pattern = ".pypirc"
+kind = "PyPI settings that can hold a token"
+
+[[secret_name]]
+pattern = "credentials"
+kind = "a credentials file"
+
+[[secret_name]]
+pattern = "credentials.json"
+kind = "a credentials file"
+
+[[secret_name]]
+pattern = "*.pem"
+kind = "a certificate or private key"
+
+[[secret_name]]
+pattern = "*.key"
+kind = "a private key"
+
+[[secret_name]]
+pattern = "*.p12"
+kind = "a key store"
+
+[[secret_name]]
+pattern = "*.pfx"
+kind = "a key store"
+
+[[secret_name]]
+pattern = "*.jks"
+kind = "a Java key store"
+
+[[secret_name]]
+pattern = "*.keystore"
+kind = "a key store"
+
+[[secret_name]]
+pattern = "*.kdbx"
+kind = "a password database"
+
+[[secret_name]]
+pattern = "*.tfstate"
+kind = "Terraform state"
+
+[[secret_name]]
+pattern = "*.tfvars"
+kind = "Terraform variable values"
+
+[[secret_name]]
+pattern = "id_rsa*"
+kind = "an SSH key"
+
+[[secret_name]]
+pattern = "id_dsa*"
+kind = "an SSH key"
+
+[[secret_name]]
+pattern = "id_ecdsa*"
+kind = "an SSH key"
+
+[[secret_name]]
+pattern = "id_ed25519*"
+kind = "an SSH key"
+
+[[secret_name]]
+pattern = "terraform.tfstate.*"
+kind = "Terraform state"
+
+[[secret_name]]
+pattern = "*secret*"
+kind = "a file whose name says it holds a secret"
+
+[[secret_name]]
+pattern = "*credential*"
+kind = "a file whose name says it holds credentials"
+
+[[secret_name]]
+pattern = "*password*"
+kind = "a file whose name says it holds a password"
+
+[[secret_name]]
+pattern = "*passwd*"
+kind = "a file whose name says it holds a password"
+
+[[secret_name]]
+pattern = "*token*"
+kind = "a file whose name says it holds a token"
+
+[[secret_dir]]
+name = ".ssh"
+kind = "SSH keys and settings (.ssh)"
+
+[[secret_dir]]
+name = ".gnupg"
+kind = "GnuPG keys (.gnupg)"
+
+[[secret_dir]]
+name = ".aws"
+kind = "AWS credentials (.aws)"
+
+[[secret_dir]]
+name = ".password-store"
+kind = "a password store"
+
+[[secret_dir]]
+name = "secrets"
+kind = "a directory named secrets"

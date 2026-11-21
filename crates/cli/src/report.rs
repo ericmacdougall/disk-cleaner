@@ -321,7 +321,62 @@ pub fn plan_summary(p: &Plan) -> String {
             );
         }
     }
+    if let Some(l) = &p.lanes {
+        lane_summary(&mut o, l);
+    }
     o
+}
+
+/// The lanes of a plan: per lane its bytes, pieces and reclaimable bytes, the dedup saving, the
+/// secret pieces kept, and the ten largest pieces of each lane with their reasons.
+fn lane_summary(o: &mut String, l: &disk_cleaner_core::Lanes) {
+    let t = &l.totals;
+    let _ = writeln!(
+        o,
+        "\nLanes ({} scanned, {} in directories that were split):",
+        human_bytes(t.scanned_bytes),
+        human_bytes(t.dir_overhead_bytes)
+    );
+    for lane in disk_cleaner_core::Lane::ALL {
+        let lt = t.by_lane.get(&lane).cloned().unwrap_or_default();
+        let _ = writeln!(
+            o,
+            "  {:<7} {:>10} in {}, {} reclaimable, {} to upload",
+            lane.as_str(),
+            human_bytes(lt.bytes),
+            count(lt.pieces, "piece", "pieces"),
+            human_bytes(lt.reclaimable_bytes),
+            human_bytes(lt.upload_bytes)
+        );
+    }
+    let _ = writeln!(
+        o,
+        "  duplicates take {} beyond one copy each; uploading each content once saves {}",
+        human_bytes(t.duplicate_bytes),
+        human_bytes(t.dedup_saved_bytes)
+    );
+    let _ = writeln!(
+        o,
+        "  {} kept on this disk, never uploaded",
+        count(t.secret_pieces, "secret piece", "secret pieces")
+    );
+    for lane in disk_cleaner_core::Lane::ALL {
+        let mut ps: Vec<&disk_cleaner_core::LanePiece> =
+            l.pieces.iter().filter(|p| p.lane == lane).collect();
+        if ps.is_empty() {
+            continue;
+        }
+        ps.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id)));
+        let _ = writeln!(o, "\nLargest {} pieces:", lane.as_str());
+        for p in ps.iter().take(10) {
+            let what = match &p.member {
+                Some(m) => format!("{}/{m}", p.path),
+                None => p.path.clone(),
+            };
+            let _ = writeln!(o, "  {:>10}  {}", human_bytes(p.bytes), esc(&what));
+            let _ = writeln!(o, "      {}", esc(&p.reason));
+        }
+    }
 }
 
 #[cfg(test)]
