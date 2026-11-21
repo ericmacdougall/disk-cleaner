@@ -33,6 +33,8 @@ pub struct FaultConfig {
     /// Every put of a key starting with `slow_prefix` takes this long (a slow link).
     pub put_delay: Option<std::time::Duration>,
     pub slow_prefix: String,
+    /// Every put of a key starting with this prefix fails (nothing stored). Empty: off.
+    pub fail_put_prefix: String,
 }
 
 pub struct Faulty {
@@ -92,13 +94,22 @@ impl Transport for Faulty {
             return Err(Error::Transport("transport died".into()));
         }
         let n = self.puts.fetch_add(1, Ordering::SeqCst);
-        let (throttle, lose, delay) = {
+        let (throttle, lose, delay, fail) = {
             let c = self.cfg.lock().expect("fault cfg");
             let delay = c.put_delay.filter(|_| key.starts_with(&c.slow_prefix));
-            (n < c.throttle_first, c.lose_response.contains(&n), delay)
+            let fail = !c.fail_put_prefix.is_empty() && key.starts_with(&c.fail_put_prefix);
+            (
+                n < c.throttle_first,
+                c.lose_response.contains(&n),
+                delay,
+                fail,
+            )
         };
         if let Some(d) = delay {
             std::thread::sleep(d);
+        }
+        if fail {
+            return Err(Error::Transport(format!("put of {key} failed (injected)")));
         }
         if throttle {
             return Err(Error::Throttled("429 Too Many Requests (injected)".into()));
