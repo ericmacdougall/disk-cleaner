@@ -201,14 +201,19 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
         }
     }
     for e in &rows {
-        if let Row::File { path, .. } = &e.row {
-            if need
-                .iter()
+        let needed = |path: &Path| {
+            need.iter()
                 .any(|(r, gd)| *r == e.run && path.starts_with(gd))
-                && !chosen.contains_key(path)
-            {
+        };
+        match &e.row {
+            Row::File { path, .. } if needed(path) && !chosen.contains_key(path) => {
                 chosen.insert(path.clone(), (e.run.clone(), e.row.clone()));
             }
+            // Empty directories (refs/heads after pack-refs) make it a git directory too.
+            Row::Dir { path, .. } if needed(path) => {
+                dirs.insert(path.clone());
+            }
+            _ => {}
         }
     }
     // Duplicates removed as noise (N4): path -> (retained copy, sha256), per run.

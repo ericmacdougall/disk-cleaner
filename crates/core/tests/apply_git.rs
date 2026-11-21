@@ -65,6 +65,7 @@ fn repo(fx: &Fx) -> Repo {
     fx.write("repo/README.md", b"hello\n");
     fx.write("repo/src/lib.rs", UNCHANGED);
     fx.write("repo/tracked.txt", b"v1\n");
+    fx.write("repo/gone.txt", b"deleted in the work tree\n");
     fx.write("repo/.gitignore", b"*.log\n.env\n");
     git(&dir, &["add", "-A"]);
     git(&dir, &["commit", "-q", "-m", "A"]);
@@ -81,6 +82,11 @@ fn repo(fx: &Fx) -> Repo {
     fx.write("repo/build.log", &[b'l'; 1024]);
     fx.write("repo/big.bin", &vec![9u8; 2 << 20]);
     fx.write("repo/.env", b"SECRET=ENV-CANARY-91c2\n");
+    fs::remove_file(dir.join("gone.txt")).unwrap();
+    // NEG-16: an untracked symlink to a file outside the repository.
+    let canary = base.join("outside-canary.txt");
+    fs::write(&canary, b"LINK-CANARY-0b7e outside the piece\n").unwrap();
+    std::os::unix::fs::symlink(&canary, dir.join("link-out")).unwrap();
     Repo { dir, bare, url }
 }
 
@@ -266,9 +272,31 @@ fn git_lane_end_to_end() {
             "{want} missing from the WIP: {files:?}"
         );
     }
-    for never in [".env", "build.log", "big.bin"] {
+    for never in [".env", "build.log", "big.bin", "gone.txt"] {
         assert!(!files.contains(&never), "{never} must not be in the WIP");
     }
+    // The symlink is entered as a link (its target bytes), never followed.
+    let link = git(&r.bare, &["ls-tree", &wip, "link-out"]);
+    assert!(link.starts_with("120000 blob "), "{link}");
+    assert_eq!(
+        git(&r.bare, &["cat-file", "-p", &format!("{wip}:link-out")]),
+        fx.tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("outside-canary.txt")
+            .display()
+            .to_string()
+    );
+    let grep = Command::new("git")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .arg("-C")
+        .arg(&r.bare)
+        .args(["grep", "-q", "LINK-CANARY", &wip])
+        .status()
+        .unwrap();
+    assert!(!grep.success(), "the link target's content was pushed");
     assert_eq!(
         git(&r.bare, &["show", &format!("{wip}:tracked.txt")]),
         "v2-MODIFIED"
@@ -293,6 +321,7 @@ fn git_lane_end_to_end() {
     let shards = fx.all_shard_bytes();
     assert!(!shards.windows(UNCHANGED.len()).any(|w| w == UNCHANGED));
     assert!(!shards.windows(14).any(|w| w == b"ENV-CANARY-91c"));
+    assert!(!shards.windows(11).any(|w| w == b"LINK-CANARY"));
     let manifest = fs::read_to_string(fx.manifest()).unwrap();
     assert!(manifest.contains("\"git_oid\""));
     assert!(manifest.contains("\"t\":\"recovery\""));
@@ -310,6 +339,9 @@ fn git_lane_end_to_end() {
 fn restore_of_one_unchanged_file_brings_its_git_dir() {
     let fx = Fx::new();
     let r = repo(&fx);
+    // Packed refs and objects: refs/heads is then an empty directory.
+    git(&r.dir, &["pack-refs", "--all"]);
+    git(&r.dir, &["gc", "-q"]);
     let (scan, plan) = docs(&[&fx.data], &[P::git(&r.dir, &[".env"], bundle_block())]);
     let mut o = gopts(&fx, true, true);
     o.oracle = Box::new(agreeing_oracle(&scan, &plan));
@@ -414,7 +446,7 @@ fn no_push_without_verified_privacy() {
         assert!(
             fs::read_to_string(fx.fake_dir.join("gh.log"))
                 .unwrap()
-                .contains("api repos/someone/thing"),
+                .contains("api --hostname github.com repos/someone/thing"),
             "{name}"
         );
         let rr = restore(&r.dir, &ropts(&fx)).unwrap();
@@ -797,4 +829,87 @@ fn push_that_leaves_no_ref_keeps_the_repo() {
     assert_eq!(out, "kept", "{why}");
     assert!(why.contains("is not on the remote"), "{why}");
     assert!(r.dir.join(".git/HEAD").exists() && r.dir.join("new.txt").exists());
+}
+
+#[test]
+fn detached_head_with_unpushed_commits_is_recovered() {
+    let fx = Fx::new();
+    let base = fx.tmp.path().canonicalize().unwrap();
+    let bare = base.join("bare.git");
+    fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "-q", "--bare", "-b", "main"]);
+    let dir = fx.data.join("det");
+    fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    fx.write("det/a.txt", b"a\n");
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "-m", "A"]);
+    let url = format!("file://{}", bare.display());
+    git(&dir, &["remote", "add", "origin", &url]);
+    git(&dir, &["push", "-q", "-u", "origin", "main"]);
+    git(&dir, &["checkout", "-q", "--detach"]);
+    fx.write("det/b.txt", b"on no branch\n");
+    git(&dir, &["add", "b.txt"]);
+    git(&dir, &["commit", "-q", "-m", "C (detached)"]);
+    let head = git(&dir, &["rev-parse", "HEAD"]);
+    let (scan, plan) = docs(&[&fx.data], &[P::git(&dir, &[], push_block(&url))]);
+    let mut o = gopts(&fx, true, false);
+    o.private_remotes = vec![url.clone()];
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    let (out, why) = outcome(&rep, 0);
+    assert_eq!(out, "removed", "{why}");
+    let date = disk_cleaner_core::apply::utc_date(o.now);
+    assert!(
+        recovery_refs(&bare).contains(&(format!("refs/recovery/testhost/{date}/wip/HEAD"), head)),
+        "{:?}",
+        recovery_refs(&bare)
+    );
+}
+
+#[test]
+fn replace_refs_and_symlinks_in_git_dir_never_break_restore() {
+    // A replace ref would make git return other bytes for a HEAD blob.
+    let fx = Fx::new();
+    let r = repo(&fx);
+    let blob = git(&r.dir, &["rev-parse", "HEAD:src/lib.rs"]);
+    fs::write(fx.tmp.path().join("other"), b"REPLACED BYTES\n").unwrap();
+    let other = git(
+        &r.dir,
+        &[
+            "hash-object",
+            "-w",
+            &fx.tmp.path().join("other").display().to_string(),
+        ],
+    );
+    git(&r.dir, &["replace", &blob, &other]);
+    let (scan, plan) = docs(&[&fx.data], &[P::git(&r.dir, &[".env"], bundle_block())]);
+    let mut o = gopts(&fx, true, true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    assert_eq!(outcome(&rep, 0).0, "removed", "{rep:#?}");
+    let target = r.dir.join("src/lib.rs");
+    let rr = restore(&target, &ropts(&fx)).unwrap();
+    assert!(rr.failed.is_empty(), "{rr:?}");
+    assert_eq!(fs::read(&target).unwrap(), UNCHANGED);
+
+    // A symlink inside .git: nothing restores from the git directory; files are uploaded raw.
+    let fx = Fx::new();
+    let r = repo(&fx);
+    let outside = fx.tmp.path().join("desc");
+    fs::write(&outside, b"desc\n").unwrap();
+    fs::remove_file(r.dir.join(".git/description")).unwrap();
+    std::os::unix::fs::symlink(&outside, r.dir.join(".git/description")).unwrap();
+    let (scan, plan) = docs(&[&fx.data], &[P::git(&r.dir, &[".env"], bundle_block())]);
+    let mut o = gopts(&fx, true, true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    assert_eq!(outcome(&rep, 0).0, "removed", "{rep:#?}");
+    let manifest = fs::read_to_string(fx.manifest()).unwrap();
+    assert!(
+        !manifest.contains("\"git_oid\":\""),
+        "no file restores from the git dir"
+    );
+    let shards = fx.all_shard_bytes();
+    assert!(shards.windows(UNCHANGED.len()).any(|w| w == UNCHANGED));
 }

@@ -155,6 +155,7 @@ pub(crate) fn git_command(
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
         .env("GIT_PROTOCOL_FROM_USER", "0")
         .env("LC_ALL", "C");
@@ -565,7 +566,13 @@ pub(crate) fn prepare(
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("extensions.objectformat"))
         .is_none_or(|(_, v)| v.eq_ignore_ascii_case("sha1"));
-    let git_partial = p.excludes.iter().any(|e| in_git_dir(e));
+    // An excluded path or a symlink inside .git means the backed-up git directory may not hold
+    // every object: then nothing restores from it (every file is uploaded raw).
+    let git_partial = p.excludes.iter().any(|e| in_git_dir(e))
+        || en
+            .members
+            .iter()
+            .any(|m| in_git_dir(&m.rel) && m.id.kind == 'l');
     // Plumbing on the repository itself only after its config passed the allowlist.
     let trusted = bad_key.is_none() && sha1_format;
     let mut head = None;
@@ -866,9 +873,20 @@ pub(crate) struct Recovered {
 /// and the same `full_name`. Anything else, or an error, is not private.
 fn gh_private(opts: &ApplyOptions, owner_repo: &str) -> Result<(), String> {
     let mut c = Command::new(&opts.gh);
-    c.env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1")
-        .args(["api", &format!("repos/{owner_repo}")]);
+    for k in [
+        "GH_HOST",
+        "GH_REPO",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ] {
+        c.env_remove(k);
+    }
+    c.env("GH_PROMPT_DISABLED", "1").env("NO_COLOR", "1").args([
+        "api",
+        "--hostname",
+        "github.com",
+        &format!("repos/{owner_repo}"),
+    ]);
     let out = run_cmd(c, None, NET_TIMEOUT, "gh api").map_err(|e| format!("gh: {e}"))?;
     let v: serde_json::Value =
         serde_json::from_slice(&out).map_err(|_| "gh returned something that is not JSON")?;
@@ -949,6 +967,37 @@ fn ls_remote(
         .collect())
 }
 
+/// git 2.32 or later (I-5 F2): older git ignores `GIT_CONFIG_GLOBAL` and would load the user's
+/// global config (an `insteadOf` rewrite could redirect the push).
+fn git_version_ok(opts: &ApplyOptions) -> Result<(), String> {
+    let mut c = Command::new(&opts.git);
+    c.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .arg("--version");
+    let out = run_cmd(c, None, LOCAL_TIMEOUT, "git --version")?;
+    let text = String::from_utf8_lossy(&out);
+    let ver = text
+        .split_whitespace()
+        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or("");
+    let mut it = ver.split('.').map(|n| {
+        n.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u32>()
+            .unwrap_or(0)
+    });
+    let (major, minor) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
+    if (major, minor) >= (2, 32) {
+        Ok(())
+    } else {
+        Err(format!(
+            "git {} is older than 2.32, which apply needs to push in isolation",
+            diag(ver)
+        ))
+    }
+}
+
 /// Recovery (act only): push recovery refs to a remote proven private, confirm them, and return
 /// the row to record. `Err` keeps the piece (F6).
 pub(crate) fn recover(
@@ -976,6 +1025,12 @@ pub(crate) fn recover(
                 ),
             });
         }
+    }
+    if let Err(why) = git_version_ok(opts) {
+        return Ok(Recovered {
+            row: None,
+            note: format!("recovery: the git directory backup ({why})"),
+        });
     }
     let work = opts.state_dir.join(format!("git-{run}-{}", p.id));
     let _ = std::fs::remove_dir_all(&work);
@@ -1085,10 +1140,11 @@ fn recover_in(
             }
         }
     }
+    let mut detached_unpushed = false;
     if let (Some(head), true) = (&w.head, head_ok) {
         if w.head_branch.is_none() {
             match unpushed(head) {
-                Ok(_) => {}
+                Ok(c) => detached_unpushed = !c.is_empty(),
                 Err(why) => {
                     head_ok = false;
                     notes.push(format!("detached HEAD not pushed: {why}"));
@@ -1158,6 +1214,12 @@ fn recover_in(
                 .ok_or("git commit-tree printed nothing")?;
             let name = w.head_branch.clone().unwrap_or_else(|| "HEAD".into());
             want.push((format!("refs/recovery/{label}/{date}/wip/{name}"), wip));
+        } else if detached_unpushed {
+            // A detached HEAD with commits on no branch and no remote, and a clean tree.
+            want.push((
+                format!("refs/recovery/{label}/{date}/wip/HEAD"),
+                head.clone(),
+            ));
         }
     }
     // Never forced (C4): a ref already there with another oid is skipped.
@@ -1254,6 +1316,7 @@ pub(crate) fn cat_blob(git: &Path, git_dir: &Path, oid: &str) -> Result<Vec<u8>,
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_DIR", git_dir)
         .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .args(["cat-file", "blob", oid])
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
