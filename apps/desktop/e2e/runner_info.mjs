@@ -3,7 +3,7 @@
 // Every probe is best effort; a probe that is not available says so instead of failing.
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -83,6 +83,30 @@ export function machine() {
     m.win32Video = v.out ?? v;
   }
   return m;
+}
+
+/**
+ * Linux: the app's processes and whether each is traced (TracerPid in /proc/<pid>/status), so an
+ * AC-9 investigation arm can show it ran with or without strace. `names` are the comm names
+ * (at most 15 characters) to look for. Elsewhere: null.
+ */
+export function tracerState(names) {
+  if (process.platform !== "linux") return null;
+  let pids;
+  try {
+    pids = readdirSync("/proc").filter((d) => /^\d+$/.test(d));
+  } catch {
+    return null;
+  }
+  const procs = [];
+  for (const pid of pids) {
+    const st = read(`/proc/${pid}/status`);
+    if (!st) continue;
+    const name = /^Name:\s*(.*)$/m.exec(st)?.[1];
+    if (!names.includes(name)) continue;
+    procs.push({ pid: Number(pid), name, tracerPid: Number(/^TracerPid:\s*(\d+)/m.exec(st)?.[1] ?? NaN) });
+  }
+  return { procs, traced: procs.filter((p) => p.tracerPid > 0).length, untraced: procs.filter((p) => p.tracerPid === 0).length };
 }
 
 /** CPU time shares between two snapshots (Linux), in percent of all CPU time. */

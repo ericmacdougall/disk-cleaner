@@ -617,4 +617,124 @@ try {
     if (proc2) stopDriver(proc2);
   }
 }
+
+// AC-9 investigation of the Linux running-app scroll (docs/DESKTOP.md), registered before any
+// sample in WAL w07983c42191 and wf5f38e99704. Opt-in (AC9_INVESTIGATE=1, Linux only) and never
+// a gate: everything goes to run.measure, nothing to a check. The gated session above is not
+// changed. Six more one-million-row sessions, each a fresh launch, with and without the strace
+// wrapper (e2e/check.sh skips it for PRUNEDISK_AC9_UNTRACED=1 with PRUNEDISK_E2E_SYNTH_NODES):
+// - steps: floor windows at the start, middle and end, around the scroll steps;
+// - idle: the app with the tree shown, no steps, the floor loop alone for the same time;
+// - blank: the same launch, navigated to about:blank (no app code), the floor loop likewise.
+if (process.platform === "linux" && process.env.AC9_INVESTIGATE === "1") {
+  const { stepsWithFloors, floorFor, stat, windows, blockMedians } = await import("./ac9x.mjs");
+  const { tracerState } = await import("./runner_info.mjs");
+  const NAMES = ["e2e", "WebKitWebProces", "WebKitNetworkPr"];
+  const WINDOW = 60;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const appPids = () => (tracerState(NAMES)?.procs ?? []).filter((p) => p.name === "e2e").map((p) => p.pid);
+  const durations = {};
+  const session = async (arm, untraced, body) => {
+    const id = `info.ac9x.${arm}.${untraced ? "untraced" : "traced"}`;
+    let proc;
+    let app;
+    try {
+      // The previous session's app must be gone, or its trace state would be read for this one.
+      for (let i = 0; i < 30 && appPids().length; i++) await sleep(500);
+      const leftover = new Set(appPids());
+      await sleep(2000);
+      const e = { ...env, PRUNEDISK_E2E_SYNTH_NODES: String(AC9.nodes) };
+      if (untraced) e.PRUNEDISK_AC9_UNTRACED = "1";
+      else delete e.PRUNEDISK_AC9_UNTRACED;
+      ({ proc } = await startDriver({ nativeDriver: a["native-driver"], port: 4448, nativePort: 4449, env: e }));
+      app = await App.open("http://127.0.0.1:4448", a.app);
+      await app.s.cmd("POST", "/timeouts", { script: 600_000 });
+      const shown = await app.s.until(
+        "const s = document.querySelector('.tg-scroll'); return s && document.getElementById('tg-row-0') ? Number(s.getAttribute('aria-rowcount')) - 1 : 0;",
+        120_000,
+      );
+      if (shown !== AC9.nodes + 1) throw new Error(`${shown} rows shown, wanted ${AC9.nodes + 1}`);
+      const tracer = tracerState(NAMES);
+      const mine = (tracer?.procs ?? []).filter((p) => p.name === "e2e" && !leftover.has(p.pid));
+      const valid = mine.length > 0 && mine.every((p) => (untraced ? p.tracerPid === 0 : p.tracerPid > 0));
+      if (!valid) {
+        run.measure({ id, valid: false, untraced, tracer, leftover: [...leftover], error: "the app's trace state does not match the arm; not measured" });
+        return;
+      }
+      const t = Date.now();
+      const out = await body(app);
+      run.measure({ id, valid: true, untraced, arm, tracer, leftover: [...leftover], wallMs: Date.now() - t, gate: false, ...out });
+    } catch (err) {
+      run.measure({ id, valid: false, untraced, arm, error: String(err?.message ?? err) });
+    } finally {
+      if (app) await app.close().catch(() => {});
+      if (proc) stopDriver(proc);
+    }
+  };
+  const floorSummary = (r) => ({
+    elapsedMs: r.elapsedMs,
+    href: r.href,
+    elements: r.elements,
+    floor: windows(r.samples, WINDOW),
+    raf: windows(r.intervals, WINDOW),
+    all: stat(r.samples),
+    samples: r.samples,
+    at: r.at,
+  });
+  const steps = (untraced) =>
+    session("steps", untraced, async (app) => {
+      const r = await app.s.execAsync(
+        `const [o, done] = arguments;
+         const measureScroll = ${measureScroll.toString()};
+         const measureFloor = ${measureFloor.toString()};
+         (${stepsWithFloors.toString()})(o, measureScroll, measureFloor).then(done, (e) => done({ error: String(e), samples: [] }));`,
+        600_000,
+        { scroll: scrollOptions(), half: AC9.scrollSamples / 2, window: WINDOW, floorWarmup: AC9.scrollWarmup },
+      );
+      if (r.error) throw new Error(r.error);
+      durations[untraced] = r.elapsedMs;
+      const w = (x) => ({ floor: stat(x.samples), raf: stat(x.intervals) });
+      return {
+        elapsedMs: r.elapsedMs,
+        windows: { start: w(r.start), mid: w(r.mid), end: w(r.end) },
+        scroll: stat(r.samples),
+        scrollPerBlock50: blockMedians(r.samples, 50),
+        rowsMax: r.rowsMax,
+        samples: r.samples,
+        floorSamples: { start: r.start.samples, mid: r.mid.samples, end: r.end.samples },
+      };
+    });
+  const floorOnly = (arm, untraced, before) =>
+    session(arm, untraced, async (app) => {
+      const pre = before ? await before(app) : {};
+      const durationMs = durations[untraced] ?? 20_000;
+      const r = await app.s.execAsync(
+        `const [o, done] = arguments;
+         (${floorFor.toString()})(o).then(done, (e) => done({ error: String(e) }));`,
+        300_000,
+        { warmup: AC9.scrollWarmup, durationMs: Math.min(durationMs, 120_000), maxSamples: 20_000 },
+      );
+      if (r.error) throw new Error(r.error);
+      return { ...pre, matchedToMs: durationMs, matchedFrom: durations[untraced] ? `steps.${untraced ? "untraced" : "traced"}` : "fallback 20 s", ...floorSummary(r) };
+    });
+  // The blank page: the same launch, then about:blank, so no app code runs in the page.
+  const blank = async (app) => {
+    let how = "navigate about:blank";
+    try {
+      await app.s.cmd("POST", "/url", { url: "about:blank" });
+    } catch (e) {
+      how = `document.open replacement (navigation failed: ${String(e?.message ?? e).slice(0, 200)}; the app's timers and window listeners may remain)`;
+      await app.s.exec("document.open(); document.write('<!doctype html><html><head></head><body></body></html>'); document.close(); return true;");
+    }
+    const page = await app.s.exec("return { href: location.href, elements: document.getElementsByTagName('*').length, grid: !!document.querySelector('.tg-scroll'), tauri: typeof window.__TAURI_INTERNALS__ };");
+    if (page.grid) throw new Error("the grid is still in the page; not a blank page");
+    return { blank: { how, page } };
+  };
+  await steps(false);
+  await steps(true);
+  await floorOnly("idle", false);
+  await floorOnly("idle", true);
+  await floorOnly("blank", false, blank);
+  await floorOnly("blank", true, blank);
+}
 process.exitCode = run.write(a.out ?? "e2e-result.json") ? 1 : 0;

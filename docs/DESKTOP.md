@@ -524,6 +524,24 @@ What these add:
 - The cause is still not established. The run without the strace wrapper, above, would
   separate strace from rendering; it has not been run.
 
+The investigation sessions (registered in the WAL before any sample, informational, never a
+gate). They are opt-in: the e2e-variants workflow's `ac9_investigate` input sets
+`AC9_INVESTIGATE=1`, and `e2e/run.mjs` then runs them on Linux after the gated session, which
+is not changed. Each one is a fresh one-million-row launch, once with the strace wrapper and once
+without:
+
+- steps: floor windows of 60 frames at the start, the middle and the end, around the 200 steps;
+- app idle: the tree shown, no steps, only the floor loop, for as long as the steps session took;
+- blank page: the same launch navigated to `about:blank`, so no app code runs in the page, then
+  the floor loop for the same time.
+
+`e2e/check.sh`'s app wrapper skips strace only when both `PRUNEDISK_AC9_UNTRACED=1` and
+`PRUNEDISK_E2E_SYNTH_NODES` are set, which only those sessions do. Each untraced launch leaves a
+marker in `$OUT/untraced/`, and the trace step prints how many there were. The write observer
+(PR gate F10) does not see those launches; the sandbox snapshot still covers them. Each session
+reads the app process's `TracerPid` from `/proc` and counts as invalid when it does not match
+its arm. Page functions: `e2e/ac9x.mjs`, which reuses `e2e/ac9.mjs`'s step and floor code.
+
 Running-app scroll tally:
 
 - Windows: 5 of 5 passed (through 030f494).

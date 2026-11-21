@@ -118,9 +118,19 @@ else
   mkdir -p "$OUT/trace"
   CALLS=$("$PY" e2e/trace_report.py --strace-calls)
   # Every launch of the app (the suite starts several) writes its own log: strace.<pid>.log.
+  # One exception, an investigation of the AC-9 timings (docs/DESKTOP.md), never a gate: a
+  # launch with PRUNEDISK_AC9_UNTRACED=1 and PRUNEDISK_E2E_SYNTH_NODES set (only run.mjs's
+  # extra one-million-row sessions) runs without strace, leaves a marker in $OUT/untraced/, and
+  # stays in the sandbox. The suite's other sessions never set it.
+  rm -rf "$OUT/untraced"
+  mkdir -p "$OUT/untraced"
   cat > "$APP" << EOF
 #!/bin/sh
 export HOME="$SB/home" XDG_CONFIG_HOME="$SB/config" XDG_DATA_HOME="$SB/data" XDG_CACHE_HOME="$SB/cache" XDG_STATE_HOME="$SB/state" TMPDIR="$SB/tmp"
+if [ "\${PRUNEDISK_AC9_UNTRACED:-}" = 1 ] && [ -n "\${PRUNEDISK_E2E_SYNTH_NODES:-}" ]; then
+  : > "$OUT/untraced/launch.\$\$"
+  exec "$E2E_BIN" "\$@"
+fi
 exec strace -f -qq --seccomp-bpf -y -o "$OUT/trace/strace.\$\$.log" -e "trace=$CALLS" "$E2E_BIN" "\$@"
 EOF
   chmod +x "$APP"
@@ -152,7 +162,10 @@ if ! $win; then
   # path, anywhere on the machine, fails the check.
   echo "== trace: every write of the app and its child processes"
   logs=("$OUT"/trace/strace.*.log)
-  echo "trace logs: ${#logs[@]} (one per launch)"
+  echo "trace logs: ${#logs[@]} (one per traced launch)"
+  untraced=("$OUT"/untraced/launch.*)
+  [ -e "${untraced[0]}" ] || untraced=()
+  echo "untraced launches (AC-9 investigation sessions, outside this trace): ${#untraced[@]}"
   "$PY" e2e/trace_report.py "${logs[@]}" "${DECLARED[@]}" "${TRACE_IGNORE[@]}" > "$OUT/trace.txt" || trace=$?
   { grep -E '^(OTHER|UNRESOLVED|UNOBSERVABLE|UNPARSED|trace:)' "$OUT/trace.txt" | head -200; } || true
 fi

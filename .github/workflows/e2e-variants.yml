@@ -9,6 +9,11 @@ on:
   push:
     branches: ["e2e-variants/**"]
   workflow_dispatch:
+    inputs:
+      ac9_investigate:
+        description: "Also run the AC-9 investigation sessions (informational, never a gate; docs/DESKTOP.md)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -68,6 +73,7 @@ jobs:
         working-directory: apps/desktop
         env:
           VARIANT: ${{ matrix.variant }}
+          AC9_INVESTIGATE: ${{ inputs.ac9_investigate && '1' || '0' }}
         run: |
           export RELEASE_BIN=none E2E_BIN="$RUNNER_TEMP/bin/e2e"
           export CLI_BIN="$GITHUB_WORKSPACE/target/release/disk-cleaner" OUT="$RUNNER_TEMP/e2e"
