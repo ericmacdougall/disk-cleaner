@@ -728,3 +728,104 @@ fn d2_an_unreadable_git_reference_keeps_everything_until_it_is_readable() {
     expect_control(&mut bad, "readable", &res, &p, &root.join("loose"));
     verdict(bad);
 }
+
+// ----------------------------------------------------------------------------------------------
+// AC-21: a plan item that removes holds no kept piece under its path except a secret piece, which
+// stays in place (lane rule 1). NEG-30: a secret-named entry inside an artifact does not make the
+// artifact ask; the item stays `remove-regenerable`, exactly as at df5d6df.
+
+/// AC-21 on one plan: every `keep` piece under a removing item's path is a secret piece.
+fn items_invariant(bad: &mut Vec<String>, label: &str, res: &ScanResult, p: &Plan) {
+    let all = members(res, p);
+    for it in p.items.iter().filter(|i| i.action.removes()) {
+        let at = real(Path::new(&it.path));
+        for (m, lp) in all.iter().filter(|(m, _)| m.starts_with(&at)) {
+            if lp.lane == Lane::Keep && lp.secret.is_none() {
+                bad.push(format!(
+                    "{label}: item {} is {:?} but {} is kept: {}",
+                    it.path,
+                    it.action,
+                    m.display(),
+                    lp.reason
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn artifact_secret_a_secret_entry_stays_in_place_and_the_artifact_is_still_noise() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = real(tmp.path()).join("root");
+    let proj = root.join("proj");
+    write(&proj.join("package.json"), "{}\n");
+    write(&proj.join("requirements.txt"), "certifi\n");
+    let nm = proj.join("node_modules");
+    let pkg = nm.join("pkg");
+    write(&pkg.join("package.json"), "{\"name\": \"pkg\"}\n");
+    write_bytes(&pkg.join("index.js"), 9 * KIB);
+    write(
+        &pkg.join(".npmrc"),
+        "registry=https://registry.example.invalid/\n",
+    );
+    write(&pkg.join("test").join("fixture.pem"), "not a key\n");
+    let venv = proj.join("venv");
+    write(&venv.join("pyvenv.cfg"), "home = /usr/bin\n");
+    let site = venv.join("lib").join("python3.11").join("site-packages");
+    write(&site.join("pip").join("__init__.py"), "\n");
+    let certifi = site.join("pip").join("_vendor").join("certifi");
+    write(&certifi.join("cacert.pem"), "not a bundle\n");
+    write_bytes(&certifi.join("core.py"), 9 * KIB);
+    let ctl = root.join("ctl");
+    content(&ctl);
+    let res = scan_roots(std::slice::from_ref(&root));
+    let p = idle_plan(&res);
+    let mut bad = Vec::new();
+    expect_control(&mut bad, "control", &res, &p, &ctl);
+    items_invariant(&mut bad, "items", &res, &p);
+    let secrets = [
+        pkg.join(".npmrc"),
+        pkg.join("test").join("fixture.pem"),
+        certifi.join("cacert.pem"),
+    ];
+    for (label, dir) in [("node_modules", &nm), ("venv", &venv)] {
+        match p
+            .items
+            .iter()
+            .find(|i| real(Path::new(&i.path)) == real(dir))
+        {
+            Some(it) if it.action != Action::RemoveRegenerable => {
+                bad.push(format!("{label}: item is {:?}: {}", it.action, it.reason))
+            }
+            Some(_) => {}
+            None => bad.push(format!("{label}: no item")),
+        }
+        let under = pieces_under(&res, &p, dir);
+        if under.len() < 2 {
+            bad.push(format!("{label}: vacuous, {} members", under.len()));
+        }
+        for (m, lp) in under {
+            let secret = secrets.iter().any(|s| real(s) == m);
+            let ok = if secret {
+                lp.lane == Lane::Keep && lp.secret.is_some()
+            } else {
+                lp.lane == Lane::Noise
+            };
+            if !ok {
+                bad.push(format!(
+                    "{label}: {} is {:?} secret={:?}: {}",
+                    m.display(),
+                    lp.lane,
+                    lp.secret,
+                    lp.reason
+                ));
+            }
+        }
+    }
+    for s in &secrets {
+        if !members(&res, &p).iter().any(|(m, _)| m == &real(s)) {
+            bad.push(format!("{} has no piece", s.display()));
+        }
+    }
+    verdict(bad);
+}
