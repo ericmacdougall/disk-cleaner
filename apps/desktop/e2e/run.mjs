@@ -277,13 +277,106 @@ const shownUntraced = (before) => {
   return apps;
 };
 
-// Linux: the default fixture's timings (timing.ipc_tree_page_p95, timing.scroll_p95), taken in a
-// launch of their own with the untraced switch, BEFORE the main session: the same fixture, the
-// same scan (git facts on, as the main session scans it), the same wide folder, the same steps,
-// thresholds, n and no retry. First, because the main session's Settings checks save the active
-// window to the sandbox's settings file, so a launch after them would scan under other settings
-// than the main session's rescan, which runs before them on the defaults.
-// flow.default_scan_settings_match compares the two scans. The sandbox snapshot covers this launch.
+// Linux, the default fixture in three launches on the same sandbox, in this order (the stream
+// owner's ruling B'):
+// 1. first run, traced: the suite's first launch on the pristine sandbox, so its first scan,
+//    render, git run and scroll pass strace and the write observer. The default scan, the drill
+//    into the wide folder, then the timing checks' steps, not timed (steps.*_traced, gate:false).
+// 2. untraced: the gated timing.ipc_tree_page_p95 and timing.scroll_p95, the same scan and steps,
+//    thresholds, n and no retry, after the trace-state and other-instance preconditions.
+// 3. the main session, traced, whose Settings checks save the active window to the sandbox's
+//    settings file (which is why both launches above come before it).
+// flow.default_scan_settings_match requires all three scans to read the same conditions.
+/** A launch of the default fixture alone (no Open or Export list, no synthetic tree). */
+const defaultEnv = (untraced) => {
+  const e = { ...env, PRUNEDISK_E2E_FOLDERS: a.fixture };
+  delete e.PRUNEDISK_E2E_OPEN;
+  delete e.PRUNEDISK_E2E_EXPORT;
+  delete e.PRUNEDISK_E2E_SYNTH_NODES;
+  if (untraced) e[UNTRACED_VAR] = "1";
+  else delete e[UNTRACED_VAR];
+  return e;
+};
+/** Open a default-fixture launch on `port` and wait for the chooser. */
+async function openDefault(port) {
+  const x = await App.open(`http://127.0.0.1:${port}`, a.app);
+  await x.s.cmd("POST", "/timeouts", { script: 600_000 });
+  await x.s.until("return [...document.querySelectorAll('h2')].some((e) => e.textContent === 'Choose what to scan')", 60_000);
+  return x;
+}
+/** The default scan: Add folders, the git-facts box as the app starts it (it must be on, the
+ *  default: never clicked here, so a changed default shows), the scan conditions read, Scan, the
+ *  scan complete and the plan ready (Export enabled, as the main session waits), then into the
+ *  wide folder. */
+async function defaultScan(x) {
+  await x.s.clickText("Add folders...");
+  await x.s.until("return document.querySelectorAll('ul.chosen li').length === 1", 10_000);
+  const gitFacts = await x.s.exec("return document.getElementById('git-facts')?.checked ?? null");
+  if (gitFacts !== true) throw new Error(`the git-facts box is ${gitFacts === null ? "missing" : "off"} before Scan, not on as the app starts it; not scanned`);
+  const scan = await scanConditions(x);
+  await x.s.clickText("Scan");
+  await x.s.until("return [...document.querySelectorAll('.bar span')].some((e) => e.textContent.startsWith('Scan complete.'))", 120_000);
+  await x.s.until(`return [...document.querySelectorAll('.bar button')].some((b) => b.textContent === '${EXPORT_LABEL}' && !b.disabled)`, 120_000);
+  return { scan, rows: await drillIntoWide(x) };
+}
+
+let firstScan = null;
+if (linux) {
+  let procF;
+  let appF;
+  let before = new Set();
+  let beforeAll = new Set();
+  let sessionPids = [];
+  let totalF = 0;
+  try {
+    before = appPids();
+    beforeAll = allPids();
+    // Recorded only: this launch is not timed.
+    othersAtStart("info.default.precondition.first_run");
+    ({ proc: procF } = await startDriver({ nativeDriver: a["native-driver"], port: 4452, nativePort: 4453, env: defaultEnv(false) }));
+    await run.check("launch.default_first_run", async () => {
+      appF = await openDefault(4452);
+      return { title: await appF.s.cmd("GET", "/title") };
+    });
+    sessionPids = procsSince(LEFT_PROCS, beforeAll);
+    await run.check("trace.default.first_run_traced", async () => {
+      const apps = newApps(before);
+      if (!apps.length) throw new Error("no app process of this launch found in /proc");
+      const untraced = apps.filter((p) => p.tracerPid === 0);
+      if (untraced.length) throw new Error(`not traced, so the first run passed the write observer unseen: ${JSON.stringify(untraced)}`);
+      return { apps };
+    });
+    await run.check("flow.default_first_run_scan", async () => {
+      if (!appF) throw new Error("the first-run launch did not open");
+      const r = await defaultScan(appF);
+      firstScan = r.scan;
+      totalF = r.rows;
+      return r;
+    });
+    // The timing checks' steps, traced and not timed: they must complete under the write
+    // observer; their numbers are information only.
+    await run.check("steps.ipc_tree_page_traced", async () => {
+      wideShown(totalF);
+      const ms = await ipcDefaultSamples(appF, totalF);
+      run.measure({ ...stats("ipc_tree_page_traced", ms, THRESHOLDS.ipcP95Ms), gate: false });
+      return { n: ms.length, timed: false };
+    });
+    await run.check("steps.scroll_traced", async () => {
+      wideShown(totalF);
+      const ms = await scrollDefaultSamples(appF);
+      run.measure({ ...stats("scroll_rows_shown_traced", ms, THRESHOLDS.scrollP95Ms), gate: false });
+      return { n: ms.length, timed: false };
+    });
+  } catch (e) {
+    run.results.push({ id: "suite.default_first_run", ok: false, ms: 0, detail: String(e?.stack ?? e) });
+    console.log(`FAIL suite.default_first_run ${String(e?.message ?? e)}`);
+  } finally {
+    if (appF) await appF.close().catch(() => {});
+    if (procF) stopDriver(procF);
+    await afterClose("first_run", sessionPids, "default");
+  }
+}
+
 let untracedScan = null;
 if (linux) {
   let procU;
@@ -298,15 +391,9 @@ if (linux) {
     before = appPids();
     beforeAll = allPids();
     notAlone = othersAtStart("info.default.precondition.untraced");
-    const envU = { ...env, PRUNEDISK_E2E_FOLDERS: a.fixture, [UNTRACED_VAR]: "1" };
-    delete envU.PRUNEDISK_E2E_OPEN;
-    delete envU.PRUNEDISK_E2E_EXPORT;
-    delete envU.PRUNEDISK_E2E_SYNTH_NODES;
-    ({ proc: procU } = await startDriver({ nativeDriver: a["native-driver"], port: 4450, nativePort: 4451, env: envU }));
+    ({ proc: procU } = await startDriver({ nativeDriver: a["native-driver"], port: 4450, nativePort: 4451, env: defaultEnv(true) }));
     await run.check("launch.default_untraced", async () => {
-      appU = await App.open("http://127.0.0.1:4450", a.app);
-      await appU.s.cmd("POST", "/timeouts", { script: 600_000 });
-      await appU.s.until("return [...document.querySelectorAll('h2')].some((e) => e.textContent === 'Choose what to scan')", 60_000);
+      appU = await openDefault(4450);
       return { title: await appU.s.cmd("GET", "/title") };
     });
     sessionPids = procsSince(LEFT_PROCS, beforeAll);
@@ -317,15 +404,10 @@ if (linux) {
     });
     await run.check("flow.default_untraced_scan", async () => {
       if (!appU) throw new Error("the untraced launch did not open");
-      await appU.s.clickText("Add folders...");
-      await appU.s.until("return document.querySelectorAll('ul.chosen li').length === 1", 10_000);
-      // Git facts on, as the main session scans the fixture (the box starts on; made sure here).
-      await appU.s.exec("const b = document.getElementById('git-facts'); if (!b.checked) b.click();");
-      untracedScan = await scanConditions(appU);
-      await appU.s.clickText("Scan");
-      await appU.s.until("return [...document.querySelectorAll('.bar span')].some((e) => e.textContent.startsWith('Scan complete.'))", 120_000);
-      totalU = await drillIntoWide(appU);
-      return { rows: totalU, scan: untracedScan };
+      const r = await defaultScan(appU);
+      untracedScan = r.scan;
+      totalU = r.rows;
+      return r;
     });
     await defaultTimings(appU, totalU, () => {
       // The trace state first: a traced app is never timed, whatever else is wrong.
@@ -428,16 +510,19 @@ try {
     return state();
   });
   if (linux) {
-    // The untraced timing session scanned the same fixture under the same settings (owner point
-    // 3): the chosen folders, the git-facts box and the settings the app reports, read just
+    // The first-run, untraced and main scans of the fixture read the same conditions (owner
+    // point 3): the chosen folders, the git-facts box and the settings the app reports, read just
     // before each Scan, are the same bytes as JSON.
     await run.check("flow.default_scan_settings_match", async () => {
-      if (!untracedScan) throw new Error("the untraced timing session recorded no scan settings, so its scan cannot be compared");
-      if (!mainScan) throw new Error("the main session recorded no scan settings");
-      const u = JSON.stringify(untracedScan);
-      const m = JSON.stringify(mainScan);
-      if (u !== m) throw new Error(`the untraced timing session scanned under other settings: untraced ${u}, main ${m}`);
-      return { scan: mainScan, bytes: m.length };
+      const scans = { first_run: firstScan, untraced: untracedScan, main: mainScan };
+      const missing = Object.keys(scans).filter((k) => !scans[k]);
+      if (missing.length) throw new Error(`no scan settings recorded for: ${missing.join(", ")}, so the scans cannot be compared`);
+      const want = JSON.stringify(mainScan);
+      const differ = Object.keys(scans).filter((k) => JSON.stringify(scans[k]) !== want);
+      if (differ.length) {
+        throw new Error(`scanned under other settings than the main session: ${differ.map((k) => `${k} ${JSON.stringify(scans[k])}`).join("; ")}; main ${want}`);
+      }
+      return { scan: mainScan, bytes: want.length, sessions: Object.keys(scans) };
     });
   }
 
@@ -477,26 +562,10 @@ try {
     total = await drillIntoWide(app);
     return { rows: total };
   });
-  if (linux) {
-    // Linux: this session is traced, so its numbers are not judged; the timings are taken in the
-    // untraced session before it (on the same fixture). The same steps run here, under the write
-    // observer: they must complete, and their numbers are recorded as information only.
-    await run.check("steps.ipc_tree_page_traced", async () => {
-      wideShown(total);
-      const ms = await ipcDefaultSamples(app, total);
-      run.measure({ ...stats("ipc_tree_page_traced", ms, THRESHOLDS.ipcP95Ms), gate: false });
-      return { n: ms.length, timed: false };
-    });
-    await run.check("steps.scroll_traced", async () => {
-      wideShown(total);
-      const ms = await scrollDefaultSamples(app);
-      run.measure({ ...stats("scroll_rows_shown_traced", ms, THRESHOLDS.scrollP95Ms), gate: false });
-      return { n: ms.length, timed: false };
-    });
-  } else {
-    // Windows has no tracer: the timings are taken here, as registered.
-    await defaultTimings(app, total, () => wideShown(total));
-  }
+  // Linux: this session is traced, so it times nothing; the timings are taken in the untraced
+  // launch before it, and their steps ran traced in the first-run launch. Windows has no tracer:
+  // the timings are taken here, as registered.
+  if (!linux) await defaultTimings(app, total, () => wideShown(total));
 
   // Developer view: a class with more than one page, Next and Previous, then another class.
   await run.check("view.dev_paging_and_class_switch", async () => {
