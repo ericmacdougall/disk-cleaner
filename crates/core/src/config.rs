@@ -41,6 +41,10 @@ pub struct Config {
     /// Most allocated bytes of its own files (everything but object files) one git directory may
     /// hold and still be removed after a backup; more asks.
     pub max_git_admin_bytes: u64,
+    /// Remote URLs the user declares private. Only apply reads it: a recovery push goes to a
+    /// remote only after apply has established that it is private, and a URL listed here counts.
+    /// The plan never reads it (see SCAN-FORMAT.md, "The git lane").
+    pub private_remotes: Vec<String>,
 }
 
 impl Default for Config {
@@ -50,6 +54,7 @@ impl Default for Config {
             trust_partial_process_check: false,
             accept_incomplete_coverage: false,
             max_git_admin_bytes: DEFAULT_MAX_GIT_ADMIN_BYTES,
+            private_remotes: Vec::new(),
         }
     }
 }
@@ -67,6 +72,7 @@ struct RawConfig {
     trust_partial_process_check: Option<bool>,
     accept_incomplete_coverage: Option<bool>,
     max_git_admin_bytes: Option<u64>,
+    private_remotes: Option<Vec<String>>,
     /// Read only to refuse it with a message naming its replacement, whatever its value.
     require_full_coverage: Option<toml::Value>,
     /// Read only to refuse it with a message saying why, whatever its value.
@@ -123,6 +129,7 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
         max_git_admin_bytes: raw
             .max_git_admin_bytes
             .unwrap_or(DEFAULT_MAX_GIT_ADMIN_BYTES),
+        private_remotes: raw.private_remotes.unwrap_or_default(),
     })
 }
 

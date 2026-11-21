@@ -43,6 +43,8 @@ pub struct ScanOptions {
     pub git_jobs: usize,
     /// Artifact and cache rules.
     pub rules: Arc<RuleSet>,
+    /// Survey the roots into pieces for plan lanes (`scan --lanes`); `None` skips it.
+    pub lanes: Option<crate::pieces::PieceOptions>,
 }
 
 impl ScanOptions {
@@ -57,6 +59,7 @@ impl ScanOptions {
             facts: FactsConfig::default(),
             git_jobs: 4,
             rules: Arc::new(RuleSet::builtin()),
+            lanes: None,
         }
     }
 }
@@ -977,6 +980,12 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             path: abs.clone(),
             source: e,
         })?;
+        // A root is a directory, or a symlink to one (CT-A2). A root that resolves to anything
+        // else is refused before anything is walked or written; one that does not resolve is
+        // reported by the walk as before.
+        if std::fs::metadata(&abs).is_ok_and(|m| !m.is_dir()) {
+            return Err(Error::NotADirectory { path: abs });
+        }
         spelled.push(abs);
     }
     let mut warnings: Vec<String> = Vec::new();
@@ -1424,6 +1433,13 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         .entry(Class::Other.as_str().to_string())
         .or_insert(0) += other_bytes;
 
+    let nodes: Vec<Node> = builds.into_iter().map(|b| b.node).collect();
+    // The second, read-only walk behind plan lanes (docs/SCAN-FORMAT.md, "Pieces and lanes").
+    let pieces = opts
+        .lanes
+        .as_ref()
+        .map(|po| crate::pieces::survey(&roots, &nodes, opts.one_file_system, &opts.rules, po));
+
     Ok(ScanResult {
         schema_version: SCHEMA_VERSION,
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1439,7 +1455,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             git_facts: opts.collect_facts,
         },
         totals,
-        nodes: builds.into_iter().map(|b| b.node).collect(),
+        nodes,
         outputs,
         big_files,
         issues,
@@ -1447,6 +1463,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         enclosing_repos,
         scope: roots_scope(&roots).to_string(),
         coverage,
+        pieces,
     })
 }
 

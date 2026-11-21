@@ -253,6 +253,7 @@ fn synthetic(nodes: Vec<disk_cleaner_core::Node>, coverage: Coverage) -> ScanRes
         enclosing_repos: vec![],
         scope: "subtree".to_string(),
         coverage,
+        pieces: None,
     }
 }
 

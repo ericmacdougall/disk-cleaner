@@ -12,6 +12,10 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A scan root is not a directory (a regular file, or a symlink to one): scan takes
+    /// directories only.
+    #[error("scan root {path} is not a directory: scan takes directories only")]
+    NotADirectory { path: PathBuf },
     /// No scan roots were given.
     #[error("no scan roots given")]
     NoRoots,

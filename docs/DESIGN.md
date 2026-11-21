@@ -27,7 +27,11 @@ analyzer, the biggest-files view and the cache rules work on any machine.
 5. **Reuse, don't rebuild.** Storage backends, git plumbing, directory walking and artifact rules
    come from established open-source projects (section 9).
 6. **Secrets stay local.** Ignored files such as `.env` are never pushed to a git remote. Credentials
-   live in the OS keychain or in rclone's own config, never in the manifest, logs or plans.
+   live in the OS keychain or in rclone's own config, never in the manifest, logs or plans. A file or
+   directory with a secret name (`rules/artifacts.toml`, `[[secret_name]]` and `[[secret_dir]]`) is
+   its own `keep` piece in the lanes of a plan: it is not uploaded, pushed, bundled, archived or
+   removed unless the user opts in for secrets at apply time. Secrets are found by name only for
+   now (content scanning is GoodQA goodqa#16530).
 
 ## 3. Classification
 
@@ -54,6 +58,13 @@ Rules that follow from the principles:
   `node_modules`, makes it ask, naming the file.
 - Artifact rules are data (a rules file), not code, so the community can extend them. Each rule
   names the marker that proves the project type (for example `Cargo.toml` next to `target`).
+
+**Lanes.** With `scan --lanes` every byte under the scan roots is also split into bounded pieces,
+and the plan gives each piece one lane with a reason: `git` (a repository saved by its preserve
+obligation and recovery, then removed), `noise` (only with evidence: a marker-backed artifact rule,
+or a byte-identical copy that stays in a kept piece), `backup` (everything else that is idle) or
+`keep` (secret, incomplete, active, or inside a kept repository). The contract is
+[SCAN-FORMAT.md, "Pieces and lanes"](SCAN-FORMAT.md#pieces-and-lanes).
 
 ### Repo safety facts
 
@@ -135,8 +146,11 @@ Default action for a repo with unsaved work:
 1. Commit nothing on the user's branches. Create `recovery/<host>/<date>/<branch>` refs that capture
    local commits, and a snapshot commit of tracked changes plus untracked files (built with a
    temporary index so the working tree and the real index are untouched).
-2. Push the recovery refs to the network remote. If there is no remote, or the push is refused,
-   write a `git bundle` of all refs and send it to backup storage.
+2. Push the recovery refs to the network remote, but only after apply has established, at that
+   moment, that the remote is private (the hosting service says so through the user's own sign-in,
+   or the URL is listed in the config key `private_remotes`). A public remote, unknown visibility,
+   no remote, or a refused push means a `git bundle` of all refs sent to backup storage instead.
+   The plan names the remote and leaves this decision to apply.
 3. Ignored-but-unique files go to backup storage as a private archive. They are never committed.
 4. Stashes are converted to recovery refs.
 5. Record everything in the manifest, then re-run the safety facts. Only a repo that now passes is
@@ -242,5 +256,7 @@ record and re-verifies it.
 
 ## 12. Out of scope for now
 
-Duplicate file detection (czkawka does this well), uninstalling applications, and registry or system
-"optimisation".
+Uninstalling applications, and registry or system "optimisation". Duplicate detection is in scope
+only as far as lanes need it: content is compared by size, then SHA-256, so a backup uploads each
+content once and a copy of a kept file can be noise; a general duplicate finder (czkawka does this
+well) is not.

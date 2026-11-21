@@ -109,7 +109,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
     let json = fs::read_to_string(&out_file).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["schema_version"], 15);
+    assert_eq!(v["schema_version"], 16);
 
     let o = run(bin()
         .args([
@@ -1372,7 +1372,7 @@ fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
     let now = far_future();
 
     let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
-    assert_eq!(pv["schema_version"], 15);
+    assert_eq!(pv["schema_version"], 16);
     let it = item_of(&pv, &a);
     assert_eq!(it["action"], "backup-then-remove", "{it}");
     let pre = &it["preserve"]["git_admin"];
@@ -1496,4 +1496,45 @@ fn r15_object_data_is_backed_up_and_no_verification_is_accepted() {
     ] {
         assert!(!text.contains(gone), "{gone:?} in {text}");
     }
+}
+
+/// CT-A2: a scan root that is a regular file, or a symlink to one, is refused with a clear error
+/// and exit 1, before the scan file is written; a directory alone still scans.
+#[test]
+fn ct_a2_a_scan_root_that_is_not_a_directory_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("big.bin");
+    fs::write(&file, vec![1u8; 64 * 1024]).unwrap();
+    let mut roots = vec![("a regular file", file.clone())];
+    #[cfg(unix)]
+    {
+        let link = tmp.path().join("link-to-file");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        roots.push(("a symlink to a file", link));
+    }
+    let dir = tmp.path().join("dir");
+    fs::create_dir_all(&dir).unwrap();
+    for (what, root) in roots {
+        let out = tmp.path().join("scan.json");
+        let o = run(bin()
+            .arg("scan")
+            .arg(&root)
+            .arg(&dir)
+            .arg("--lanes")
+            .arg("--out")
+            .arg(&out));
+        assert_eq!(o.status.code(), Some(1), "{what}: {o:?}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("is not a directory") && err.contains("directories only"),
+            "{what}: {err}"
+        );
+        assert!(!out.exists(), "{what}: the scan file was written");
+        assert!(stdout(&o).trim().is_empty(), "{what}: {}", stdout(&o));
+    }
+    // Control: the directory alone scans.
+    let out = tmp.path().join("scan.json");
+    let o = run(bin().arg("scan").arg(&dir).arg("--out").arg(&out));
+    assert!(o.status.success(), "{o:?}");
+    assert!(out.exists());
 }
