@@ -95,6 +95,8 @@ export class SettingsForm {
   pending = false;
   /** The shorten question is open; the form stays locked until it is answered. */
   private confirming = false;
+  /** What the form was last filled with from the file, to tell an edit from a stale read. */
+  private filled: Draft | null = null;
 
   constructor(
     private backend: Backend,
@@ -144,7 +146,11 @@ export class SettingsForm {
     if (this.pending || this.confirming) return;
     try {
       const p = await this.backend.getSettings();
-      this.show(p);
+      // The read can end after a save started or the question opened: those own the form now.
+      if (this.pending || this.confirming) return;
+      // An edit made since the form was last filled is kept; only what the file holds (the
+      // values Save compares against, and the facts) is updated.
+      this.show(p, this.edited());
       if (p.replanned) {
         this.message.textContent = "The config file changed; the plan was recomputed.";
         this.onSaved(true);
@@ -154,13 +160,23 @@ export class SettingsForm {
     }
   }
 
-  private show(p: SettingsPayload): void {
+  /** The draft differs from what the form was last filled with: the user changed it. */
+  private edited(): boolean {
+    if (!this.filled) return false;
+    const d = this.draft();
+    return (Object.keys(d) as (keyof Draft)[]).some((k) => d[k] !== this.filled?.[k]);
+  }
+
+  private show(p: SettingsPayload, keepDraft = false): void {
     this.current = p;
-    this.inputs.activeWindowDays.value = String(p.core.active_window_days);
-    this.inputs.gitAdminMib.value = String(Math.round(p.core.max_git_admin_bytes / MIB));
-    this.inputs.topFiles.value = String(p.app.top_files);
-    this.inputs.minOutputMib.value = String(p.app.min_output_mib);
-    this.inputs.oneFileSystem.checked = p.app.one_file_system;
+    if (!keepDraft) {
+      this.inputs.activeWindowDays.value = String(p.core.active_window_days);
+      this.inputs.gitAdminMib.value = String(Math.round(p.core.max_git_admin_bytes / MIB));
+      this.inputs.topFiles.value = String(p.app.top_files);
+      this.inputs.minOutputMib.value = String(p.app.min_output_mib);
+      this.inputs.oneFileSystem.checked = p.app.one_file_system;
+      this.filled = this.draft();
+    }
     const notes: string[] = [];
     if (!p.core.active_window_in_range) notes.push("The active window in the file is outside this app's range; it is kept unless you change it.");
     if (!p.core.max_git_admin_in_range) notes.push("The git folder limit in the file is outside this app's range; it is kept unless you change it.");
