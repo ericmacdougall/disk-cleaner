@@ -815,6 +815,7 @@ active_window_days = 7
 # trust_partial_process_check = true   # optional, see below; default false
 # accept_incomplete_coverage = true    # optional, see "Accepting incomplete coverage"; default false
 # max_git_admin_bytes = 67108864       # optional, see "The preserve obligation"; default 64 MiB
+# private_remotes = ["git@github.com:me/private.git"]  # optional, read by apply only, see "The git lane"
 ```
 
 The key `verify_objects` of schemas 12 and 13 is refused with a message: there is no object
