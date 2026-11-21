@@ -43,14 +43,16 @@ fn excluded_paths_and_their_hard_link_groups_are_never_uploaded() {
     assert_eq!(rep.exit_code, 0, "{rep:#?}");
     // the excluded file, both members of the group one excluded member belongs to, and the
     // symlink whose target is excluded: none receipted, none of their bytes in the store
-    for p in [
+    let receipted: Vec<&str> = [
         "keys/id_secret",
         "data/a.bin",
         "cache/a-link.bin",
         "data/to-secret",
-    ] {
-        assert!(!named(&rs, p), "{p} was receipted");
-    }
+    ]
+    .into_iter()
+    .filter(|p| named(&rs, p))
+    .collect();
+    assert!(receipted.is_empty(), "receipted: {receipted:?}");
     assert!(!store_contains(&env.p("store"), &secret[..4096]));
     assert!(!store_contains(&env.p("store"), &linked[..4096]));
     assert!(named(&rs, "data/kept.bin"));
@@ -72,6 +74,33 @@ fn only_listed_paths_are_backed_up_and_unsafe_entries_are_refused() {
     assert!(named(&rs, "a/listed.bin"));
     assert!(!named(&rs, "a/unlisted.bin"));
     assert!(!store_contains(&env.p("store"), &unlisted[..4096]));
+
+    // a listed path that has vanished, and one reached through a symlinked directory: both
+    // skipped or reported changed, neither receipted, and the outside bytes never read
+    let env = Env::new();
+    let src = env.p("src");
+    let outside = rand_bytes(73, 200 << 10);
+    write(&env.p("outside/f.bin"), &outside);
+    write(&src.join("a/listed.bin"), &listed);
+    std::os::unix::fs::symlink(env.p("outside"), src.join("lnk")).expect("symlink");
+    let mut o = opts(&src, &env.p("r.jsonl"));
+    o.files_from = Some(vec![
+        b"a/listed.bin".to_vec(),
+        b"a/gone.bin".to_vec(),
+        b"lnk/f.bin".to_vec(),
+    ]);
+    let (rep, rs) = run(&env, &o);
+    assert_eq!(rep.exit_code, 2, "{rep:#?}");
+    assert!(named(&rs, "a/listed.bin"));
+    for p in ["a/gone.bin", "lnk/f.bin"] {
+        assert!(!named(&rs, p), "{p} was receipted");
+        assert!(
+            rep.skipped.iter().any(|(s, why)| s == p && !why.is_empty())
+                || rep.changed.iter().any(|c| c == p),
+            "{p} neither skipped nor changed: {rep:#?}"
+        );
+    }
+    assert!(!store_contains(&env.p("store"), &outside[..4096]));
 
     for bad in [&b"../outside"[..], b"/etc/passwd", b"a/../../x"] {
         let env = Env::new();
@@ -245,10 +274,29 @@ fn one_file_system_stops_at_mount_points() {
         .filter_map(|l| l.split_whitespace().nth(1))
         .filter(|m| m.starts_with("/dev/") && m.matches('/').count() == 2)
         .collect();
-    if sub.is_empty() {
-        eprintln!("skipping: no mount below /dev here");
+    let under = |one: bool| -> Vec<String> {
+        let f = Filter::new(&[]).expect("filter");
+        let w = xfer::walk::walk(
+            Path::new("/dev"),
+            &xfer::walk::WalkOpts {
+                filter: &f,
+                files_from: None,
+                one_file_system: one,
+            },
+        )
+        .expect("walk");
+        let rels = w.nodes.iter().map(|n| n.rel.clone());
+        let rels = rels.chain(w.skipped.iter().map(|(r, _)| r.clone()));
+        rels.map(|r| String::from_utf8_lossy(&r).into_owned())
+            .filter(|r| sub.iter().any(|m| r.starts_with(&format!("{}/", &m[5..]))))
+            .collect()
+    };
+    // the control: without the flag the walk does enter a mount below /dev
+    if under(false).is_empty() {
+        eprintln!("skipping: no populated mount below /dev here ({sub:?})");
         return;
     }
+    assert_eq!(under(true), Vec::<String>::new(), "a mount was crossed");
     let env = Env::new();
     let mut o = opts(Path::new("/dev"), &env.p("r.jsonl"));
     o.one_file_system = true;
@@ -267,4 +315,13 @@ fn one_file_system_stops_at_mount_points() {
             "{m} was walked"
         );
     }
+    // a device is skipped with a reason, never receipted (NEG-4)
+    assert!(!named(&rs, "null"));
+    assert!(
+        rep.skipped
+            .iter()
+            .any(|(p, why)| p == "null" && !why.is_empty()),
+        "/dev/null not skipped: {:?}",
+        rep.skipped
+    );
 }
