@@ -444,7 +444,11 @@ impl TreeView {
                 while open.last().is_some_and(|&a| self.depths[a] >= depth) {
                     open.pop();
                 }
-                let parent = if depth == 0 { None } else { open.last().copied() };
+                let parent = if depth == 0 {
+                    None
+                } else {
+                    open.last().copied()
+                };
                 open.push(i);
                 self.row(self.rows[i], depth, parent, self.places[i] as usize)
             })
@@ -667,14 +671,23 @@ mod tests {
     }
 
     /// (name, parent_row, posinset, setsize) for a page.
-    fn places(v: &TreeView, offset: usize, limit: usize) -> Vec<(String, Option<usize>, usize, usize)> {
+    fn places(
+        v: &TreeView,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<(String, Option<usize>, usize, usize)> {
         v.page(offset, limit)
             .into_iter()
             .map(|r| (r.name, r.parent_row, r.posinset, r.setsize))
             .collect()
     }
 
-    fn p(name: &str, parent: Option<usize>, at: usize, of: usize) -> (String, Option<usize>, usize, usize) {
+    fn p(
+        name: &str,
+        parent: Option<usize>,
+        at: usize,
+        of: usize,
+    ) -> (String, Option<usize>, usize, usize) {
         (name.to_string(), parent, at, of)
     }
 
@@ -697,14 +710,20 @@ mod tests {
             ]
         );
         // Pages that start below the parent, and below a sibling's open subtree.
-        assert_eq!(places(&v, 4, 2), vec![p("a2.bin", Some(2), 2, 2), p("Beta", Some(0), 3, 3)]);
+        assert_eq!(
+            places(&v, 4, 2),
+            vec![p("a2.bin", Some(2), 2, 2), p("Beta", Some(0), 3, 3)]
+        );
         assert_eq!(places(&v, 5, 1), vec![p("Beta", Some(0), 3, 3)]);
         assert_eq!(places(&v, 3, 1), vec![p("a1.bin", Some(2), 1, 2)]);
         // Opening a folder above shifts the parent's row.
         assert!(v.expand(4));
         assert_eq!(places(&v, 6, 1), vec![p("b1.bin", Some(5), 1, 1)]);
         assert!(v.collapse(1));
-        assert_eq!(places(&v, 3, 2), vec![p("Beta", Some(0), 3, 3), p("b1.bin", Some(3), 1, 1)]);
+        assert_eq!(
+            places(&v, 3, 2),
+            vec![p("Beta", Some(0), 3, 3), p("b1.bin", Some(3), 1, 1)]
+        );
         // A new order renumbers the places; open folders stay open.
         v.set_sort(Sort {
             key: SortKey::Name,
