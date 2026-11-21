@@ -274,6 +274,21 @@ describe("treegrid keyboard (CT-F4, APG treegrid pattern)", () => {
     expect(focusAt().rowindex).toBe(ri(0));
   });
 
+  it("a double click on a row's name drills in: the first click keeps the name node in its row", async () => {
+    // CI e2e (run 44877158666, view.tree_drill_into_wide): the click re-render moved the name
+    // span out of its cell, so the browser's dblclick on that span never reached the row.
+    const { g, backend } = await setup();
+    const name = [...g.el.querySelectorAll<HTMLElement>('.tg-body [role="row"] .name')].find((x) => x.textContent === "B")!;
+    name.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await flush(10);
+    name.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await flush(10);
+    expect(name.closest('[role="row"]')?.isConnected).toBe(true);
+    name.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await flush(10);
+    expect(backend.calls.filter((c) => c.name === "treeFocus").map((c) => c.args)).toEqual([[1, 6]]);
+  });
+
   it("keys on a column header's sort button do not move or open rows", async () => {
     const { g, backend } = await setup();
     const sort = g.el.querySelector<HTMLButtonElement>('[role="columnheader"] button')!;

@@ -321,7 +321,9 @@ export class TreeGrid {
     return el;
   }
 
-  /** Update a kept row node in place: same row and cell nodes, new attributes and text. */
+  /** Update a kept row node in place: same row and cell nodes, new attributes and text. A cell
+   *  whose content did not change keeps its child nodes, so a click's target stays inside the
+   *  row and the double click that follows reaches the row's handler. */
   private patch(el: HTMLElement, r: Row, index: number): HTMLElement {
     for (const [k, v] of Object.entries(this.rowAttrs(r, index))) {
       if (v === null) el.removeAttribute(k);
@@ -329,7 +331,7 @@ export class TreeGrid {
     }
     this.cells(r, r.depth).forEach((fresh, i) => {
       const cell = el.children[i] as HTMLElement | undefined;
-      if (!cell) return;
+      if (!cell || cell.isEqualNode(fresh)) return;
       for (const a of [...fresh.attributes]) if (cell.getAttribute(a.name) !== a.value) cell.setAttribute(a.name, a.value);
       cell.style.cssText = fresh.style.cssText;
       cell.replaceChildren(...fresh.childNodes);
