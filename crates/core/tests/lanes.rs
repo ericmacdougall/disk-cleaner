@@ -458,6 +458,38 @@ fn lane_noise_by_rule_for_a_marked_node_modules() {
     assert_eq!(src.lane, Lane::Backup);
 }
 
+/// PR review a2-3 F2, its product effect: a dependency checkout with its own `.git` inside a
+/// regenerable directory. The git directory is never removed piecemeal, so the piece that holds
+/// it is kept. A sibling package in another piece keeps the lane the plan gives the artifact (the
+/// `.git` already makes the artifact ask, so it is backed up, not noise).
+#[cfg(unix)]
+#[test]
+fn neg12_a_git_directory_inside_an_artifact_keeps_its_piece_only() {
+    let (_tmp, root, _) = workspace();
+    let proj = root.join("proj");
+    write(&proj.join("package.json"), "{}");
+    let nm = proj.join("node_modules");
+    let dep = nm.join("dep");
+    write(&dep.join("index.js"), "x");
+    init_repo(&dep);
+    // A sibling package too big to share a piece with dep (max_piece_bytes splits them).
+    let po = PieceOptions {
+        max_piece_bytes: 64 * KIB as u64,
+        ..PieceOptions::default()
+    };
+    write_bytes(&nm.join("big").join("x.js"), 100 * KIB);
+    let res = lanes_scan_with(&root, network_everywhere(), po);
+    let p = plan(&res, &idle_opts());
+    let l = lanes_of(&p);
+    let sibling = the_piece(&res, l, &nm.join("big").join("x.js"));
+    assert_eq!(sibling.lane, Lane::Backup, "{}", sibling.reason);
+    let held = the_piece(&res, l, &dep.join(".git").join("HEAD"));
+    assert_ne!(sibling.id, held.id);
+    assert_eq!(held.lane, Lane::Keep, "{}", held.reason);
+    assert!(held.reason.contains("git directory"), "{}", held.reason);
+    check_invariants(&res, &p);
+}
+
 // Unix only: without file identity every lane is keep (asserted by the partition test).
 #[cfg(unix)]
 #[test]
@@ -2143,21 +2175,25 @@ fn oracle_secret(p: &Path) -> bool {
 }
 
 /// Is `dir`, or any directory above it on its real path, a git directory on disk (named `.git`
-/// in any case, or holding HEAD, objects and refs)?
+/// in any case, or holding HEAD, objects and refs), or named `.git` as spelled?
 #[cfg(unix)]
 fn oracle_in_gitdir(dir: &Path) -> bool {
+    let spelled_git = dir
+        .components()
+        .any(|c| c.as_os_str().eq_ignore_ascii_case(".git"));
     let real = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    real.ancestors().any(|a| {
-        let is = |n: &str, d: bool| {
-            fs::symlink_metadata(a.join(n))
-                .map(|m| if d { m.is_dir() } else { m.is_file() })
+    spelled_git
+        || real.ancestors().any(|a| {
+            let is = |n: &str, d: bool| {
+                fs::symlink_metadata(a.join(n))
+                    .map(|m| if d { m.is_dir() } else { m.is_file() })
+                    .unwrap_or(false)
+            };
+            a.file_name()
+                .map(|n| n.eq_ignore_ascii_case(".git"))
                 .unwrap_or(false)
-        };
-        a.file_name()
-            .map(|n| n.eq_ignore_ascii_case(".git"))
-            .unwrap_or(false)
-            || (is("HEAD", false) && is("objects", true) && is("refs", true))
-    })
+                || (is("HEAD", false) && is("objects", true) && is("refs", true))
+        })
 }
 
 /// The three invariants, over every removing plan piece and every blob. Returns every violation
@@ -2322,6 +2358,33 @@ fn guard_context_follows_location_over_composed_layouts() {
         base.clone(),
         base.join("secrets"),
     ));
+    // The spelled path alone carries the context: a root that is a symlink with a context name
+    // (`secrets`, `.git`, a name that is not UTF-8) to an ordinary directory.
+    let base = top.join("SpelledOnly");
+    let target = base.join("target");
+    fill(&target);
+    let mut spelled: Vec<(&str, PathBuf)> = vec![
+        ("secrets", base.join("secrets")),
+        (".git", base.join("x").join(".git")),
+    ];
+    if cfg!(target_os = "linux") {
+        use std::os::unix::ffi::OsStrExt;
+        spelled.push((
+            "invalid",
+            base.join(std::ffi::OsStr::from_bytes(b"bad\xfflink")),
+        ));
+    }
+    for (what, link) in spelled {
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        cases.push((
+            format!("a root spelled {what}, real path plain"),
+            Kind::Secrets,
+            Pos::Root,
+            link,
+            target.join("sub"),
+        ));
+    }
     std::thread::sleep(std::time::Duration::from_millis(1100));
     let mut violations: Vec<String> = Vec::new();
     for (label, kind, pos, root, inner) in &cases {
