@@ -147,22 +147,22 @@ differ. Outside the folders it scans, the app writes only this:
 
 **Every system, only when you ask**
 
-- `disk-cleaner/config.toml (with config.toml.bak and config.toml.lock)`: on Save of the plan settings: the two plan settings you changed, a copy of the text loaded and the save lock. In ~/.config (Linux), ~/Library/Application Support (macOS) or %APPDATA% (Windows).
-- `disk-cleaner/prunedisk-app.json`: on Save: the app's own scan settings, in the same folder.
+- `disk-cleaner/config.toml (with config.toml.bak and config.toml.lock)`: on Save of the plan settings: the two plan settings you changed, a copy of the text loaded and the save lock. config.toml and config.toml.bak are each written as a temporary NAME.PID.N.tmp beside it (PID the app's process, N a number) and renamed over it. In ~/.config (Linux), ~/Library/Application Support (macOS) or %APPDATA% (Windows).
+- `disk-cleaner/prunedisk-app.json`: on Save: the app's own scan settings, in the same folder, written the same way through a temporary NAME.PID.N.tmp.
 - `the plan file you export`: on Export: a new file in the folder you choose; never an existing file.
 
 **Linux, by the system libraries the window uses**
 
-- `~/.local/share/io.github.ericmacdougall.prunedisk/`: the web view's private session still stores random salts (storage/salt, mediakeys/v1/salt, CacheStorage/salt, WebKitCache/Version 17/salt), an empty WebKitCache/Version 17/Blobs folder and its HTTPS policy store (hsts-storage.sqlite). No browsing data: the app shows only its own page.
-- `~/.cache/mesa_shader_cache/`: the graphics driver's shader cache, as for any program that draws with Mesa.
-- `~/.cache/mesa_shader_cache_db/`: the same cache in newer Mesa's single-file form.
-- `~/.cache/fontconfig/`: the font cache, when the system's is out of date.
+- `~/.local/share/io.github.ericmacdougall.prunedisk/`: the web view's private session still stores random salts (storage/salt, mediakeys/v1/salt, CacheStorage/salt, WebKitCache/Version 17/salt), an empty WebKitCache/Version 17/Blobs folder and its HTTPS policy store (hsts-storage.sqlite, with hsts-storage.sqlite-journal while it writes). No browsing data: the app shows only its own page.
+- `~/.cache/mesa_shader_cache/`: the graphics driver's shader cache, as for any program that draws with Mesa: the whole folder is the driver's.
+- `~/.cache/mesa_shader_cache_db/`: the same cache in newer Mesa's single-file form: the whole folder is the driver's.
+- `~/.cache/fontconfig/`: the font cache, when the system's is out of date: the whole folder is fontconfig's.
 - `$XDG_RUNTIME_DIR/dconf/user`: the settings system's change flag, in memory, not on disk (in ~/.cache/dconf/user on a system with no runtime folder).
 - `$XDG_RUNTIME_DIR/at-spi2-XXXXXX/`: only while a screen reader or other assistive technology is on: the accessibility bridge's socket for the window, in memory (in ~/.cache on a system with no runtime folder). XXXXXX is six random letters or digits.
 - `~/.local/share/recently-used.xbel`: the file dialog (GTK) adds the folders and files you pick in it to your recent files, as in every GTK app. It writes a temporary recently-used.xbel.XXXXXX (six random letters or digits) beside the list and renames it over the list.
 - `~/.config/gtk-3.0/`: an empty folder the file dialog creates for its bookmarks, when there is none.
 - `~/.config/glib-2.0/settings/`: an empty folder for the settings system's file store, on a system without dconf.
-- `dconf: org.gtk.Settings.FileChooser`: the file dialog saves its own size and view settings when it closes. Not yet observed by the app's checks: the settings service writes it from its own process, which the trace does not follow.
+- `~/.config/dconf/user`: on a system with the settings service (dconf-service, started by the desktop session), the file dialog's size and view settings (org.gtk.Settings.FileChooser), saved when it closes. The service writes this database from its own process, so the checks see it in a snapshot of the home folder (Debian 12), not in the trace.
 - `~/.dbus/session-bus/ and /tmp/dbus-*`: only on a system with no desktop session bus, where the system library starts one.
 
 **macOS**
@@ -190,20 +190,26 @@ entry above. The owner chose this ("Keep and disclose", GoodQA goodqa#16452); re
 app's own entries after each dialog and the desktop portal are not built.
 
 How the Linux list is checked. `e2e/idle-launch.sh` runs the shipped build (the release binary
-in the end-to-end job) idle for 20 s in a sandbox, with a session bus, under strace, and
-`e2e/trace_report.py` fails on any write outside the declared salts, Blobs folder, HTTPS policy
-store, Mesa and fontconfig caches and dconf flag. In the owner's run of the 682a0ff AppImage
-(Docker on Ubuntu 24.04, not a click-test) that was every write; without a session bus the same
-launch also wrote `~/.dbus/session-bus/` and `/tmp/dbus-*`. The end-to-end suite picks folders
-through a test hook, so the file dialog's writes are checked by the `appimage-hosts` job:
-`e2e/appimage-dialog.sh` runs the AppImage through the same idle launch on bare Fedora 41 and
-Debian 12, opens the real dialog through the accessibility bus and accepts a folder, and the
-trace may then add only the dialog's entries above: the recent-files list and its temporary
-file, the empty `gtk-3.0` and `glib-2.0/settings` folders and the accessibility socket folder.
-A randomly named file is declared as a template (`--declared-temp`), which allows exactly six
+in the end-to-end job) idle for 20 s in a sandbox, with a session bus, under the write observer
+("The write observer (Linux)" below), and allows only the declarations of profile
+`shipped-idle` in `e2e/declarations.py`: the salts, the Blobs folder and the HTTPS policy store
+with its journal, the Mesa and fontconfig caches (whole folders: the libraries' own), the dconf
+flag and, while an assistive technology is on, the accessibility bridge's folder and socket.
+Each declaration names the entry above that discloses it, and `e2e/test_trace_report.py` fails
+when they differ (a folder declared empty must be described as empty, a whole folder as the
+whole folder, a file must be named). In the owner's run of the 682a0ff AppImage (Docker on
+Ubuntu 24.04, not a click-test) that was every write; without a session bus the same launch
+also wrote `~/.dbus/session-bus/` and `/tmp/dbus-*`, which no check observes (every check runs
+under a session bus). The end-to-end suite picks folders through a test hook, so the file
+dialog's writes are checked by the `appimage-hosts` job: `e2e/appimage-dialog.sh` runs the
+AppImage through the same idle launch on bare Fedora 41 and Debian 12 (Debian with the settings
+service, dconf-service, Fedora without), opens the real dialog through the accessibility bus
+and accepts a folder, and profile `dialog` then adds only the dialog's entries above: the
+recent-files list and its temporary file, the empty `gtk-3.0` and `glib-2.0/settings` folders
+and dconf's database. A randomly named file is declared as a template, which allows exactly six
 letters or digits in place of `XXXXXX` and nothing else; a neighbouring name still fails. The
-dialog's own settings are written by the settings service, a separate process the trace does
-not follow, so that entry stays "not yet observed".
+database is written by dconf-service, a process the trace does not follow: the snapshot of the
+session's home folder sees it (`declared added: ~/.config/dconf/user` on Debian 12).
 
 Webview data. The window is the system webview, which keeps data in folders named after the
 bundle id `io.github.ericmacdougall.prunedisk`. These do not follow `HOME`: WebKit uses the
@@ -364,16 +370,127 @@ No-write proof:
   data folders and, on Linux, the graphics driver's shader cache (below).
 - On Windows the real `%LOCALAPPDATA%\<bundle id>` and `%APPDATA%\disk-cleaner` folders are
   watched too.
-- On Linux the app and its child processes also run under strace (`-f -y`, the calls
-  `e2e/trace_report.py --strace-calls` names, via seccomp-bpf; one log per launch), and
-  `e2e/trace_report.py` judges every path written anywhere, including outside the sandbox. It
-  is a gate (PR gate F10): a write outside the declared paths (OTHER), a relative path or
-  descriptor it cannot place (UNRESOLVED), io_uring (UNOBSERVABLE) or a traced call it cannot
-  read (UNPARSED) fails the check, and so does a log with no traced call. Declared outside the
-  sandbox: only dconf's flag file. Ignored: only `/dev/null`. Not covered: writes through a
-  memory map of a file opened read-write (the open itself is judged), and the macOS window.
+- On Linux the app and every process it starts also run under the write observer ("The write
+  observer (Linux)" below), profile `e2e-suite`, and the snapshots are judged by the same typed
+  declarations. Outside the sandbox only the dconf flag and the accessibility bridge are
+  declared, and `/dev/null`.
 - The same job runs `e2e/idle-launch.sh` on the release binary: the shipped config, idle,
   under the same gate, with the list in "Files the desktop app writes".
+
+#### The write observer (Linux)
+
+PR gate F10; PR review F11, F12 and F15. Every traced launch (the suite's wrapper in
+`e2e/check.sh`, `e2e/idle-launch.sh`, `e2e/observer-controls.sh`) runs
+`PRUNEDISK_TRACE_SESSION=<log> strace -DD -o <log> <trace_report.py --strace-args> <program>`:
+`-f` follows every child, `-y` decodes every descriptor to the object it refers to, `-ttt`
+orders the calls of several logs, and every call is traced but a list of frequent ones that
+change nothing (`HOT`, each also in the observer's no-effect class; a test checks it). `-DD`
+makes the program the launcher's own process and strace a detached grandchild, so stopping the
+program never stops strace.
+
+No `--seccomp-bpf`. With it, strace stops only for the calls its own tables cover, and on
+Linux 6.8 strace 5.16 (Ubuntu 22.04) and 6.1 (Debian 12) let 450 or 451 to 461 run unseen,
+`fchmodat2` among them (measured on t2-dev; strace 6.17 on Fedora 41 saw them all). Without it
+every call stops, and one strace has no table for is printed by number (`syscall_0x1c4`).
+The `syscall-coverage` control calls every number from 334 to 1023 under the same launch and
+fails if one the kernel has is not in the log.
+
+`e2e/trace_report.py` judges the logs and fails (exit 1) on:
+
+- UNKNOWN: a call it has not classified. Every x86_64 call is classified, from the kernel's
+  own table (`e2e/syscalls-x86_64-linux-6.8.txt`) and the build host's `unistd_64.h` (a test
+  fails on a name in either that is not): no effect, a new anonymous descriptor, an open, a
+  write through a descriptor, a change named by a path, the descriptor table and process
+  tree, or unsupported. A call printed by number is named from the kernel's table: a no-effect
+  call passes, any other is UNRESOLVED unless it failed.
+- UNSUPPORTED: a successful call whose effects the trace cannot follow: io_uring, Linux AIO,
+  `ptrace`, `process_vm_writev`, `bpf`, a seccomp filter, mounts, a new root or mount, user or
+  PID namespace, POSIX message queues, keyrings, an `fcntl` command it does not know.
+- UNPARSED: a line it cannot read; LATE: a log that does not start with the program's
+  `execve`; LOST: a process with no exit record (strace let it go or was killed); an empty log.
+- UNRESOLVED: a path or descriptor whose object it cannot establish.
+- OTHER: a change no declaration allows.
+
+Descriptors: a write through any descriptor (inherited, `dup`, `dup2`, `dup3`, `F_DUPFD`,
+received over a socket, shared or copied by `fork` and `clone`) is judged by the object strace
+decodes for it; the observer's own table (with close-on-exec, `close_range` and `unshare`)
+gives each descriptor's access mode for shared maps and the object behind `/proc/self/fd/N`.
+Paths: each call is resolved link by link with its own rule for a final link (`truncate`
+follows, `lchown` and `AT_SYMLINK_NOFOLLOW` do not, an open with `O_CREAT|O_EXCL` does not),
+against what the trace knows at that moment: the links that were there (seeded from the
+snapshot taken before), and those the traced processes made, renamed, exchanged, hard-linked
+and removed. A name the trace changes and did not see made is UNRESOLVED rather than read from
+the disk as it is when the report runs. An open is also judged by the object the kernel
+returned.
+
+Declarations are typed and exact (`e2e/declarations.py`): a file (created, written, its
+metadata changed, renamed, removed, mapped), a folder that may only be created, a socket, a
+subtree (only where the entry above says the whole folder is a library's, and the e2e build's
+webview profile), the harness's capture of standard output (through a descriptor only) and the
+null device. Placeholders: `{XXXXXX}` (six letters or digits), `{PID}` (the writing process's
+own id), `{N}`, `{STAMP}`, `{SEQ}`. The folders on the way to a declared path may be created.
+
+The second check is a snapshot (`e2e/manifest.py`) before and after of the sandbox, the
+runtime folder and, in the dialog check, the session's whole home, judged by the same
+declarations: it sees what processes the trace does not follow write there (the `ask-service`
+control; dconf-service on Debian 12). The third is the end of the session (`e2e/traced.py`):
+every process carrying the session's marker, or traced by its strace, must have ended 2 s
+after the program did; one still alive is printed (state, parent, open descriptors, tracer),
+killed and fails the check, strace is never signalled while one runs, and at the end of the
+suite every session folder is swept again. The run of the observer fails when any of the three
+does.
+
+The controls (`e2e/observer-controls.sh`, `e2e/observer_controls.py`) run in the end-to-end job
+and on each `appimage-hosts` leg, as the session's user: 46 planted actions (one change each
+that must be caught by the check named for it, and passes that must pass) and three planted
+logs. `e2e/test_trace_report.py` (job "read-only guard") replays the controls as strace 5.16,
+6.1 and 6.17 recorded them on Linux 6.8 (`e2e/recorded/observer-controls.json.xz`, from
+`observer_controls.py record`), and plants each fault class of the review into the observer
+(any write call classified as harmless, writes judged only through descriptors the trace saw
+opened, an unknown descriptor taken as read-only, the final link never followed or always
+followed, links the trace made forgotten, a folder read as a subtree, a template of any length,
+the output capture writable by path, a temporary of another process): each must give a wrong
+answer, or the test fails. The 87221db observer misses 26 of the controls on all three strace
+versions (19 without a declared link, among them `bind`, an inherited or copied descriptor,
+`pwritev2`, `sendfile`, shared maps, a write after the trace let the process go, an unknown
+call and a file inside a folder declared empty).
+
+Ten ways a write could get past the observer, and what covers each:
+
+1. A process strace does not follow: every fork, vfork and clone is followed from the
+   program's own `execve`; a process the trace let go is LOST (`slow-write`).
+2. A helper that is not a child (D-Bus activation, a systemd user unit, a portal): not traced.
+   The snapshot sees its writes in the sandbox, the runtime folder and (dialog check) the
+   session's home (`ask-service`). Not seen: such a helper's writes anywhere else.
+3. Writes on the app's behalf by dconf-service or the X server: dconf-service's database is
+   seen by the snapshot of the home folder and declared. The X server (Xvfb) writes none of
+   the snapshot roots; what it writes elsewhere is not seen.
+4. A memory map: a shared map of a descriptor that may write (opened for writing, or of a mode
+   the trace did not see: inherited or received) is judged as a write of the file when it is
+   made, with or without `PROT_WRITE` (`mmap-shared-write`, `mmap-shared-readonly-prot`).
+5. io_uring and Linux AIO: UNSUPPORTED when set up.
+6. A write before the tracer attaches: strace starts the program; a log whose first call is not
+   its `execve` is LATE (`late-log`).
+7. A write after the tracer detaches: a process the trace let go is LOST; a process still alive
+   2 s after the program is a survivor, killed before the snapshot after (`leave-child`).
+8. seccomp and ptrace: strace runs without `--seccomp-bpf` (above); a seccomp filter or
+   `ptrace` by a traced process is UNSUPPORTED. A container's own seccomp profile refuses some
+   calls (EPERM) after ptrace has seen them, so they are judged too.
+9. Races on a path between the check and the use: the observer follows the traced processes'
+   own changes to links and names in order, and judges an open by the object the kernel
+   returned, not the name. Not seen: a link swapped by a process that is not traced, outside
+   the snapshot roots, between two traced calls; strace reads a descriptor's name from `/proc`
+   when the call returns, so a rename by an untraced process at that moment can misname it.
+10. Another mount namespace: `clone` or `unshare` into a new mount, user or PID namespace,
+    `setns`, `mount`, `pivot_root` and `chroot` are UNSUPPORTED: paths after them cannot be
+    compared.
+
+macOS and Windows have no write tracer in CI. macOS: an idle launch, then the webview's folders
+under `~/Library` must not exist (job "bundle"). Windows: the end-to-end suite's snapshots of
+the sandbox, `%LOCALAPPDATA%\<bundle id>` and `%APPDATA%\disk-cleaner`. The Windows equivalent
+of the observer would be ETW file and registry events (or Process Monitor) for the app's
+process tree, with snapshots of `%LOCALAPPDATA%`, `%APPDATA%`, `%TEMP%` and `HKCU`; it is not
+built.
 
 Graphics driver cache (Linux): the webview's GPU process writes Mesa's shader cache to
 `$XDG_CACHE_HOME/mesa_shader_cache/` (else `~/.cache/mesa_shader_cache/`). Any program drawing

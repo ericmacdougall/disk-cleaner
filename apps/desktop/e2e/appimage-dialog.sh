@@ -10,20 +10,24 @@
 # Fedora and Debian (and derivatives) are supported. Steps:
 #   1. installs only a display, a session and accessibility bus, AT-SPI's Python binding,
 #      strace, and the libraries every desktop has that an AppImage leaves to the host (GL,
-#      fontconfig, freetype, harfbuzz, fribidi, libgpg-error, one font);
+#      fontconfig, freetype, harfbuzz, fribidi, libgpg-error, one font); on Debian also the
+#      settings service (dconf-service), so one host has it and one does not;
 #   2. fails (exit 2) unless the host is bare: no /usr/share/mime, no Adwaita or hicolor
 #      index.theme, no gdk-pixbuf loader folder, no libgtk-3, no GTK file-chooser schema;
-#   3. extracts the AppImage and starts its AppRun through e2e/idle-launch.sh (the write
-#      observer, PR gate F10) under Xvfb and dbus-run-session, from a folder named
-#      chosen-by-dialog;
-#   4. the driver (this script with --driver) presses "Add folders..." through AT-SPI, waits
+#   3. runs the write observer's controls (e2e/observer-controls.sh) as the session's user;
+#   4. extracts the AppImage and starts its AppRun through e2e/idle-launch.sh (the write
+#      observer, PR gate F10, profile dialog of e2e/declarations.py; snapshots of the sandbox,
+#      the runtime folder and the user's whole home) under Xvfb and dbus-run-session, from a
+#      folder named chosen-by-dialog;
+#   5. the driver (this script with --driver) presses "Add folders..." through AT-SPI, waits
 #      for the "Choose folders to scan" window, types this folder's path into it and presses Return, waits for the
 #      folder to appear in the app's chosen list, checking the app is alive after each step;
-#   5. fails if the app exited, the dialog did not open or return the folder, or GTK logged an
+#   6. fails if the app exited, the dialog did not open or return the folder, or GTK logged an
 #      error, a critical, or a missing pixbuf, icon or icon theme.
-# Two verdicts are printed, the dialog check (CT-F1) and the write observer (F10). Exit 0 when
-# both pass, 1 when the dialog check fails, 3 when only the write observer fails, 2 on a host
-# that is not bare or bad usage. The first argument may also be an extracted AppImage (AppDir).
+# Two verdicts are printed, the dialog check (CT-F1) and the write observer (F10: its controls
+# and the launch). Exit 0 when both pass, 1 when the dialog check fails, 3 when only the write
+# observer fails, 2 on a host that is not bare or bad usage. The first argument may also be an
+# extracted AppImage (AppDir).
 set -euo pipefail
 
 if [ "${1:-}" = --driver ]; then
@@ -86,7 +90,7 @@ case " $ID ${ID_LIKE:-} " in
     { apt-get update && apt-get install -y --no-install-recommends \
       xvfb xauth xdotool dbus dbus-bin at-spi2-core python3 python3-gi gir1.2-atspi-2.0 strace procps \
       libgl1 libegl1 libgles2 libgl1-mesa-dri libfontconfig1 libfreetype6 libharfbuzz0b fonts-dejavu-core \
-      libfribidi0 libgpg-error0; } \
+      libfribidi0 libgpg-error0 dconf-service; } \
       > "$RESULT/install.log" 2>&1 || { tail -30 "$RESULT/install.log"; exit 2; }
     dpkg-query -W -f '${Package} ${Version}\n' | sort > "$RESULT/packages.txt"
     ;;
@@ -131,17 +135,21 @@ cd "$W/chosen-by-dialog"
 export RESULT="$RESULT" WEBKIT_DISABLE_COMPOSITING_MODE=1
 export IDLE_DRIVER="bash '$HERE/appimage-dialog.sh' --driver"
 # What the dialog adds, each listed in src/writes.ts (shown in Settings; the user chose to keep
-# GTK's behaviour and disclose it, GoodQA #16452). Accepting the dialog adds the folder to GTK's
-# recently used list, written through a temporary recently-used.xbel.XXXXXX renamed over it; the
-# dialog makes empty gtk-3.0 (bookmarks) and, without dconf, glib-2.0/settings folders; the
-# accessibility bridge this check turns on (as a screen reader would) makes its socket folder.
-export IDLE_DECLARE="$RESULT/launch/sandbox/data/recently-used.xbel
-$RESULT/launch/sandbox/data/recently-used.xbel.XXXXXX
-$RESULT/launch/sandbox/config/gtk-3.0
-$RESULT/launch/sandbox/config/glib-2.0/settings
-$RUN_DIR/at-spi2-XXXXXX"
+# GTK's behaviour and disclose it, GoodQA #16452): e2e/declarations.py, profile dialog. Accepting
+# the dialog adds the folder to GTK's recently used list, written through a temporary
+# recently-used.xbel.XXXXXX renamed over it; the dialog makes empty gtk-3.0 (bookmarks) and
+# glib-2.0/settings folders; the accessibility bridge this check turns on (as a screen reader
+# would) makes its socket folder; dconf-service, where the host has it, saves the dialog's
+# settings in the session's home (the snapshots of the whole home see it).
+export IDLE_PROFILE=dialog IDLE_SESSION_HOME="\$HOME" IDLE_SNAPSHOT="\$HOME"
 bash "$HERE/idle-launch.sh" "$W/squashfs-root/AppRun" "$RESULT/launch"
 EOF
+# The write observer's controls first, as the same user under the same strace launch (PR review
+# F11, F12, F15): each planted change must be caught, the positive controls must pass.
+echo "== write observer controls"
+controls=0
+su tester -s /bin/bash -c "bash '$HERE/observer-controls.sh' '$RESULT/controls'" > "$RESULT/controls.log" 2>&1 || controls=$?
+grep -E '^(==|::error|observer controls|coverage:)' "$RESULT/controls.log" || true
 observer=0
 su tester -s /bin/bash -c "export XDG_RUNTIME_DIR=$RUN_DIR; xvfb-run -a -s '-screen 0 1440x900x24' dbus-run-session -- bash '$W/session.sh'" \
   > "$RESULT/session.log" 2>&1 || observer=$?
@@ -166,6 +174,10 @@ else
   cat "$RESULT/dialog.txt" 2> /dev/null || echo "(the driver recorded nothing)"
   [ -z "$gtk_bad" ] || printf 'GTK logged:\n%s\n' "$gtk_bad"
 fi
-if [ "$observer" = 0 ]; then echo "write observer (F10): PASS"; else echo "::error::write observer (F10): FAIL (idle-launch.sh exit $observer)"; fi
+if [ "$observer" = 0 ] && [ "$controls" = 0 ]; then
+  echo "write observer (F10): PASS"
+else
+  echo "::error::write observer (F10): FAIL (observer controls exit $controls, idle-launch.sh exit $observer)"
+fi
 [ "$dialog" = pass ] || exit 1
-[ "$observer" = 0 ] || exit 3
+[ "$observer" = 0 ] && [ "$controls" = 0 ] || exit 3

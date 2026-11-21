@@ -90,8 +90,13 @@ jobs:
         run: scripts/check-readonly.sh
       - name: Planted-violation controls (each must be caught)
         run: scripts/check-readonly.sh --controls
-      - name: The end-to-end write observer fails on any undeclared write (PR gate F10)
+      - name: The end-to-end write observer (PR gate F10; review F11, F12, F15)
+        # Recorded controls of three strace versions, planted mutants, every rule, the
+        # classifier against the kernel's table and this runner's unistd_64.h (required here),
+        # the declarations against src/writes.ts, the survivor check.
         working-directory: apps/desktop
+        env:
+          PRUNEDISK_REQUIRE_UNISTD: "1"
         run: python3 -m unittest -v e2e/test_trace_report.py
 
   ui-crates:
@@ -391,6 +396,10 @@ jobs:
             ${{ runner.temp }}/e2e/*.txt
             ${{ runner.temp }}/e2e/idle-release/*.txt
             ${{ runner.temp }}/e2e/idle-release/*.log
+            ${{ runner.temp }}/e2e/trace/close.*.txt
+            ${{ runner.temp }}/e2e/trace/sweep.txt
+            ${{ runner.temp }}/e2e/controls/*.txt
+            ${{ runner.temp }}/e2e/controls/run-*/*.txt
             ${{ runner.temp }}/e2e/inputs/
             !${{ runner.temp }}/e2e/before.json
             !${{ runner.temp }}/e2e/after.json
@@ -623,4 +632,6 @@ jobs:
             ${{ runner.temp }}/out/*.log
             ${{ runner.temp }}/out/launch/*.txt
             ${{ runner.temp }}/out/launch/*.log
+            ${{ runner.temp }}/out/controls/*.txt
+            ${{ runner.temp }}/out/controls/run-*/*.txt
           retention-days: 14

@@ -81,6 +81,9 @@ if [ "$RELEASE_BIN" != none ]; then
       node e2e/probe.mjs --app "$RELEASE_BIN" --out "$OUT/probe-release.json" || echo "probe of the release binary failed (see $OUT/probe-release.json)"
     # PR gate F10: what the shipped config itself writes, idle, under the write observer.
     echo "== idle launch of the release binary (shipped config) under the write observer"
+    # The snapshots also watch the runner's own settings and data folders, where a service the
+    # session bus starts for the app (dconf-service) would write.
+    export IDLE_SNAPSHOT="$HOME/.config $HOME/.local/share"
     if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
       bash e2e/idle-launch.sh "$RELEASE_BIN" "$OUT/idle-release" || idle=$?
     else
@@ -101,27 +104,38 @@ if $win; then
 else
   ROOTS=("$FIX" "$SB")
   RUNTIME=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-  # One list for both observers (the manifest watches the roots; the trace sees every path):
-  # - core's config folder: config.toml, its .bak and .lock, and the temp files of a save;
-  # - the export the suite asks for;
-  # - the e2e build's webview profile: incognito is off for WebKitWebDriver, so the webview
-  #   keeps its data in the sandbox's data and cache folders (docs/DESKTOP.md);
-  # - Mesa's shader cache, written for any program that draws with Mesa (docs/DESKTOP.md);
-  # - GLib's dconf flag file, opened read-write in the runtime folder (a memory file system).
-  DECLARED=(--declared "$SB/config/disk-cleaner" --declared "$SB/home/exports/plan.json"
-    --declared "$SB/data/$ID" --declared "$SB/cache/$ID" --declared "$SB/cache/mesa_shader_cache"
-    --declared "$RUNTIME/dconf/user")
-  TRACE_IGNORE=(--ignore /dev/null)
+  # One list of typed declarations for both observers (the snapshots watch the roots; the trace
+  # sees every path), each tied to its entry of src/writes.ts: e2e/declarations.py, profile
+  # e2e-suite (core's settings files and the temporaries a save renames over them, the export
+  # the suite asks for, the libraries' caches, GLib's dconf flag file, and the e2e build's own
+  # webview profile: incognito is off for WebKitWebDriver, docs/DESKTOP.md).
+  DECLARE=(--profile e2e-suite --root DATA="$SB/data" --root CACHE="$SB/cache" --root CONFIG="$SB/config"
+    --root HOME="$SB/home" --root RUNTIME="$RUNTIME" --root EXPORT="$SB/home/exports/plan.json" --root STDIO=-)
   BIG=/usr
   APP="$OUT/app-traced.sh"
-  rm -rf "$OUT/trace"
+  rm -rf "$OUT/trace" "$OUT/controls"
   mkdir -p "$OUT/trace"
-  CALLS=$("$PY" e2e/trace_report.py --strace-calls)
-  # Every launch of the app (the suite starts several) writes its own log: strace.<pid>.log.
+  # PR review F11, F12, F15: first the observer's own controls, under the same strace launch:
+  # each planted change must be caught and the positive control must pass.
+  echo "== write observer controls"
+  controls=0
+  bash e2e/observer-controls.sh "$OUT/controls" > "$OUT/controls.log" 2>&1 || controls=$?
+  grep -E '^(==|::error|observer controls|coverage:)' "$OUT/controls.log" || true
+  mapfile -t STRACE_ARGS < <("$PY" e2e/trace_report.py --strace-args)
+  STRACE_Q=$(printf ' %q' "${STRACE_ARGS[@]}")
+  E2E_DIR=$(pwd)/e2e
+  # Every launch of the app (the suite starts several) writes its own log, strace.<pid>.log.
+  # strace -DD: the driver's process is the app itself and strace a detached grandchild, so the
+  # driver ending the app never ends strace first (which let traced processes run on untraced).
+  # Each launch's processes carry PRUNEDISK_TRACE_SESSION, and a detached e2e/traced.py waits
+  # for the app to end, then for every one of them: one alive 2 s later is a survivor (killed,
+  # recorded in close.<pid>.txt, and the check fails).
   cat > "$APP" << EOF
-#!/bin/sh
+#!/bin/bash
 export HOME="$SB/home" XDG_CONFIG_HOME="$SB/config" XDG_DATA_HOME="$SB/data" XDG_CACHE_HOME="$SB/cache" XDG_STATE_HOME="$SB/state" TMPDIR="$SB/tmp"
-exec strace -f -qq --seccomp-bpf -y -o "$OUT/trace/strace.\$\$.log" -e "trace=$CALLS" "$E2E_BIN" "\$@"
+( setsid python3 "$E2E_DIR/traced.py" settle "$OUT/trace/strace.\$\$.log" --wait-pid \$\$ --grace 2 --record "$OUT/trace/close.\$\$.txt" --label "launch \$\$" < /dev/null > /dev/null 2>&1 & )
+export PRUNEDISK_TRACE_SESSION="$OUT/trace/strace.\$\$.log"
+exec strace -DD -o "$OUT/trace/strace.\$\$.log"$STRACE_Q "$E2E_BIN" "\$@"
 EOF
   chmod +x "$APP"
 fi
@@ -141,21 +155,51 @@ else
 fi
 sleep 2
 
+survive=0
+controls=${controls:-0}
+if ! $win; then
+  # Every launch's survivor check must have finished (its app ended) and found nothing; then
+  # nothing of any launch may be left at all.
+  echo "== survivors: every process of every launch ended within 2 s of its app"
+  logs=("$OUT"/trace/strace.*.log)
+  [ -e "${logs[0]}" ] || logs=()
+  for log in "${logs[@]}"; do
+    p=${log##*/strace.}
+    p=${p%.log}
+    for _ in $(seq 1 150); do grep -q '^done ' "$OUT/trace/close.$p.txt" 2> /dev/null && break; sleep 0.1; done
+    if ! grep -q '^done ' "$OUT/trace/close.$p.txt" 2> /dev/null; then
+      echo "::error::launch $p: its app had not ended when the suite did"; survive=1
+    fi
+    if grep -q '^survivor' "$OUT/trace/close.$p.txt" 2> /dev/null; then survive=1; fi
+    cat "$OUT/trace/close.$p.txt" 2> /dev/null || true
+  done
+  "$PY" e2e/traced.py sweep "$OUT/trace" --record "$OUT/trace/sweep.txt" || survive=1
+fi
+
 echo "== snapshot after and compare"
 "$PY" e2e/manifest.py snapshot "$OUT/after.json" "${ROOTS[@]}"
 nowrite=0
-"$PY" e2e/manifest.py compare "$OUT/before.json" "$OUT/after.json" "${DECLARED[@]}" | tee "$OUT/manifest.txt" || nowrite=$?
+if $win; then
+  "$PY" e2e/manifest.py compare "$OUT/before.json" "$OUT/after.json" "${DECLARED[@]}" | tee "$OUT/manifest.txt" || nowrite=$?
+else
+  # The same typed declarations as the trace (e2e/declarations.py), not folder prefixes.
+  "$PY" e2e/trace_report.py --snapshot "$OUT/before.json" "$OUT/after.json" "${DECLARE[@]}" > "$OUT/manifest.txt" || nowrite=$?
+  grep -v '^declared .*mesa_shader_cache' "$OUT/manifest.txt" | head -200 || true
+fi
 
 trace=0
 if ! $win; then
-  # PR gate F10: the write observer is a gate. Any write it cannot place inside a declared
-  # path, anywhere on the machine, fails the check.
-  echo "== trace: every write of the app and its child processes"
-  logs=("$OUT"/trace/strace.*.log)
+  # PR gate F10: the write observer is a gate. Any change it cannot place on a declared path,
+  # anywhere on the machine, any call it does not know and any process it lost fails the check.
+  echo "== trace: every change by the app and its child processes"
   echo "trace logs: ${#logs[@]} (one per launch)"
-  "$PY" e2e/trace_report.py "${logs[@]}" "${DECLARED[@]}" "${TRACE_IGNORE[@]}" > "$OUT/trace.txt" || trace=$?
-  { grep -E '^(OTHER|UNRESOLVED|UNOBSERVABLE|UNPARSED|trace:)' "$OUT/trace.txt" | head -200; } || true
+  if [ "${#logs[@]}" = 0 ]; then
+    echo "::error::no trace log: the suite launched no traced app"; trace=1
+  else
+    "$PY" e2e/trace_report.py "${logs[@]}" "${DECLARE[@]}" --links-from "$OUT/before.json" > "$OUT/trace.txt" || trace=$?
+    { grep -E '^(LATE|LOST|UNKNOWN|UNSUPPORTED|UNPARSED|UNRESOLVED|OTHER|trace:)' "$OUT/trace.txt" | head -200; } || true
+  fi
 fi
 
-echo "suite exit $status, no-write exit $nowrite, trace exit $trace, idle-launch exit $idle"
-[ "$status" = 0 ] && [ "$nowrite" = 0 ] && [ "$trace" = 0 ] && [ "$idle" = 0 ]
+echo "suite exit $status, no-write exit $nowrite, trace exit $trace, survivors exit $survive, observer controls exit $controls, idle-launch exit $idle"
+[ "$status" = 0 ] && [ "$nowrite" = 0 ] && [ "$trace" = 0 ] && [ "$survive" = 0 ] && [ "$controls" = 0 ] && [ "$idle" = 0 ]

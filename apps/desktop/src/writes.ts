@@ -2,7 +2,10 @@
 // (Settings, "What this app writes") and docs/DESKTOP.md repeats ("Files the desktop app
 // writes"; src/writes.test.ts fails when they differ). It never deletes, moves or backs up
 // a scanned file. Each entry was observed (e2e/idle-launch.sh and the end-to-end checks on
-// Linux, the bundle job on macOS) unless it says otherwise.
+// Linux, the bundle job on macOS) unless it says otherwise. On Linux the write observer allows
+// only what these entries say, through e2e/declarations.py (e2e/test_trace_report.py fails
+// when an entry and its declarations differ: a folder declared empty, a whole folder, a file
+// named).
 //
 // The recent-files entry and the file dialog's settings are GTK's: turning GTK's recent-files
 // setting off erases the user's existing list (measured with GTK 3.24.41), so the app leaves
@@ -32,11 +35,11 @@ export const WRITES: WriteGroup[] = [
     writes: [
       {
         path: "disk-cleaner/config.toml (with config.toml.bak and config.toml.lock)",
-        what: "on Save of the plan settings: the two plan settings you changed, a copy of the text loaded and the save lock. In ~/.config (Linux), ~/Library/Application Support (macOS) or %APPDATA% (Windows).",
+        what: "on Save of the plan settings: the two plan settings you changed, a copy of the text loaded and the save lock. config.toml and config.toml.bak are each written as a temporary NAME.PID.N.tmp beside it (PID the app's process, N a number) and renamed over it. In ~/.config (Linux), ~/Library/Application Support (macOS) or %APPDATA% (Windows).",
       },
       {
         path: "disk-cleaner/prunedisk-app.json",
-        what: "on Save: the app's own scan settings, in the same folder.",
+        what: "on Save: the app's own scan settings, in the same folder, written the same way through a temporary NAME.PID.N.tmp.",
       },
       { path: "the plan file you export", what: "on Export: a new file in the folder you choose; never an existing file." },
     ],
@@ -46,11 +49,20 @@ export const WRITES: WriteGroup[] = [
     writes: [
       {
         path: "~/.local/share/io.github.ericmacdougall.prunedisk/",
-        what: "the web view's private session still stores random salts (storage/salt, mediakeys/v1/salt, CacheStorage/salt, WebKitCache/Version 17/salt), an empty WebKitCache/Version 17/Blobs folder and its HTTPS policy store (hsts-storage.sqlite). No browsing data: the app shows only its own page.",
+        what: "the web view's private session still stores random salts (storage/salt, mediakeys/v1/salt, CacheStorage/salt, WebKitCache/Version 17/salt), an empty WebKitCache/Version 17/Blobs folder and its HTTPS policy store (hsts-storage.sqlite, with hsts-storage.sqlite-journal while it writes). No browsing data: the app shows only its own page.",
       },
-      { path: "~/.cache/mesa_shader_cache/", what: "the graphics driver's shader cache, as for any program that draws with Mesa." },
-      { path: "~/.cache/mesa_shader_cache_db/", what: "the same cache in newer Mesa's single-file form." },
-      { path: "~/.cache/fontconfig/", what: "the font cache, when the system's is out of date." },
+      {
+        path: "~/.cache/mesa_shader_cache/",
+        what: "the graphics driver's shader cache, as for any program that draws with Mesa: the whole folder is the driver's.",
+      },
+      {
+        path: "~/.cache/mesa_shader_cache_db/",
+        what: "the same cache in newer Mesa's single-file form: the whole folder is the driver's.",
+      },
+      {
+        path: "~/.cache/fontconfig/",
+        what: "the font cache, when the system's is out of date: the whole folder is fontconfig's.",
+      },
       {
         path: "$XDG_RUNTIME_DIR/dconf/user",
         what: "the settings system's change flag, in memory, not on disk (in ~/.cache/dconf/user on a system with no runtime folder).",
@@ -69,8 +81,8 @@ export const WRITES: WriteGroup[] = [
         what: "an empty folder for the settings system's file store, on a system without dconf.",
       },
       {
-        path: "dconf: org.gtk.Settings.FileChooser",
-        what: "the file dialog saves its own size and view settings when it closes. Not yet observed by the app's checks: the settings service writes it from its own process, which the trace does not follow.",
+        path: "~/.config/dconf/user",
+        what: "on a system with the settings service (dconf-service, started by the desktop session), the file dialog's size and view settings (org.gtk.Settings.FileChooser), saved when it closes. The service writes this database from its own process, so the checks see it in a snapshot of the home folder (Debian 12), not in the trace.",
       },
       {
         path: "~/.dbus/session-bus/ and /tmp/dbus-*",
