@@ -1,0 +1,18 @@
+rule: self-check: a mutant with two killing tests, one of which passes, SURVIVES
+killing-test: rescue cta3
+assertion: are not the scan's
+killing-test: rescue artifact_secret
+assertion: control: control
+--- a/crates/core/src/pieces.rs
++++ b/crates/core/src/pieces.rs
+@@ -364,7 +364,9 @@
+         let root_dev = md.dev;
+         // The root's own blocks are counted as the main scan counts them: those of the directory
+         // it names (a symlinked root's target), never the link object's (CT-A3).
+-        let root_alloc = md.alloc;
++        let root_alloc = std::fs::symlink_metadata(root)
++            .map(|l| meta(&l).alloc)
++            .unwrap_or(md.alloc);
+         let idx = t.dirs.len();
+         t.dirs.push(DirRec {
+             path: root.clone(),
