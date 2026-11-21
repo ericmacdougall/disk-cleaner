@@ -849,6 +849,68 @@ fn neg12_secret_inode_across_the_git_directory_boundary() {
     }
 }
 
+/// Code inspection F4: a secret directory inside a git directory keeps its entries secret (the
+/// git piece becomes incomplete) and passes secrecy to hard-link aliases outside, in both walk
+/// orders; nothing of it is hashed.
+#[cfg(unix)]
+#[test]
+fn neg12_secret_directory_inside_a_git_directory() {
+    for dir_name in ["secrets", ".aws"] {
+        for loose_name in ["a-loose", "z-loose"] {
+            let (_tmp, root, remotes) = workspace();
+            let repo = pushed_repo(&root, &remotes, "m-repo");
+            let inner = repo.join(".git").join(dir_name);
+            write_bytes(&inner.join("plain.bin"), 100 * KIB);
+            write_bytes(&inner.join("other.bin"), 100 * KIB);
+            let loose = root.join(loose_name);
+            fs::create_dir_all(&loose).unwrap();
+            fs::hard_link(inner.join("plain.bin"), loose.join("data.bin")).unwrap();
+            let res = lanes_scan(&root);
+            let p = plan(&res, &idle_opts());
+            check_invariants(&res, &p);
+            let l = lanes_of(&p);
+            let what = format!("{dir_name} {loose_name}");
+            let gp = the_piece(&res, l, &repo.join("README.md"));
+            assert_eq!(gp.lane, Lane::Keep, "{what}: {}", gp.reason);
+            let survey = res.pieces.as_ref().unwrap();
+            assert!(survey.pieces[gp.scan_piece].incomplete.is_some(), "{what}");
+            // The directory stays inside the git piece.
+            assert_eq!(
+                the_piece(&res, l, &inner.join("other.bin")).id,
+                gp.id,
+                "{what}"
+            );
+            let alias = the_piece(&res, l, &loose.join("data.bin"));
+            assert_eq!(alias.lane, Lane::Keep, "{what}");
+            assert!(alias.secret.is_some(), "{what}");
+            assert!(survey.blobs.is_empty(), "{what}: {:#?}", survey.blobs);
+        }
+    }
+}
+
+/// Code inspection F5: a scan root spelled through a symlink to a directory is surveyed like
+/// the main scan surveys it.
+#[cfg(unix)]
+#[test]
+fn partition_a_symlinked_scan_root_is_surveyed() {
+    let (tmp, root, _) = workspace();
+    write_bytes(&root.join("notes").join("a.bin"), 5000);
+    write(&root.join("top.txt"), "x");
+    let alias = tmp.path().join("alias");
+    std::os::unix::fs::symlink(&root, &alias).unwrap();
+    let res = lanes_scan(&alias);
+    assert!(res.totals.allocated_bytes > 0);
+    check_partition(&alias, &res);
+    let p = plan(&res, &idle_opts());
+    check_invariants(&res, &p);
+    let survey = res.pieces.as_ref().unwrap();
+    assert!(!survey.pieces.is_empty());
+    for sp in &survey.pieces {
+        assert!(Path::new(&sp.path).starts_with(&alias), "{}", sp.path);
+        assert_eq!(recheck(sp, RecheckScope::All), Ok(()), "{}", sp.path);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn neg5_a_hardlink_kept_elsewhere_frees_nothing() {

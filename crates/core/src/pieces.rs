@@ -343,11 +343,18 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
         roots: Vec::new(),
     };
     for (ri, root) in roots.iter().enumerate() {
-        let md = match std::fs::symlink_metadata(root) {
+        // A scan root may be spelled through a symlink to a directory, as the main scan allows;
+        // only the root itself is followed, never an entry below it.
+        let md = match std::fs::metadata(root) {
             Ok(md) if md.is_dir() => meta(&md),
             _ => continue,
         };
         let root_dev = md.dev;
+        // The root's own blocks are counted as the main scan counts them: those of the name
+        // given (a symlink's, not its target directory's).
+        let root_alloc = std::fs::symlink_metadata(root)
+            .map(|l| meta(&l).alloc)
+            .unwrap_or(md.alloc);
         let idx = t.dirs.len();
         t.dirs.push(DirRec {
             path: root.clone(),
@@ -358,7 +365,7 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
             parent: None,
             root: ri,
             children: Vec::new(),
-            alloc: md.alloc,
+            alloc: root_alloc,
             unreadable: false,
             mount_skipped: false,
             other_root: false,
@@ -541,12 +548,12 @@ fn annotate(t: &mut Tree, nodes: &[Node], rules: &RuleSet, order: &[usize]) {
         t.dirs[d].in_artifact = part || nclass.map(|c| c.is_artifact()).unwrap_or(false);
         if psecret.is_some() {
             t.dirs[d].secret_dir = psecret;
-        } else if !t.dirs[d].in_gitdir {
-            // A scan root with a secret directory name is a secret directory too.
-            if let Some(kind) = t.dirs[d].name.to_str().and_then(|n| rules.secret_dir(n)) {
-                t.dirs[d].secret_dir = Some(kind.to_string());
-                t.dirs[d].secret_top = true;
-            }
+        } else if let Some(kind) = t.dirs[d].name.to_str().and_then(|n| rules.secret_dir(n)) {
+            // A scan root with a secret directory name is a secret directory too. Inside a git
+            // directory it is not cut out (the git piece stays whole), but its entries are
+            // secret-in-git-dir, which makes the git piece incomplete.
+            t.dirs[d].secret_dir = Some(kind.to_string());
+            t.dirs[d].secret_top = !t.dirs[d].in_gitdir;
         }
     }
     for e in 0..t.ents.len() {
@@ -573,11 +580,12 @@ fn annotate(t: &mut Tree, nodes: &[Node], rules: &RuleSet, order: &[usize]) {
                 .map(|k| k.to_string())
         };
         t.ents[e].gitdir_secret = in_gitdir
-            && t.ents[e]
-                .name
-                .to_str()
-                .and_then(|n| rules.secret_file(n, false))
-                .is_some();
+            && (dir.secret_dir.is_some()
+                || t.ents[e]
+                    .name
+                    .to_str()
+                    .and_then(|n| rules.secret_file(n, false))
+                    .is_some());
         t.ents[e].in_gitdir = in_gitdir;
         t.ents[e].secret = secret;
     }
@@ -1453,8 +1461,9 @@ pub fn recheck(piece: &Piece, scope: RecheckScope) -> Result<(), Drift> {
         }
         return Ok(());
     }
-    let md = std::fs::symlink_metadata(base)
-        .map_err(|_| drift("", "the piece's directory is missing"))?;
+    // The piece's own directory is followed if it is a symlink (a scan root spelled through
+    // one); its members are compared by device and inode, so a different target is drift.
+    let md = std::fs::metadata(base).map_err(|_| drift("", "the piece's directory is missing"))?;
     if !md.is_dir() {
         return Err(drift("", "the piece's directory is no longer a directory"));
     }
