@@ -582,7 +582,15 @@ fn a_case_colliding_pair_never_overwrites_one_with_the_other() {
         ],
     );
     let (env, out) = run_case(&r);
-    if case_insensitive(env.dir.path()) {
+    let insensitive = case_insensitive(env.dir.path());
+    // macOS CI's APFS volume is case-insensitive, so the refusal branch runs there for certain
+    if cfg!(target_os = "macos") && std::env::var_os("CI").is_some() {
+        assert!(
+            insensitive,
+            "expected a case-insensitive volume on macOS CI"
+        );
+    }
+    if insensitive {
         // refused: the second name is an error and the first keeps its own bytes
         assert_eq!(out.code, 3, "{}", out.text);
         assert!(out.text.contains("collision"), "{}", out.text);
