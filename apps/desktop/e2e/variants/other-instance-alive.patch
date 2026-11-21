@@ -1,0 +1,40 @@
+diff --git a/apps/desktop/e2e/run.mjs b/apps/desktop/e2e/run.mjs
+index 258c5d8..90d61af 100644
+--- a/apps/desktop/e2e/run.mjs
++++ b/apps/desktop/e2e/run.mjs
+@@ -11,7 +11,9 @@
+ //          --big <a large folder to cancel during> --valid <scan.json> --malformed <file>
+ //          --export <an empty folder the export folder dialog picks> --out <result.json>
+ 
+-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
++import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
++import { spawn } from "node:child_process";
++import os from "node:os";
+ import path from "node:path";
+ import { App, Run, args, startDriver, stopDriver } from "./driver.mjs";
+ import { KEY } from "./webdriver.mjs";
+@@ -388,6 +390,24 @@ if (linux) {
+   let notAlone = null;
+   let totalU = 0;
+   try {
++    // Variant other-instance-alive: a second app instance under the shipped binary's name (comm
++    // prunedisk-deskt, which no session of the suite uses), in a home of its own, alive from here
++    // to the end of the run.
++    {
++      const bin = process.env.E2E_BIN;
++      if (!bin) throw new Error("variant other-instance-alive: E2E_BIN is not set");
++      const stray = path.join(path.dirname(bin), "prunedisk-desktop");
++      copyFileSync(bin, stray);
++      chmodSync(stray, 0o755);
++      const home = mkdtempSync(path.join(os.tmpdir(), "prunedisk-stray-"));
++      const xdg = { HOME: home, XDG_CONFIG_HOME: `${home}/config`, XDG_DATA_HOME: `${home}/data`, XDG_CACHE_HOME: `${home}/cache`, XDG_STATE_HOME: `${home}/state` };
++      spawn(stray, [], { env: { ...defaultEnv(false), ...xdg }, detached: true, stdio: "ignore" }).unref();
++      const end = Date.now() + 30_000;
++      while (!(tracerState(APP_NAMES)?.procs ?? []).some((p) => p.name === "prunedisk-deskt")) {
++        if (Date.now() > end) throw new Error("variant other-instance-alive: the second instance did not start");
++        await new Promise((r) => setTimeout(r, 200));
++      }
++    }
+     before = appPids();
+     beforeAll = allPids();
+     notAlone = othersAtStart("info.default.precondition.untraced");

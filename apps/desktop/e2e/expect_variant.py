@@ -33,12 +33,24 @@ EXPECT = {
         ["timing.ipc_tree_page_p95", "timing.scroll_p95", "timing.synth_1m.ipc_tree_page_p95", "timing.synth_1m.scroll_p95"],
         None,
     ),
+    # The default-fixture scans (first run, untraced timing, main) must read the same conditions:
+    # here the first-run and untraced scans run with git facts off.
+    "scan-settings-differ": (["flow.default_scan_settings_match"], None),
+    # A second app instance (the shipped binary's name) alive at the timed sessions' start. The
+    # one-million-row checks are untraced under either wrapper, so they reach the other-instance
+    # precondition; the default ones may stop at the trace state first.
+    "other-instance-alive": (["timing.synth_1m.ipc_tree_page_p95", "timing.synth_1m.scroll_p95"], None),
 }
-# variant -> text each of its failed checks must report: caught by that check's precondition,
-# not by its numbers
+# variant -> the texts each of its failed checks must report (all of them): caught by the
+# reason the variant breaks, not by something incidental
 DETAIL = {
-    "untraced-ignored": "not shown to be untraced; not measured",
+    "untraced-ignored": ["not shown to be untraced; not measured"],
+    "scan-settings-differ": ["scanned under other settings than the main session"],
+    "other-instance-alive": ["another app instance is alive at the session start", "prunedisk-deskt"],
 }
+# A check that failed on one of its preconditions reports this; it was not measured, so for a
+# variant without a DETAIL it is not a catch.
+NOT_MEASURED = "not measured"
 # variant -> the line the trace report (trace.txt) must hold
 TRACE = {
     "planted-outside": "OTHER openat: /tmp/prunedisk-planted-outside",
@@ -62,10 +74,17 @@ def main(argv: list[str]) -> int:
     for c in checks:
         print(f"{'caught' if c in failed else 'MISSED'}: {c}")
         caught &= c in failed
-        if variant in DETAIL and c in failed:
-            hit = DETAIL[variant] in details.get(c, "")
-            print(f"{'caught' if hit else 'MISSED'}: {c} reports {DETAIL[variant]!r}: {details.get(c, '')[:200]!r}")
-            caught &= hit
+        if c not in failed:
+            continue
+        detail = details.get(c, "")
+        if variant in DETAIL:
+            for text in DETAIL[variant]:
+                hit = text in detail
+                print(f"{'caught' if hit else 'MISSED'}: {c} reports {text!r}: {detail[:200]!r}")
+                caught &= hit
+        elif NOT_MEASURED in detail:
+            print(f"MISSED: {c} failed on a precondition, not on this variant: {detail[:200]!r}")
+            caught = False
     if manifest_text is not None:
         report = (out / "manifest.txt").read_text() if (out / "manifest.txt").exists() else ""
         hit = [line for line in report.splitlines() if line.startswith(manifest_text) and ".planted-by-variant" in line]

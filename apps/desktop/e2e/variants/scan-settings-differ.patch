@@ -1,0 +1,13 @@
+diff --git a/apps/desktop/e2e/run.mjs b/apps/desktop/e2e/run.mjs
+index 258c5d8..886c74c 100644
+--- a/apps/desktop/e2e/run.mjs
++++ b/apps/desktop/e2e/run.mjs
+@@ -312,7 +312,7 @@ async function defaultScan(x) {
+   await x.s.clickText("Add folders...");
+   await x.s.until("return document.querySelectorAll('ul.chosen li').length === 1", 10_000);
+   const gitFacts = await x.s.exec("return document.getElementById('git-facts')?.checked ?? null");
+-  if (gitFacts !== true) throw new Error(`the git-facts box is ${gitFacts === null ? "missing" : "off"} before Scan, not on as the app starts it; not scanned`);
++  if (gitFacts) await x.s.exec("document.getElementById('git-facts').click();");
+   const scan = await scanConditions(x);
+   await x.s.clickText("Scan");
+   await x.s.until("return [...document.querySelectorAll('.bar span')].some((e) => e.textContent.startsWith('Scan complete.'))", 120_000);
