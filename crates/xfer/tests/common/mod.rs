@@ -104,8 +104,17 @@ pub fn sample_tree(root: &Path) {
         std::os::unix::fs::symlink("../a/small.txt", root.join("c/link")).expect("symlink");
         std::os::unix::fs::symlink("nowhere", root.join("c/dangling")).expect("symlink");
         std::fs::hard_link(root.join("a/small.txt"), root.join("d/hard.txt")).expect("hardlink");
-        let name = std::ffi::OsStr::from_bytes(b"e/caf\xe9-latin1.txt");
-        write(&root.join(name), b"non-utf8 name");
+        // APFS refuses names that are not UTF-8 (EILSEQ); there a decomposed (NFD) name checks
+        // that restore keeps the exact bytes of the name instead
+        let name: &[u8] = if cfg!(target_os = "macos") {
+            "e/cafe\u{301}-nfd.txt".as_bytes()
+        } else {
+            b"e/caf\xe9-latin1.txt"
+        };
+        write(
+            &root.join(std::ffi::OsStr::from_bytes(name)),
+            b"non-utf8 name",
+        );
         std::fs::set_permissions(
             root.join("a/small.txt"),
             std::fs::Permissions::from_mode(0o640),
