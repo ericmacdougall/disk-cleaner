@@ -133,6 +133,50 @@ fn rcd_round_trip_and_hygiene() {
     assert!(!dir.exists(), "private dir left behind");
 }
 
+/// rcd's memory must not grow with the bytes uploaded. rclone keeps a stats group per rc call,
+/// and a finished upload's accounting entry holds the buffer the object was read into, so without
+/// the per-upload group and its deletion 24 uploads of 16 MiB leave rcd holding about 400 MiB.
+#[cfg(target_os = "linux")]
+#[test]
+fn rcd_memory_does_not_grow_with_bytes_uploaded() {
+    let Some(bin) = common::rclone() else { return };
+    let remote = tempfile::tempdir().expect("tmp");
+    let root = remote.path().to_string_lossy().into_owned();
+    let t = RcloneRcd::start(&bin, &root, 16 << 20).expect("rcd starts");
+    let kib = |field: &str| -> u64 {
+        let s =
+            std::fs::read_to_string(format!("/proc/{}/status", t.rclone_pid())).expect("status");
+        s.lines()
+            .find(|l| l.starts_with(field))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .expect("field")
+    };
+    let mut data = vec![0u8; 16 << 20];
+    xfer::gen::Rng::new(5).fill(&mut data);
+    let n = 24u32;
+    for i in 0..n {
+        data[..4].copy_from_slice(&i.to_le_bytes());
+        verified_put(
+            &t,
+            &format!("v1/packs/{:02x}/p{i}.pack", i),
+            &data,
+            RetryPolicy::fast(),
+            &|_| {},
+        )
+        .expect("upload");
+    }
+    let peak_mib = kib("VmHWM:") / 1024;
+    let now_mib = kib("VmRSS:") / 1024;
+    assert_eq!(t.list("v1/packs").expect("list").len(), n as usize);
+    // The live set is one buffered upload; Go's heap target allows about twice that plus the
+    // runtime. Retaining every upload would be n × 16 MiB = 384 MiB.
+    assert!(
+        peak_mib < 160,
+        "rcd peak RSS {peak_mib} MiB (now {now_mib} MiB) after {n} uploads of 16 MiB"
+    );
+}
+
 #[test]
 fn rcd_refuses_old_or_missing_binary() {
     let r = RcloneRcd::start("/nonexistent/rclone", "/tmp/x", 32 << 20);

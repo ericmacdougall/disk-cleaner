@@ -30,7 +30,14 @@ const ALLOWED: &[&str] = &[
     "operations/stat",
     "operations/list",
     "operations/uploadfile",
+    "core/stats-delete",
 ];
+/// rcd keeps a stats group per rc call ("job/N", up to `--max-stats-groups`, default 1000), and
+/// a finished upload's accounting entry still holds the buffer rclone read the pack into. Without
+/// cleanup rcd's memory grows with the bytes uploaded (about 3.4 GB after 3 GiB of 32 MiB packs).
+/// Each upload therefore runs in its own named group, deleted when the call returns, and the group
+/// count is capped as a backstop.
+const MAX_STATS_GROUPS: u32 = 64;
 const RESPONSE_MAX: u64 = 256 << 20;
 
 #[cfg(unix)]
@@ -174,6 +181,8 @@ impl RcloneRcd {
                 "200Mi".into(),
                 "--s3-upload-cutoff".into(),
                 "200Mi".into(),
+                "--max-stats-groups".into(),
+                MAX_STATS_GROUPS.to_string(),
                 "--log-level".into(),
                 "NOTICE".into(),
             ];
@@ -424,13 +433,24 @@ impl Transport for RcloneRcd {
         let body = std::io::Cursor::new(head.into_bytes())
             .chain(data)
             .chain(std::io::Cursor::new(tail.into_bytes()));
-        let url = format!(
-            "{}operations/uploadfile?fs={}&remote={}",
-            self.base,
-            pct(&self.root),
-            pct(dir)
-        );
-        self.agent
+        let group = format!("xfer-{}", util::random_hex(8));
+        let url = if cfg!(feature = "broken-stats-groups") {
+            format!(
+                "{}operations/uploadfile?fs={}&remote={}",
+                self.base,
+                pct(&self.root),
+                pct(dir)
+            )
+        } else {
+            format!(
+                "{}operations/uploadfile?fs={}&remote={}&_group={group}",
+                self.base,
+                pct(&self.root),
+                pct(dir)
+            )
+        };
+        let r = self
+            .agent
             .post(&url)
             .set("Authorization", &self.auth)
             .set(
@@ -439,8 +459,12 @@ impl Transport for RcloneRcd {
             )
             .set("Content-Length", &len.to_string())
             .send(body)
-            .map_err(|e| self.map_err("operations/uploadfile", e))?;
-        Ok(())
+            .map_err(|e| self.map_err("operations/uploadfile", e));
+        if !cfg!(feature = "broken-stats-groups") {
+            // Best effort: a failure here leaves one group for the --max-stats-groups cap.
+            let _ = self.rc("core/stats-delete", json!({ "group": group }));
+        }
+        r.map(|_| ())
     }
 
     fn stat(&self, key: &str) -> Result<Option<RemoteObject>> {
