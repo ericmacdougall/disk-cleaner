@@ -1,8 +1,10 @@
 //! The commands the webview may call (spec AC-12). No path ever comes from the webview except
-//! scan roots, which are checked; import and export paths come from native dialogs opened here.
+//! scan roots, which are checked; import and export paths come from native dialogs opened here
+//! (built by dialogs.rs, which also picks the folder each one starts in).
 //! View commands take a view id, node ids, sort keys and bounded counts (at most 1,000).
 //! Every command runs off the UI thread (`async`).
 
+use crate::dialogs;
 use crate::state::{AppError, Emit, Inner, SaveReport, ScanEvent, ScanSettings};
 use disk_cleaner_view::dev::{DevItem, DevSummary};
 use disk_cleaner_view::export::{stamp, write_plan_new};
@@ -16,7 +18,6 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
-use tauri_plugin_dialog::DialogExt;
 
 /// The managed state.
 pub struct AppState(pub Arc<Inner>);
@@ -133,9 +134,7 @@ fn pick_folders(app: &AppHandle) -> Res<Vec<PathBuf>> {
     if let Some(p) = crate::e2e::folders() {
         return Ok(p);
     }
-    app.dialog()
-        .file()
-        .set_title("Choose folders to scan")
+    dialogs::file_dialog(app, "Choose folders to scan")
         .blocking_pick_folders()
         .unwrap_or_default()
         .into_iter()
@@ -220,10 +219,7 @@ fn pick_scan_file(app: &AppHandle) -> Res<Option<PathBuf>> {
     if let Some(answer) = crate::e2e::next_open() {
         return Ok(answer);
     }
-    let Some(picked) = app
-        .dialog()
-        .file()
-        .set_title("Open a scan file")
+    let Some(picked) = dialogs::file_dialog(app, "Open a scan file")
         .add_filter("Scan JSON", &["json"])
         .blocking_pick_file()
     else {
@@ -242,10 +238,7 @@ fn pick_export_file(app: &AppHandle) -> Res<Option<PathBuf>> {
         return Ok(answer);
     }
     let name = format!("prunedisk-plan-{}.json", stamp(disk_cleaner_view::units::now()));
-    let Some(picked) = app
-        .dialog()
-        .file()
-        .set_title("Export the plan")
+    let Some(picked) = dialogs::file_dialog(app, "Export the plan")
         .set_file_name(&name)
         .add_filter("JSON", &["json"])
         .blocking_save_file()

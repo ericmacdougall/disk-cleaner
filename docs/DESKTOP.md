@@ -55,6 +55,55 @@ flag (`xattr -dr com.apple.quarantine PruneDisk.app`) and, on Apple silicon, sig
 (`codesign --force --deep --sign - PruneDisk.app`) before opening. Windows SmartScreen asks
 before running an unsigned installer.
 
+### Linux AppImage
+
+The AppImage carries GTK, gdk-pixbuf and its loaders, and its AppRun hook (written by
+linuxdeploy's GTK plugin, which Tauri embeds) points `XDG_DATA_DIRS`,
+`GDK_PIXBUF_MODULE_FILE`, `GSETTINGS_SCHEMA_DIR`, `GIO_MODULE_DIR` and `GTK_PATH` inside
+the image. The plugin bundles no shared-mime-info database and no icon theme, so the
+image adds them (`bundle.linux.appimage.files` in `src-tauri/tauri.conf.json`, staged
+from the build host by `src-tauri/appimage/stage-data.mjs`, Tauri's
+`beforeBundleCommand`):
+
+- the compiled shared-mime-info database (`usr/share/mime`). Ubuntu's gdk-pixbuf chooses an
+  image loader by content-type sniffing, which reads this database. Without it, even GTK's
+  built-in fallback icon is an "Unrecognized image file format".
+- Adwaita without its sizes above 48 px and without `icon-theme.cache`, plus hicolor's
+  `index.theme`. Without an icon theme, the folder dialog falls back to that fallback icon.
+- each package's copyright file (`usr/share/doc`).
+
+Without them, "Add folders..." aborted the whole app ("Bail out! Gtk:ERROR ...
+image-missing.png: Unrecognized image file format") on any host without
+`/usr/share/mime` (CT-F1, GoodQA #16452). The bundle job fails if the AppImage lacks any of
+these files.
+
+The job "AppImage without host GTK" runs the shipped AppImage in bare `fedora:41` and
+`debian:bookworm-slim` containers (`e2e/appimage-dialog.sh`). The containers have no GTK,
+gdk-pixbuf, mime database or icon theme; the script refuses a host that has any of them. The
+test opens the dialog through the accessibility tree, picks a folder by path and requires the
+folder in the app with the app alive. It fails on a GTK error, critical or missing icon. It
+runs under `e2e/idle-launch.sh`, so the write observer sees the dialog's writes. A control
+leg deletes the added data from the same AppImage and requires the check to fail.
+
+The `.deb` needs none of this: it depends on `libgtk-3-0`, which brings shared-mime-info,
+Adwaita and hicolor even without recommended packages. On Debian 12 with
+`--no-install-recommends`, the 682a0ff `.deb` opened the dialog and returned a folder.
+
+### Screen readers on Linux (known limit)
+
+WebKitGTK 2.50.0 to 2.50.4 send screen readers the wrong role for every element from
+"paragraph" on in AT-SPI's list: headings are read as "document frame", paragraphs as
+"footer", links as "form" and the size tree's rows as "input method window". WebKit's own
+copy of AT-SPI's role list lost an entry (fixed upstream in WebKitGTK 2.50.5, WebKit bug
+300090). The app cannot correct it.
+- The `.deb` uses the system's WebKitGTK, so it has this fault on any host that still has one
+  of those versions. Ubuntu 22.04 ships 2.50.4.
+- The AppImage built on Ubuntu 22.04 carries 2.50.4 itself, so it has the fault on every
+  host: 7 of 27 roles were wrong on Debian 12, Fedora 41 and Ubuntu 24.04. The same binary
+  on a system WebKitGTK 2.52.6 had none wrong.
+- Moving the AppImage build to a maintained WebKitGTK also moves the oldest Linux it starts
+  on. That decision is open (GoodQA #16452).
+
 To run from source (needs Rust, Node 22 and the Tauri system libraries):
 
 ```
@@ -90,16 +139,71 @@ npx tauri dev
 
 ### Files the desktop app writes
 
-Its own files are in core's config folder, which follows `HOME` (macOS:
-`~/Library/Application Support/disk-cleaner/`), `APPDATA` (Windows: `%APPDATA%\disk-cleaner\`)
-or `XDG_CONFIG_HOME` (Linux: `$XDG_CONFIG_HOME/disk-cleaner/`, else `~/.config/disk-cleaner/`):
+The app never deletes, moves or backs up a scanned file. The window's tagline says: "Read-only
+disk view: nothing here deletes, moves or backs up anything. What it writes is listed in
+Settings." Settings, under "What this app writes", shows the list below, from
+`apps/desktop/src/writes.ts`; `src/writes.test.ts` fails when this section and that file
+differ. Outside the folders it scans, the app writes only this:
 
-- `prunedisk-app.json`, the app's scan settings;
-- on an explicit Save of the plan settings: `config.toml` (only `active_window_days` and
-  `max_git_admin_bytes` change), `config.toml.bak` (the text Settings loaded),
-  `config.toml.lock` (the save lock; it stays, empty, by design) and, during the save, a temp
-  file that is renamed over `config.toml` or removed;
-- a plan export, always a new file, in the folder chosen for it.
+**Every system, only when you ask**
+
+- `disk-cleaner/config.toml (with config.toml.bak and config.toml.lock)`: on Save of the plan settings: the two plan settings you changed, a copy of the text loaded and the save lock. In ~/.config (Linux), ~/Library/Application Support (macOS) or %APPDATA% (Windows).
+- `disk-cleaner/prunedisk-app.json`: on Save: the app's own scan settings, in the same folder.
+- `the plan file you export`: on Export: a new file in the folder you choose; never an existing file.
+
+**Linux, by the system libraries the window uses**
+
+- `~/.local/share/io.github.ericmacdougall.prunedisk/`: the web view's private session still stores random salts (storage/salt, mediakeys/v1/salt, CacheStorage/salt, WebKitCache/Version 17/salt), an empty WebKitCache/Version 17/Blobs folder and its HTTPS policy store (hsts-storage.sqlite). No browsing data: the app shows only its own page.
+- `~/.cache/mesa_shader_cache/`: the graphics driver's shader cache, as for any program that draws with Mesa.
+- `~/.cache/mesa_shader_cache_db/`: the same cache in newer Mesa's single-file form.
+- `~/.cache/fontconfig/`: the font cache, when the system's is out of date.
+- `$XDG_RUNTIME_DIR/dconf/user`: the settings system's change flag, in memory, not on disk (in ~/.cache/dconf/user on a system with no runtime folder).
+- `$XDG_RUNTIME_DIR/at-spi2-XXXXXX/`: only while a screen reader or other assistive technology is on: the accessibility bridge's socket for the window, in memory (in ~/.cache on a system with no runtime folder). XXXXXX is six random letters or digits.
+- `~/.local/share/recently-used.xbel`: the file dialog (GTK) adds the folders and files you pick in it to your recent files, as in every GTK app. It writes a temporary recently-used.xbel.XXXXXX (six random letters or digits) beside the list and renames it over the list.
+- `~/.config/gtk-3.0/`: an empty folder the file dialog creates for its bookmarks, when there is none.
+- `~/.config/glib-2.0/settings/`: an empty folder for the settings system's file store, on a system without dconf.
+- `dconf: org.gtk.Settings.FileChooser`: the file dialog saves its own size and view settings when it closes. Not yet observed by the app's checks: the settings service writes it from its own process, which the trace does not follow.
+- `~/.dbus/session-bus/ and /tmp/dbus-*`: only on a system with no desktop session bus, where the system library starts one.
+
+**macOS**
+
+- `~/Library/WebKit/io.github.ericmacdougall.prunedisk and ~/Library/Caches/io.github.ericmacdougall.prunedisk`: none: the web view's session is kept in memory (checked after every build).
+
+**Windows**
+
+- `%LOCALAPPDATA%\io.github.ericmacdougall.prunedisk\EBWebView\`: the web view's (WebView2) data folder, created by the runtime; the private session keeps browsing data out of it. Not yet observed file by file.
+
+Details. Core's config folder follows `HOME` (macOS: `~/Library/Application Support/disk-cleaner/`),
+`APPDATA` (Windows) or `XDG_CONFIG_HOME` (Linux, else `~/.config/disk-cleaner/`). On Save only
+`active_window_days` and `max_git_admin_bytes` change in `config.toml`; `config.toml.bak` holds
+the text Settings loaded; `config.toml.lock` stays, empty, by design; during the save a temp
+file is renamed over `config.toml` or removed. A plan export is always a new file, in the folder
+chosen for it; the app then says "Plan exported to <the file>. Nothing else was changed." Every
+file and folder dialog starts in your Documents folder, or your home folder when there is none;
+the app does not remember the last folder used.
+
+Recent files (Linux). GTK has a setting that turns its recent-files list off, but with it off
+the next dialog accept rewrites the account's `recently-used.xbel` empty: the user's existing
+list is erased (measured with GTK 3.24.41: a real file dialog accepted through its Open
+button, with one entry already in the list). So the app leaves the setting alone and lists the
+entry above. The owner chose this ("Keep and disclose", GoodQA goodqa#16452); removing the
+app's own entries after each dialog and the desktop portal are not built.
+
+How the Linux list is checked. `e2e/idle-launch.sh` runs the shipped build (the release binary
+in the end-to-end job) idle for 20 s in a sandbox, with a session bus, under strace, and
+`e2e/trace_report.py` fails on any write outside the declared salts, Blobs folder, HTTPS policy
+store, Mesa and fontconfig caches and dconf flag. In the owner's run of the 682a0ff AppImage
+(Docker on Ubuntu 24.04, not a click-test) that was every write; without a session bus the same
+launch also wrote `~/.dbus/session-bus/` and `/tmp/dbus-*`. The end-to-end suite picks folders
+through a test hook, so the file dialog's writes are checked by the `appimage-hosts` job:
+`e2e/appimage-dialog.sh` runs the AppImage through the same idle launch on bare Fedora 41 and
+Debian 12, opens the real dialog through the accessibility bus and accepts a folder, and the
+trace may then add only the dialog's entries above: the recent-files list and its temporary
+file, the empty `gtk-3.0` and `glib-2.0/settings` folders and the accessibility socket folder.
+A randomly named file is declared as a template (`--declared-temp`), which allows exactly six
+letters or digits in place of `XXXXXX` and nothing else; a neighbouring name still fails. The
+dialog's own settings are written by the settings service, a separate process the trace does
+not follow, so that entry stays "not yet observed".
 
 Webview data. The window is the system webview, which keeps data in folders named after the
 bundle id `io.github.ericmacdougall.prunedisk`. These do not follow `HOME`: WebKit uses the
@@ -122,11 +226,11 @@ account's home folder. The app runs the webview in incognito mode (`"incognito":
 - Windows (not observed here): WebView2 keeps a user data folder,
   `%LOCALAPPDATA%\io.github.ericmacdougall.prunedisk\EBWebView\`; incognito runs it InPrivate,
   which keeps browsing data out of it, but the runtime still creates the folder.
-- Linux (not observed here): incognito gives webkit2gtk an ephemeral data manager, so no
-  browsing data should be written under `~/.local/share/io.github.ericmacdougall.prunedisk/`
-  or `~/.cache/io.github.ericmacdougall.prunedisk/`. With Mesa graphics drivers, the webview's
-  GPU process writes the driver's shader cache to `~/.cache/mesa_shader_cache/`, as any
-  program drawing with Mesa does (seen in the end-to-end job, below).
+- Linux: incognito gives webkit2gtk an ephemeral data manager, so no browsing data is
+  written, but it still creates the salts, Blobs folder and HTTPS policy store listed above
+  under `~/.local/share/io.github.ericmacdougall.prunedisk/` (observed; this section said
+  "not observed" until PR gate F10). With Mesa graphics drivers, the webview's GPU process
+  writes the driver's shader cache, as any program drawing with Mesa does.
 
 What Tauri 2 offers here: `incognito` (every desktop platform; a non-persistent store),
 `dataDirectory` (Windows and Linux only; it moves the data, it does not turn it off) and
@@ -232,8 +336,11 @@ One session (`e2e/run.mjs`) covers these flows, in order:
 5. Page the developer view (Next and Previous), keeping focus on the pager, then switch class.
 6. In Settings: save a longer window, then try a shorter one three times, answering with
    Escape, Keep and Shorten. Each answer checks focus and the saved value.
-7. Export the plan, then try a second export, which is cancelled and writes nothing.
-8. Open a valid scan file, a malformed one (focus returns to Open) and a cancelled one.
+7. Export the plan (the message names the file and says nothing else changed), then New
+   scan: the chooser shows no status from the results.
+8. Open a valid scan file (no status left from the read), try a second export, which is
+   cancelled and writes and says nothing, then New scan and Add folders (no status from the
+   import), a malformed file (focus returns to Open) and a cancelled one.
 9. Check that the CSP blocks inline script.
 
 A second session then opens on a one-million-row size tree for the AC-9 timings (below).
@@ -260,9 +367,16 @@ No-write proof:
   data folders and, on Linux, the graphics driver's shader cache (below).
 - On Windows the real `%LOCALAPPDATA%\<bundle id>` and `%APPDATA%\disk-cleaner` folders are
   watched too.
-- On Linux the app and its child processes also run under strace (writes only, via
-  seccomp-bpf), and `e2e/trace_report.py` lists every path written anywhere, including outside
-  the sandbox. That list is a report, not a gate.
+- On Linux the app and its child processes also run under strace (`-f -y`, the calls
+  `e2e/trace_report.py --strace-calls` names, via seccomp-bpf; one log per launch), and
+  `e2e/trace_report.py` judges every path written anywhere, including outside the sandbox. It
+  is a gate (PR gate F10): a write outside the declared paths (OTHER), a relative path or
+  descriptor it cannot place (UNRESOLVED), io_uring (UNOBSERVABLE) or a traced call it cannot
+  read (UNPARSED) fails the check, and so does a log with no traced call. Declared outside the
+  sandbox: only dconf's flag file. Ignored: only `/dev/null`. Not covered: writes through a
+  memory map of a file opened read-write (the open itself is judged), and the macOS window.
+- The same job runs `e2e/idle-launch.sh` on the release binary: the shipped config, idle,
+  under the same gate, with the list in "Files the desktop app writes".
 
 Graphics driver cache (Linux): the webview's GPU process writes Mesa's shader cache to
 `$XDG_CACHE_HOME/mesa_shader_cache/` (else `~/.cache/mesa_shader_cache/`). Any program drawing
@@ -568,7 +682,9 @@ guarantee, and `e2e/expect_variant.py` passes only when the check written for it
 | `planted-write.patch` | writes a file into the first scan root | manifest: an UNDECLARED addition |
 | `offered-check-removed.patch` | Start no longer checks that a root was offered | `ipc.refused.root_not_offered`, `ipc.refused.subfolder_of_offered_root` |
 | `capability-broadened.patch` | grants `core:path:default` | `ipc.refused.not_in_capabilities.path` |
-| `focus-broken.patch` | the shorten question no longer takes focus | `settings.save_confirm_keep_escape` |
+| `focus-broken.patch` | the shorten question gives first focus to Shorten | `settings.save_confirm_keep_escape` |
+| `modal-trap-removed.patch` | the question opens non-modally: no inert background, no Tab trap | `settings.confirm_focus_contained` |
+| `planted-outside.patch` | writes `/tmp/prunedisk-planted-outside`, outside every snapshot root | trace: `OTHER openat: /tmp/prunedisk-planted-outside` (and the manifest must not see it) |
 | `row-cap-removed.patch` | the size tree's row cap is raised to 1000 and the grid renders up to the cap (a 1000-row buffer). Raising or deleting `MAX_DOM_ROWS` alone changes nothing at the app's window height, where the visible height (about 28 rows) is the binding limit, so the patch also renders the cap | `timing.synth_1m.scroll_p95` |
 
 macOS: no WebDriver exists for an app's WKWebView. Apple's safaridriver drives Safari only,

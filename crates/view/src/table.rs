@@ -13,6 +13,11 @@ use std::sync::Arc;
 /// Most rows one page may hold.
 pub const MAX_PAGE: usize = 1000;
 
+/// A 1-based place among siblings from a 0-based index.
+fn place(i: usize) -> u32 {
+    u32::try_from(i.saturating_add(1)).unwrap_or(u32::MAX)
+}
+
 /// Column to sort by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +111,13 @@ pub struct Row {
     pub summary: bool,
     /// A class or tag from the developer view (`repo`, `cache`, `agent-session`...).
     pub tag: Option<String>,
+    /// Row index of the parent's row (`None` at depth 0), so a client that holds only a page of
+    /// rows can still move to the parent (the treegrid's Left arrow).
+    pub parent_row: Option<usize>,
+    /// 1-based position among its siblings, and how many siblings there are (itself included):
+    /// a screen reader's "3 of 40", which a paged client cannot count (aria-posinset/setsize).
+    pub posinset: usize,
+    pub setsize: usize,
 }
 
 /// A child for the treemap.
@@ -143,6 +155,8 @@ pub struct TreeView {
     expanded: Vec<bool>,
     rows: Vec<NodeId>,
     depths: Vec<u16>,
+    /// Per row: its 1-based place among its siblings (spliced with `rows`).
+    places: Vec<u32>,
     focus: Option<NodeId>,
     tags: HashMap<NodeId, String>,
 }
@@ -165,6 +179,7 @@ impl TreeView {
             expanded: vec![false; n],
             rows: Vec::new(),
             depths: Vec::new(),
+            places: Vec::new(),
             focus: None,
             tags: HashMap::new(),
         };
@@ -239,16 +254,23 @@ impl TreeView {
     fn rebuild(&mut self) {
         self.rows.clear();
         self.depths.clear();
+        self.places.clear();
         let top = self.top_level();
         // Depth-first, children pushed in reverse so they come out in order.
-        let mut stack: Vec<(NodeId, u16)> = top.into_iter().rev().map(|id| (id, 0)).collect();
-        while let Some((id, depth)) = stack.pop() {
+        let mut stack: Vec<(NodeId, u16, u32)> = top
+            .into_iter()
+            .enumerate()
+            .rev()
+            .map(|(i, id)| (id, 0, place(i)))
+            .collect();
+        while let Some((id, depth, at)) = stack.pop() {
             self.rows.push(id);
             self.depths.push(depth);
+            self.places.push(at);
             if self.expanded[id as usize] {
                 self.ensure_sorted(id);
-                for &c in self.kids(id).iter().rev() {
-                    stack.push((c, depth.saturating_add(1)));
+                for (i, &c) in self.kids(id).iter().enumerate().rev() {
+                    stack.push((c, depth.saturating_add(1), place(i)));
                 }
             }
         }
@@ -306,6 +328,7 @@ impl TreeView {
         self.rows.splice(pos + 1..pos + 1, kids);
         self.depths
             .splice(pos + 1..pos + 1, std::iter::repeat_n(depth, n));
+        self.places.splice(pos + 1..pos + 1, (0..n).map(place));
         self.expanded[id as usize] = true;
         true
     }
@@ -342,6 +365,7 @@ impl TreeView {
         }
         self.rows.drain(pos + 1..end);
         self.depths.drain(pos + 1..end);
+        self.places.drain(pos + 1..end);
         self.expanded[id as usize] = false;
         true
     }
@@ -355,8 +379,12 @@ impl TreeView {
         }
     }
 
-    fn row(&self, id: NodeId, depth: u16) -> Row {
+    fn row(&self, id: NodeId, depth: u16, parent_row: Option<usize>, posinset: usize) -> Row {
         let t = &self.tree;
+        let setsize = match t.parent(id) {
+            Some(p) => t.children(p).len(),
+            None => self.roots.len(),
+        };
         let parent_alloc = match t.parent(id) {
             Some(p) => t.alloc(p),
             None => t.total_alloc(),
@@ -384,6 +412,9 @@ impl TreeView {
             hardlink_duplicate: f & flags::HARDLINK_DUPLICATE != 0,
             summary: f & flags::SUMMARY != 0,
             tag: self.tags.get(&id).cloned(),
+            parent_row,
+            posinset,
+            setsize: setsize.max(posinset),
         }
     }
 
@@ -392,14 +423,49 @@ impl TreeView {
         let limit = limit.min(MAX_PAGE);
         let start = offset.min(self.rows.len());
         let end = start.saturating_add(limit).min(self.rows.len());
+        // Open ancestors of the row being read, nearest last: found once for the first row by
+        // walking back to its top-level row, then kept as the page is read in order.
+        let mut open: Vec<usize> = Vec::new();
+        if start < end {
+            let mut want = self.depths[start];
+            let mut j = start;
+            while want > 0 && j > 0 {
+                j -= 1;
+                if self.depths[j] < want {
+                    open.push(j);
+                    want = self.depths[j];
+                }
+            }
+            open.reverse();
+        }
         (start..end)
-            .map(|i| self.row(self.rows[i], self.depths[i]))
+            .map(|i| {
+                let depth = self.depths[i];
+                while open.last().is_some_and(|&a| self.depths[a] >= depth) {
+                    open.pop();
+                }
+                let parent = if depth == 0 {
+                    None
+                } else {
+                    open.last().copied()
+                };
+                open.push(i);
+                self.row(self.rows[i], depth, parent, self.places[i] as usize)
+            })
             .collect()
     }
 
     /// One entry as a row (depth 0), whether visible or not.
     pub fn entry_row(&self, id: NodeId) -> Option<Row> {
-        self.valid(id).then(|| self.row(id, 0))
+        if !self.valid(id) {
+            return None;
+        }
+        let siblings = match self.tree.parent(id) {
+            Some(p) => self.kids(p),
+            None => &self.roots[..],
+        };
+        let at = siblings.iter().position(|&s| s == id).map_or(1, |i| i + 1);
+        Some(self.row(id, 0, None, at))
     }
 
     /// The focus and its ancestors, root first.
@@ -602,6 +668,82 @@ mod tests {
         );
         assert!(v.collapse(0));
         assert_eq!(v.row_count(), 1);
+    }
+
+    /// (name, parent_row, posinset, setsize) for a page.
+    fn places(
+        v: &TreeView,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<(String, Option<usize>, usize, usize)> {
+        v.page(offset, limit)
+            .into_iter()
+            .map(|r| (r.name, r.parent_row, r.posinset, r.setsize))
+            .collect()
+    }
+
+    fn p(
+        name: &str,
+        parent: Option<usize>,
+        at: usize,
+        of: usize,
+    ) -> (String, Option<usize>, usize, usize) {
+        (name.to_string(), parent, at, of)
+    }
+
+    /// The treegrid's Left arrow and "2 of 3" need the parent row and the place among siblings
+    /// even when the page holds neither the parent nor the siblings (CT-F4, CT-F5).
+    #[test]
+    fn rows_know_their_parent_row_and_place_among_siblings() {
+        let mut v = TreeView::new(sample());
+        assert!(v.expand(0));
+        assert!(v.expand(1));
+        assert_eq!(
+            places(&v, 0, 100),
+            vec![
+                p("/root", None, 1, 1),
+                p("zeta.txt", Some(0), 1, 3),
+                p("alpha", Some(0), 2, 3),
+                p("a1.bin", Some(2), 1, 2),
+                p("a2.bin", Some(2), 2, 2),
+                p("Beta", Some(0), 3, 3),
+            ]
+        );
+        // Pages that start below the parent, and below a sibling's open subtree.
+        assert_eq!(
+            places(&v, 4, 2),
+            vec![p("a2.bin", Some(2), 2, 2), p("Beta", Some(0), 3, 3)]
+        );
+        assert_eq!(places(&v, 5, 1), vec![p("Beta", Some(0), 3, 3)]);
+        assert_eq!(places(&v, 3, 1), vec![p("a1.bin", Some(2), 1, 2)]);
+        // Opening a folder above shifts the parent's row.
+        assert!(v.expand(4));
+        assert_eq!(places(&v, 6, 1), vec![p("b1.bin", Some(5), 1, 1)]);
+        assert!(v.collapse(1));
+        assert_eq!(
+            places(&v, 3, 2),
+            vec![p("Beta", Some(0), 3, 3), p("b1.bin", Some(3), 1, 1)]
+        );
+        // A new order renumbers the places; open folders stay open.
+        v.set_sort(Sort {
+            key: SortKey::Name,
+            descending: false,
+        });
+        assert_eq!(
+            places(&v, 0, 100),
+            vec![
+                p("/root", None, 1, 1),
+                p("alpha", Some(0), 1, 3),
+                p("Beta", Some(0), 2, 3),
+                p("b1.bin", Some(2), 1, 1),
+                p("zeta.txt", Some(0), 3, 3),
+            ]
+        );
+        // Drilled in: the focus's children are the top level, with no parent row.
+        assert!(v.set_focus(Some(1)));
+        assert_eq!(places(&v, 1, 5), vec![p("a2.bin", None, 2, 2)]);
+        let e = v.entry_row(3).unwrap();
+        assert_eq!((e.posinset, e.setsize, e.parent_row), (2, 2, None));
     }
 
     #[test]

@@ -417,29 +417,44 @@ try {
     const text = readFileSync(a.export, "utf8");
     const plan = JSON.parse(text);
     const status = await live();
-    // The save dialog's list is used up: the second export is a cancel and writes nothing.
-    await app.s.exec("document.querySelector('p.live').textContent = ''");
-    await app.s.clickText("Export plan...");
-    await new Promise((r) => setTimeout(r, 1500));
-    const second = await live();
-    if (second !== "") throw new Error(`second export said: ${second}`);
-    return { status, bytes: text.length, keys: Object.keys(plan).slice(0, 12) };
+    // CT-c: the confirmation names the file and says nothing else changed.
+    if (!/^Plan exported to .+\. Nothing else was changed\.$/.test(status)) throw new Error(`export said: ${status}`);
+    // CT-F6, first sequence: the confirmation is gone on the chooser after New scan. (No
+    // clearing of the status from here: that hid this defect.)
+    await app.s.clickText("New scan");
+    await waitH2("Choose what to scan");
+    const onChooser = await live();
+    if (onChooser !== "") throw new Error(`after New scan the chooser shows: ${onChooser}`);
+    return { status, onChooser, bytes: text.length, keys: Object.keys(plan).slice(0, 12) };
   });
 
   await run.check("flow.open_valid_scan_file", async () => {
-    await app.s.clickText("New scan");
-    await waitH2("Choose what to scan");
     await app.s.clickText("Open a scan file...");
     await app.s.until("return [...document.querySelectorAll('.bar span')].some((e) => e.textContent.startsWith('Imported scan file.'))", 60_000);
+    // CT-F6: "Reading the scan file..." ends with the read.
+    const afterImport = await live();
+    if (afterImport !== "") throw new Error(`after the import the status says: ${afterImport}`);
     const tabs = await app.s.exec("return [...document.querySelectorAll('[role=tab]')].map((t) => t.textContent)");
     if (tabs.includes("Size tree")) throw new Error(`an imported scan shows ${JSON.stringify(tabs)}`);
-    return { tabs };
+    // The save dialog's list is used up: this second export is a cancel, writes nothing and
+    // says nothing.
+    await app.s.clickText("Export plan...");
+    await new Promise((r) => setTimeout(r, 1500));
+    const second = await live();
+    if (second !== "") throw new Error(`a cancelled export said: ${second}`);
+    return { tabs, afterImport, second };
   });
   await axe("axe.imported_developer_view", "body");
 
   await run.check("flow.open_malformed_scan_file", async () => {
     await app.s.clickText("New scan");
     await waitH2("Choose what to scan");
+    // CT-F6, second sequence: after an import, New scan and Add folders, the chooser shows no
+    // status from the import.
+    await app.s.clickText("Add folders...");
+    await new Promise((r) => setTimeout(r, 1000));
+    const afterAdd = await live();
+    if (afterAdd !== "") throw new Error(`after import, New scan and Add folders the status says: ${afterAdd}`);
     await app.s.clickText("Open a scan file...");
     const msg = await app.s.until("const t = document.querySelector('p.live')?.textContent ?? ''; return t.startsWith('Cannot open that scan file:') ? t : null;", 30_000);
     const focus = await active();

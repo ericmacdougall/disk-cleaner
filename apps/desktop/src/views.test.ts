@@ -334,6 +334,91 @@ describe("settings (spec AC-5, NEG-5)", () => {
     expect(f.el.querySelector('[role="status"]')?.textContent).toContain("The config file changed; the plan was recomputed.");
     expect(replans).toEqual([true]);
   });
+
+  // Settings is loaded again each time it is shown and on every re-render of the results (a scan
+  // event). A read of the file that ends after the user typed must not put the file's values back
+  // over what they typed (Windows end-to-end runs on 2ff3381 and 7de6845: Save then had nothing
+  // to save).
+  it("an edit made while the file is read is kept when the read ends, and Save sends it", async () => {
+    const reads: { resolve: (p: SettingsPayload) => void }[] = [];
+    const b = mockBackend({
+      getSettings: () => {
+        const d = deferred<SettingsPayload>();
+        reads.push(d);
+        return d.promise;
+      },
+    });
+    const f = new SettingsForm(b);
+    document.body.replaceChildren(f.el);
+    const first = f.load();
+    reads[0]?.resolve(structuredClone(SETTINGS));
+    await first;
+    const input = f.el.querySelector("#set-window") as HTMLInputElement;
+    expect(input.value).toBe("30");
+    const again = f.load(); // Settings shown again
+    input.value = "60"; // the user types before the read ends
+    reads[1]?.resolve(structuredClone(SETTINGS));
+    await again;
+    expect(input.value).toBe("60");
+    await f.save(false);
+    const saves = b.calls.filter((c) => c.name === "saveSettings");
+    expect(saves).toHaveLength(1);
+    expect(saves[0]?.args[0]).toMatchObject({ active_window_days: 60 });
+  });
+
+  it("with nothing edited, showing Settings again shows what the file now holds", async () => {
+    let days = 30;
+    const b = mockBackend({
+      getSettings: async () => {
+        const s = structuredClone(SETTINGS);
+        s.core.active_window_days = days;
+        return s;
+      },
+    });
+    const f = new SettingsForm(b);
+    document.body.replaceChildren(f.el);
+    await f.load();
+    days = 45; // another program changed the file
+    await f.load();
+    expect((f.el.querySelector("#set-window") as HTMLInputElement).value).toBe("45");
+  });
+
+  it("a read that ends while a save is pending changes nothing on the form", async () => {
+    const reads: { resolve: (p: SettingsPayload) => void }[] = [];
+    let release!: () => void;
+    const b = mockBackend({
+      getSettings: () => {
+        const d = deferred<SettingsPayload>();
+        reads.push(d);
+        return d.promise;
+      },
+      saveSettings: () =>
+        new Promise<SaveResult>((r) => {
+          release = () => {
+            const s = structuredClone(SETTINGS);
+            s.core.active_window_days = 60;
+            r({ report: { outcome: "saved", note: null, replanned: false }, settings: s });
+          };
+        }),
+    });
+    const f = new SettingsForm(b);
+    document.body.replaceChildren(f.el);
+    const first = f.load();
+    reads[0]?.resolve(structuredClone(SETTINGS));
+    await first;
+    const input = f.el.querySelector("#set-window") as HTMLInputElement;
+    const again = f.load();
+    input.value = "60";
+    const saving = f.save(false);
+    reads[1]?.resolve(structuredClone(SETTINGS)); // the file still says 30
+    await again;
+    expect(input.value).toBe("60");
+    expect(f.el.querySelector("fieldset")?.disabled).toBe(true);
+    release();
+    await saving;
+    expect(input.value).toBe("60");
+    expect(f.el.querySelector('[role="status"]')?.textContent).toBe("Saved.");
+  });
 });
 
 describe("the shorten question is modal (PR gate F8)", () => {

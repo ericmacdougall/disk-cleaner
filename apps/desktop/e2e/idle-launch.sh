@@ -11,7 +11,8 @@
 # IDLE_DRIVER: a command run once the app has started (after IDLE_SECONDS) that drives the
 #   window (xdotool, for example); the observer covers what the driven flow writes. It sees
 #   SANDBOX (the sandbox folder) in its environment.
-# IDLE_DECLARE: more paths the driven flow may write (one per line; the caller states why).
+# IDLE_DECLARE: more paths the driven flow may write (one per line; the caller states why, and
+#   each must be in src/writes.ts). A line ending in XXXXXX is a template (see below).
 set -euo pipefail
 PROG=${1:?program}
 OUT=${2:?out folder}
@@ -43,12 +44,20 @@ DECLARED=(
   # Mesa's shader cache and fontconfig's font cache: written by those libraries for any program
   # that draws text and graphics with them; the app does not ask for either.
   --declared "$SB/cache/mesa_shader_cache" --declared "$SB/cache/fontconfig"
+  # Newer Mesa (Fedora 41) keeps the same shader cache as one database folder.
+  --declared "$SB/cache/mesa_shader_cache_db"
   # GLib's dconf settings client opens its shared-memory flag file read-write (in the runtime
   # folder, a memory file system); the app writes no setting.
   --declared "$RUNTIME/dconf/user"
 )
+# A line ending in XXXXXX is a template (trace_report.py --declared-temp): exactly six random
+# letters or digits in their place, as GLib names its temporary files and folders.
 while IFS= read -r extra; do
-  if [ -n "$extra" ]; then DECLARED+=(--declared "$extra"); fi
+  case "$extra" in
+    "") ;;
+    *XXXXXX) DECLARED+=(--declared-temp "$extra") ;;
+    *) DECLARED+=(--declared "$extra") ;;
+  esac
 done <<< "${IDLE_DECLARE:-}"
 IGNORE=(--ignore /dev/null)
 CALLS=$(cd "$HERE" && python3 trace_report.py --strace-calls)

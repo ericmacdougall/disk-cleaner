@@ -3,7 +3,14 @@
 child processes changed, from an strace log, judged against the declared paths. The default
 for a write nobody declared is failure.
 
-usage: trace_report.py LOG [LOG...] [--declared PATH]... [--ignore PATH]...
+usage: trace_report.py LOG [LOG...] [--declared PATH]... [--declared-temp TEMPLATE]...
+                       [--ignore PATH]...
+
+A TEMPLATE is a path whose last name ends in XXXXXX, as for mkstemp and g_mkdtemp: it allows a
+file or folder whose name is the template with those six characters replaced by exactly six
+letters or digits, and anything inside such a folder. For the randomly named files that GLib
+writes next to a declared file and renames over it (recently-used.xbel.XXXXXX), and the folder
+the accessibility bridge makes (at-spi2-XXXXXX). Nothing else about the name may differ.
 
 The log is strace output made with -f -y (descriptors decoded to their paths), as e2e/check.sh
 and e2e/idle-launch.sh write it; a log per process (-ff) works too.
@@ -23,8 +30,8 @@ process (chdir, fchdir and clone are followed). Each path is also judged with it
 symbolic links resolved, as they are when the report runs.
 
 Each path is printed once with its kind:
-  declared    a declared path or inside one (a declared path is a file or a folder), or a folder
-              created on the way to one (mkdir only)
+  declared    a declared path or inside one (a declared path is a file or a folder), a name a
+              template allows or inside it, or a folder created on the way to either (mkdir only)
   ignored     an --ignore path or inside one (exact paths and folders, never a name prefix)
   anonymous   a descriptor that names no file (memfd, socket, pipe, anon_inode)
   OTHER       anything else
@@ -215,10 +222,29 @@ def strip_deleted(p: str) -> str:
     return p[: -len(" (deleted)")] if p.endswith(" (deleted)") else p
 
 
+TEMPLATE_TAIL = "XXXXXX"
+
+
+def template_pattern(prefix: str) -> re.Pattern[str]:
+    """The names a template allows: the prefix, exactly six letters or digits, then nothing or a
+    path inside that folder."""
+    return re.compile(re.escape(prefix) + r"[A-Za-z0-9]{6}(?:/.*)?")
+
+
 class Report:
-    def __init__(self, declared: list[str], ignore: list[str]):
+    def __init__(self, declared: list[str], ignore: list[str], temps: list[str] | None = None):
         self.declared = self._both(declared)
         self.ignore = self._both(ignore)
+        # Each template's folder, as written and with its links resolved, joined to the name's
+        # fixed part; the folders count as declared folders for mkdir on the way.
+        self.temp_prefixes: list[str] = []
+        for t in temps or []:
+            if not os.path.basename(t).endswith(TEMPLATE_TAIL):
+                raise ValueError(f"a template's last name must end in {TEMPLATE_TAIL}: {t}")
+            stem = os.path.basename(t)[: -len(TEMPLATE_TAIL)]
+            for folder in self._both([os.path.dirname(os.path.normpath(t))]):
+                self.temp_prefixes.append(os.path.join(folder, stem))
+        self.temps = [template_pattern(p) for p in sorted(set(self.temp_prefixes))]
         self.seen: dict[tuple[str, str], set[str]] = defaultdict(set)
         self.cwd: dict[str, str | None] = {}
         self.calls = 0
@@ -236,7 +262,10 @@ class Report:
         return any(p == r or p.startswith(r.rstrip("/") + "/") for r in roots)
 
     def _on_the_way(self, p: str) -> bool:
-        return any(r.startswith(p.rstrip("/") + "/") for r in self.declared)
+        return any(r.startswith(p.rstrip("/") + "/") for r in self.declared + self.temp_prefixes)
+
+    def _a_temp(self, p: str) -> bool:
+        return any(t.fullmatch(p) for t in self.temps)
 
     def kind(self, p: str, call: str) -> str:
         """The kind of one absolute path, judged as written and with its folders' links
@@ -244,7 +273,7 @@ class Report:
         forms = {p, os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p))}
         kinds = set()
         for f in forms:
-            if self._under(f, self.declared) or (call in MKDIRS and self._on_the_way(f)):
+            if self._under(f, self.declared) or self._a_temp(f) or (call in MKDIRS and self._on_the_way(f)):
                 kinds.add("declared")
             elif self._under(f, self.ignore):
                 kinds.add("ignored")
@@ -411,15 +440,16 @@ class Report:
 def main(argv: list[str]) -> int:
     logs: list[str] = []
     declared: list[str] = []
+    temps: list[str] = []
     ignore: list[str] = []
     rest = list(argv)
     while rest:
         a = rest.pop(0)
-        if a in ("--declared", "--ignore"):
+        if a in ("--declared", "--declared-temp", "--ignore"):
             if not rest:
                 print(__doc__, file=sys.stderr)
                 return 2
-            (declared if a == "--declared" else ignore).append(rest.pop(0))
+            {"--declared": declared, "--declared-temp": temps, "--ignore": ignore}[a].append(rest.pop(0))
         elif a.startswith("--"):
             print(__doc__, file=sys.stderr)
             return 2
@@ -428,7 +458,11 @@ def main(argv: list[str]) -> int:
     if not logs:
         print(__doc__, file=sys.stderr)
         return 2
-    report = Report(declared, ignore)
+    try:
+        report = Report(declared, ignore, temps)
+    except ValueError as e:
+        print(f"trace: {e}", file=sys.stderr)
+        return 2
     for log in logs:
         try:
             report.read(log)
