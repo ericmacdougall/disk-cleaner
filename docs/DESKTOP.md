@@ -594,8 +594,8 @@ What the numbers show:
   The slices describe the profile pass.
 - Unchanged frames are already irregular on the EPYC 7763 runners (floor p95 57 to 60 ms).
 - The profile does not separate the grid's DOM work from software rendering or strace. A run of
-  the one-million-row session without the strace wrapper would; it has not been run.
-- The cause of the slow Linux frame is not established. One candidate is WebKitGTK compositing
+  the one-million-row session without the strace wrapper does (cc3e711, below).
+- At this commit the cause of the slow Linux frame was not established. One candidate is WebKitGTK compositing
   and painting through Mesa's software renderer under Xvfb (the shader cache shows Mesa). That
   would fit the CPU dependence. Another is the strace wrapper, which also traces the
   `ftruncate` of WebKit's shared-memory buffers (`/memfd:WebKitSharedMemory`).
@@ -635,8 +635,8 @@ What these add:
 - Windows does not slow down: medians per 50 steps stay at 31.3 ms and the floor after the
   steps is one frame period.
 - The page's own work, IPC included, stays at 6 to 8 ms p50 in the profile pass.
-- The cause is still not established. The run without the strace wrapper, above, would
-  separate strace from rendering; it has not been run.
+- The cause was not established at this commit. The run without the strace wrapper, later at
+  cc3e711, separates strace from rendering (below).
 
 The investigation sessions (registered in the WAL before any sample, informational, never a
 gate). They are opt-in: the e2e-variants workflow's `ac9_investigate` input sets
@@ -656,14 +656,74 @@ marker in `$OUT/untraced/`, and the trace step prints how many there were. The w
 reads the app process's `TracerPid` from `/proc` and counts as invalid when it does not match
 its arm. Page functions: `e2e/ac9x.mjs`, which reuses `e2e/ac9.mjs`'s step and floor code.
 
-Running-app scroll tally:
+Running-app scroll tally, Linux under the strace wrapper. Through 030f494 the count was 4 of 16
+passed in the registered order. By procedure and head, through cc3e711:
 
-- Windows: 5 of 5 passed (through 030f494).
-- Linux, in the registered order: 4 of 16 passed. 4 of 9 before 0588a6e (three desktop runs and
-  six tree-neutral variant jobs, CPU not recorded), and 0 of 7 at 030f494.
-- Linux at 0588a6e, with the floor ahead of the gated steps: 0 of 7 passed. Kept apart from
-  the tally above, because the procedure differed.
+| Procedure | Head | Linux jobs passed | Note |
+|---|---|---|---|
+| registered order | 86fafdc, 0291587, cb39cc1 | 4 of 9 | three desktop runs and six tree-neutral variant jobs; CPU not recorded |
+| registered order | 030f494 | 0 of 7 | desktop run 44883021601, e2e-variants run 44883021841 |
+| registered order | cc3e711 | 1 of 7 | six tree-neutral jobs of e2e-variants run 44884912971 (the gated session each opens with) and desktop push run 44884907082 |
+| registered order, total | | 5 of 23 | the earlier count of 5 of 22 left out desktop run 44884907082 |
+| floor ahead of the gated steps | 0588a6e | 0 of 7 | kept apart: the procedure differed |
+
+- Windows: 5 of 5 passed (86fafdc, 0291587, cb39cc1, 0588a6e, 030f494). Windows has no tracer.
 - The row-cap variant is left out of every count, as it fails by design.
+- At cc3e711 the gated session measured, p50/p95/max: EPYC 7763 46/64/86 and 46/69/79, Xeon
+  Platinum 8573C 35/51/67 and 34/49/60 (the pass), EPYC 9V74 41/55/68 and 39/57/66, and in the
+  desktop push run EPYC 7763 46/66/84.
+
+The blank-page and app-idle controls (e2e-variants run 44884912971 at cc3e711, WAL entries
+w07983c42191 and wf5f38e99704 registered them before any sample). Each arm is a fresh launch of
+the one-million-row session, with the strace wrapper and without it, in the order steps, app
+idle, blank page. The app-idle and blank-page arms run the floor loop for as long as the steps
+arm of the same condition took (17 to 23 s traced, 10 s untraced). The blank page is
+`about:blank` (3 elements, no grid, no app code). All 36 sessions of the six tree-neutral jobs
+were valid: the app process was traced (`TracerPid` above 0) in every traced arm and untraced
+in every untraced arm. Floor p95 in ms at the start, middle and end of each arm:
+
+| CPU (jobs) | Arm | With strace | Without strace |
+|---|---|---|---|
+| AMD EPYC 7763 (2) | steps | 22-23 / 71 / 125-126 | 17 / 17 / 17 |
+| AMD EPYC 7763 (2) | app idle | 21-22 / 77-82 / 141-145 | 17 / 18-19 / 18 |
+| AMD EPYC 7763 (2) | blank page | 20-22 / 80-81 / 136-144 | 17 / 17 / 18 |
+| Intel Xeon Platinum 8573C (2) | steps | 26-29 / 85-97 / 121-135 | 17 / 17 / 17 |
+| Intel Xeon Platinum 8573C (2) | app idle | 27 / 40-41 / 153-157 | 17 / 17-19 / 17 |
+| Intel Xeon Platinum 8573C (2) | blank page | 24-29 / 80-83 / 136-137 | 17 / 17 / 17-18 |
+| AMD EPYC 9V74 (2) | steps | 20 / 57-61 / 103-106 | 17 / 17 / 17 |
+| AMD EPYC 9V74 (2) | app idle | 19-20 / 63-66 / 106-111 | 17 / 18 / 17-19 |
+| AMD EPYC 9V74 (2) | blank page | 20 / 59-66 / 109-118 | 17 / 17-18 / 17-18 |
+
+- With strace the rAF interval p50 goes from 16 ms at the start to 65 to 113 ms at the end, in
+  every arm. Without strace it stays at 16 ms.
+- The blank page, with no app code, slows down exactly as the app does. What slows the frames
+  is in the engine or the harness, not in what the app holds.
+- Time is matched too. At their middle window (about 9 to 11 s in) the traced arms were already
+  at floor p50 27 to 57 ms; the untraced arms were still at 16 ms at their end (10 s). The
+  row-cap variant's app-idle and blank-page arms ran 20 s in both conditions: traced went from
+  floor p50 16 to 62-64 ms, untraced stayed at 16 ms.
+
+The untraced numbers. Without strace, on every CPU class seen (EPYC 7763, Xeon Platinum 8573C,
+EPYC 9V74; two jobs each):
+
+- the scroll steps measured p50/p95/max 33/35-37/36-55 ms (n=200, the same steps and clock as
+  the gate, with floor windows between the halves), and the medians per 50 steps were 33, 33,
+  33, 33;
+- the floor stayed at p50 16 ms and p95 17 to 19 ms in every window, the rAF interval at 16 ms.
+
+With strace, the same steps arm measured 59-60/100-104/118 ms on the EPYC 7763, 39-41/65-69/83-91
+on the Xeon Platinum 8573C and 49/80-82/91-98 on the EPYC 9V74, with medians per 50 steps rising
+from 33-45 to 54-90 ms.
+
+The measurement condition was changed after these results were seen. The running-app scroll
+gate was registered to be timed under the strace wrapper, and the results above were known
+when the change was decided. The reason is the control data: the blank page slows down under
+strace like the app, and nothing slows down without it, so under strace the gate times the
+harness, not the app. Main's ruling (relayed by the stream owner; its WAL entry is in main's
+WAL, inferred) keeps the threshold (50 ms nearest-rank p95), n (200 after 10 warm-up steps) and
+the no-retry rule, and times the scroll in an untraced launch. Floor-relative thresholds and a
+measure-only gate were rejected. The gate as changed is described below and was registered
+before its first run (WAL w3bd2a24a6c6, amended in wad2689e80fc before any run).
 
 Both builds showed 1,000,001 rows before measuring in both runs. Linux's WebDriver clock ticks in whole
 milliseconds. The variant run is workflow "e2e-variants" run 44877270665 at 86fafdc. In it,
