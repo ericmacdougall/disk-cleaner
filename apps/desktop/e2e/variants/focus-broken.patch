@@ -1,0 +1,15 @@
+diff --git a/apps/desktop/src/views/settings.ts b/apps/desktop/src/views/settings.ts
+index e4d4392..4efdcca 100644
+--- a/apps/desktop/src/views/settings.ts
++++ b/apps/desktop/src/views/settings.ts
+@@ -220,8 +220,8 @@ export class SettingsForm {
+       title: "Shorten the active window?",
+       text: e.message,
+       buttons: [
+-        { label: `Keep ${e.old ?? ""} days`, initial: true, onClick: () => answer(false) },
+-        { label: `Shorten to ${e.new ?? ""} days`, primary: true, onClick: () => answer(true) },
++        { label: `Keep ${e.old ?? ""} days`, onClick: () => answer(false) },
++        { label: `Shorten to ${e.new ?? ""} days`, primary: true, initial: true, onClick: () => answer(true) },
+       ],
+       onCancel: () => answer(false),
+     });

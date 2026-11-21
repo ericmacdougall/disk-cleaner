@@ -1,0 +1,10 @@
+# Functions allowed to call a guarded file or process API (spec AC-6), one per line:
+#   <file> <function>
+# Each must carry `#[allow(clippy::disallowed_methods)]` directly; no other item may.
+crates/view/src/export.rs write_plan_new
+crates/view/src/settings.rs save_core_config
+crates/view/src/settings.rs lock_config
+crates/view/src/settings.rs save_app_settings
+crates/view/src/settings.rs write_temp
+crates/view/src/import.rs open_scan_file
+apps/desktop/src-tauri/src/worker.rs spawn_worker

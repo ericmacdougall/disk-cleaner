@@ -1,0 +1,13 @@
+diff --git a/apps/desktop/src-tauri/src/state.rs b/apps/desktop/src-tauri/src/state.rs
+index 7a72b3d..f69d8c3 100644
+--- a/apps/desktop/src-tauri/src/state.rs
++++ b/apps/desktop/src-tauri/src/state.rs
+@@ -480,7 +480,7 @@ impl Inner {
+         let checked = Inner::check_roots(roots)?;
+         {
+             let offered = lock(&self.offered);
+-            if let Some(r) = roots.iter().find(|r| !offered.contains(r.as_str())) {
++            if let Some(r) = roots.iter().find(|r| offered.is_empty() && !offered.contains(r.as_str())) {
+                 return Err(AppError::refused(format!(
+                     "{} was not offered by this window; add it with Add folders or pick a drive",
+                     display_name(r)

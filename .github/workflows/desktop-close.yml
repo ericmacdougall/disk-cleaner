@@ -1,0 +1,92 @@
+name: desktop-close
+
+# The window goes away during a scan (click-test CT-a, GoodQA #16452): the real window closed
+# through a window manager (openbox), destroyed without a close request (with and without a
+# window manager), the X connection closed (logout), and SIGTERM, SIGHUP and SIGKILL, each
+# during the size walk and during the analysis. The main process, the worker and every git
+# it started must be gone within the 10 s deadline, the app must end the way each route
+# should (no crash), and nothing may be written. apps/desktop/e2e/close/check_close.py; a
+# no-action control must fail, and each broken variant (e2e/close/variant.py) must fail on
+# exactly the routes it breaks.
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-close-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  close:
+    name: window close during a scan (linux, ${{ matrix.variant }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: app
+            check: ""
+          # The worker's backstop: every route where the app dies without its own shutdown.
+          - variant: worker-ignores-eof
+            check: --expect-fail analyse:kill-client,analyse:sigterm,analyse:sighup,analyse:sigkill,analyse:destroy-nowm
+          # The app's own shutdown: every route that ends through the run loop's Exit.
+          - variant: exit-skips-shutdown
+            check: --expect-fail walk:wm-close,analyse:wm-close,walk:destroy-wm,analyse:destroy-wm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: apps/desktop/src-tauri
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: System libraries, a virtual display and a window manager
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential file libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev xvfb openbox
+          dpkg -s openbox xvfb | grep -E '^(Package|Version)'
+      - name: Frontend and icons
+        working-directory: apps/desktop
+        run: |
+          npm ci --no-audit --no-fund
+          npx tauri icon app-icon.svg
+      - name: Broken variant (${{ matrix.variant }})
+        if: matrix.variant != 'app'
+        working-directory: apps/desktop
+        run: python3 e2e/close/variant.py "${{ matrix.variant }}" && git diff --stat
+      - name: Build the app with the e2e feature and the production window config
+        # The e2e feature adds only test hooks (PRUNEDISK_E2E_START starts the scan; event
+        # lines on stderr). The window config is the shipped one (incognito on).
+        working-directory: apps/desktop
+        run: npx tauri build --ci --no-bundle --features e2e
+      - name: Close the window during a scan, by every route
+        working-directory: apps/desktop
+        run: |
+          python3 e2e/close/check_close.py --app src-tauri/target/release/prunedisk-desktop \
+            --big /usr --big /opt --out "$RUNNER_TEMP/close" ${{ matrix.check }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: desktop-close-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/close/results.json
+            ${{ runner.temp }}/close/*/result.json
+            ${{ runner.temp }}/close/*/log.txt
+            ${{ runner.temp }}/close/*/app.log
+            ${{ runner.temp }}/close/*/openbox.log
+            ${{ runner.temp }}/close/*/xvfb.log
+          retention-days: 14

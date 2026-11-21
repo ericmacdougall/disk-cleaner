@@ -1,0 +1,87 @@
+name: e2e-variants
+
+# Broken variants for the end-to-end checks (PR gate F1). Each job applies one patch from
+# apps/desktop/e2e/variants/, runs the suite, and passes only when the check written for that
+# guarantee fails (e2e/expect_variant.py). The unpatched suite is desktop.yml's end-to-end
+# job. Extra release builds, one per variant, so this runs on e2e-variants/** branches and by hand only.
+
+on:
+  push:
+    branches: ["e2e-variants/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-variants-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  variant:
+    name: variant (${{ matrix.variant }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [planted-write, planted-outside, offered-check-removed, capability-broadened, focus-broken, modal-trap-removed]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Apply the broken variant
+        run: git apply --verbose "apps/desktop/e2e/variants/${{ matrix.variant }}.patch"
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            apps/desktop/src-tauri
+            .
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: System libraries, WebKitWebDriver, strace and a virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential file libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev webkit2gtk-driver xvfb strace
+      - name: tauri-driver
+        run: cargo install tauri-driver --locked --version 2.1.0
+      - name: Frontend and icons
+        working-directory: apps/desktop
+        run: |
+          npm ci --no-audit --no-fund
+          npx tauri icon app-icon.svg
+      - name: Build the e2e binary of the variant
+        working-directory: apps/desktop
+        run: |
+          npx tauri build --ci --no-bundle --features e2e --config e2e/automation.conf.json
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp src-tauri/target/release/prunedisk-desktop "$RUNNER_TEMP/bin/e2e"
+      - name: Build the CLI (writes the scan file the app opens)
+        run: cargo build --release --locked -p disk-cleaner-cli
+      - name: The variant must be caught by its own check
+        working-directory: apps/desktop
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          export RELEASE_BIN=none E2E_BIN="$RUNNER_TEMP/bin/e2e"
+          export CLI_BIN="$GITHUB_WORKSPACE/target/release/disk-cleaner" OUT="$RUNNER_TEMP/e2e"
+          status=0
+          xvfb-run -a -s "-screen 0 1280x1024x24" bash e2e/check.sh || status=$?
+          [ "$status" != 0 ] || { echo "::error::variant $VARIANT passed every check"; exit 1; }
+          python3 e2e/expect_variant.py "$VARIANT" "$OUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: e2e-variant-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/e2e/*.json
+            ${{ runner.temp }}/e2e/*.txt
+            !${{ runner.temp }}/e2e/before.json
+            !${{ runner.temp }}/e2e/after.json
+          retention-days: 14

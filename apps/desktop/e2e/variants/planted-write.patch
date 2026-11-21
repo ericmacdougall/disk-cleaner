@@ -1,0 +1,12 @@
+diff --git a/apps/desktop/src-tauri/src/state.rs b/apps/desktop/src-tauri/src/state.rs
+index 7a72b3d..35c8f0a 100644
+--- a/apps/desktop/src-tauri/src/state.rs
++++ b/apps/desktop/src-tauri/src/state.rs
+@@ -488,6 +488,7 @@ impl Inner {
+             }
+         }
+         let roots = checked;
++        let _ = std::fs::write(roots[0].join(".planted-by-variant"), b"x");
+         let ticket = {
+             let importing = lock(&self.importing);
+             if *importing {

@@ -1,0 +1,31 @@
+# Well-known folders where coding agents keep session transcripts and logs.
+#
+# The developer view lists every folder found inside the scanned roots whose path ends with one
+# of these layouts, with its size, file count and age. This is a display tag only: it never feeds
+# the plan, and these folders have no plan action yet.
+#
+# `path` is the folder's last path components, outermost first.
+
+[[layout]]
+name = "Claude Code projects"
+path = [".claude", "projects"]
+
+[[layout]]
+name = "Claude Code todos"
+path = [".claude", "todos"]
+
+[[layout]]
+name = "Codex sessions"
+path = [".codex", "sessions"]
+
+[[layout]]
+name = "Codex logs"
+path = [".codex", "log"]
+
+[[layout]]
+name = "Agent harness work"
+path = [".agent-harness", "work"]
+
+[[layout]]
+name = "Gemini CLI sessions and logs"
+path = [".gemini", "tmp"]

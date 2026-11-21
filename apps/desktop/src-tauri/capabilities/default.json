@@ -1,0 +1,29 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The app's own read-only commands and event listening. No filesystem, shell, opener or dialog access from the page: dialogs are opened by the backend.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-app-info",
+    "allow-list-volumes",
+    "allow-choose-folders",
+    "allow-open-scan-file",
+    "allow-export-plan",
+    "allow-start-scan",
+    "allow-cancel-scan",
+    "allow-current-state",
+    "allow-tree-page",
+    "allow-tree-toggle",
+    "allow-tree-sort",
+    "allow-tree-focus",
+    "allow-tree-tiles",
+    "allow-top-files",
+    "allow-dev-summary",
+    "allow-dev-page",
+    "allow-session-folders",
+    "allow-get-settings",
+    "allow-save-settings"
+  ]
+}

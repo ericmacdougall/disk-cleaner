@@ -1,0 +1,52 @@
+[package]
+name = "prunedisk-desktop"
+description = "PruneDisk desktop app (read-only): size tree, treemap, top files and developer view"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ericmacdougall/disk-cleaner"
+publish = false
+
+# Its own workspace: it needs system webview libraries that the core CI jobs do not install.
+[workspace]
+
+[lib]
+name = "prunedisk_desktop_lib"
+crate-type = ["rlib"]
+
+[features]
+# Test-only hooks for the WebDriver smoke test (open a scan file named by an environment
+# variable at start). Release bundles are built without it.
+e2e = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+disk-cleaner-core = { path = "../../../crates/core" }
+disk-cleaner-view = { path = "../../../crates/view" }
+# The documents and home folders the native dialogs start in (dialogs.rs). Already in the lockfile
+# as tauri's own dependency (tauri resolves its document_dir and home_dir with it).
+dirs = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = { version = "0.33", default-features = false, features = ["disk", "system"] }
+tauri = { version = "2.12", features = [] }
+tauri-plugin-dialog = "2"
+
+[target.'cfg(unix)'.dependencies]
+# setsid for the analysis worker (worker::spawn_worker only).
+libc = "0.2"
+# A safe setrlimit: when its parent dies the worker stops starting processes before its
+# sweep (worker::stop_new_processes). MIT, depends only on libc.
+rlimit = "0.10.2"
+
+[target.'cfg(windows)'.dependencies]
+# A job object for the analysis worker (worker::spawn_worker only).
+command-group = "5"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"

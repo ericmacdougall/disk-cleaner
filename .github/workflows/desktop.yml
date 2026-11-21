@@ -1,0 +1,626 @@
+name: desktop
+
+# Terminal view, desktop app checks, read-only guard, smoke tests, performance and unsigned
+# bundles. Everything compiles here: nothing heavy is built on a developer machine.
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lockfiles:
+    name: lockfiles are current
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - name: Resolve the root workspace
+        run: cargo metadata --format-version 1 > /dev/null
+      - name: Resolve the desktop workspace
+        working-directory: apps/desktop/src-tauri
+        run: cargo metadata --format-version 1 > /dev/null
+      - name: Upload the resolved lockfiles
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lockfiles
+          path: |
+            Cargo.lock
+            apps/desktop/src-tauri/Cargo.lock
+          retention-days: 7
+      - name: Fail when a lockfile changed
+        run: |
+          git status --porcelain -- Cargo.lock apps/desktop/src-tauri/Cargo.lock
+          test -z "$(git status --porcelain -- Cargo.lock apps/desktop/src-tauri/Cargo.lock)" || {
+            echo "::error::Cargo.lock is not current; commit the 'lockfiles' artifact of this run"; exit 1; }
+
+  deny-desktop:
+    # ci.yml's "cargo deny licenses" reads the root Cargo.lock only; the desktop app's
+    # dependencies (tauri, rlimit, the webview crates) are in apps/desktop/src-tauri/Cargo.lock.
+    name: cargo deny (desktop workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: cargo-deny version
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          manifest-path: apps/desktop/src-tauri/Cargo.toml
+          arguments: --locked
+          command: --version
+      - name: Every crate of the desktop lockfile with its licence
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          manifest-path: apps/desktop/src-tauri/Cargo.toml
+          # --config and --locked are global options, so they go before the subcommand.
+          arguments: --all-features --locked --config apps/desktop/src-tauri/deny.toml
+          command: list
+          command-arguments: --layout crate
+      - name: Licences, advisories, bans and sources
+        if: ${{ !cancelled() }}
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          manifest-path: apps/desktop/src-tauri/Cargo.toml
+          arguments: --all-features --locked --config apps/desktop/src-tauri/deny.toml
+          command: check licenses advisories bans sources
+
+  readonly-guard:
+    name: read-only guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check this checkout
+        run: scripts/check-readonly.sh
+      - name: Planted-violation controls (each must be caught)
+        run: scripts/check-readonly.sh --controls
+      - name: The end-to-end write observer fails on any undeclared write (PR gate F10)
+        working-directory: apps/desktop
+        run: python3 -m unittest -v e2e/test_trace_report.py
+
+  ui-crates:
+    name: view and tui (${{ matrix.os }})
+    needs: lockfiles
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Clippy (view, tui)
+        run: cargo clippy -p disk-cleaner-view -p disk-cleaner-tui --all-targets --locked -- -D warnings
+      - name: Read-only guard, clippy-layer controls (one planted call per disallowed path)
+        shell: bash
+        run: |
+          py="$(command -v python3 || command -v python)"
+          "$py" scripts/readonly_controls.py . --clippy
+      - name: Test (view, tui)
+        run: cargo test -p disk-cleaner-view -p disk-cleaner-tui --locked --no-fail-fast
+      - name: Build the disk-cleaner binary with the tui subcommand
+        run: cargo build -p disk-cleaner-cli --locked
+
+  perf:
+    name: performance at one million nodes (linux)
+    needs: lockfiles
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Runner
+        run: |
+          nproc; free -m; df -h "$RUNNER_TEMP" .
+      - name: View timings (release, seed 16452, each measured twice, better run compared)
+        run: |
+          cargo test --release -p disk-cleaner-view --locked --test perf -- --ignored --nocapture --test-threads=1 2>&1 | tee perf-view.txt
+          test "${PIPESTATUS[0]}" -eq 0
+      - name: TUI frame time
+        run: |
+          cargo test --release -p disk-cleaner-tui --locked --test render -- --ignored --nocapture 2>&1 | tee perf-tui.txt
+          test "${PIPESTATUS[0]}" -eq 0
+      - name: Memory, scan load and import estimate (measured peak must not exceed the estimate)
+        run: |
+          set -uo pipefail
+          cargo build --release -p disk-cleaner-view --locked --example perfmem
+          B=target/release/examples/perfmem
+          W="$RUNNER_TEMP/perf"; mkdir -p "$W"
+          # Every measurement runs; the step fails at the end if any of them failed.
+          failed=0
+          run() { "$@" || { echo "FAILED (exit $?): $*"; failed=1; }; }
+          {
+            run "$B" index
+            run "$B" gen-scan 1000000 "$W/scan-1m.json"
+            run "$B" split "$W/scan-1m.json"
+            run "$B" load "$W/scan-1m.json" --plan
+            rm -f "$W/scan-1m.json"
+            # Sizes whose estimates sit just under the 4 GiB import budget.
+            for spec in tiny:112 objects:22 strings:800 nested:120; do
+              kind="${spec%%:*}"; size="${spec##*:}"
+              run "$B" gen-adversarial "$kind" "$size" "$W/adv-$kind.json"
+              run "$B" load "$W/adv-$kind.json"
+              rm -f "$W/adv-$kind.json"
+            done
+            echo "perfmem failures: $failed"
+          } 2>&1 | tee perf-mem.txt
+          grep -q '^perfmem failures: 0$' perf-mem.txt
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Performance (ubuntu-latest, seed 16452)"
+            echo
+            echo "Workload: synthetic 1,000,000-node tree and scan; thresholds from spec AC-9."
+            echo
+            echo '```'
+            cat perf-view.txt perf-tui.txt perf-mem.txt 2>/dev/null | grep -E '^PERF' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: perf-results
+          path: perf-*.txt
+          retention-days: 30
+
+  frontend:
+    name: frontend unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - run: npm ci --no-audit --no-fund
+      # Tests first, so a type error does not hide which tests fail; both gate the job.
+      - run: npm test
+      - run: npm run typecheck
+        if: ${{ !cancelled() }}
+      - run: npm run build
+
+  desktop-check:
+    name: desktop backend (linux)
+    needs: lockfiles
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: apps/desktop/src-tauri
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: System libraries for the webview
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential file libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Frontend and icons
+        working-directory: apps/desktop
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npx tauri icon app-icon.svg
+      - name: Clippy (desktop)
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy (desktop, e2e feature)
+        working-directory: apps/desktop/src-tauri
+        run: cargo clippy --all-targets --locked --features e2e -- -D warnings
+      - name: Test (desktop; includes the worker containment test)
+        working-directory: apps/desktop/src-tauri
+        run: |
+          cargo build --locked --examples
+          cargo test --locked --no-fail-fast -- --nocapture
+      - name: Containment test repeated (10 runs, no failure allowed)
+        if: ${{ !cancelled() }}
+        working-directory: apps/desktop/src-tauri
+        run: ../../../scripts/repeat-containment.sh 10
+
+  containment:
+    name: worker containment (${{ matrix.os }})
+    needs: lockfiles
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: apps/desktop/src-tauri
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Frontend and icons
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          npx tauri icon app-icon.svg
+      - name: Worker, handshake and containment tests
+        working-directory: apps/desktop/src-tauri
+        shell: bash
+        run: |
+          cargo build --locked --examples
+          cargo test --locked --no-fail-fast -- --nocapture
+      - name: Containment test repeated (10 runs, no failure allowed)
+        if: ${{ !cancelled() }}
+        working-directory: apps/desktop/src-tauri
+        shell: bash
+        run: ../../../scripts/repeat-containment.sh 10
+
+  e2e:
+    # WebDriver checks on the packaged app (PR gate F1): tauri-driver with WebKitWebDriver on
+    # Linux and the Edge driver on Windows. macOS has no WebDriver for an app's WKWebView;
+    # see docs/DESKTOP.md for what covers it. Broken variants run in e2e-variants.yml.
+    name: end-to-end (${{ matrix.os }})
+    needs: lockfiles
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            apps/desktop/src-tauri
+            .
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: System libraries, WebKitWebDriver, strace and a virtual display
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential file libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev webkit2gtk-driver xvfb strace
+          dpkg -s webkit2gtk-driver | grep -E '^(Package|Version)'
+      - name: tauri-driver
+        shell: bash
+        run: cargo install tauri-driver --locked --version 2.1.0
+      - name: Edge driver matching the WebView2 runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # The newest installed runtime folder, not the EdgeUpdate registry value, which can lag
+          # behind it (156 against 157 on one runner).
+          $wv = (Get-ChildItem 'C:\Program Files (x86)\Microsoft\EdgeWebView\Application' -Directory |
+            Where-Object Name -match '^\d+\.\d+\.\d+\.\d+$' | Sort-Object { [version]$_.Name } | Select-Object -Last 1).Name
+          $have = (Get-Item "$env:EDGEWEBDRIVER\msedgedriver.exe").VersionInfo.ProductVersion
+          "WebView2 runtime: $wv; runner's msedgedriver: $have"
+          if ($have.Split('.')[0] -ne $wv.Split('.')[0]) {
+            $dir = "$env:RUNNER_TEMP\edgedriver"
+            New-Item -ItemType Directory -Force $dir | Out-Null
+            Invoke-WebRequest "https://msedgedriver.microsoft.com/$wv/edgedriver_win64.zip" -OutFile "$dir\d.zip"
+            Expand-Archive "$dir\d.zip" $dir -Force
+            "EDGEWEBDRIVER=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            "downloaded msedgedriver: $((Get-Item "$dir\msedgedriver.exe").VersionInfo.ProductVersion)"
+          }
+      - name: Frontend and icons
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          npm ci --no-audit --no-fund
+          npx tauri icon app-icon.svg
+      - name: Build the release binary (production config, no e2e feature)
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          npx tauri build --ci --no-bundle
+          mkdir -p "$RUNNER_TEMP/bin"
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
+          cp "src-tauri/target/release/prunedisk-desktop$ext" "$RUNNER_TEMP/bin/release$ext"
+      - name: Build the e2e binary (--features e2e and an automation config, docs/DESKTOP.md)
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          conf=e2e/automation.conf.json
+          [ "$RUNNER_OS" = Windows ] && conf=e2e/windows-automation.conf.json
+          npx tauri build --ci --no-bundle --features e2e --config "$conf"
+          mkdir -p "$RUNNER_TEMP/bin"
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
+          cp "src-tauri/target/release/prunedisk-desktop$ext" "$RUNNER_TEMP/bin/e2e$ext"
+      - name: Build the CLI (writes the scan file the app opens)
+        shell: bash
+        run: cargo build --release --locked -p disk-cleaner-cli
+      - name: End-to-end checks
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
+          export RELEASE_BIN="$RUNNER_TEMP/bin/release$ext" E2E_BIN="$RUNNER_TEMP/bin/e2e$ext"
+          export CLI_BIN="$GITHUB_WORKSPACE/target/release/disk-cleaner$ext" OUT="$RUNNER_TEMP/e2e"
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a -s "-screen 0 1280x1024x24" bash e2e/check.sh
+          else
+            bash e2e/check.sh
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: e2e-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/e2e/*.json
+            ${{ runner.temp }}/e2e/*.txt
+            ${{ runner.temp }}/e2e/idle-release/*.txt
+            ${{ runner.temp }}/e2e/idle-release/*.log
+            ${{ runner.temp }}/e2e/inputs/
+            !${{ runner.temp }}/e2e/before.json
+            !${{ runner.temp }}/e2e/after.json
+          retention-days: 14
+
+  bundles:
+    name: bundle (${{ matrix.name }})
+    needs: [ui-crates, frontend, desktop-check, readonly-guard]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - name: macos-x64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+          - name: linux-x64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: apps/desktop/src-tauri
+          key: ${{ matrix.target }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: System libraries for the webview
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # shared-mime-info, adwaita-icon-theme and hicolor-icon-theme are what
+          # src-tauri/appimage/stage-data.mjs copies into the AppImage (docs/DESKTOP.md).
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential file libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            shared-mime-info adwaita-icon-theme hicolor-icon-theme
+      - name: Frontend and icons
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          npm ci --no-audit --no-fund
+          npx tauri icon app-icon.svg
+      - name: Build the unsigned bundle
+        working-directory: apps/desktop
+        shell: bash
+        run: npx tauri build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: The shipped programs are not end-to-end builds (docs/DESKTOP.md)
+        # The bundle is built from src-tauri/tauri.conf.json alone: no --config and no e2e
+        # feature. This unpacks each bundle and looks for the strings only those add.
+        working-directory: apps/desktop
+        shell: bash
+        run: bash e2e/check-shipped.sh "src-tauri/target/${{ matrix.target }}/release/bundle" "$RUNNER_TEMP/shipped"
+      - name: The AppImage carries the folder dialog's data (CT-F1, docs/DESKTOP.md)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(ls "$GITHUB_WORKSPACE"/apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage)
+          d="$RUNNER_TEMP/appimage-data"; rm -rf "$d"; mkdir -p "$d"
+          (cd "$d" && "$app" --appimage-extract > /dev/null)
+          s="$d/squashfs-root/usr/share"
+          missing=0
+          for f in mime/mime.cache mime/magic mime/globs2 mime/subclasses mime/aliases \
+            icons/Adwaita/index.theme icons/Adwaita/scalable/places/user-home-symbolic.svg \
+            icons/Adwaita/scalable/places/folder-symbolic.svg icons/hicolor/index.theme \
+            doc/shared-mime-info/copyright doc/adwaita-icon-theme/copyright doc/hicolor-icon-theme/copyright; do
+            [ -s "$s/$f" ] || { echo "::error::the AppImage has no $f"; missing=1; }
+          done
+          if [ -e "$s/icons/Adwaita/icon-theme.cache" ]; then
+            echo "::error::the AppImage's Adwaita has an icon-theme.cache that does not match its files"; missing=1
+          fi
+          grep -q 'GDK_PIXBUF_MODULE_FILE="$APPDIR' "$d/squashfs-root/apprun-hooks/linuxdeploy-plugin-gtk.sh" ||
+            { echo "::error::the AppRun hook no longer points gdk-pixbuf inside the image"; missing=1; }
+          grep -q 'XDG_DATA_DIRS="$APPDIR/usr/share' "$d/squashfs-root/apprun-hooks/linuxdeploy-plugin-gtk.sh" ||
+            { echo "::error::the AppRun hook no longer puts the image's usr/share first"; missing=1; }
+          du -sh "$s/mime" "$s/icons/Adwaita"
+          rm -rf "$d"
+          exit "$missing"
+      - name: Stage bundles and checksums
+        shell: bash
+        run: |
+          mkdir -p dist-bundles
+          base="apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          find "$base" -maxdepth 2 -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \
+            -o -name '*.AppImage' -o -name '*.deb' \) -exec cp {} dist-bundles/ \;
+          if [ -d "$base/macos" ]; then
+            (cd "$base/macos" && tar -czf "$GITHUB_WORKSPACE/dist-bundles/PruneDisk-${{ matrix.name }}.app.tar.gz" *.app)
+          fi
+          cd dist-bundles
+          ls -la
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum * > SHA256SUMS; else shasum -a 256 * > SHA256SUMS; fi
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: prunedisk-${{ matrix.name }}-unsigned
+          path: dist-bundles/*
+          retention-days: 14
+          if-no-files-found: error
+      - name: Webview data written by an idle launch (macOS; listed in docs/DESKTOP.md)
+        if: matrix.name == 'macos-arm64'
+        shell: bash
+        run: |
+          set -uo pipefail
+          id=io.github.ericmacdougall.prunedisk
+          # Every folder an idle launch could write under the bundle id (docs/DESKTOP.md says
+          # it writes none of them).
+          places=("$HOME/Library/WebKit/$id" "$HOME/Library/Caches/$id"
+            "$HOME/Library/HTTPStorages/$id" "$HOME/Library/HTTPStorages/$id.binarycookies"
+            "$HOME/Library/Saved Application State/$id.savedState")
+          for p in "${places[@]}"; do
+            if [ -e "$p" ]; then echo "::error::$p exists before the launch"; exit 1; fi
+          done
+          app=$(ls -d apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app | head -1)
+          exe="$app/Contents/MacOS/$(ls "$app/Contents/MacOS" | head -1)"
+          "$exe" > launch.log 2>&1 &
+          pid=$!
+          sleep 20
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "::error::the app exited during the idle launch"; cat launch.log; exit 1
+          fi
+          kill "$pid"; wait "$pid" 2>/dev/null || true
+          echo "Written by a 20 s idle launch and its quit:"
+          # find fails on a folder that does not exist, which is the good case.
+          listing=$(find "${places[@]}" -maxdepth 4 2>/dev/null | sed "s|^$HOME|~|" || true)
+          echo "${listing:-nothing under any of: ${places[*]}}"
+          du -sk "${places[@]}" 2>/dev/null || true
+          if [ -n "$listing" ]; then
+            echo "::error::an idle launch wrote webview or app-state data (listed above)"; exit 1
+          fi
+          echo "Nothing written under any of the five places."
+
+  appimage-hosts:
+    # The shipped Linux AppImage on distributions with no GTK, gdk-pixbuf, shared-mime-info or
+    # icon theme (CT-F1, GoodQA #16452): the GTK folder dialog must open and return a folder,
+    # and the app must keep running. e2e/appimage-dialog.sh says what it installs and checks.
+    # The control leg removes the dialog's data from the same AppImage; the check must fail it.
+    name: AppImage without host GTK (${{ matrix.name }})
+    needs: bundles
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fedora-41
+            image: fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d
+            control: false
+          - name: debian-12-slim
+            image: debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+            control: false
+          - name: fedora-41 without the dialog data (control)
+            image: fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d
+            control: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: prunedisk-linux-x64-unsigned
+          path: ${{ runner.temp }}/bundle
+      - name: The program under test
+        id: prog
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(ls "$RUNNER_TEMP"/bundle/*.AppImage)
+          (cd "$RUNNER_TEMP/bundle" && sha256sum -c --ignore-missing SHA256SUMS)
+          chmod +x "$app"
+          if [ "${{ matrix.control }}" = true ]; then
+            (cd "$RUNNER_TEMP" && "$app" --appimage-extract > /dev/null)
+            appdir="$RUNNER_TEMP/squashfs-root"
+            rm -rf "$appdir/usr/share/mime" "$appdir/usr/share/icons/Adwaita" "$appdir/usr/share/icons/hicolor/index.theme"
+            { echo "path=$appdir"; echo "target=/bundle/appdir"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "path=$app"; echo "target=/bundle/app.AppImage"; } >> "$GITHUB_OUTPUT"
+          fi
+      - name: Open the folder dialog in a bare container
+        id: run
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          set +e
+          docker run --rm --cap-add SYS_PTRACE \
+            -v "${{ steps.prog.outputs.path }}:${{ steps.prog.outputs.target }}:ro" \
+            -v "$GITHUB_WORKSPACE/apps/desktop/e2e:/e2e:ro" -v "$RUNNER_TEMP/out:/out" \
+            "${{ matrix.image }}" bash /e2e/appimage-dialog.sh "${{ steps.prog.outputs.target }}" /out
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "appimage-dialog.sh exit $code (0 pass, 1 dialog check failed, 3 only the write observer failed, 2 host not bare)"
+      - name: Dialog check (CT-F1)
+        shell: bash
+        run: |
+          code=${{ steps.run.outputs.code }}
+          if [ "${{ matrix.control }}" = true ]; then
+            # Without the data the dialog must abort the app, as it did on 682a0ff.
+            if [ "$code" = 1 ] && grep -q 'Unrecognized image file format' "$RUNNER_TEMP/out/launch/launch.log"; then
+              echo "The check caught the AppImage without its dialog data."
+            else
+              echo "::error::the check passed an AppImage without its dialog data (exit $code)"; exit 1
+            fi
+          else
+            [ "$code" = 0 ] || [ "$code" = 3 ] || { echo "::error::dialog check failed (exit $code)"; exit 1; }
+          fi
+      - name: Write observer through the dialog (F10)
+        if: ${{ !matrix.control }}
+        shell: bash
+        run: |
+          [ "${{ steps.run.outputs.code }}" = 0 ] || { echo "::error::undeclared writes: trace.txt in the artifact"; exit 1; }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: appimage-hosts-${{ strategy.job-index }}
+          path: |
+            ${{ runner.temp }}/out/*.txt
+            ${{ runner.temp }}/out/*.log
+            ${{ runner.temp }}/out/launch/*.txt
+            ${{ runner.temp }}/out/launch/*.log
+          retention-days: 14

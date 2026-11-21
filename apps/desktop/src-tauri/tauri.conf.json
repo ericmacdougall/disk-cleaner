@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PruneDisk",
+  "version": "0.1.0",
+  "identifier": "io.github.ericmacdougall.prunedisk",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "node src-tauri/appimage/stage-data.mjs"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "PruneDisk",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 720,
+        "minHeight": 480,
+        "incognito": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "shortDescription": "Shows what fills a disk and what is safe to remove (read-only).",
+    "copyright": "MIT licence",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "signingIdentity": "-"
+    },
+    "linux": {
+      "appimage": {
+        "files": {
+          "/usr/share/mime": "gen/appimage-data/mime",
+          "/usr/share/icons/Adwaita": "gen/appimage-data/icons/Adwaita",
+          "/usr/share/icons/hicolor/index.theme": "gen/appimage-data/icons/hicolor/index.theme",
+          "/usr/share/doc/shared-mime-info/copyright": "gen/appimage-data/doc/shared-mime-info/copyright",
+          "/usr/share/doc/adwaita-icon-theme/copyright": "gen/appimage-data/doc/adwaita-icon-theme/copyright",
+          "/usr/share/doc/hicolor-icon-theme/copyright": "gen/appimage-data/doc/hicolor-icon-theme/copyright"
+        }
+      }
+    }
+  }
+}

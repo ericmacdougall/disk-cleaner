@@ -1,0 +1,41 @@
+# cargo deny policy for the desktop workspace, which has its own Cargo.lock (job "cargo deny
+# (desktop workspace)" in .github/workflows/desktop.yml). The licence list is the root
+# deny.toml's: keep the two the same. Every advisory ignore names the advisory, why it cannot
+# be fixed in this repository, and what would remove it.
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[advisories]
+# cargo-deny's defaults: a vulnerability in any crate of the lockfile fails the job; an
+# unmaintained or unsound notice fails it only for a direct dependency. No ignores. Under those
+# defaults these transitive notices do not fail it (OSV, 2026-11-19): RUSTSEC-2024-0429 (glib
+# 0.18 VariantStrIter unsound, via webkit2gtk and gtk 0.18 on Linux), RUSTSEC-2024-0370
+# (proc-macro-error unmaintained, build-time, via glib-macros and gtk3-macros) and
+# RUSTSEC-2026-0543 (chrono unmaintained, via serde_with in tauri-utils).
+ignore = []
+
+[bans]
+# Tauri's tree has crates at several versions that this repository cannot unify: they warn,
+# so the job's log shows them, without failing it. No crate is banned.
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+# Crates come from crates.io only: another registry or a git source fails the job.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
