@@ -9,21 +9,21 @@
 //! Remote layout (all objects immutable): `v1/format.json`, `v1/packs/<xx>/<blake3>.pack`,
 //! `v1/index/<run>/<seq>.idx`, `v1/snapshots/<run>.json`.
 
-pub mod backup;
+// WIP pub mod backup;
 pub mod chunker;
 pub mod compress;
 pub mod control;
 pub mod error;
 pub mod gen;
 pub mod hash;
-pub mod meta;
+// WIP pub mod meta;
 pub mod pack;
-pub mod receipt;
-pub mod repo;
-pub mod restore;
+// WIP pub mod receipt;
+// WIP pub mod repo;
+// WIP pub mod restore;
 pub mod transport;
 pub mod util;
-pub mod walk;
+// WIP pub mod walk;
 
 pub use error::{Error, Result};
 

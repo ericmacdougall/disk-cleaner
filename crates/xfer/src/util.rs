@@ -13,7 +13,7 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let v = |c: u8| -> Option<u8> {
@@ -36,11 +36,21 @@ pub fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -48,7 +58,9 @@ pub fn base64(data: &[u8]) -> String {
 /// Parse "64Mi", "4G", "1.5GiB", "1000" (bytes). Binary and decimal suffixes are both accepted.
 pub fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
-    let split = s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len());
+    let split = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
     let (num, suf) = s.split_at(split);
     let n: f64 = num.parse().ok()?;
     let mult: f64 = match suf.trim().to_ascii_lowercase().as_str() {
@@ -63,7 +75,7 @@ pub fn parse_size(s: &str) -> Option<u64> {
         "ti" | "tib" => 1024f64.powi(4),
         _ => return None,
     };
-    if !(n >= 0.0) {
+    if n.is_nan() || n < 0.0 {
         return None;
     }
     Some((n * mult) as u64)
@@ -134,7 +146,11 @@ pub fn peak_rss_bytes() -> u64 {
         if rc == 0 {
             let v = ru.ru_maxrss as u64;
             // Linux reports KiB, macOS bytes.
-            return if cfg!(target_os = "macos") { v } else { v * 1024 };
+            return if cfg!(target_os = "macos") {
+                v
+            } else {
+                v * 1024
+            };
         }
     }
     0

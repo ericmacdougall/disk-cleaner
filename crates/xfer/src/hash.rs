@@ -81,8 +81,14 @@ mod tests {
     use super::*;
     #[test]
     fn digests_match_known_values() {
-        assert_eq!(HashKind::Sha1.digest(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
-        assert_eq!(HashKind::Md5.digest(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            HashKind::Sha1.digest(b"abc"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            HashKind::Md5.digest(b"abc"),
+            "900150983cd24fb0d6963f7d28e17f72"
+        );
         let id = ChunkId::of(b"abc");
         assert_eq!(ChunkId::from_hex(&id.to_hex()), Some(id));
     }
