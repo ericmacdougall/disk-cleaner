@@ -90,10 +90,13 @@ describe("tree grid (spec AC-4, AC-9, NEG-12)", () => {
     const scroller = g.el.querySelector('[role="treegrid"]') as HTMLElement;
     Object.defineProperty(scroller, "clientHeight", { value: 1_000_000 });
     await g.load();
-    expect(g.el.querySelectorAll('.tg-body [role="row"]').length).toBe(MAX_DOM_ROWS);
+    // At most 200 `.tg-row` elements in all, the header row included (the spec's number).
+    expect(MAX_DOM_ROWS).toBe(200);
+    expect(g.el.querySelectorAll(".tg-row").length).toBe(200);
+    expect(g.el.querySelectorAll('.tg-body [role="row"]').length).toBe(199);
     // The header row counts: one million entries and one header (PR gate F6).
     expect(scroller.getAttribute("aria-rowcount")).toBe("1000001");
-    for (const call of b.calls.filter((c) => c.name === "treePage")) expect(call.args[2]).toBeLessThanOrEqual(MAX_DOM_ROWS);
+    for (const call of b.calls.filter((c) => c.name === "treePage")) expect(call.args[2]).toBeLessThanOrEqual(199);
   });
 
   it("is operable by keyboard: Right expands, Enter drills in, Backspace goes up", async () => {

@@ -1,6 +1,8 @@
 // The size tree (spec AC-2, AC-4, AC-9): a virtualized WAI-ARIA treegrid. Only the rows near the
-// view (at most MAX_DOM_ROWS) are in the DOM, plus the focused row when it is scrolled away;
-// pages come from the backend by offset.
+// view are in the DOM, plus the focused row when it is scrolled away; pages come from the backend
+// by offset. At most MAX_DOM_ROWS `.tg-row` elements are in the DOM in every state: the header
+// row, the page and a pinned focused row together. A slot is kept for the pin only while one is
+// shown.
 //
 // Keyboard (APG treegrid pattern, CT-F4): one focus owner by roving tabindex. Focus is on a row,
 // or on one of its cells after Right. Up/Down, PageUp/PageDown move a row (keeping the cell
@@ -127,21 +129,22 @@ export class TreeGrid {
     this.el = h("section", { class: "tree", "aria-label": "Size tree" }, this.sourceLine, this.crumbs, h("div", { class: "tg" }, this.scroller));
   }
 
-  /** Visible row count for the scroller's height. */
+  /** Data rows for the scroller's height: at most MAX_DOM_ROWS - 1, as the header row counts. */
   private visibleRows(): number {
     const height = this.scroller.clientHeight || ROW_HEIGHT * 30;
-    return Math.min(MAX_DOM_ROWS, Math.ceil(height / ROW_HEIGHT) + 10);
+    return Math.min(MAX_DOM_ROWS - 1, Math.ceil(height / ROW_HEIGHT) + 10);
   }
 
   async load(): Promise<void> {
     const first = Math.max(0, Math.floor(this.scroller.scrollTop / ROW_HEIGHT) - 5);
     const id = ++this.request;
     try {
-      const limit = this.visibleRows();
       const wanted = this.selected;
       // The selected row is scrolled away: fetch it alone (alongside the page), to keep its
-      // node and so focus.
-      const away = wanted < first || wanted >= first + limit;
+      // node and so focus. Only then is a slot kept for it.
+      const visible = this.visibleRows();
+      const away = wanted < first || wanted >= first + visible;
+      const limit = away ? Math.min(visible, MAX_DOM_ROWS - 2) : visible;
       const [page, alone] = await Promise.all([
         this.backend.treePage(this.view, first, limit),
         away ? this.backend.treePage(this.view, wanted, 1) : Promise.resolve(null),
@@ -153,7 +156,10 @@ export class TreeGrid {
         pinned = alone && alone.offset === sel ? (alone.rows[0] ?? null) : (await this.backend.treePage(this.view, sel, 1)).rows[0] ?? null;
         if (id !== this.request) return;
       }
-      this.page = page;
+      // The cap holds whatever page came back: the header, the pinned row and the page together
+      // are at most MAX_DOM_ROWS rows (spec AC-9).
+      const room = MAX_DOM_ROWS - 1 - (pinned ? 1 : 0);
+      this.page = page.rows.length > room ? { ...page, rows: page.rows.slice(0, room) } : page;
       this.pinned = pinned;
       this.render();
     } catch (e) {

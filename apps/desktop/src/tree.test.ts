@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import type { Backend, Row, TreePage } from "./api";
 import { flush, mockBackend, row } from "./testing";
-import { TreeGrid } from "./views/tree";
+import { MAX_DOM_ROWS, TreeGrid } from "./views/tree";
 
 interface Node {
   id: number;
@@ -386,14 +386,44 @@ describe("one focus owner under virtualisation (CT-F4, gate F6)", () => {
     expect(focusAt().rowindex).toBe(ri(1));
   });
 
-  it("keeps the DOM under the row cap with the focused row pinned", async () => {
+  // Spec AC-9's DOM limit, as ruled (relayed by the stream owner): at most 200 `.tg-row` elements
+  // in every state, the header row and a pinned focused row included. A slot is kept for the pin
+  // only while one is shown, so the cap is reached exactly in both states. The number is the
+  // spec's, written here, so a change to the constant cannot move the bound with it.
+  const DOM_CAP = 200;
+  it("the row cap is the spec's 200", () => expect(MAX_DOM_ROWS).toBe(DOM_CAP));
+
+  it("holds at most 200 rows at the cap with the focused row pinned", async () => {
     const { grid } = await setup([6]);
     Object.defineProperty(grid, "clientHeight", { value: 1_000_000 });
     await press("ArrowDown");
     grid.scrollTop = 800 * 28;
     grid.dispatchEvent(new Event("scroll"));
     await flush(10);
-    expect(grid.querySelectorAll('.tg-body [role="row"]').length).toBeLessThanOrEqual(201);
+    // The focused row is pinned out of the window, and keeps focus.
+    expect(focusAt().rowindex).toBe(ri(1));
+    expect(grid.querySelectorAll(".tg-row").length).toBe(DOM_CAP);
+  });
+
+  it("holds at most 200 rows at the cap with the focused row in view", async () => {
+    const { grid } = await setup([6]);
+    Object.defineProperty(grid, "clientHeight", { value: 1_000_000 });
+    grid.scrollTop = 800 * 28;
+    grid.dispatchEvent(new Event("scroll"));
+    await flush(10);
+    const inView = grid.querySelector<HTMLElement>(`.tg-body [role="row"][aria-rowindex="${ri(850)}"]`)!;
+    expect(inView).not.toBeNull();
+    inView.click();
+    await flush(10);
+    expect(focusAt().rowindex).toBe(ri(850));
+    expect(grid.querySelectorAll(".tg-row").length).toBeLessThanOrEqual(DOM_CAP);
+    // The next page load, with the focused row in view, fills the cap exactly.
+    grid.dispatchEvent(new Event("scroll"));
+    await flush(10);
+    expect(focusAt().rowindex).toBe(ri(850));
+    expect(grid.querySelectorAll(".tg-row").length).toBe(DOM_CAP);
+    // No row is out of the flow: nothing is pinned.
+    expect([...grid.querySelectorAll<HTMLElement>(".tg-body .tg-row")].filter((r) => r.style.position === "absolute")).toEqual([]);
   });
 
   it("a crumb click leaves focus on the first row, not on the document body", async () => {
