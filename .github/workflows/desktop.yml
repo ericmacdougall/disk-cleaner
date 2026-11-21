@@ -389,6 +389,8 @@ jobs:
           path: |
             ${{ runner.temp }}/e2e/*.json
             ${{ runner.temp }}/e2e/*.txt
+            ${{ runner.temp }}/e2e/idle-release/*.txt
+            ${{ runner.temp }}/e2e/idle-release/*.log
             ${{ runner.temp }}/e2e/inputs/
             !${{ runner.temp }}/e2e/before.json
             !${{ runner.temp }}/e2e/after.json

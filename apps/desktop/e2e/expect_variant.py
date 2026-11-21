@@ -21,6 +21,12 @@ EXPECT = {
     "focus-broken": (["settings.save_confirm_keep_escape"], None),
     # PR gate F8: the question opened without showModal, inert or the Tab trap.
     "modal-trap-removed": (["settings.confirm_focus_contained"], None),
+    # PR gate F10: a write outside every snapshot root; only the trace can see it.
+    "planted-outside": ([], None),
+}
+# variant -> the line the trace report (trace.txt) must hold
+TRACE = {
+    "planted-outside": "OTHER openat: /tmp/prunedisk-planted-outside",
 }
 
 
@@ -45,6 +51,16 @@ def main(argv: list[str]) -> int:
         hit = [line for line in report.splitlines() if line.startswith(manifest_text) and ".planted-by-variant" in line]
         print(f"{'caught' if hit else 'MISSED'}: manifest {hit[:1]}")
         caught &= bool(hit)
+    if variant in TRACE:
+        trace = (out / "trace.txt").read_text() if (out / "trace.txt").exists() else ""
+        hit = TRACE[variant] in trace.splitlines()
+        print(f"{'caught' if hit else 'MISSED'}: trace {TRACE[variant]!r}")
+        caught &= hit
+        # The snapshot roots do not hold it, so the manifest must not be what caught it.
+        report = (out / "manifest.txt").read_text() if (out / "manifest.txt").exists() else ""
+        if "prunedisk-planted-outside" in report:
+            print("unexpected: the manifest saw the write outside its roots")
+            caught = False
     others = sorted(failed - set(checks))
     print(f"other failed checks: {others}")
     print(f"variant {variant}: {'caught' if caught else 'NOT caught'}")
