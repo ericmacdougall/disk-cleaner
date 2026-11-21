@@ -489,15 +489,22 @@ impl Manifest {
         out
     }
 
-    /// Paths retained by earlier duplicate removals (protected in later runs, N4).
-    pub fn retained_paths(&self) -> BTreeSet<PathBuf> {
-        self.rows
-            .iter()
-            .filter_map(|e| match &e.row {
-                Row::Retains { retained, .. } => Some(retained.clone()),
-                _ => None,
-            })
-            .collect()
+    /// The retention index (N4): each path retained by an earlier duplicate removal, with the
+    /// sha256 of every duplicate that relied on it. A later run protects the path only while it
+    /// still holds one of those contents (Codex plan review r7, F3).
+    pub fn retained_index(&self) -> BTreeMap<PathBuf, BTreeSet<String>> {
+        let mut out: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+        for e in &self.rows {
+            if let Row::Retains {
+                retained, sha256, ..
+            } = &e.row
+            {
+                out.entry(retained.clone())
+                    .or_default()
+                    .insert(sha256.clone());
+            }
+        }
+        out
     }
 
     pub fn path(&self) -> &Path {

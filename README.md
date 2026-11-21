@@ -66,7 +66,9 @@ Each distinct file content is uploaded once, in shards of
 `--shard-mib` (default 64) through `--jobs` (default 4) rclone uploads at a time, streamed with no
 local copy. A shard is verified in storage by size and hash before any file in it is removed, and a
 shard that fails removes nothing. Content already in storage is reused only after its shard is
-confirmed again by size and hash (a shard whose backend reports no hash is read back). Every removal
+confirmed again by size and hash. A shard whose backend reports no hash is downloaded in full and
+checked again, which costs up to one shard of download per reuse; if that fails, the content is
+uploaded again. Every removal
 is written first to a manifest (`~/.disk-cleaner/prunedisk/<host>.jsonl`), which is also copied,
 with a checksum, to the remote. If a crash left a torn last line in the manifest, the next `apply
 --apply` saves it beside the manifest as `<manifest>.torn-<time>` and cuts it before writing.
@@ -75,7 +77,23 @@ Each file is removed by first renaming it to a hidden name in its own folder
 (`.pd-rm-<hash>`), checking that it is still the file that was backed up, then deleting it; anything
 else is put back. A crash between those steps can leave such a name behind, and the next run
 finishes it. One that is reported as "left at" a `.pd-rm-` path is a different file that took the
-name and was not removed.
+name and was not removed. On a file system that cannot rename without replacing another file,
+nothing is removed.
+
+Removing part of a folder changes that folder, so a later `apply` with the same scan file keeps
+the rest of it with the reason "an earlier apply run changed this folder; scan again to continue".
+Run `scan` again and make a new plan.
+
+`apply` exits with:
+
+| Status | Meaning |
+|---|---|
+| 0 | Done (or the dry run was printed). |
+| 1 | Another error; read the message. |
+| 2 | The scan or plan was refused before anything was done. |
+| 3 | Another `apply` is running. |
+| 4 | A shard failed; the pieces that depend on it were kept. |
+| 5 | Some pieces were kept because an earlier apply run changed their folder; scan again. |
 
 ### Getting files back
 

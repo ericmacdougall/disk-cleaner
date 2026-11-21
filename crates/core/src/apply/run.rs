@@ -8,7 +8,9 @@ use super::manifest::{Manifest, Row, Segment};
 use super::recheck::{self, Member};
 use super::shard::{self, BlobSrc, UploadHooks};
 use super::storage::Rclone;
-use super::{canonical, names, ApplyError, ApplyOptions, ApplyReport, CrashPoint, PieceReport};
+use super::{
+    canonical, names, ApplyError, ApplyOptions, ApplyReport, CrashPoint, PieceReport, RESCAN_HINT,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -85,40 +87,50 @@ fn take_lock(dir: &Path) -> Result<Lock, ApplyError> {
         rustix::fs::Mode::from_raw_mode(0o600),
     )
     .map_err(|e| ApplyError::Io(format!("{}: {e}", p.display())))?;
-    if rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
-        // DIAGNOSTIC ONLY (branch diag/apply-lock-macos): who holds the lock?
-        let me = std::process::id();
-        let lsof = std::process::Command::new("lsof")
-            .args(["-nP", "--"])
-            .arg(&p)
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_else(|e| format!("lsof failed: {e}"));
-        let ps = std::process::Command::new("ps")
-            .args(["-axo", "pid,ppid,stat,lstart,command"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        let kids: Vec<&str> = ps
-            .lines()
-            .filter(|l| {
-                let f: Vec<&str> = l.split_whitespace().collect();
-                f.len() > 1 && (f[0] == me.to_string() || f[1] == me.to_string())
-            })
-            .collect();
-        eprintln!("PD-LOCK-DIAG self={me}\nlsof:\n{lsof}\nself and children:\n{}", kids.join("\n"));
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let again = rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive);
-        let lsof2 = std::process::Command::new("lsof")
-            .args(["-nP", "--"])
-            .arg(&p)
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        eprintln!("PD-LOCK-DIAG after 300 ms: retry ok={} lsof:\n{lsof2}", again.is_ok());
-        return Err(ApplyError::Locked(p.clone()));
+    // DIAGNOSTIC ONLY (branch diag/apply-lock-macos): on EWOULDBLOCK wait up to 3 s and log
+    // each wait (and how long it took to clear) to $PD_LOCK_LOG, so passing runs show it too.
+    let started = std::time::Instant::now();
+    let mut waited = false;
+    let note = |m: String| {
+        if let Some(f) = std::env::var_os("PD_LOCK_LOG") {
+            use std::io::Write;
+            if let Ok(mut h) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(f)
+            {
+                let _ = writeln!(h, "{m} pid={} lock={}", std::process::id(), p.display());
+            }
+        }
+    };
+    loop {
+        match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                if waited {
+                    note(format!(
+                        "PD-LOCK-RETRY cleared_ms={:.1}",
+                        started.elapsed().as_secs_f64() * 1e3
+                    ));
+                }
+                return Ok(Lock { _fd: fd });
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::WOULDBLOCK)
+                if started.elapsed() < std::time::Duration::from_secs(3) =>
+            {
+                waited = true;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                note("PD-LOCK-RETRY gave_up_after_ms=3000".into());
+                return Err(ApplyError::Locked(p.clone()));
+            }
+            Err(e) => {
+                note(format!("PD-LOCK-OTHER errno={e}"));
+                return Err(ApplyError::Io(format!("cannot lock {}: {e}", p.display())));
+            }
+        }
     }
-    Ok(Lock { _fd: fd })
 }
 
 /// Newest mtime of any non-directory entry under `dir` (not following symlinks, skipping
@@ -324,7 +336,7 @@ pub fn apply(
     }
 
     // 1b. The retention index (N4, acceptance finding 1).
-    let retained = ctx.manifest.retained_paths();
+    let retained = ctx.manifest.retained_index();
     let mut retention_notes: BTreeMap<usize, String> = BTreeMap::new();
     prepared.retain_mut(|pr| match protect_retained(&ctx, &retained, pr) {
         Ok(None) => true,
@@ -371,6 +383,7 @@ pub fn apply(
             }
         }
         ctx.report.uploaded_bytes = bytes;
+        mark_rescan(&mut ctx.report);
         return Ok(ctx.report);
     }
 
@@ -431,6 +444,7 @@ pub fn apply(
     // Closing mirror, whatever happened (revision 2c, finding 4).
     let _ = mirror(&mut ctx);
     result?;
+    mark_rescan(&mut ctx.report);
     Ok(ctx.report)
 }
 
@@ -444,7 +458,7 @@ pub fn apply(
 /// possible: a resumed removal, a secret name, or a member that changed.
 fn protect_retained(
     ctx: &Ctx,
-    retained: &BTreeSet<PathBuf>,
+    retained: &BTreeMap<PathBuf, BTreeSet<String>>,
     pr: &mut Prepared,
 ) -> Result<Option<String>, String> {
     let p = &ctx.inputs.pieces[pr.piece];
@@ -454,9 +468,9 @@ fn protect_retained(
             continue;
         }
         let path = rel_join(&p.path, &m.rel);
-        if !retained.contains(&path) {
+        let Some(relied_on) = retained.get(&path) else {
             continue;
-        }
+        };
         let keep = |why: &str| {
             Err(format!(
                 "{} is the retained copy of a duplicate removed earlier, and {why}",
@@ -477,6 +491,12 @@ fn protect_retained(
         let (sha, id) = shard::hash_file(&p.path, &m.rel)?;
         if !id.same_strict(&m.id) {
             return keep("it changed while it was being checked");
+        }
+        if !relied_on.contains(&sha) {
+            return keep(
+                "it changed since that duplicate was removed, so the duplicate's content is no \
+                 longer on disk to back up",
+            );
         }
         m.content = Content::Blob { sha256: sha };
         moved.push(path.display().to_string());
@@ -509,6 +529,27 @@ fn dry_word(l: Lane) -> &'static str {
         Lane::Git => "would recover, back up the git directory, then remove",
         Lane::Keep => "kept",
     }
+}
+
+/// The reason for a piece whose scan piece drifted. When entries of that scan piece were
+/// already removed under this scan (an earlier run or batch), the scan itself is stale: the
+/// reason leads with [`RESCAN_HINT`] and the piece is listed in `rescan_needed`.
+fn drift_reason(what: &str, d: &recheck::Drift, earlier: &BTreeMap<String, Ident>) -> String {
+    if earlier.is_empty() {
+        format!("{what}: {}", d.0)
+    } else {
+        format!("{RESCAN_HINT} ({what}: {})", d.0)
+    }
+}
+
+/// The one place `rescan_needed` is computed: every kept piece whose reason is the rescan hint.
+fn mark_rescan(rep: &mut ApplyReport) {
+    rep.rescan_needed = rep
+        .pieces
+        .iter()
+        .filter(|r| r.outcome == "kept" && r.reason.starts_with(RESCAN_HINT))
+        .map(|r| r.id)
+        .collect();
 }
 
 fn set_outcome(rep: &mut ApplyReport, piece: usize, outcome: &str, reason: &str) {
@@ -563,7 +604,8 @@ fn prepare(
     let removed = ctx
         .manifest
         .removed_under(p.scan_piece, &sp.path, &ctx.inputs.scan_digest);
-    recheck::recheck(sp, &removed).map_err(|d| format!("changed since the scan: {}", d.0))?;
+    recheck::recheck(sp, &removed)
+        .map_err(|d| drift_reason("changed since the scan", &d, &removed))?;
     let en = recheck::enumerate(p.kind, &p.path, &p.files, &p.excludes).map_err(|d| d.0)?;
     if let Some(m) = en.members.iter().find(|m| m.id.kind == 'o') {
         return Err(format!("{} is a FIFO, socket or device file", m.rel));
@@ -1098,7 +1140,7 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
                         &mut ctx.report,
                         pr.piece,
                         "kept",
-                        &format!("changed during the backup: {}", d.0),
+                        &drift_reason("changed during the backup", &d, &removed),
                     );
                     continue;
                 }

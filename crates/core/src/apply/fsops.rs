@@ -234,25 +234,39 @@ pub fn quarantine_name(leaf: &str) -> String {
     format!(".pd-rm-{hex}")
 }
 
-/// Rename within `d` without replacing an existing target. On a file system without no-replace
-/// support (`EINVAL`, `ENOSYS`, `ENOTSUP`) it checks the target is absent, then renames.
-fn rename_noreplace(d: &OwnedFd, from: &str, to: &str) -> io::Result<()> {
-    match fs::renameat_with(
+/// What a removal reports on a file system that cannot rename without replacing.
+pub const NO_ATOMIC_RENAME: &str =
+    "this file system cannot rename without replacing another file, so nothing is removed here";
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// Makes every no-replace rename on this thread fail as on a file system without support.
+    pub static NOREPLACE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn renameat_noreplace_raw(d: &OwnedFd, from: &str, to: &str) -> Result<(), Errno> {
+    #[cfg(feature = "test-hooks")]
+    if NOREPLACE_UNSUPPORTED.with(|c| c.get()) {
+        return Err(Errno::NOTSUP);
+    }
+    fs::renameat_with(
         d,
         OsStr::new(from),
         d,
         OsStr::new(to),
         fs::RenameFlags::NOREPLACE,
-    ) {
+    )
+}
+
+/// Rename within `d` without replacing an existing target, atomically. A file system without
+/// no-replace support (`EINVAL`, `ENOSYS`, `ENOTSUP`) gets no check-then-rename fallback, since
+/// a file created between the check and the rename would be overwritten (Codex plan review r7,
+/// F1): the rename fails and the member stays where it is.
+fn rename_noreplace(d: &OwnedFd, from: &str, to: &str) -> io::Result<()> {
+    match renameat_noreplace_raw(d, from, to) {
         Ok(()) => Ok(()),
         Err(Errno::INVAL) | Err(Errno::NOSYS) | Err(Errno::NOTSUP) => {
-            match fs::statat(d, OsStr::new(to), AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(_) => Err(e(Errno::EXIST)),
-                Err(Errno::NOENT) => {
-                    fs::renameat(d, OsStr::new(from), d, OsStr::new(to)).map_err(e)
-                }
-                Err(err) => Err(e(err)),
-            }
+            Err(io::Error::new(io::ErrorKind::Unsupported, NO_ATOMIC_RENAME))
         }
         Err(err) => Err(e(err)),
     }

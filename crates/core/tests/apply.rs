@@ -875,7 +875,10 @@ fn sibling_removed_in_an_earlier_run_passes_recheck() {
     fx.write("s/d2.bin", b"two");
     fx.write("s/rest/r.txt", b"rest");
     let scan = scan_doc(&[&fx.data], &[P::tree(&s, "backup")]);
-    // Run 1 removes only d1.
+    // Run 1 removes only d1, clearly after the scan: the folder's status-change time then
+    // falls after the scan whatever the clock resolution (stream A's directory re-check
+    // compares it, so without the wait the outcome under A depended on the second boundary).
+    std::thread::sleep(Duration::from_millis(1100));
     let plan_a = plan_doc(&scan, &[P::derived(&s, "d1.bin", 0, "backup")]);
     let rep = apply(&scan, &plan_a, &fx.opts(true)).unwrap();
     assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
@@ -890,6 +893,105 @@ fn sibling_removed_in_an_earlier_run_passes_recheck() {
         "{rep:#?}"
     );
     assert!(!s.exists());
+}
+
+/// Main's ruling on stream A's directory re-check: when a scan piece drifts after an earlier
+/// run of the same scan removed entries from it, the scan is stale. Its pieces are kept, the
+/// reason says to scan again, and the report lists them in `rescan_needed` (the CLI exits 5).
+/// The same drift with no earlier run is an ordinary change: no hint, nothing listed.
+#[test]
+fn a_piece_kept_after_an_earlier_run_of_the_same_scan_says_scan_again() {
+    use disk_cleaner_core::apply::RESCAN_HINT;
+    for earlier_run in [true, false] {
+        let fx = Fx::new();
+        let s = fx.data.join("s");
+        fx.write("s/d1.bin", b"one");
+        fx.write("s/d2.bin", b"two");
+        fx.write("s/rest/r.txt", b"rest");
+        let scan = scan_doc(&[&fx.data], &[P::tree(&s, "backup")]);
+        if earlier_run {
+            let plan_a = plan_doc(&scan, &[P::derived(&s, "d1.bin", 0, "backup")]);
+            let rep = apply(&scan, &plan_a, &fx.opts(true)).unwrap();
+            assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
+            assert!(rep.rescan_needed.is_empty(), "{rep:?}");
+        }
+        // The folder changes after the scan, without making the group active (a status
+        // change only, like the directory ctime that stream A's re-check reads).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let r = s.join("rest/r.txt");
+        fs::set_permissions(&r, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut residual = P::tree(&s, "backup");
+        residual.moved_out = vec!["d1.bin".into(), "d2.bin".into()];
+        let plan_b = plan_doc(&scan, &[residual, P::derived(&s, "d2.bin", 0, "backup")]);
+        let rep = apply(&scan, &plan_b, &fx.opts(true)).unwrap();
+        for p in &rep.pieces {
+            assert_eq!(p.outcome, "kept", "{earlier_run}: {rep:#?}");
+            assert_eq!(
+                p.reason.starts_with(RESCAN_HINT),
+                earlier_run,
+                "{earlier_run}: {}",
+                p.reason
+            );
+        }
+        let want: Vec<usize> = if earlier_run {
+            rep.pieces.iter().map(|p| p.id).collect()
+        } else {
+            vec![]
+        };
+        assert_eq!(rep.rescan_needed, want, "{earlier_run}: {rep:#?}");
+        assert_eq!(fs::read(s.join("d2.bin")).unwrap(), b"two");
+        assert_eq!(fs::read(s.join("rest/r.txt")).unwrap(), b"rest");
+    }
+}
+
+/// AC-8 as amended in Revision 6 (Codex plan review r7, F2): a begun removal resumes to the
+/// end; untouched siblings of a scan piece that an earlier run changed are kept until a new scan
+/// and plan, which then complete; every removed generation restores from the remote manifest
+/// alone. The chmod stands in for the folder status change stream A's re-check reads.
+#[test]
+fn crash_resume_rescan_then_complete_and_restore_from_remote() {
+    let fx = Fx::new();
+    let s = fx.data.join("s");
+    fx.write("s/d1.bin", b"one");
+    fx.write("s/d2.bin", b"two");
+    fx.write("s/rest/r.txt", b"rest");
+    let scan = scan_doc(&[&fx.data], &[P::tree(&s, "backup")]);
+    // 1. A removal is begun, the process "dies", and the same plan resumes it to the end.
+    let plan_a = plan_doc(&scan, &[P::derived(&s, "d1.bin", 0, "backup")]);
+    let mut o = fx.opts(true);
+    o.hooks.crash_at = Some(CrashPoint::AfterRemoveBegin);
+    assert!(matches!(
+        apply(&scan, &plan_a, &o),
+        Err(ApplyError::InjectedCrash(_))
+    ));
+    let rep = apply(&scan, &plan_a, &fx.opts(true)).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "removed", "{rep:#?}");
+    assert!(!s.join("d1.bin").exists());
+    // 2. The folder has changed since the scan: its other pieces are kept, scan again.
+    std::thread::sleep(Duration::from_millis(1100));
+    fs::set_permissions(s.join("rest/r.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+    let mut residual = P::tree(&s, "backup");
+    residual.moved_out = vec!["d1.bin".into(), "d2.bin".into()];
+    let plan_b = plan_doc(&scan, &[residual, P::derived(&s, "d2.bin", 0, "backup")]);
+    let rep = apply(&scan, &plan_b, &fx.opts(true)).unwrap();
+    assert!(rep.pieces.iter().all(|p| p.outcome == "kept"), "{rep:#?}");
+    assert_eq!(rep.rescan_needed.len(), 2, "{rep:#?}");
+    // 3. A new scan and plan complete the folder.
+    let scan2 = scan_doc(&[&fx.data], &[P::tree(&s, "backup")]);
+    let plan_c = plan_doc(&scan2, &[P::tree(&s, "backup")]);
+    let rep = apply(&scan2, &plan_c, &fx.opts(true)).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "removed", "{rep:#?}");
+    assert!(rep.rescan_needed.is_empty());
+    assert!(!s.exists());
+    // 4. Everything removed, in both generations, restores from the remote manifest alone.
+    fs::remove_file(fx.manifest()).unwrap();
+    let mut ro = ropts(&fx);
+    ro.from_remote = true;
+    let r = restore(&s, &ro).unwrap();
+    assert!(r.failed.is_empty() && r.conflicts.is_empty(), "{r:?}");
+    assert_eq!(fs::read(s.join("d1.bin")).unwrap(), b"one");
+    assert_eq!(fs::read(s.join("d2.bin")).unwrap(), b"two");
+    assert_eq!(fs::read(s.join("rest/r.txt")).unwrap(), b"rest");
 }
 
 #[test]
