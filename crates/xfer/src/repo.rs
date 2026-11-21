@@ -807,6 +807,12 @@ impl ChunkMap {
     pub fn capacity(&self) -> usize {
         self.entries.capacity()
     }
+    /// Room for `n` more packs, so loading never regrows the pack table (charged per pack as
+    /// each is added, through `PACK_COST`).
+    pub fn reserve_packs(&mut self, n: usize) {
+        self.packs.reserve_exact(n);
+        self.pack_ix.reserve(n);
+    }
     pub fn pack_index(&mut self, p: &ObjRef) -> u32 {
         if let Some(&i) = self.pack_ix.get(&p.key) {
             return i;
@@ -1205,12 +1211,16 @@ impl Repo {
 
     /// Listed packs: key -> (size, hash). Hashes may be absent on some backends.
     pub fn list_packs(&self) -> Result<HashMap<String, RemoteObject>> {
-        Ok(self
-            .list("v1/packs")?
-            .into_iter()
-            .filter(|o| o.key.ends_with(".pack"))
-            .map(|o| (o.key.clone(), o))
-            .collect())
+        let listed = self.list("v1/packs")?;
+        // sized once: a table grown by doubling leaves each old one resident on macOS
+        let mut out = HashMap::with_capacity(listed.len());
+        out.extend(
+            listed
+                .into_iter()
+                .filter(|o| o.key.ends_with(".pack"))
+                .map(|o| (o.key.clone(), o)),
+        );
+        Ok(out)
     }
 
     /// Load every committed chunk map. Chunks whose pack is not listed with the recorded size
@@ -1273,8 +1283,12 @@ impl Repo {
             )));
         }
         meter.charge(listing)?;
+        // the listing was built by the caller: hand back what building it freed
+        crate::util::release_free_memory();
         crate::util::mem_trace("index listing charged");
         let mut map = ChunkMap::new(meter)?;
+        // the map's own pack table holds at most the listed packs; sized once, as above
+        map.reserve_packs(packs.len());
         // A backup reserves room for every entry its share can pay for, so merging a commit's
         // chunks never reallocates. A restore only loads: a chunk entry takes at least ~32
         // compressed bytes (its id is random), so z/8 bounds an honest index; past it the map

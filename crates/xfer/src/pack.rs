@@ -57,7 +57,8 @@ pub fn bounded_zstd(data: &[u8], limit: usize) -> Result<Vec<u8>> {
         zstd::stream::read::Decoder::new(data).map_err(|e| Error::corrupt(format!("zstd: {e}")))?;
     // reserved once, as `util::read_bounded` does: a doubling buffer leaves freed copies
     // resident on macOS (a segment's `ulen` is its exact size)
-    let mut out = Vec::with_capacity((limit as u64 + 1).min(crate::util::READ_RESERVE_MAX) as usize);
+    let mut out =
+        Vec::with_capacity((limit as u64 + 1).min(crate::util::READ_RESERVE_MAX) as usize);
     dec.take(limit as u64 + 1)
         .read_to_end(&mut out)
         .map_err(|e| Error::corrupt(format!("zstd: {e}")))?;

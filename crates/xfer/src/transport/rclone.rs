@@ -394,7 +394,14 @@ impl RcloneRcd {
     }
 
     fn read_json(&self, what: &str, resp: ureq::Response) -> Result<Value> {
-        let mut buf = Vec::new();
+        // sized from Content-Length when rcd sends it (a listing can be megabytes), so the body
+        // is one allocation (see `util::read_bounded`)
+        let hint = resp
+            .header("Content-Length")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(RESPONSE_MAX);
+        let mut buf = Vec::with_capacity(hint as usize + 1);
         resp.into_reader()
             .take(RESPONSE_MAX + 1)
             .read_to_end(&mut buf)?;
