@@ -1047,7 +1047,7 @@ A **piece**:
 | `newest_mtime` | newest modification time of the members (for `git-node`, of the work tree outside its git directory); absent when it has no members |
 | `walked_at` | unix seconds, rounded down, at the start of the survey walk (before any entry of this piece was read) |
 | `secret` | present on a secret piece: the kind of secret name that matched (`a private SSH key`) |
-| `incomplete` | present when the piece cannot be judged whole, with why: entries that could not be read, a mount point that was not entered, a FIFO, socket or device file, a name that is not valid UTF-8 (it could not be written back exactly), a secret-named file inside a git directory, another scan root inside a `git-node` piece's git directory, or, for a `tree` or `files` piece, lying inside a git directory (a git directory is handled only whole; see "Re-check") |
+| `incomplete` | present when the piece cannot be judged whole, with why: entries that could not be read, a mount point that was not entered, a FIFO, socket or device file, a path or name that is not valid UTF-8, anywhere in its real or spelled path (it could not be written back exactly), a secret-named file inside a git directory, another scan root inside a `git-node` piece's git directory, or, for a `tree` or `files` piece, lying inside a git directory (a git directory is handled only whole; see "Re-check") |
 
 **Membership is enumerated, never "the directory, recursively".** A piece's members are exactly
 its `members` list, written into the scan file with the identity and metadata each one had. An
@@ -1151,19 +1151,34 @@ They never match a secret name, word or directory: for example, `.git/refs/heads
 `server.pem` in `.git/info/logs`, which is not a git top's `logs`, or an `id_rsa` inside
 `.git/worktrees/secrets`), and an enclosing secret directory still covers everything below it.
 
-A scan root takes its context from the directories that enclose it, as if the walk had reached
-it from above. This holds in any root order, and whether or not an enclosing root was scanned too:
-for example, a root walked on its own because it is another file system under `--one-file-system`.
-- Git-directory context follows its real path. It comes from the scan's nodes, and also from the
-  directories themselves: a root named `.git`, or one below a directory named `.git` or shaped
-  like a git directory (a `HEAD` file and `objects` and `refs` directories), is inside a git
-  directory even when the scan holds no node for that repository.
-- Node and artifact context follow its real path through the scan's nodes only. A root inside a
+**Context follows location.** Every directory's context (secret, git directory, artifact, and
+whether its path can be written back exactly) is derived by one rule from where it is, the same
+for a directory the walk enters and for a scan root. A scan root takes its context from every
+component of its real path, its own name included, as if the walk had reached it from above, and
+also from its path as spelled (a symlink alias such as `~/k -> ~/.ssh`). This holds in any root
+order, and whether or not an enclosing root was scanned too: for example, a root walked on its
+own because it is another file system under `--one-file-system`.
+- A directory is in a git directory when it, or any directory above it, is named `.git`
+  (compared ignoring ASCII case), is shaped like one (a `HEAD` file and `objects` and `refs`
+  directories), or is a bare-repo node. This is read from the directories themselves, so it holds
+  inside artifacts (`node_modules/dep/.git`) and for a repository that is not a node. A `.git`
+  file (a linked worktree's or submodule's pointer) belongs to git too.
+- Node and artifact context follow the real path through the scan's nodes only. A root inside a
   repository or artifact that no scanned root covers has no node there; it is judged as an
   ungrouped root (`backup`, never `noise` by rule), and secret words apply to its names: both
   on the safe side.
-- If any directory above it, in its real path or as spelled, has a secret directory name, the
-  root is a secret `tree` piece. A scan root that itself has a secret directory name is one too.
+- If the directory, or any directory above it, in its real path or as spelled, has a secret
+  directory name (outside the git bookkeeping names above), it is in a secret directory, and so
+  is everything below it. A secret piece starts at the topmost such directory, or at a scan root
+  inside one.
+- A path is exact when every component, in its real path and as spelled, is valid UTF-8.
+
+One check decides every piece as it is emitted: a piece that is not exact (its path or a
+member's name is not valid UTF-8), a `tree` or `files` piece that lies in a git directory or holds
+a file of one, and a `git-node` piece whose git directory holds a secret are `incomplete`; a
+piece in a secret directory, or holding a secret entry, has `secret` set, whether or not it has
+file members. So a removing lane never reaches a path that does not round-trip, a part of a git
+directory or a secret.
 
 Over-matching (a `tokenizer.py` in loose code) keeps a file on disk, the safe side. **Known
 limit:** secrets are found by name only. A secret under an ordinary name (a copied `.env` saved as

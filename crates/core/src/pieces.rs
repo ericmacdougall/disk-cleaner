@@ -305,6 +305,8 @@ struct DirRec {
     /// The topmost secret directory at or above this one: its kind.
     secret_dir: Option<String>,
     secret_top: bool,
+    /// Its whole path is valid UTF-8, as spelled and as real (`Place::exact`).
+    exact: bool,
 }
 
 #[derive(Debug)]
@@ -389,6 +391,7 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
             in_artifact: false,
             secret_dir: None,
             secret_top: false,
+            exact: true,
         });
         t.roots.push(idx);
         let mut stack = vec![idx];
@@ -438,6 +441,7 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
                             in_artifact: false,
                             secret_dir: None,
                             secret_top: false,
+                            exact: true,
                         });
                         t.dirs[d].children.push(Child::Dir(ci));
                         if !mount && !other {
@@ -536,78 +540,190 @@ const GIT_REF_DIRS: [&str; 2] = ["refs", "logs"];
 /// Directories of a git top whose subdirectories are named after worktrees and submodules.
 const GIT_ADMIN_DIRS: [&str; 2] = ["worktrees", "modules"];
 
-/// The context a directory hands to its children.
-#[derive(Clone, Debug, Default)]
-struct Inherited {
+/// Everything a directory's physical location says about what lies below it. It is derived by
+/// one function, `Place::step`, from the parent's place and the directory's own facts, for every
+/// directory: each component of a scan root's real path from the file system root down to the
+/// root itself, then every directory the walk enters. So a directory's context never depends on
+/// which root reached it, in what order, or whether an enclosing root was scanned.
+#[derive(Clone, Debug)]
+struct Place {
+    /// Innermost scan node at or above.
     node: Option<usize>,
+    /// This directory is a scan node's own path.
     is_node: bool,
     in_gitdir: bool,
+    git_top: bool,
+    git_area: bool,
+    git_named: bool,
     in_artifact: bool,
+    /// The topmost secret directory at or above: its kind.
     secret_dir: Option<String>,
+    /// Every component of the path, as spelled and as real, is valid UTF-8, so the path can be
+    /// written into the scan file and read back exactly.
+    exact: bool,
 }
 
-/// Physical evidence that `dir` is a git directory, whether or not the scan holds its repository
-/// as a node: it is named `.git`, or it has the shape of one (a `HEAD` file and `objects` and
-/// `refs` directories, as a bare repository has). Symlinks are not followed. This only ever adds
-/// git-directory context, which keeps entries (the safe side).
-fn looks_like_git_dir(dir: &Path) -> bool {
-    if dir.file_name() == Some(OsStr::new(".git")) {
-        return true;
-    }
-    let is = |name: &str, want_dir: bool| {
-        std::fs::symlink_metadata(dir.join(name))
-            .map(|m| if want_dir { m.is_dir() } else { m.is_file() })
-            .unwrap_or(false)
-    };
-    is("HEAD", false) && is("objects", true) && is("refs", true)
+/// The facts about one directory that its place depends on.
+struct DirFacts<'a> {
+    name: Option<&'a OsStr>,
+    /// The scan node whose path this directory is.
+    node: Option<usize>,
+    /// It holds a file named `HEAD`.
+    has_head: bool,
+    /// It holds `objects` and `refs` directories.
+    has_objects_and_refs: bool,
 }
 
-/// The context a scan root inherits from the directories that physically enclose it, as if the
-/// walk had reached it from above: whatever the order of the roots, and whether or not an
-/// enclosing root was scanned too (a root walked on its own because it is another file system
-/// under `--one-file-system`, or a root given alone). Node and artifact context follow the
-/// root's real path through the scan's nodes. Git-directory context follows the nodes too, and
-/// also the directories themselves (`looks_like_git_dir`), so a root inside the git directory of
-/// a repository the scan did not cover is still inside a git directory. Secrecy follows any
-/// secret-named directory above the root in its real path or its spelling, so everything inside
-/// a secret directory stays local.
-fn enclosing_context(
-    root: &Path,
-    real_nodes: &HashMap<PathBuf, usize>,
-    nodes: &[Node],
-    rules: &RuleSet,
-) -> Inherited {
-    let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let class_of = |n: Option<usize>| n.and_then(|n| nodes.get(n)).map(|n| n.class);
-    let secret_name = |a: &Path| {
-        a.file_name()
-            .and_then(|n| n.to_str())
-            .and_then(|n| rules.secret_dir(n))
-            .map(|k| k.to_string())
-    };
-    let mut c = Inherited::default();
-    let above: Vec<&Path> = real.ancestors().skip(1).collect();
-    for a in above.into_iter().rev() {
-        let here = real_nodes.get(a).copied();
-        let pclass = if c.is_node { class_of(c.node) } else { None };
-        let name_is_git = a.file_name() == Some(OsStr::new(".git"));
-        c.in_gitdir = c.in_gitdir
-            || class_of(here) == Some(Class::BareRepo)
-            || (name_is_git && matches!(pclass, Some(Class::Repo) | Some(Class::Worktree)))
-            || looks_like_git_dir(a);
-        if here.is_some() {
-            c.node = here;
-        }
-        c.is_node = here.is_some();
-        c.in_artifact = c.in_artifact || class_of(c.node).map(|k| k.is_artifact()).unwrap_or(false);
-        if c.secret_dir.is_none() {
-            c.secret_dir = secret_name(a);
+impl Place {
+    /// The place above every path: no context, exact.
+    fn top() -> Place {
+        Place {
+            node: None,
+            is_node: false,
+            in_gitdir: false,
+            git_top: false,
+            git_area: false,
+            git_named: false,
+            in_artifact: false,
+            secret_dir: None,
+            exact: true,
         }
     }
-    if c.secret_dir.is_none() {
-        c.secret_dir = root.ancestors().skip(1).find_map(secret_name);
+
+    /// The place of a directory with facts `f` below a directory at `self`.
+    fn step(&self, f: &DirFacts, nodes: &[Node], rules: &RuleSet) -> Place {
+        let class_of = |n: Option<usize>| n.and_then(|n| nodes.get(n)).map(|n| n.class);
+        let node = f.node.or(self.node);
+        let name_str = f.name.and_then(|n| n.to_str());
+        let name_in = |list: &[&str]| name_str.map(|n| list.contains(&n)).unwrap_or(false);
+        // A git directory by location: a bare-repository node, a directory named `.git` (any
+        // case: a case-insensitive file system resolves `.GIT` for git too) or one shaped like a
+        // git directory (HEAD, objects, refs), whether or not the scan holds its repository as a
+        // node (inside an artifact it never does).
+        let name_is_git = name_str
+            .map(|n| n.eq_ignore_ascii_case(".git"))
+            .unwrap_or(false);
+        let in_gitdir = self.in_gitdir
+            || class_of(f.node) == Some(Class::BareRepo)
+            || name_is_git
+            || (f.has_head && f.has_objects_and_refs);
+        let top = in_gitdir && (!self.in_gitdir || (self.git_area && f.has_head));
+        let area =
+            in_gitdir && !top && ((self.git_top && name_in(&GIT_ADMIN_DIRS)) || self.git_area);
+        let named = in_gitdir && (self.git_named || (self.git_top && name_in(&GIT_REF_DIRS)));
+        let secret_dir = if self.secret_dir.is_some() {
+            self.secret_dir.clone()
+        } else if self.git_named || self.git_area {
+            // A ref, worktree or submodule name: never a secret directory by name.
+            None
+        } else {
+            name_str
+                .and_then(|n| rules.secret_dir(n))
+                .map(|k| k.to_string())
+        };
+        Place {
+            node,
+            is_node: f.node.is_some(),
+            in_gitdir,
+            git_top: top,
+            git_area: area,
+            git_named: named,
+            in_artifact: self.in_artifact
+                || class_of(node).map(|c| c.is_artifact()).unwrap_or(false),
+            secret_dir,
+            exact: self.exact && f.name.map(|n| n.to_str().is_some()).unwrap_or(true),
+        }
     }
-    c
+
+    /// The place of a scan root: `step` folded over every component of its real path, down to
+    /// and including the root itself, with the facts on disk (symlinks not followed below the
+    /// real path) and the scan's nodes by real path. Its spelling is folded too, by names only;
+    /// secrecy, git-directory context and inexactness found there are added, never taken away.
+    fn of_root(
+        root: &Path,
+        root_node: Option<usize>,
+        real_nodes: &HashMap<PathBuf, usize>,
+        nodes: &[Node],
+        rules: &RuleSet,
+    ) -> Place {
+        let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let lstat_is = |p: &Path, want_dir: bool| {
+            std::fs::symlink_metadata(p)
+                .map(|m| if want_dir { m.is_dir() } else { m.is_file() })
+                .unwrap_or(false)
+        };
+        let mut place = Place::top();
+        let comps: Vec<&Path> = real.ancestors().collect();
+        for (i, a) in comps.iter().rev().enumerate() {
+            let is_root = i + 1 == comps.len();
+            let mut node = real_nodes.get(*a).copied();
+            if is_root {
+                node = root_node.or(node);
+            }
+            place = place.step(
+                &DirFacts {
+                    name: a.file_name(),
+                    node,
+                    has_head: lstat_is(&a.join("HEAD"), false),
+                    has_objects_and_refs: lstat_is(&a.join("objects"), true)
+                        && lstat_is(&a.join("refs"), true),
+                },
+                nodes,
+                rules,
+            );
+        }
+        let mut spelled = Place::top();
+        let names: Vec<&Path> = root.ancestors().collect();
+        for a in names.iter().rev() {
+            spelled = spelled.step(
+                &DirFacts {
+                    name: a.file_name(),
+                    node: None,
+                    has_head: false,
+                    has_objects_and_refs: false,
+                },
+                nodes,
+                rules,
+            );
+        }
+        if place.secret_dir.is_none() {
+            place.secret_dir = spelled.secret_dir;
+        }
+        if spelled.in_gitdir && !place.in_gitdir {
+            place.in_gitdir = true;
+            place.git_top = false;
+            place.git_area = false;
+            place.git_named = false;
+        }
+        place.exact = place.exact && spelled.exact;
+        place
+    }
+
+    fn apply(&self, d: &mut DirRec) {
+        d.node = self.node;
+        d.is_node = self.is_node;
+        d.in_gitdir = self.in_gitdir;
+        d.git_top = self.git_top;
+        d.git_area = self.git_area;
+        d.git_named = self.git_named;
+        d.in_artifact = self.in_artifact;
+        d.secret_dir = self.secret_dir.clone();
+        d.exact = self.exact;
+    }
+
+    fn of_dir(d: &DirRec) -> Place {
+        Place {
+            node: d.node,
+            is_node: d.is_node,
+            in_gitdir: d.in_gitdir,
+            git_top: d.git_top,
+            git_area: d.git_area,
+            git_named: d.git_named,
+            in_artifact: d.in_artifact,
+            secret_dir: d.secret_dir.clone(),
+            exact: d.exact,
+        }
+    }
 }
 
 /// The real path of every node: its root's real path plus the rest, since the walk only
@@ -637,92 +753,61 @@ fn real_node_paths(roots: &[PathBuf], nodes: &[Node]) -> HashMap<PathBuf, usize>
         .collect()
 }
 
-/// Fill node, git-directory, artifact and secret context, top down. A scan root starts from the
-/// context of the directories that enclose it (`enclosing_context`).
+/// Fill every directory's place (`Place`), top down, and every entry's git-directory and secret
+/// status from its directory's place and its own name.
 fn annotate(t: &mut Tree, roots: &[PathBuf], nodes: &[Node], rules: &RuleSet, order: &[usize]) {
     let real_nodes = real_node_paths(roots, nodes);
+    let named = |t: &Tree, d: usize, name: &str, want_dir: bool| {
+        t.dirs[d].children.iter().any(|c| match *c {
+            Child::Ent(e) if !want_dir => {
+                t.ents[e].m.kind == b'f' && t.ents[e].name.eq_ignore_ascii_case(name)
+            }
+            Child::Dir(c) if want_dir => t.dirs[c].name.eq_ignore_ascii_case(name),
+            _ => false,
+        })
+    };
     for &d in order {
-        let parent = t.dirs[d].parent;
-        let pctx = match parent {
-            Some(p) => Inherited {
-                node: t.dirs[p].node,
-                is_node: t.dirs[p].is_node,
-                in_gitdir: t.dirs[p].in_gitdir,
-                in_artifact: t.dirs[p].in_artifact,
-                secret_dir: t.dirs[p].secret_dir.clone(),
-            },
-            None => enclosing_context(&t.dirs[d].path, &real_nodes, nodes, rules),
+        let place = match t.dirs[d].parent {
+            Some(p) => {
+                // A directory that is another scan root is not entered here: its facts come from
+                // its own walk, and its context from `Place::of_root` there.
+                let facts = DirFacts {
+                    name: Some(t.dirs[d].name.as_os_str()),
+                    node: if t.dirs[d].is_node {
+                        t.dirs[d].node
+                    } else {
+                        None
+                    },
+                    has_head: named(t, d, "HEAD", false),
+                    has_objects_and_refs: named(t, d, "objects", true) && named(t, d, "refs", true),
+                };
+                Place::of_dir(&t.dirs[p]).step(&facts, nodes, rules)
+            }
+            None => {
+                let root_node = if t.dirs[d].is_node {
+                    t.dirs[d].node
+                } else {
+                    None
+                };
+                Place::of_root(&t.dirs[d].path, root_node, &real_nodes, nodes, rules)
+            }
         };
-        let (pnode, pgit, part, psecret) =
-            (pctx.node, pctx.in_gitdir, pctx.in_artifact, pctx.secret_dir);
-        if t.dirs[d].node.is_none() {
-            t.dirs[d].node = pnode;
-        }
-        let own = if t.dirs[d].is_node {
-            t.dirs[d].node
-        } else {
-            None
-        };
-        let class = own.and_then(|n| nodes.get(n)).map(|n| n.class);
-        let pclass = pnode.and_then(|n| nodes.get(n)).map(|n| n.class);
-        let name_is_git = t.dirs[d].name == OsStr::new(".git");
-        t.dirs[d].in_gitdir = pgit
-            || class == Some(Class::BareRepo)
-            || (name_is_git
-                && pctx.is_node
-                && matches!(pclass, Some(Class::Repo) | Some(Class::Worktree)))
-            // A scan root that is itself a git directory the scan holds no node for.
-            || (parent.is_none() && looks_like_git_dir(&t.dirs[d].path));
-        let nclass = t.dirs[d].node.and_then(|n| nodes.get(n)).map(|n| n.class);
-        t.dirs[d].in_artifact = part || nclass.map(|c| c.is_artifact()).unwrap_or(false);
-        let (ptop, parea, pnamed) = parent
-            .map(|p| (t.dirs[p].git_top, t.dirs[p].git_area, t.dirs[p].git_named))
-            .unwrap_or((false, false, false));
-        let name_in = |list: &[&str]| {
-            t.dirs[d]
-                .name
-                .to_str()
-                .map(|n| list.contains(&n))
-                .unwrap_or(false)
-        };
-        let has_head = t.dirs[d].children.iter().any(|c| match *c {
-            Child::Ent(e) => t.ents[e].name == OsStr::new("HEAD"),
-            Child::Dir(_) => false,
-        });
-        let in_gitdir = t.dirs[d].in_gitdir;
-        let top = in_gitdir && (!pgit || (parea && has_head));
-        let area = in_gitdir && !top && ((ptop && name_in(&GIT_ADMIN_DIRS)) || parea);
-        let named = in_gitdir && (pnamed || (ptop && name_in(&GIT_REF_DIRS)));
-        t.dirs[d].git_top = top;
-        t.dirs[d].git_area = area;
-        t.dirs[d].git_named = named;
-        if psecret.is_some() {
-            t.dirs[d].secret_dir = psecret;
-        } else if pnamed || parea {
-            // A ref, worktree or submodule name: never a secret directory by name.
-        } else if let Some(kind) = t.dirs[d].name.to_str().and_then(|n| rules.secret_dir(n)) {
-            // A scan root with a secret directory name is a secret directory too. Inside a git
-            // directory it is not cut out (the git piece stays whole), but its entries are
-            // secret-in-git-dir, which makes the git piece incomplete.
-            t.dirs[d].secret_dir = Some(kind.to_string());
-            t.dirs[d].secret_top = !t.dirs[d].in_gitdir;
-        }
-        // A scan root inside a secret directory is the top of a secret piece of its own.
-        if parent.is_none() && t.dirs[d].secret_dir.is_some() {
-            t.dirs[d].secret_top = !t.dirs[d].in_gitdir;
-        }
+        place.apply(&mut t.dirs[d]);
+        // Where a secret piece starts: the topmost secret directory, or a scan root inside one
+        // (a root always starts its own pieces). Inside a git directory nothing is cut out (the
+        // git piece stays whole); its entries are secret-in-git-dir instead.
+        let parent_secret = t.dirs[d]
+            .parent
+            .map(|p| t.dirs[p].secret_dir.is_some())
+            .unwrap_or(false);
+        t.dirs[d].secret_top =
+            t.dirs[d].secret_dir.is_some() && !t.dirs[d].in_gitdir && !parent_secret;
     }
     for e in 0..t.ents.len() {
         let d = t.ents[e].dir;
         let dir = &t.dirs[d];
-        let parent_is_worktree_node = dir.is_node
-            && dir
-                .node
-                .and_then(|n| nodes.get(n))
-                .map(|n| n.class == Class::Worktree)
-                .unwrap_or(false);
-        let in_gitdir =
-            dir.in_gitdir || (parent_is_worktree_node && t.ents[e].name == OsStr::new(".git"));
+        // A `.git` file (a linked worktree's or submodule's pointer) belongs to git too.
+        let in_gitdir = dir.in_gitdir || t.ents[e].name.eq_ignore_ascii_case(".git");
         let in_artifact = dir.in_artifact;
         // Git's own bookkeeping names (refs, reflogs, packed-refs) are branch names.
         let git_named = in_gitdir
@@ -929,6 +1014,62 @@ impl<'a> Cutter<'a> {
         )
     }
 
+    /// The one place that decides, for every piece, whether it is secret and whether something
+    /// about where it lies keeps it from being judged whole. Every piece is pushed through here,
+    /// so no lane can remove a piece that:
+    /// - has secret context: it lies in a secret directory (outside a git directory) or holds a
+    ///   secret entry; the piece is secret;
+    /// - is not a `git-node` piece and lies in a git directory or holds a file of one: a git
+    ///   directory is handled only whole, as part of its repository, under the preserve
+    ///   obligation;
+    /// - is a `git-node` piece whose git directory holds a secret: the preserve obligation would
+    ///   back it up;
+    /// - cannot be written back exactly: its path or a member's name is not valid UTF-8;
+    /// - is on a platform without file identity.
+    fn verdict(
+        &self,
+        kind: PieceKind,
+        anchor: usize,
+        ents: &[usize],
+    ) -> (Option<String>, Option<String>) {
+        let a = &self.t.dirs[anchor];
+        let secret = if a.secret_dir.is_some() && !a.in_gitdir {
+            a.secret_dir.clone()
+        } else {
+            ents.iter().find_map(|&e| self.t.ents[e].secret.clone())
+        };
+        let why = if !a.exact || ents.iter().any(|&e| !self.t.ents[e].utf8) {
+            Some(
+                "its path or a member's name is not valid UTF-8, so it cannot be written back \
+                 exactly"
+                    .to_string(),
+            )
+        } else if kind != PieceKind::GitNode
+            && (a.in_gitdir || ents.iter().any(|&e| self.t.ents[e].in_gitdir))
+        {
+            Some(
+                "it lies inside a git directory, which is handled only whole, as part of its \
+                 repository; kept"
+                    .to_string(),
+            )
+        } else if let Some(&e) = ents
+            .iter()
+            .find(|&&e| kind == PieceKind::GitNode && self.t.ents[e].gitdir_secret)
+        {
+            let er = &self.t.ents[e];
+            Some(format!(
+                "its git directory holds the secret-named file {}, which the preserve obligation \
+                 would back up",
+                self.rel(anchor, er.dir, Some(&er.name))
+            ))
+        } else if !has_identity() {
+            Some(NO_IDENTITY.to_string())
+        } else {
+            None
+        };
+        (secret, why)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn push_piece(
         &mut self,
@@ -937,7 +1078,6 @@ impl<'a> Cutter<'a> {
         ents: &[usize],
         dirs_alloc: u64,
         excludes: Vec<String>,
-        secret: Option<String>,
         mut incomplete: Option<String>,
         key: usize,
     ) {
@@ -962,23 +1102,9 @@ impl<'a> Cutter<'a> {
         for &e in ents {
             self.t.ents[e].piece = id;
         }
-        // The choke point for every piece kind other than `git-node`: a git directory is handled
-        // only whole, as part of its repository's `git-node` piece under the preserve obligation
-        // (where a secret-named file makes that piece incomplete, in `collect`). So any other
-        // piece that lies in a git directory or holds a file of one (the piece of a scan root
-        // inside a git directory, secret-named or not) is incomplete, and kept.
-        if incomplete.is_none()
-            && kind != PieceKind::GitNode
-            && (self.t.dirs[anchor].in_gitdir || ents.iter().any(|&e| self.t.ents[e].in_gitdir))
-        {
-            incomplete = Some(
-                "it lies inside a git directory, which is handled only whole, as part of its \
-                 repository; kept"
-                    .to_string(),
-            );
-        }
-        if incomplete.is_none() && !has_identity() {
-            incomplete = Some(NO_IDENTITY.to_string());
+        let (secret, why) = self.verdict(kind, anchor, ents);
+        if incomplete.is_none() {
+            incomplete = why;
         }
         let node = self.t.dirs[anchor].node;
         let mut excludes = excludes;
@@ -1032,24 +1158,13 @@ impl<'a> Cutter<'a> {
                             r.boundary_ents.push(e);
                             continue;
                         }
-                        if ctx == Ctx::Git {
-                            if !er.ok || er.m.kind == b'o' || !er.utf8 {
-                                r.incomplete.get_or_insert_with(|| {
-                                    format!(
-                                        "{} is unreadable, a FIFO, socket or device file, or not a valid UTF-8 name",
-                                        self.rel(d, er.dir, Some(&er.name))
-                                    )
-                                });
-                            }
-                            if er.gitdir_secret {
-                                r.incomplete.get_or_insert_with(|| {
-                                    format!(
-                                        "its git directory holds the secret-named file {}, which the \
-                                         preserve obligation would back up",
-                                        self.rel(d, er.dir, Some(&er.name))
-                                    )
-                                });
-                            }
+                        if ctx == Ctx::Git && (!er.ok || er.m.kind == b'o' || !er.utf8) {
+                            r.incomplete.get_or_insert_with(|| {
+                                format!(
+                                    "{} is unreadable, a FIFO, socket or device file, or not a valid UTF-8 name",
+                                    self.rel(d, er.dir, Some(&er.name))
+                                )
+                            });
                         }
                         r.ents.push(e);
                     }
@@ -1110,8 +1225,7 @@ impl<'a> Cutter<'a> {
                 Task::Boundary(d) => self.boundary(d, &dir_key, &mut tasks),
                 Task::Ent(e) => {
                     let er = &self.t.ents[e];
-                    let secret = er.secret.clone();
-                    let incomplete = if secret.is_some() {
+                    let incomplete = if er.secret.is_some() {
                         None
                     } else if !er.ok {
                         Some("its metadata could not be read".to_string())
@@ -1127,16 +1241,7 @@ impl<'a> Cutter<'a> {
                     };
                     let d = er.dir;
                     let key = dir_key.get(&d).copied().unwrap_or(0);
-                    self.push_piece(
-                        PieceKind::Files,
-                        d,
-                        &[e],
-                        0,
-                        Vec::new(),
-                        secret,
-                        incomplete,
-                        key,
-                    );
+                    self.push_piece(PieceKind::Files, d, &[e], 0, Vec::new(), incomplete, key);
                 }
             }
         }
@@ -1166,7 +1271,6 @@ impl<'a> Cutter<'a> {
                 r.dirs_alloc,
                 r.excludes.clone(),
                 None,
-                None,
                 key,
             );
             self.queue_boundaries(&r, tasks);
@@ -1191,7 +1295,7 @@ impl<'a> Cutter<'a> {
                         && !self.fits(batch_bytes.saturating_add(len), batch.len() as u64 + 1)
                     {
                         let ents = std::mem::take(&mut batch);
-                        self.push_piece(PieceKind::Files, d, &ents, 0, Vec::new(), None, None, key);
+                        self.push_piece(PieceKind::Files, d, &ents, 0, Vec::new(), None, key);
                         batch_bytes = 0;
                     }
                     batch.push(e);
@@ -1210,7 +1314,7 @@ impl<'a> Cutter<'a> {
             }
         }
         if !batch.is_empty() {
-            self.push_piece(PieceKind::Files, d, &batch, 0, Vec::new(), None, None, key);
+            self.push_piece(PieceKind::Files, d, &batch, 0, Vec::new(), None, key);
         }
         for t in later.into_iter().rev() {
             tasks.push(t);
@@ -1224,7 +1328,6 @@ impl<'a> Cutter<'a> {
             return;
         }
         if dr.secret_top {
-            let kind = dr.secret_dir.clone();
             let r = self.collect(d, Ctx::Normal, true);
             self.push_piece(
                 PieceKind::Tree,
@@ -1232,7 +1335,6 @@ impl<'a> Cutter<'a> {
                 &r.ents,
                 r.dirs_alloc,
                 r.excludes.clone(),
-                kind,
                 None,
                 key,
             );
@@ -1248,7 +1350,6 @@ impl<'a> Cutter<'a> {
                     &r.ents,
                     r.dirs_alloc,
                     r.excludes.clone(),
-                    None,
                     r.incomplete.clone(),
                     key,
                 );
@@ -1274,7 +1375,6 @@ impl<'a> Cutter<'a> {
             &r.ents,
             r.dirs_alloc,
             r.excludes.clone(),
-            None,
             Some(why.to_string()),
             key,
         );

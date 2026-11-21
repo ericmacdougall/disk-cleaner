@@ -2038,3 +2038,345 @@ fn neg12_another_scan_root_inside_a_git_directory_makes_it_incomplete() {
         }
     }
 }
+
+// ----------------------------------------------------------------------------------------------
+// The class guard for context by location (PR review a2-3, F1-F3, and every earlier instance:
+// CI3 F1/F2, CI4 F4/F5, PR3 F1, the .git root case). Layouts are composed from a context kind
+// placed at an ancestor of the scan root, at the root itself, behind a symlink alias that is the
+// root, below the root, and as a retained inner root; each is scanned with the real scan and
+// `--lanes`, and checked against an oracle that reads only the disk.
+
+/// A directory that gives what lies below it a context.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    /// No context: the control, which must give removing pieces.
+    Plain,
+    Secrets,
+    Aws,
+    /// A repository's `.git`.
+    DotGit,
+    /// A bare repository.
+    Bare,
+    /// A `.git` inside an opaque artifact (`node_modules/dep/.git`): never a git node.
+    ArtifactGit,
+    /// A directory named `.GIT`, with nothing in it: the name in another case (a git directory on
+    /// a case-insensitive volume) is enough.
+    UpperGit,
+    /// A component that is not valid UTF-8 (Linux only: macOS file systems refuse such names).
+    Invalid,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pos {
+    /// The scan root is a directory inside the context directory.
+    Ancestor,
+    /// The scan root is the context directory.
+    Root,
+    /// The scan root is an ordinary-named symlink to the context directory.
+    Alias,
+    /// The context directory is below the scan root.
+    Descendant,
+}
+
+/// Make the context directory of `kind` under `base` and return it.
+#[cfg(unix)]
+fn make_context(base: &Path, kind: Kind) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let d = match kind {
+        Kind::Plain => base.join("plain"),
+        Kind::Secrets => base.join("secrets"),
+        Kind::Aws => base.join(".aws"),
+        Kind::DotGit => {
+            init_repo(&base.join("repo"));
+            base.join("repo").join(".git")
+        }
+        Kind::Bare => {
+            init_bare(&base.join("bare.git"));
+            base.join("bare.git")
+        }
+        Kind::ArtifactGit => {
+            let proj = base.join("proj");
+            write(&proj.join("package.json"), "{}");
+            let dep = proj.join("node_modules").join("dep");
+            write(&dep.join("index.js"), "x");
+            init_repo(&dep);
+            dep.join(".git")
+        }
+        Kind::UpperGit => base.join("up").join(".GIT"),
+        Kind::Invalid => base.join(std::ffi::OsStr::from_bytes(b"bad\xffdir")),
+    };
+    fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Files that tempt every lane: two equal copies (hashing), a file in a subdirectory, and a
+/// subtree of empty directories (a piece with no file members).
+#[cfg(unix)]
+fn fill(dir: &Path) {
+    write_bytes(&dir.join("a.bin"), 100 * KIB);
+    write_bytes(&dir.join("b.bin"), 100 * KIB);
+    write_bytes(&dir.join("sub").join("c.bin"), 100 * KIB);
+    write(&dir.join("notes.txt"), "n");
+    fs::create_dir_all(dir.join("hollow").join("deeper")).unwrap();
+}
+
+/// Is any directory at or above `p` (as spelled, and as real) a secret directory by name?
+#[cfg(unix)]
+fn oracle_secret(p: &Path) -> bool {
+    let rules = RuleSet::builtin();
+    let real = p
+        .parent()
+        .and_then(|d| fs::canonicalize(d).ok())
+        .unwrap_or_default();
+    [p.parent().unwrap_or(p).to_path_buf(), real]
+        .iter()
+        .any(|q| {
+            q.components().any(|c| {
+                c.as_os_str()
+                    .to_str()
+                    .map(|n| rules.secret_dir(n).is_some())
+                    .unwrap_or(false)
+            })
+        })
+}
+
+/// Is `dir`, or any directory above it on its real path, a git directory on disk (named `.git`
+/// in any case, or holding HEAD, objects and refs)?
+#[cfg(unix)]
+fn oracle_in_gitdir(dir: &Path) -> bool {
+    let real = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    real.ancestors().any(|a| {
+        let is = |n: &str, d: bool| {
+            fs::symlink_metadata(a.join(n))
+                .map(|m| if d { m.is_dir() } else { m.is_file() })
+                .unwrap_or(false)
+        };
+        a.file_name()
+            .map(|n| n.eq_ignore_ascii_case(".git"))
+            .unwrap_or(false)
+            || (is("HEAD", false) && is("objects", true) && is("refs", true))
+    })
+}
+
+/// The three invariants, over every removing plan piece and every blob. Returns every violation
+/// (so one run shows every layout that fails, not only the first).
+#[cfg(unix)]
+fn location_violations(label: &str, res: &ScanResult, p: &Plan) -> Vec<String> {
+    let mut v = Vec::new();
+    let survey = res.pieces.as_ref().unwrap();
+    let l = lanes_of(p);
+    for lp in l.pieces.iter().filter(|lp| lp.lane.removes()) {
+        let sp = &survey.pieces[lp.scan_piece];
+        let anchor = Path::new(&sp.path);
+        // A removing piece identifies its files exactly: its path and every member read back.
+        if sp.path.contains('\u{FFFD}') || fs::symlink_metadata(anchor).is_err() {
+            v.push(format!(
+                "{label}: removing piece {} has a path that does not read back: {}",
+                lp.id, sp.path
+            ));
+            continue;
+        }
+        if sp.kind != disk_cleaner_core::PieceKind::GitNode && oracle_in_gitdir(anchor) {
+            v.push(format!(
+                "{label}: removing {:?} piece {} lies inside a git directory: {}",
+                sp.kind, lp.id, sp.path
+            ));
+        }
+        // The anchor itself, so a piece with no file members (empty directories only) counts.
+        if oracle_secret(&anchor.join("_")) {
+            v.push(format!(
+                "{label}: removing {:?} piece {} is in a secret directory: {}",
+                sp.kind, lp.id, sp.path
+            ));
+        }
+        for m in &sp.members {
+            if lp.moved_out.iter().any(|x| x == m.path()) {
+                continue;
+            }
+            let full = anchor.join(m.path());
+            if fs::symlink_metadata(&full).is_err() {
+                v.push(format!(
+                    "{label}: member {} does not read back",
+                    full.display()
+                ));
+            }
+            if oracle_secret(&full) {
+                v.push(format!(
+                    "{label}: {} is in a secret directory and in removing piece {} ({:?})",
+                    full.display(),
+                    lp.id,
+                    lp.lane
+                ));
+            }
+            if sp.kind != disk_cleaner_core::PieceKind::GitNode
+                && oracle_in_gitdir(full.parent().unwrap())
+            {
+                v.push(format!(
+                    "{label}: {} is inside a git directory and in removing piece {}",
+                    full.display(),
+                    lp.id
+                ));
+            }
+        }
+    }
+    // The survey contract, whatever lane a piece gets: a piece anchored in a secret directory
+    // (outside a git directory) is marked secret, empty or not.
+    for (i, sp) in survey.pieces.iter().enumerate() {
+        let anchor = Path::new(&sp.path);
+        if sp.secret.is_none()
+            && fs::symlink_metadata(anchor).is_ok()
+            && oracle_secret(&anchor.join("_"))
+            && !oracle_in_gitdir(anchor)
+        {
+            v.push(format!(
+                "{label}: survey piece {i} is in a secret directory but not marked secret: {}",
+                sp.path
+            ));
+        }
+    }
+    for b in &survey.blobs {
+        for c in &b.copies {
+            if oracle_secret(Path::new(&c.path)) {
+                v.push(format!(
+                    "{label}: {} is in a secret directory and was hashed",
+                    c.path
+                ));
+            }
+        }
+    }
+    v
+}
+
+/// The real scan with `--lanes` of `roots`, without the fixture-age wait (the caller waits once).
+#[cfg(unix)]
+fn scan_now(roots: &[PathBuf]) -> ScanResult {
+    let mut opts = ScanOptions::new(roots.to_vec());
+    opts.facts = network_everywhere();
+    opts.git_jobs = 2;
+    opts.lanes = Some(PieceOptions::default());
+    scan(&opts).expect("scan")
+}
+
+#[cfg(unix)]
+#[test]
+fn guard_context_follows_location_over_composed_layouts() {
+    let mut kinds = vec![
+        Kind::Plain,
+        Kind::Secrets,
+        Kind::Aws,
+        Kind::DotGit,
+        Kind::Bare,
+        Kind::ArtifactGit,
+        Kind::UpperGit,
+    ];
+    if cfg!(target_os = "linux") {
+        kinds.push(Kind::Invalid);
+    }
+    let positions = [Pos::Ancestor, Pos::Root, Pos::Alias, Pos::Descendant];
+    let tmp = tempfile::tempdir().unwrap();
+    let top = fs::canonicalize(tmp.path()).unwrap();
+    // Build every layout first, then wait once so that every fixture predates the walks.
+    let mut cases: Vec<(String, Kind, Pos, PathBuf, PathBuf)> = Vec::new();
+    for &kind in &kinds {
+        for &pos in &positions {
+            let base = top.join(format!("{kind:?}-{pos:?}"));
+            fs::create_dir_all(&base).unwrap();
+            let ctx = make_context(&base, kind);
+            let (root, inner) = match pos {
+                Pos::Ancestor => {
+                    let inner = ctx.join("inner");
+                    fill(&inner);
+                    (inner.clone(), inner)
+                }
+                Pos::Root => {
+                    fill(&ctx);
+                    (ctx.clone(), ctx.join("sub"))
+                }
+                Pos::Alias => {
+                    fill(&ctx);
+                    let alias = base.join("alias");
+                    std::os::unix::fs::symlink(&ctx, &alias).unwrap();
+                    (alias, ctx.join("sub"))
+                }
+                Pos::Descendant => {
+                    fill(&ctx);
+                    // A control file outside the context, so the scan has removable work.
+                    write_bytes(&base.join("loose").join("z.bin"), 10 * KIB);
+                    (base.clone(), ctx.join("sub"))
+                }
+            };
+            cases.push((format!("{kind:?} at {pos:?}"), kind, pos, root, inner));
+        }
+    }
+    // A secret directory holding only empty directories: its piece has no file member, so only
+    // the directory's own context makes it secret.
+    let base = top.join("EmptySecrets");
+    fs::create_dir_all(base.join("secrets").join("hollow").join("deeper")).unwrap();
+    write_bytes(&base.join("loose").join("z.bin"), 10 * KIB);
+    cases.push((
+        "empty Secrets below the root".to_string(),
+        Kind::Secrets,
+        Pos::Root,
+        base.clone(),
+        base.join("secrets"),
+    ));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let mut violations: Vec<String> = Vec::new();
+    for (label, kind, pos, root, inner) in &cases {
+        let res = scan_now(std::slice::from_ref(root));
+        let p = plan(&res, &idle_opts());
+        violations.extend(location_violations(label, &res, &p));
+        // Not vacuous: without context the same layout gives removing pieces.
+        if *kind == Kind::Plain {
+            let removing = lanes_of(&p)
+                .pieces
+                .iter()
+                .filter(|lp| lp.lane.removes())
+                .count();
+            assert!(removing > 0, "{label}: the control removes nothing");
+        }
+        // A retained inner root inside the context, in both root orders (the outer walk does not
+        // enter it, as for a mount under --one-file-system).
+        if *pos == Pos::Descendant {
+            for roots in [
+                vec![root.clone(), inner.clone()],
+                vec![inner.clone(), root.clone()],
+            ] {
+                let nested = with_survey(res.clone(), &roots);
+                let np = plan(&nested, &idle_opts());
+                let order = if roots[0] == *root {
+                    "outer first"
+                } else {
+                    "inner first"
+                };
+                violations.extend(location_violations(
+                    &format!("{label}, nested root, {order}"),
+                    &nested,
+                    &np,
+                ));
+            }
+        }
+    }
+    // One line per failing layout and invariant (the first example of each).
+    let mut seen = BTreeSet::new();
+    let summary: Vec<&String> = violations
+        .iter()
+        .filter(|v| {
+            let key = v.split(": ").next().unwrap_or("").to_string()
+                + v.split(" is ").nth(1).unwrap_or("").get(..20).unwrap_or("");
+            seen.insert(key)
+        })
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "{} violations; by layout:\n{}",
+        violations.len(),
+        summary
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
