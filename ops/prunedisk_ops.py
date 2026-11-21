@@ -59,6 +59,7 @@ GSAFE = ["-c", "core.fsmonitor=false", "-c", "gc.auto=0", "-c", "maintenance.aut
 NET = re.compile(r"^(https?://|ssh://|git@)")
 C = {}
 NOW = time.time()
+GH = shutil.which("gh") or os.path.expanduser("~/.local/bin/gh")
 
 
 class ProbeError(Exception):
@@ -171,6 +172,10 @@ def jload(name, default=None):
         return json.load(f)
 
 
+import threading, concurrent.futures
+LEDGER_LOCK = threading.Lock()
+
+
 def ledger(rec):
     for k in ("url", "repo_url"):
         if rec.get(k):
@@ -178,7 +183,7 @@ def ledger(rec):
     rec.setdefault("at", time.strftime("%Y-%m-%dT%H:%M:%S%z"))
     rec.setdefault("ts", time.time())
     rec.setdefault("host", C["host"])
-    with open(os.path.join(C["state"], "ledger.jsonl"), "a") as f:
+    with LEDGER_LOCK, open(os.path.join(C["state"], "ledger.jsonl"), "a") as f:
         f.write(json.dumps(rec, sort_keys=True) + "\n")
 
 
@@ -898,7 +903,7 @@ VIS = {}
 def visibility(url):
     if url not in VIS:
         m = re.search(r"github\.com[:/]([^/]+/[^/\s]+?)(\.git)?/?$", url)
-        v = run(["gh", "repo", "view", m.group(1), "--json", "visibility", "-q", ".visibility"])[1].strip() if m else ""
+        v = run([GH, "repo", "view", m.group(1), "--json", "visibility", "-q", ".visibility"])[1].strip() if m else ""
         VIS[url] = v or C["visibility_default"]
     return VIS[url]
 
@@ -1211,8 +1216,10 @@ def cmd_backup(a):
                 continue
             g = uidx.of(p) or os.path.join(C["home"], "/".join(rel(p).split("/")[:2]))
             groups.setdefault(g, []).append(p)
-    for g, members in sorted(groups.items()):
-        go("logs", sorted(members), "%s/logs/%s.tar.zst" % (pre, keyname(g)), C["home"], {"group": rel(g), "repo_url": owner_url(g)})
+    # independent archives: upload in parallel (each has its own temp dir; ledger writes are locked)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=C.get("upload_workers", 8)) as ex:
+        list(ex.map(lambda gm: go("logs", sorted(gm[1]), "%s/logs/%s.tar.zst" % (pre, keyname(gm[0])), C["home"],
+                                  {"group": rel(gm[0]), "repo_url": owner_url(gm[0])}), sorted(groups.items())))
     # 2. media not recoverable from a secured repo, deduplicated by content (duplicates listed in the index)
     seen, mgroups, dups, hstat = {}, {}, {}, {}
     tracked_cache = {}
@@ -1238,14 +1245,17 @@ def cmd_backup(a):
                 dups.setdefault(seen[h], []).append(p); continue
             seen[h] = p
             mgroups.setdefault(uidx.of(p) or os.path.join(C["home"], "/".join(rel(p).split("/")[:2])), []).append(p)
+    media_jobs = []
     for g, members in sorted(mgroups.items()):
         extra_index = []
         for o in members:
             for d in dups.get(o, []):
                 size, mtime = hstat[d]  # stat taken at hash time, so a later rewrite no longer matches this row
                 extra_index.append({"path": o, "dup_path": d, "type": "dup", "size": size, "mtime": mtime})
-        go("media", sorted(members), "%s/media/%s.tar.zst" % (pre, keyname(g)), C["home"],
-           {"group": rel(g), "repo_url": owner_url(g)}, extra_index)
+        media_jobs.append(("media", sorted(members), "%s/media/%s.tar.zst" % (pre, keyname(g)), C["home"],
+                           {"group": rel(g), "repo_url": owner_url(g)}, extra_index))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=C.get("upload_workers", 8)) as ex:
+        list(ex.map(lambda j: go(*j), media_jobs))
     jdump({"media_unique": len(seen), "media_dups": sum(len(v) for v in dups.values())}, "media-dedupe.json")
     jdump({"groups": sorted({rel(g) for g in groups} | {rel(g) for g in mgroups})}, "expected-groups.json")
     # 3. residue of each wipe unit
