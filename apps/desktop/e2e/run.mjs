@@ -338,11 +338,11 @@ try {
 
     await setWindow(10);
     await save();
-    await app.s.until("return !!document.querySelector('#panel [role=alertdialog]')", 15_000);
+    await app.s.until("return !!document.querySelector('[role=alertdialog]')", 15_000);
     const onOpen = await active();
     if (!onOpen?.text?.startsWith("Keep 30")) throw new Error(`focus when the question opens: ${JSON.stringify(onOpen)}`);
     await app.s.keys(KEY.escape);
-    await app.s.until("return !document.querySelector('#panel [role=alertdialog]')", 10_000);
+    await app.s.until("return !document.querySelector('[role=alertdialog]')", 10_000);
     steps.escape = await message();
     const afterEscape = await active();
     if (afterEscape?.id !== "set-window") throw new Error(`focus after Escape: ${JSON.stringify(afterEscape)}`);
@@ -350,14 +350,14 @@ try {
     if (saved.value?.core?.active_window_days !== 30) throw new Error(`after Escape: ${JSON.stringify(saved)}`);
 
     await save();
-    await app.s.until("return !!document.querySelector('#panel [role=alertdialog]')", 15_000);
-    await app.s.clickText("Keep 30 days", "#panel [role=alertdialog] button");
-    await app.s.until("return !document.querySelector('#panel [role=alertdialog]')", 10_000);
+    await app.s.until("return !!document.querySelector('[role=alertdialog]')", 15_000);
+    await app.s.clickText("Keep 30 days", "[role=alertdialog] button");
+    await app.s.until("return !document.querySelector('[role=alertdialog]')", 10_000);
     steps.keep = await message();
 
     await save();
-    await app.s.until("return !!document.querySelector('#panel [role=alertdialog]')", 15_000);
-    await app.s.clickText("Shorten to 10 days", "#panel [role=alertdialog] button");
+    await app.s.until("return !!document.querySelector('[role=alertdialog]')", 15_000);
+    await app.s.clickText("Shorten to 10 days", "[role=alertdialog] button");
     await app.s.until("const t = document.querySelector('#panel .message')?.textContent ?? ''; return t.startsWith('Saved') || t.startsWith('Plan settings saved') ? t : null;", 30_000);
     steps.shorten = await message();
     if (steps.escape !== "Not saved: the active window was kept." || steps.keep !== steps.escape) throw new Error(JSON.stringify(steps));
@@ -365,6 +365,47 @@ try {
     if (saved.value?.core?.active_window_days !== 10) throw new Error(`after Shorten: ${JSON.stringify(saved)}`);
     steps.activeWindowDays = 10;
     return steps;
+  });
+
+  // The shorten question is modal (PR gate F8): Tab and Shift+Tab never leave it, nothing behind
+  // it takes a click, and it leaves nothing inert behind once answered.
+  await run.check("settings.confirm_focus_contained", async () => {
+    await app.s.exec(
+      `const i = document.getElementById('set-window'); i.value = '5'; i.dispatchEvent(new Event('input', { bubbles: true }));`,
+    );
+    await app.s.clickText("Save", "#panel form button");
+    await app.s.until("return !!document.querySelector('[role=alertdialog]')", 15_000);
+    const inside = () => app.s.exec("const d = document.querySelector('[role=alertdialog]'); return !!d && d.contains(document.activeElement);");
+    const seen = [];
+    for (let i = 0; i < 6; i++) {
+      await app.s.keys(KEY.tab);
+      seen.push((await active())?.text ?? null);
+      if (!(await inside())) throw new Error(`Tab ${i + 1} left the question: ${JSON.stringify(seen)}`);
+    }
+    for (let i = 0; i < 6; i++) {
+      await app.s.chord(KEY.shift, KEY.tab);
+      seen.push((await active())?.text ?? null);
+      if (!(await inside())) throw new Error(`Shift+Tab ${i + 1} left the question: ${JSON.stringify(seen)}`);
+    }
+    // A click on New scan behind the question must do nothing (it is inert).
+    const before = await state();
+    try {
+      await app.s.clickText("New scan");
+    } catch {
+      // A driver may refuse to click an element it cannot reach; either way nothing happens.
+    }
+    await new Promise((r) => setTimeout(r, 500));
+    const after = await state();
+    if (!(await app.s.exec("return !!document.querySelector('[role=alertdialog]')"))) throw new Error("the question closed on a click behind it");
+    if (after.view !== before.view || after.state !== before.state) throw new Error(`a click behind the question acted: ${JSON.stringify(after)}`);
+    if (!(await inside())) throw new Error("focus left the question after a click behind it");
+    await app.s.keys(KEY.escape);
+    await app.s.until("return !document.querySelector('[role=alertdialog]')", 10_000);
+    const leftInert = await app.s.exec("return document.querySelectorAll('[inert]').length");
+    if (leftInert !== 0) throw new Error(`${leftInert} elements left inert`);
+    const saved = await app.invoke("get_settings");
+    if (saved.value?.core?.active_window_days !== 10) throw new Error(`after Escape: ${JSON.stringify(saved)}`);
+    return { tabCycle: seen };
   });
 
   await run.check("flow.export_plan", async () => {

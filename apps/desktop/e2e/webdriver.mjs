@@ -153,6 +153,17 @@ export class Session {
     return this.cmd("POST", "/actions", { actions: [{ type: "key", id: "keyboard", actions }] });
   }
 
+  /** Press `key` while `modifier` is held (e.g. Shift+Tab). */
+  chord(modifier, key) {
+    const actions = [
+      { type: "keyDown", value: modifier },
+      { type: "keyDown", value: key },
+      { type: "keyUp", value: key },
+      { type: "keyUp", value: modifier },
+    ];
+    return this.cmd("POST", "/actions", { actions: [{ type: "key", id: "keyboard", actions }] });
+  }
+
   /** Wait until `body` (a sync script) returns a truthy value; return it. */
   async until(body, timeoutMs = 30_000, ...args) {
     const end = Date.now() + timeoutMs;

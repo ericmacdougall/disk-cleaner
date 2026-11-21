@@ -90,6 +90,9 @@ jobs:
         run: scripts/check-readonly.sh
       - name: Planted-violation controls (each must be caught)
         run: scripts/check-readonly.sh --controls
+      - name: The end-to-end write observer fails on any undeclared write (PR gate F10)
+        working-directory: apps/desktop
+        run: python3 -m unittest -v e2e/test_trace_report.py
 
   ui-crates:
     name: view and tui (${{ matrix.os }})
@@ -386,6 +389,8 @@ jobs:
           path: |
             ${{ runner.temp }}/e2e/*.json
             ${{ runner.temp }}/e2e/*.txt
+            ${{ runner.temp }}/e2e/idle-release/*.txt
+            ${{ runner.temp }}/e2e/idle-release/*.log
             ${{ runner.temp }}/e2e/inputs/
             !${{ runner.temp }}/e2e/before.json
             !${{ runner.temp }}/e2e/after.json

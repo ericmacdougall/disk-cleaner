@@ -3,7 +3,7 @@ name: e2e-variants
 # Broken variants for the end-to-end checks (PR gate F1). Each job applies one patch from
 # apps/desktop/e2e/variants/, runs the suite, and passes only when the check written for that
 # guarantee fails (e2e/expect_variant.py). The unpatched suite is desktop.yml's end-to-end
-# job. Four extra release builds, so this runs on e2e-variants/** branches and by hand only.
+# job. Extra release builds, one per variant, so this runs on e2e-variants/** branches and by hand only.
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [planted-write, offered-check-removed, capability-broadened, focus-broken]
+        variant: [planted-write, planted-outside, offered-check-removed, capability-broadened, focus-broken, modal-trap-removed]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Apply the broken variant

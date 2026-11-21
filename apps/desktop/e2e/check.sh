@@ -67,9 +67,26 @@ echo "== fixture (seed 16452)"
 "$CLI_BIN" scan --no-git --out "$(native "$INPUTS/valid-scan.json")" "$(native "$FIX")" > /dev/null
 printf '{"version": 1, "roots": ["unterminated' > "$INPUTS/malformed-scan.json"
 
+idle=0
 if [ "$RELEASE_BIN" != none ]; then
   echo "== probe: the release binary as shipped"
-  node e2e/probe.mjs --app "$(native "$RELEASE_BIN")" --out "$OUT/probe-release.json" || echo "probe of the release binary failed (see $OUT/probe-release.json)"
+  # In a sandbox of its own, so not even the probe writes to the runner's real home folders.
+  PSB="$OUT/probe-sandbox"
+  rm -rf "$PSB"; mkdir -p "$PSB/home" "$PSB/config" "$PSB/data" "$PSB/cache" "$PSB/state" "$PSB/tmp" "$PSB/appdata"
+  if $win; then
+    APPDATA=$(native "$PSB/appdata") node e2e/probe.mjs --app "$(native "$RELEASE_BIN")" --out "$OUT/probe-release.json" || echo "probe of the release binary failed (see $OUT/probe-release.json)"
+  else
+    HOME="$PSB/home" XDG_CONFIG_HOME="$PSB/config" XDG_DATA_HOME="$PSB/data" XDG_CACHE_HOME="$PSB/cache" \
+      XDG_STATE_HOME="$PSB/state" TMPDIR="$PSB/tmp" \
+      node e2e/probe.mjs --app "$RELEASE_BIN" --out "$OUT/probe-release.json" || echo "probe of the release binary failed (see $OUT/probe-release.json)"
+    # PR gate F10: what the shipped config itself writes, idle, under the write observer.
+    echo "== idle launch of the release binary (shipped config) under the write observer"
+    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+      bash e2e/idle-launch.sh "$RELEASE_BIN" "$OUT/idle-release" || idle=$?
+    else
+      dbus-run-session -- bash e2e/idle-launch.sh "$RELEASE_BIN" "$OUT/idle-release" || idle=$?
+    fi
+  fi
 fi
 
 if $win; then
@@ -83,21 +100,28 @@ if $win; then
   APP="$E2E_BIN"
 else
   ROOTS=("$FIX" "$SB")
-  # On Linux the e2e binary runs with incognito off, so the webview keeps its data in the
-  # sandbox's data and cache folders.
-  # The graphics driver (Mesa) keeps its shader cache in XDG_CACHE_HOME for any program that
-  # draws with it, the shipped app included (docs/DESKTOP.md).
+  RUNTIME=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+  # One list for both observers (the manifest watches the roots; the trace sees every path):
+  # - core's config folder: config.toml, its .bak and .lock, and the temp files of a save;
+  # - the export the suite asks for;
+  # - the e2e build's webview profile: incognito is off for WebKitWebDriver, so the webview
+  #   keeps its data in the sandbox's data and cache folders (docs/DESKTOP.md);
+  # - Mesa's shader cache, written for any program that draws with Mesa (docs/DESKTOP.md);
+  # - GLib's dconf flag file, opened read-write in the runtime folder (a memory file system).
   DECLARED=(--declared "$SB/config/disk-cleaner" --declared "$SB/home/exports/plan.json"
-    --declared "$SB/data/$ID" --declared "$SB/cache/$ID" --declared "$SB/cache/mesa_shader_cache")
+    --declared "$SB/data/$ID" --declared "$SB/cache/$ID" --declared "$SB/cache/mesa_shader_cache"
+    --declared "$RUNTIME/dconf/user")
+  TRACE_IGNORE=(--ignore /dev/null)
   BIG=/usr
   APP="$OUT/app-traced.sh"
+  rm -rf "$OUT/trace"
   mkdir -p "$OUT/trace"
+  CALLS=$("$PY" e2e/trace_report.py --strace-calls)
+  # Every launch of the app (the suite starts several) writes its own log: strace.<pid>.log.
   cat > "$APP" << EOF
 #!/bin/sh
 export HOME="$SB/home" XDG_CONFIG_HOME="$SB/config" XDG_DATA_HOME="$SB/data" XDG_CACHE_HOME="$SB/cache" XDG_STATE_HOME="$SB/state" TMPDIR="$SB/tmp"
-exec strace -f -qq --seccomp-bpf -o "$OUT/trace/strace.log" -e status=successful \
-  -e trace=open,openat,openat2,creat,mkdir,mkdirat,rename,renameat,renameat2,link,linkat,symlink,symlinkat,unlink,unlinkat,rmdir,truncate,chmod,fchmodat,chown,lchown,fchownat,utimensat,utimes,utime \
-  "$E2E_BIN" "\$@"
+exec strace -f -qq --seccomp-bpf -y -o "$OUT/trace/strace.\$\$.log" -e "trace=$CALLS" "$E2E_BIN" "\$@"
 EOF
   chmod +x "$APP"
 fi
@@ -122,12 +146,16 @@ echo "== snapshot after and compare"
 nowrite=0
 "$PY" e2e/manifest.py compare "$OUT/before.json" "$OUT/after.json" "${DECLARED[@]}" | tee "$OUT/manifest.txt" || nowrite=$?
 
+trace=0
 if ! $win; then
-  echo "== trace (report only)"
-  "$PY" e2e/trace_report.py "$OUT/trace/strace.log" "${DECLARED[@]}" \
-    --ignore /dev/ --ignore /proc/ --ignore /sys/ --ignore /run/user/ > "$OUT/trace.txt" || true
-  grep -E '^(OTHER|trace:)' "$OUT/trace.txt" || true
+  # PR gate F10: the write observer is a gate. Any write it cannot place inside a declared
+  # path, anywhere on the machine, fails the check.
+  echo "== trace: every write of the app and its child processes"
+  logs=("$OUT"/trace/strace.*.log)
+  echo "trace logs: ${#logs[@]} (one per launch)"
+  "$PY" e2e/trace_report.py "${logs[@]}" "${DECLARED[@]}" "${TRACE_IGNORE[@]}" > "$OUT/trace.txt" || trace=$?
+  { grep -E '^(OTHER|UNRESOLVED|UNOBSERVABLE|UNPARSED|trace:)' "$OUT/trace.txt" | head -200; } || true
 fi
 
-echo "suite exit $status, no-write exit $nowrite"
-[ "$status" = 0 ] && [ "$nowrite" = 0 ]
+echo "suite exit $status, no-write exit $nowrite, trace exit $trace, idle-launch exit $idle"
+[ "$status" = 0 ] && [ "$nowrite" = 0 ] && [ "$trace" = 0 ] && [ "$idle" = 0 ]
