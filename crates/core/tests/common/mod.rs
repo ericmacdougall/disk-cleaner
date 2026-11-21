@@ -137,12 +137,41 @@ pub fn write_bytes(path: &Path, len: usize) {
     fs::write(path, vec![7u8; len]).unwrap();
 }
 
+/// `p` as the scan records it: its real path on Unix (macOS spells the temporary directory
+/// through the /var symlink), as given elsewhere. Windows' real-path form (`\\?\C:\...`) is
+/// not one git accepts in a remote URL, and the scan does not resolve roots there.
+pub fn scan_spelling(p: &Path) -> PathBuf {
+    if cfg!(unix) {
+        fs::canonicalize(p).unwrap()
+    } else {
+        p.to_path_buf()
+    }
+}
+
+/// A temporary directory whose `path()` is the one the scan records ([`scan_spelling`]), so
+/// fixtures built under it compare equal to scan output on every system.
+pub struct RealTemp {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl RealTemp {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub fn real_tempdir() -> RealTemp {
+    let dir = tempfile::tempdir().unwrap();
+    let path = scan_spelling(dir.path());
+    RealTemp { _dir: dir, path }
+}
+
 /// Scan root and remote live side by side so the remote is not part of the scan.
 pub fn workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
-    // The scan records real paths on Unix (macOS spells the temporary directory through the
-    // /var symlink), so the fixtures are built under the real path and compare equal to it.
-    let base = fs::canonicalize(tmp.path()).unwrap();
+    // Built under the path the scan records, so fixtures compare equal to it.
+    let base = scan_spelling(tmp.path());
     let scan_root = base.join("scan");
     let remotes = base.join("remotes");
     fs::create_dir_all(&scan_root).unwrap();

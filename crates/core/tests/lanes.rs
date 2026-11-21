@@ -927,7 +927,7 @@ fn dedup_copy_of_a_file_in_a_kept_repo_is_noise() {
 #[test]
 fn neg1_a_secret_directory_scanned_as_the_root_stays_secret() {
     for name in ["secrets", ".aws"] {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = real_tempdir();
         let root = tmp.path().join(name);
         write_bytes(&root.join("data.bin"), 100 * KIB);
         write_bytes(&root.join("sub").join("copy.bin"), 100 * KIB);

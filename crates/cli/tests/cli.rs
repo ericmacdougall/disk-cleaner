@@ -66,6 +66,30 @@ fn listing(dir: &Path) -> Vec<(PathBuf, u64)> {
     out
 }
 
+/// A temporary directory whose `path()` is the one the scan records: its real path on Unix
+/// (macOS spells the temporary directory through the /var symlink), as given elsewhere, where
+/// the scan does not resolve roots and git rejects Windows' `\\?\C:\...` form in a remote URL.
+struct RealTemp {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl RealTemp {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn real_tempdir() -> RealTemp {
+    let dir = tempfile::tempdir().unwrap();
+    let path = if cfg!(unix) {
+        fs::canonicalize(dir.path()).unwrap()
+    } else {
+        dir.path().to_path_buf()
+    };
+    RealTemp { _dir: dir, path }
+}
+
 fn far_future() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -76,7 +100,7 @@ fn far_future() -> String {
 
 #[test]
 fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("work dir");
     let repo = root.join("app");
     fs::create_dir_all(&repo).unwrap();
@@ -163,7 +187,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
 #[test]
 fn scan_json_on_stdout_and_unicode_paths_round_trip_into_the_plan() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("scan");
     let proj = root.join("café ☕").join("проект one");
     write(&proj.join("package.json"), "{}");
@@ -227,7 +251,7 @@ fn scan_json_on_stdout_and_unicode_paths_round_trip_into_the_plan() {
 
 #[test]
 fn active_flag_keeps_everything_under_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("scan");
     let proj = root.join("proj");
     write(&proj.join("package.json"), "{}");
@@ -355,7 +379,7 @@ fn nm_action(o: &Output, nm: &str) -> String {
 
 #[test]
 fn neg11_default_window_is_seven_days_and_a_shorter_one_changes_the_answer() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let (scan_file, nm) = scan_with_project_touched(tmp.path(), 6);
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
@@ -385,7 +409,7 @@ fn neg11_default_window_is_seven_days_and_a_shorter_one_changes_the_answer() {
 
 #[test]
 fn config_file_sets_the_window_and_the_flag_overrides_it() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let (scan_file, nm) = scan_with_project_touched(tmp.path(), 6);
     let home = tmp.path().join("home");
     let cfg = default_config_under(&home);
@@ -411,7 +435,7 @@ fn config_file_sets_the_window_and_the_flag_overrides_it() {
 
 #[test]
 fn neg12_malformed_config_is_an_error_never_a_silent_fallback() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let (scan_file, _nm) = scan_with_project_touched(tmp.path(), 6);
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
@@ -461,8 +485,8 @@ fn neg12_malformed_config_is_an_error_never_a_silent_fallback() {
     assert!(!o.status.success());
 }
 
-fn idle_fixture() -> (tempfile::TempDir, PathBuf, String, PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+fn idle_fixture() -> (RealTemp, PathBuf, String, PathBuf) {
+    let tmp = real_tempdir();
     let (scan_file, nm) = scan_with_project_touched(tmp.path(), 100);
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
@@ -534,7 +558,7 @@ fn f5_active_path_that_matches_nothing_scanned_is_an_error() {
 #[cfg(unix)]
 #[test]
 fn f16_control_characters_in_paths_are_escaped_in_human_output() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("scan");
     let proj = root.join("evil\u{1b}[31m\n  archive  FORGED-LINE");
     write(&proj.join("package.json"), "{}");
@@ -590,7 +614,7 @@ fn snapshot_git_state(repo: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 
 #[test]
 fn scan_with_git_enabled_leaves_the_index_refs_and_objects_byte_identical() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("scan");
     let repo = root.join("app");
     fs::create_dir_all(&repo).unwrap();
@@ -656,7 +680,7 @@ fn scan_with_git_enabled_leaves_the_index_refs_and_objects_byte_identical() {
 
 #[test]
 fn bad_scan_file_and_missing_root_fail_cleanly() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let f = tmp.path().join("scan.json");
     fs::write(&f, "{\"schema_version\": 99}").unwrap();
     let o = run(bin().args([
@@ -741,7 +765,7 @@ type Setup = Box<dyn Fn(&mut Command)>;
 
 #[test]
 fn g1_inherited_git_config_never_runs_a_filter_and_is_not_applied() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let t = tmp.path();
     let root = t.join("scan");
 
@@ -952,7 +976,7 @@ fn g1_inherited_git_config_never_runs_a_filter_and_is_not_applied() {
 /// the refusal must name the section and variable only.
 #[test]
 fn h1_credential_in_a_config_subsection_never_reaches_any_output() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("scan");
     let repo = root.join("app");
     fs::create_dir_all(&repo).unwrap();
@@ -1030,7 +1054,7 @@ fn h1_credential_in_a_config_subsection_never_reaches_any_output() {
 
 #[test]
 fn j4_trust_partial_process_check_flag_and_config_are_accepted_and_recorded() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let (scan_file, _nm) = scan_with_project_touched(tmp.path(), 30);
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
@@ -1077,7 +1101,7 @@ fn plan_exit(scan_json: &serde_json::Value, dir: &Path, name: &str) -> (Option<i
 
 #[test]
 fn l1_hostile_scan_files_are_a_clean_error_with_exit_code_1() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let (scan_file, _nm) = scan_with_project_touched(tmp.path(), 30);
     let v: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
@@ -1102,7 +1126,7 @@ fn l1_hostile_scan_files_are_a_clean_error_with_exit_code_1() {
 
 #[test]
 fn l1_changing_one_index_at_a_time_gives_an_error_or_a_plan_never_a_crash() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let (scan_file, _nm) = scan_with_project_touched(tmp.path(), 30);
     let v: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
@@ -1195,7 +1219,7 @@ fn assert_process_check_usable(plan: &serde_json::Value) {
 #[test]
 fn r1_t2_unreadable_folder_clone_asks_by_default_and_archives_when_accepted() {
     use std::os::unix::fs::PermissionsExt;
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("scan");
     let a = root.join("a");
     archivable_repo(&a);
@@ -1325,7 +1349,7 @@ fn r1_t2_unreadable_folder_clone_asks_by_default_and_archives_when_accepted() {
 
 #[test]
 fn r1_a_fully_readable_scan_is_complete_and_adds_no_coverage_sentence() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("scan");
     let a = root.join("a");
     archivable_repo(&a);
@@ -1361,7 +1385,7 @@ fn r1_a_fully_readable_scan_is_complete_and_adds_no_coverage_sentence() {
 
 #[test]
 fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("scan");
     let a = root.join("a");
     archivable_repo(&a);
@@ -1399,7 +1423,7 @@ fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
 /// (exit 1). The human plan says what "the manifest" is once, in its header.
 #[test]
 fn r15_object_data_is_backed_up_and_no_verification_is_accepted() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("scan");
     let a = root.join("a");
     archivable_repo(&a);
@@ -1502,7 +1526,7 @@ fn r15_object_data_is_backed_up_and_no_verification_is_accepted() {
 /// and exit 1, before the scan file is written; a directory alone still scans.
 #[test]
 fn ct_a2_a_scan_root_that_is_not_a_directory_is_refused() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let file = tmp.path().join("big.bin");
     fs::write(&file, vec![1u8; 64 * 1024]).unwrap();
     let mut roots = vec![("a regular file", file.clone())];
