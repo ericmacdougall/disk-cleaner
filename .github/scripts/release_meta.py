@@ -407,6 +407,8 @@ def package(dist, template_path, notes_out, tag, version, sha, bin_name, repo):
 def manual_cleanup(repo, identity):
     """What a maintainer does with a draft this run made and left in place. Nothing here removes it."""
     rid = identity.get("id")
+    if not (isinstance(repo, str) and REPO_RE.fullmatch(repo)):
+        repo = "<owner>/<repo>"
     if not isinstance(rid, int):
         return ("a draft this run created could not be identified here (its identity record is missing or "
                 "unreadable); it was left in place and nothing was deleted. Do not publish it. List the "
@@ -449,7 +451,7 @@ def load_identity(path):
         with open(path, encoding="utf-8") as f:
             identity = json.load(f)
         return identity if isinstance(identity, dict) else {}
-    except (OSError, ValueError):
+    except Exception:  # never raises: the caller reports with whatever is known
         return {}
 
 
@@ -465,12 +467,16 @@ def check_binding(tag, sha, remote="origin", cwd=None, after_create=False, repo=
     """The tag on the remote still points at the built commit. With after_create (a draft exists),
     every failure names the draft this run created and how to remove it by hand; the guard never
     deletes a release."""
-    validate_tag(tag)
-    validate_sha(sha)
     if after_create:
-        with draft_retained(validate_repo(repo or ""), load_identity(identity_path), summary):
+        # Everything, input checks included, runs inside the wrapper: a draft already exists.
+        with draft_retained(repo, load_identity(identity_path), summary):
+            validate_tag(tag)
+            validate_sha(sha)
+            validate_repo(repo or "")
             require_binding(tag, sha, remote, cwd, out)
         return
+    validate_tag(tag)
+    validate_sha(sha)
     try:
         require_binding(tag, sha, remote, cwd, out)
     except GuardError as e:

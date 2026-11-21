@@ -713,11 +713,72 @@ class TestBinding(unittest.TestCase):
         self.assertIn("not at the built commit", msg)  # the original reason
         self.assertIn("a draft this run created could not be identified here", msg)
         self.assertIn("List the releases for the tag", msg)  # and an unwritable summary did not mask it
+        broken = os.path.join(d, "broken-identity.json")
+        with open(broken, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        with self.assertRaises(rm.GuardError) as cm:
+            rm.check_binding("v0.1.0", self.r.B, cwd=self.r.work, after_create=True, repo=REPO,
+                             identity_path=broken, out=self.out, summary=summary)
+        self.assertIn("a draft this run created could not be identified here", str(cm.exception))
+
+    def test_after_create_bad_inputs_still_name_the_draft(self):
+        # Input checks run inside the wrapper too: by the time this step runs, a draft exists.
+        gh, ident, identity, summary = self.made_draft()
+        named = "release %d (%s) is a draft this run created" % (identity["id"], identity["html_url"])
+        for tag, sha, repo, why in (("not-a-tag", self.r.A, REPO, "not-a-tag"),
+                                    ("v0.1.0", "xyz", REPO, "xyz"),
+                                    ("v0.1.0", self.r.A, "bad repo", "is not owner/name")):
+            with self.subTest(tag=tag, sha=sha, repo=repo):
+                with self.assertRaises(rm.GuardError) as cm:
+                    rm.check_binding(tag, sha, cwd=self.r.work, after_create=True, repo=repo,
+                                     identity_path=ident, out=self.out, summary=summary)
+                self.assertIn(why, str(cm.exception))
+                self.assertIn(named, str(cm.exception))
+                self.assertIn(str(cm.exception), read(summary))
 
     def test_sigterm_becomes_a_reportable_exit(self):
         with self.assertRaises(SystemExit) as cm:
             rm._terminated(15, None)
         self.assertEqual(cm.exception.code, 143)
+
+    @unittest.skipIf(os.name != "posix", "needs POSIX signals and a shell script on PATH")
+    def test_a_cancelled_after_create_step_names_the_draft(self):
+        # The real CLI, as the workflow runs it, gets SIGTERM while git is running; it must exit 143
+        # and the job summary must name the draft. This fails if main() stops installing the handler.
+        import json as _json
+        import signal as _signal
+        import time as _time
+        d = tempfile.mkdtemp(prefix="release-sigterm-")
+        self.addCleanup(shutil.rmtree, d, True)
+        bindir = os.path.join(d, "bin")
+        os.mkdir(bindir)
+        marker = os.path.join(d, "git-started")
+        with open(os.path.join(bindir, "git"), "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n: > '%s'\nexec sleep 30\n" % marker)
+        os.chmod(os.path.join(bindir, "git"), 0o755)
+        with open(os.path.join(d, rm.IDENTITY_FILE), "w", encoding="utf-8") as f:
+            _json.dump({"id": 4242, "html_url": "https://github.com/%s/releases/tag/untagged-x" % REPO}, f)
+        summary = os.path.join(d, "summary.md")
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get("PATH", ""), TAG="v0.1.0",
+                   SHA="a" * 40, GITHUB_REPOSITORY=REPO, GITHUB_STEP_SUMMARY=summary)
+        p = subprocess.Popen([sys.executable, "-I", os.path.join(HERE, "release_meta.py"), "check-binding",
+                              "--after-create"], cwd=d, env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+        try:
+            deadline = _time.time() + 20
+            while not os.path.exists(marker) and _time.time() < deadline and p.poll() is None:
+                _time.sleep(0.05)
+            self.assertTrue(os.path.exists(marker), "the fake git never started")
+            p.send_signal(_signal.SIGTERM)
+            p.communicate(timeout=20)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.communicate()
+        self.assertEqual(p.returncode, 143)
+        self.assertIn("SystemExit: 143", read(summary))
+        self.assertIn("release 4242 (https://github.com/%s/releases/tag/untagged-x) is a draft this run created"
+                      % REPO, read(summary))
 
     def test_after_create_with_the_tag_in_place_passes(self):
         gh, ident, _, summary = self.made_draft()
