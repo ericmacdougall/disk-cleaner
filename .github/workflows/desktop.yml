@@ -508,3 +508,90 @@ jobs:
             echo "::error::an idle launch wrote webview or app-state data (listed above)"; exit 1
           fi
           echo "Nothing written under any of the five places."
+
+  appimage-hosts:
+    # The shipped Linux AppImage on distributions with no GTK, gdk-pixbuf, shared-mime-info or
+    # icon theme (CT-F1, GoodQA #16452): the GTK folder dialog must open and return a folder,
+    # and the app must keep running. e2e/appimage-dialog.sh says what it installs and checks.
+    # The control leg removes the dialog's data from the same AppImage; the check must fail it.
+    name: AppImage without host GTK (${{ matrix.name }})
+    needs: bundles
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: fedora-41
+            image: fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d
+            control: false
+          - name: debian-12-slim
+            image: debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+            control: false
+          - name: fedora-41 without the dialog data (control)
+            image: fedora:41@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d
+            control: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: prunedisk-linux-x64-unsigned
+          path: ${{ runner.temp }}/bundle
+      - name: The program under test
+        id: prog
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(ls "$RUNNER_TEMP"/bundle/*.AppImage)
+          (cd "$RUNNER_TEMP/bundle" && sha256sum -c --ignore-missing SHA256SUMS)
+          chmod +x "$app"
+          if [ "${{ matrix.control }}" = true ]; then
+            (cd "$RUNNER_TEMP" && "$app" --appimage-extract > /dev/null)
+            appdir="$RUNNER_TEMP/squashfs-root"
+            rm -rf "$appdir/usr/share/mime" "$appdir/usr/share/icons/Adwaita" "$appdir/usr/share/icons/hicolor/index.theme"
+            { echo "path=$appdir"; echo "target=/bundle/appdir"; } >> "$GITHUB_OUTPUT"
+          else
+            { echo "path=$app"; echo "target=/bundle/app.AppImage"; } >> "$GITHUB_OUTPUT"
+          fi
+      - name: Open the folder dialog in a bare container
+        id: run
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          set +e
+          docker run --rm --cap-add SYS_PTRACE \
+            -v "${{ steps.prog.outputs.path }}:${{ steps.prog.outputs.target }}:ro" \
+            -v "$GITHUB_WORKSPACE/apps/desktop/e2e:/e2e:ro" -v "$RUNNER_TEMP/out:/out" \
+            "${{ matrix.image }}" bash /e2e/appimage-dialog.sh "${{ steps.prog.outputs.target }}" /out
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "appimage-dialog.sh exit $code (0 pass, 1 dialog check failed, 3 only the write observer failed, 2 host not bare)"
+      - name: Dialog check (CT-F1)
+        shell: bash
+        run: |
+          code=${{ steps.run.outputs.code }}
+          if [ "${{ matrix.control }}" = true ]; then
+            # Without the data the dialog must abort the app, as it did on 682a0ff.
+            if [ "$code" = 1 ] && grep -q 'Unrecognized image file format' "$RUNNER_TEMP/out/launch/launch.log"; then
+              echo "The check caught the AppImage without its dialog data."
+            else
+              echo "::error::the check passed an AppImage without its dialog data (exit $code)"; exit 1
+            fi
+          else
+            [ "$code" = 0 ] || [ "$code" = 3 ] || { echo "::error::dialog check failed (exit $code)"; exit 1; }
+          fi
+      - name: Write observer through the dialog (F10)
+        if: ${{ !matrix.control }}
+        shell: bash
+        run: |
+          [ "${{ steps.run.outputs.code }}" = 0 ] || { echo "::error::undeclared writes: trace.txt in the artifact"; exit 1; }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: appimage-hosts-${{ strategy.job-index }}
+          path: |
+            ${{ runner.temp }}/out/*.txt
+            ${{ runner.temp }}/out/*.log
+            ${{ runner.temp }}/out/launch/*.txt
+            ${{ runner.temp }}/out/launch/*.log
+          retention-days: 14
