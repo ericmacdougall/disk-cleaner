@@ -637,7 +637,7 @@ a failure fails that check with a reason ending "not measured", and nothing is r
 
 1. The trace state: every app process of the launch (`TracerPid` in `/proc`) is untraced,
    else "not shown to be untraced; not measured" (`trace.default.timed_launch_untraced`,
-   `trace.synth_1m.timed_launch_untraced`; the variant `untraced-ignored`).
+   `trace.synth_1m.timed_launch_untraced`).
 2. No other app instance alive at the session's start: any `/proc` entry named `e2e` or
    `prunedisk-deskt`, zombies counted, read once at the start, else "another app instance is
    alive at the session start (...); not measured". Pre-registered before any result (WAL
@@ -697,18 +697,14 @@ The untraced switch. `e2e/run.mjs` sets `PRUNEDISK_E2E_UNTRACED=1` for the timed
 (the default fixture's and the one-million-row one) and the investigation's untraced arms; the
 main session's environment never holds it. `e2e/check.sh`'s app wrapper (CI only; it never
 ships) then starts that launch without strace, but only when the e2e binary holds the switch's
-name, which only a `--features e2e` build does (`src-tauri/src/e2e.rs`). The switch alone
-selects it: any other value, an empty one or the old name `PRUNEDISK_AC9_UNTRACED` is traced,
-and every launch without the switch is traced ("Timing is never measured under the tracer",
-above). The app checks the claim for the synthetic tree: with the switch set and a tracer
-attached, it shows none. An untraced launch is still a session of the survivor check: the
-wrapper exports `PRUNEDISK_TRACE_SESSION=$OUT/trace/untraced.<pid>` (inside the folder that
-`e2e/traced.py sweep` covers) and starts `e2e/traced.py settle` on it, which records it in
-`close.untraced.<pid>.txt`; check.sh's survivor step reads the record of every launch, traced
-(its log) or untraced (its marker), so nothing an untraced launch started may outlive it. Each
-untraced launch leaves a marker in `$OUT/untraced/`, each traced one-million-row launch one in
-`$OUT/traced-synth/`, and the trace step fails when a traced one-million-row launch left no
-strace log or none ran. A release binary holds no `PRUNEDISK_E2E_` name (check.sh's string
+name, which only a `--features e2e` build does (`src-tauri/src/e2e.rs`). The app checks the
+claim for the synthetic tree: with the switch set and a tracer attached, it shows none. An
+untraced launch is still a session of the survivor check: its processes carry
+`PRUNEDISK_TRACE_SESSION` and `e2e/traced.py settle` records it in `close.<pid>.txt` like a
+traced launch, so nothing it started may outlive it. Each untraced launch leaves a marker in
+`$OUT/untraced/`, each traced one-million-row launch one in `$OUT/traced-synth/`, and the trace
+step fails when a traced one-million-row launch left no strace log or none ran. A release
+binary holds no `PRUNEDISK_E2E_` name (check.sh's string
 check); `e2e/check-shipped.sh` names `PRUNEDISK_E2E_UNTRACED` on its own, check.sh's control
 requires it to report that name on the e2e binary, and the variant `untraced-switch-shipped`
 (below) plants the switch in a release build, which check-shipped.sh must fail.
@@ -1063,12 +1059,8 @@ identical):
 
 Main ruled the leftover a test-tooling defect. Likely, not proven: the driver ends the process it
 started, which was strace; strace's exit detaches the app, which is then orphaned and runs on
-untraced. The wrapper fix (`strace -DD`, 9e97d44, with the survivor check `e2e/traced.py`:
-check.sh's "survivors" step fails when any process of a launch, traced or untraced, is alive 2 s
-after its app ended) is to show it: after it, the traced session must leave nothing. Its first
-run, desktop 44895185802 at 9e97d44 (before the AC-9 sessions were added to the suite), reported
-"every process of the session ended within 16 ms" for the suite's one launch on Linux. Writes
-after the detach were not traced.
+untraced. The wrapper fix (`strace -DD`) is to show it: after it, the traced session must leave
+nothing. Writes after the detach were not traced.
 
 The DOM limit counts every `.tg-row`, selected or not, the header row included. Since 5530ecf
 the grid holds to it in every state (main's ruling, relayed by the stream owner; inferred): at
