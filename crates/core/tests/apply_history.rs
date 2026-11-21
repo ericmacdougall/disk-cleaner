@@ -412,75 +412,12 @@ fn a_stale_or_cut_head_slot_alone_loses_nothing_and_restores_completely() {
     }
 }
 
-/// Codex plan review r9b, F1: what earlier runs relied on comes from the whole stored history,
-/// not only from the local manifest. A duplicate removed earlier relied on its retained copy;
-/// with the local manifest lost, or with a new state directory taking the label over, a later
-/// plan that removes the retained copy as noise backs it up first, and both files restore from
-/// storage alone.
-#[test]
-fn a_retained_copy_stays_protected_when_local_history_is_lost_or_taken_over() {
-    for case in ["local manifest lost", "label taken over"] {
-        let fx = Fx::new();
-        let content = b"the same bytes in three places\n";
-        let orig = fx.write("keep/orig.txt", content);
-        let dup = fx.write("dups/copy.txt", content);
-        let third = fx.write("other/third.txt", content);
-        let mut piece = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
-        piece.evidence = Some(serde_json::json!({
-            "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
-            "retained_copy": orig, "retained_piece": 0
-        }));
-        let (scan, plan) = docs(
-            &[&fx.data],
-            &[P::tree(&fx.data.join("keep"), "keep"), piece],
-        );
-        let mut o = fx.opts(true);
-        o.oracle = Box::new(agreeing_oracle(&scan, &plan));
-        let rep = apply(&scan, &plan, &o).unwrap();
-        assert_eq!(rep.pieces[1].outcome, "removed", "{case}: {rep:?}");
-        let other = fx.state.parent().unwrap().join("state-two");
-        if case == "local manifest lost" {
-            fs::remove_file(fx.manifest()).unwrap();
-        } else {
-            fs::create_dir_all(&other).unwrap();
-        }
-        let mut piece = P::files(&fx.data.join("keep"), &["orig.txt"], "noise");
-        piece.evidence = Some(serde_json::json!({
-            "kind": "duplicate", "sha256": sha(&third), "size": content.len(),
-            "retained_copy": third, "retained_piece": 0
-        }));
-        let (scan, plan) = docs(
-            &[&fx.data],
-            &[P::tree(&fx.data.join("other"), "keep"), piece],
-        );
-        let mut o = fx.opts(true);
-        o.oracle = Box::new(agreeing_oracle(&scan, &plan));
-        if case == "label taken over" {
-            o.state_dir = other.join("lock");
-            o.manifest = other.join("manifest.jsonl");
-            o.take_over_label = true;
-        }
-        let before = fx.shard_total();
-        let rep = apply(&scan, &plan, &o).unwrap();
-        assert!(rep.history_gaps.is_empty(), "{case}: {rep:?}");
-        assert_eq!(rep.pieces[1].outcome, "removed", "{case}: {rep:?}");
-        assert!(
-            rep.pieces[1].reason.contains("retained copy"),
-            "{case}: {rep:?}"
-        );
-        assert!(
-            fx.shard_total() > before,
-            "{case}: the retained copy was archived before removal"
-        );
-        let _ = fs::remove_file(fx.manifest());
-        let _ = fs::remove_file(other.join("manifest.jsonl"));
-        for p in [&dup, &orig] {
-            let r = restore(p, &ropts(&fx)).unwrap();
-            assert!(r.failed.is_empty(), "{case}: {}: {r:?}", p.display());
-            assert_eq!(fs::read(p).unwrap(), content, "{case}");
-        }
-    }
-}
+// Retired with option A (main's ruling on Codex plan review r10 F1): the test
+// `a_retained_copy_stays_protected_when_local_history_is_lost_or_taken_over` (r9b F1) pinned
+// the retention index rebuilt from storage. No removal relies on a retained copy any more, so
+// there is nothing to protect; apply_namespaces.rs pins the outcome it guarded (every removed
+// duplicate restores from its own history alone after local state is lost, the label is taken
+// over, or another label or remote removes the copy).
 
 /// Codex plan review r9b, F2: every gap a run sees is durable in the next head. A segment
 /// stored with its sidecar but not yet listed (a crash before the head) and then damaged is a

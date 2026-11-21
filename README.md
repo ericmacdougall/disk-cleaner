@@ -45,11 +45,12 @@ again on the scan and keeps any noise or git piece the scan does not support. Se
 on this disk unless you pass `--secrets upload` yourself.
 
 - **backup:** uploaded, verified, then removed (below).
-- **noise:** removed only while its evidence holds: a dependency or build folder next to its marker
-  file (restore lists it to regenerate), or a duplicate whose kept copy still has the same content
-  (restore copies it back from there). Noise whose evidence no longer holds is backed up like the
-  backup lane instead (a secret-like name keeps it). A file kept as the copy of a duplicate removed
-  earlier is itself backed up before any later run removes it.
+- **noise:** a dependency or build folder next to its marker file is removed only while that
+  evidence holds (restore lists it to regenerate). A duplicate of a kept file is backed up and
+  verified like the backup lane before it is removed (its content is uploaded once, or found
+  already verified in storage), so it never depends on the kept copy staying; a secret-like name
+  keeps it unless you pass `--secrets upload`. Noise whose evidence no longer holds is backed up
+  like the backup lane instead (a secret-like name keeps it).
 - **git:** a repository is removed only after its `.git` directory and every file that differs from
   the last commit are backed up; unchanged files come back from the backed-up history. Unsaved work
   (unpushed commits, plus a snapshot of changed and new files, never secret-named, ignored or very
@@ -125,13 +126,13 @@ wrote (status 8). The head cannot show the newest copy deleted together with the
 whole folder rolled back to an older state. Add `--run <id>` (printed by `apply`) to restore an older generation of a path that was backed up more than once. Replacing or downgrading the
 `disk-cleaner` binary never brings data back; `restore` does.
 
-Known limits of the stored history, none of which loses a backed-up file:
+Known limits of the stored history:
 
 - **Two labels or two remotes for the same files.** Each acting run reads the history of its own
-  label on its own remote only. If you clean the same folders under two labels, or switch to
-  another remote after the local manifest was lost, what runs under the other label or remote
-  relied on (for example the kept copy of a removed duplicate) is not seen, and nothing detects
-  this. Use one label and one remote per state directory.
+  label on its own remote only, and a path restores through the label and remote that removed it
+  (`restore --remote R --host-label L`). No removal relies on a file staying on disk, so what one label removes
+  never depends on what another label or remote does later; but restore does not search other
+  labels or remotes for you. Use one label and one remote per state directory.
 - **A take-over while the old state directory is still in use.** `--take-over-label` is for a
   state directory that is gone for good. A later run from the old one is refused (status 8), but
   a run of the old one still in progress during the take-over can overwrite the new owner's head

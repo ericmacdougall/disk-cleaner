@@ -487,39 +487,6 @@ pub fn apply(
         ctx.report.pieces.push(rep);
     }
 
-    // 1b. The retention index (N4, acceptance finding 1).
-    let retained = ctx.manifest.retained_index();
-    let mut retention_notes: BTreeMap<usize, String> = BTreeMap::new();
-    prepared.retain_mut(|pr| match protect_retained(&ctx, &retained, pr) {
-        Ok(None) => true,
-        Ok(Some(note)) => {
-            retention_notes.insert(pr.piece, note.clone());
-            let outcome = if opts.act {
-                "pending"
-            } else {
-                dry_word(Lane::Backup)
-            };
-            let before = ctx
-                .report
-                .pieces
-                .iter()
-                .find(|r| r.id == pr.piece)
-                .map(|r| r.reason.clone())
-                .unwrap_or_default();
-            let reason = if before.is_empty() {
-                note
-            } else {
-                format!("{before}; {note}")
-            };
-            set_outcome(&mut ctx.report, pr.piece, outcome, &reason);
-            true
-        }
-        Err(why) => {
-            set_outcome(&mut ctx.report, pr.piece, "kept", &why);
-            false
-        }
-    });
-
     if !opts.act {
         // Dry run: count what would be uploaded against the local manifest only (no network).
         let known = ctx.manifest.blobs(&opts.remote);
@@ -553,12 +520,7 @@ pub fn apply(
                 if let Some(row) = r.row {
                     ctx.manifest.append(opts.now, vec![row])?;
                 }
-                let note = match retention_notes.get(&pr.piece) {
-                    Some(n) if !r.note.is_empty() => format!("{}; {n}", r.note),
-                    Some(n) => n.clone(),
-                    None => r.note.clone(),
-                };
-                set_outcome(&mut ctx.report, pr.piece, "pending", &note);
+                set_outcome(&mut ctx.report, pr.piece, "pending", &r.note);
                 recovered.push(pr);
             }
             Err(why) => set_outcome(
@@ -602,69 +564,6 @@ pub fn apply(
     }
     mark_rescan(&mut ctx.report);
     Ok(ctx.report)
-}
-
-/// The retention index (N4, acceptance finding 1), consulted for every removing piece of every
-/// lane. A file that is the retained copy of a duplicate removed by an earlier run is the only
-/// local copy of that duplicate's bytes, and restore of the duplicate finds them by sha256. So a
-/// member that is such a copy is never removed without its own archived blob: a member the
-/// piece would remove without one (noise, a git HEAD blob restored from the object store) is
-/// re-hashed and backed up like the backup lane, under the backup lane's secret rule. Returns
-/// a note when members were moved to the backup, or `Err` (keep the piece) when that is not
-/// possible: a resumed removal, a secret name, or a member that changed.
-fn protect_retained(
-    ctx: &Ctx,
-    retained: &BTreeMap<PathBuf, BTreeSet<String>>,
-    pr: &mut Prepared,
-) -> Result<Option<String>, String> {
-    let p = &ctx.inputs.pieces[pr.piece];
-    let mut moved = Vec::new();
-    for m in pr.members.iter_mut() {
-        if matches!(m.content, Content::Blob { .. }) {
-            continue;
-        }
-        let path = rel_join(&p.path, &m.rel);
-        let Some(relied_on) = retained.get(&path) else {
-            continue;
-        };
-        let keep = |why: &str| {
-            Err(format!(
-                "{} is the retained copy of a duplicate removed earlier, and {why}",
-                path.display()
-            ))
-        };
-        if pr.reason == "resuming an interrupted removal" {
-            return keep("this interrupted removal recorded no archived copy of it");
-        }
-        if m.id.kind != 'f' {
-            return keep("it is no longer a regular file");
-        }
-        if !ctx.opts.secrets_upload && names::rel_is_secret(&m.rel) {
-            return keep(
-                "it has a secret name, so it stays local (upload only with --secrets upload)",
-            );
-        }
-        let (sha, id) = shard::hash_file(&p.path, &m.rel)?;
-        if !id.same_strict(&m.id) {
-            return keep("it changed while it was being checked");
-        }
-        if !relied_on.contains(&sha) {
-            return keep(
-                "it changed since that duplicate was removed, so the duplicate's content is no \
-                 longer on disk to back up",
-            );
-        }
-        m.content = Content::Blob { sha256: sha };
-        moved.push(path.display().to_string());
-    }
-    Ok((!moved.is_empty()).then(|| {
-        format!(
-            "{} {} the retained copy of a duplicate removed earlier, so it is backed up and \
-             verified before removal",
-            moved.join(", "),
-            if moved.len() == 1 { "is" } else { "are" }
-        )
-    }))
 }
 
 /// Nothing of the piece is left on disk (a re-run after a completed removal).
@@ -717,6 +616,15 @@ fn set_outcome(rep: &mut ApplyReport, piece: usize, outcome: &str, reason: &str)
     }
 }
 
+/// The lane whose secret rules bind a piece: a duplicate is backed up (option A), so it is
+/// judged like the backup lane (main's Q2); every other piece by its own lane.
+fn secret_rule_lane(p: &PlanPiece) -> Lane {
+    match (p.lane, &p.evidence) {
+        (Lane::Noise, Some(Evidence::Duplicate { .. })) => Lane::Backup,
+        (l, _) => l,
+    }
+}
+
 /// Secret check over members (C2, revision 3 F4). Inside an artifact (noise) only the
 /// non-substring rules apply, like the scan.
 fn secret_member(members: &[Member], lane: Lane) -> Option<String> {
@@ -736,10 +644,13 @@ fn prepare(
     rederived: Option<&BTreeMap<usize, String>>,
 ) -> Result<Prepared, String> {
     let sp = &ctx.inputs.scan_pieces[p.scan_piece];
+    // A duplicate is backed up like the backup lane (option A, main's ruling on Codex plan
+    // review r10 F1), so the backup lane's secret rules are the ones that bind it (main's Q2).
+    let secret_lane = secret_rule_lane(p);
     if p.secret.is_some() && !ctx.opts.secrets_upload {
         return Err("secret-named, stays local (upload only with --secrets upload)".into());
     }
-    if p.lane == Lane::Noise && p.secret.is_some() {
+    if secret_lane == Lane::Noise && p.secret.is_some() {
         return Err("a secret is never removed without a backup".into());
     }
     if let Some(why) = ctx.group_active(p) {
@@ -766,8 +677,8 @@ fn prepare(
     if let Some(m) = en.members.iter().find(|m| m.id.kind == 'o') {
         return Err(format!("{} is a FIFO, socket or device file", m.rel));
     }
-    if !(ctx.opts.secrets_upload && p.lane != Lane::Noise) {
-        if let Some(s) = secret_member(&en.members, p.lane) {
+    if !(ctx.opts.secrets_upload && secret_lane != Lane::Noise) {
+        if let Some(s) = secret_member(&en.members, secret_lane) {
             return Err(format!(
                 "{s} has a secret name and stays local (upload only with --secrets upload)"
             ));
@@ -868,37 +779,22 @@ fn prepare_noise(ctx: &Ctx, p: &PlanPiece, en: &recheck::Enumerated) -> Result<P
             });
             format!("regenerate ({rule})")
         }
-        Evidence::Duplicate {
-            sha256,
-            size,
-            retained_copy,
-            retained_piece,
-        } => {
+        // Option A (main's ruling on Codex plan review r10 F1): a duplicate is never removed on
+        // the strength of another copy staying. Its own bytes are uploaded once per sha256 (or
+        // reused only after the shard is verified again) and verified before removal, under the
+        // backup lane's secret rules, so it restores from the history that removed it alone,
+        // whatever later happens to the copy it duplicates.
+        Evidence::Duplicate { retained_copy, .. } => {
             if p.kind != PieceKind::Files || en.members.len() != 1 {
                 return Err("duplicate evidence on a piece that is not one file".into());
             }
-            let m = &en.members[0];
-            let me = p.path.join(&m.rel);
-            if me == *retained_copy {
-                return Err("the retained copy is the duplicate itself".into());
-            }
-            let (got, _) = shard::hash_file(&p.path, &m.rel)?;
-            if got != *sha256 || m.id.len != *size {
-                return Err(
-                    "the duplicate no longer has the recorded content; it is backed up instead"
-                        .into(),
-                );
-            }
-            let _ = retained_piece;
-            noise_proof(ctx, p)?;
-            extra.push(Row::Retains {
-                plan_piece: p.id,
-                path: me,
-                retained: retained_copy.clone(),
-                sha256: sha256.clone(),
-                size: *size,
-            });
-            format!("copy of {}", retained_copy.display())
+            let mut pr = prepare_backup(p, en)?;
+            pr.reason = format!(
+                "a duplicate of {}; backed up and verified before removal, so it never depends \
+                 on that copy staying",
+                retained_copy.display()
+            );
+            return Ok(pr);
         }
         Evidence::Archive { .. } => {
             return Err("archive evidence is not produced by plan; kept".into())
@@ -954,38 +850,9 @@ fn noise_proof(ctx: &Ctx, p: &PlanPiece) -> Result<(), String> {
             }
             Ok(())
         }
-        Evidence::Duplicate {
-            sha256,
-            size,
-            retained_copy,
-            retained_piece,
-        } => {
-            let kept_ok = retained_piece
-                .and_then(|k| ctx.inputs.pieces.get(k))
-                .is_some_and(|rp| rp.lane == Lane::Keep && retained_copy.starts_with(&rp.path));
-            if !kept_ok {
-                return Err("the retained copy is not in a kept piece".into());
-            }
-            let rmd = retained_copy
-                .symlink_metadata()
-                .map_err(|_| "the retained copy is gone")?;
-            if !rmd.file_type().is_file() || rmd.len() != *size {
-                return Err(
-                    "the retained copy is not a regular file of the recorded length".into(),
-                );
-            }
-            let parent = retained_copy
-                .parent()
-                .ok_or("retained copy has no parent")?;
-            let leaf = retained_copy
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or("retained name is not UTF-8")?;
-            let (rsha, _) = shard::hash_file(parent, leaf)?;
-            if rsha != *sha256 {
-                return Err("the retained copy no longer has the recorded content".into());
-            }
-            Ok(())
+        // Option A: another copy staying is never a removal proof; a duplicate is backed up.
+        Evidence::Duplicate { .. } => {
+            Err("a duplicate is removed only after its own bytes are backed up".into())
         }
         Evidence::Archive { .. } => Err("archive evidence is not produced by plan; kept".into()),
     }

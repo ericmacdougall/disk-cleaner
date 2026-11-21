@@ -4,8 +4,8 @@
 //!   the member back (`fsops::remove_member`, r6b F1);
 //! - the manifest's torn tail, also one that is not UTF-8, is repaired before an acting run
 //!   appends (`manifest::open_for_append` and `Manifest::load`, r6b F2);
-//! - the retention index backs up a retained copy before any lane removes it (`protect_retained`,
-//!   N4);
+//! - a duplicate is backed up like the backup lane, so no removal relies on another copy
+//!   staying (option A, r10 F1; the retention index of N4 is gone);
 //! - an archived shard is reused only when its stored hash still matches
 //!   (`shard::shard_still_verified`, I-1, NEG-8);
 //! - noise whose evidence fails is backed up instead, under the backup lane's secret rule (AC-7,
@@ -411,137 +411,98 @@ fn a_failed_repair_stops_before_anything_is_removed() {
     );
 }
 
-// ---- Class 3: the retention index (N4) ----
+// ---- Class 3: a duplicate is backed up like the backup lane (option A, Codex plan review r10 F1) ----
+//
+// The retention index (N4, `protect_retained`) is gone: no removal relies on another copy
+// staying. Its guards (r7 F3 a retained copy edited later, r8 F2 a retained copy changed during
+// the run, a secret-named retained copy) are replaced by one rule: a duplicate's own bytes are
+// uploaded and verified before it is removed, under the backup lane's secret rule (main's Q2).
+// apply_namespaces.rs covers what later runs, labels, remotes and take-overs do to the copy.
+
+fn holds(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+fn dup_piece(dir: &Path, name: &str, retained: &Path) -> P {
+    let mut piece = P::files(dir, &[name], "noise");
+    piece.evidence = Some(serde_json::json!({
+        "kind": "duplicate", "sha256": sha(retained),
+        "size": fs::metadata(retained).unwrap().len(),
+        "retained_copy": retained, "retained_piece": 0
+    }));
+    piece
+}
 
 #[test]
-fn retained_copy_protected_in_later_run() {
+fn a_duplicate_is_backed_up_so_its_retained_copy_can_go_later() {
     let fx = Fx::new();
     let content = b"the same bytes in three places\n";
     let orig = fx.write("keep/orig.txt", content);
     let dup = fx.write("dups/copy.txt", content);
     let third = fx.write("other/third.txt", content);
-    // Run 1: copy.txt is removed as a duplicate of keep/orig.txt.
-    let mut piece = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
-    piece.evidence = Some(serde_json::json!({
-        "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
-        "retained_copy": orig, "retained_piece": 0
-    }));
-    let (scan, plan) = docs(
-        &[&fx.data],
-        &[P::tree(&fx.data.join("keep"), "keep"), piece],
-    );
-    let mut o = fx.opts(true);
-    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
-    let rep = apply(&scan, &plan, &o).unwrap();
-    assert_eq!(rep.pieces[1].outcome, "removed", "{rep:?}");
-    // Run 2: a later plan proposes removing keep/orig.txt as a duplicate of other/third.txt.
-    let mut piece = P::files(&fx.data.join("keep"), &["orig.txt"], "noise");
-    piece.evidence = Some(serde_json::json!({
-        "kind": "duplicate", "sha256": sha(&third), "size": content.len(),
-        "retained_copy": third, "retained_piece": 0
-    }));
-    let (scan, plan) = docs(
-        &[&fx.data],
-        &[P::tree(&fx.data.join("other"), "keep"), piece],
-    );
-    // A dry run says the retained copy would be backed up, and counts its bytes.
+    // A dry run says the duplicate is backed up, and counts its bytes in the upload bound.
+    let pieces = [
+        P::tree(&fx.data.join("keep"), "keep"),
+        dup_piece(&fx.data.join("dups"), "copy.txt", &orig),
+    ];
+    let (scan, plan) = docs(&[&fx.data], &pieces);
     let mut o = fx.opts(false);
     o.oracle = Box::new(agreeing_oracle(&scan, &plan));
     let dry = apply(&scan, &plan, &o).unwrap();
     assert!(dry.pieces[1].outcome.contains("back up"), "{dry:?}");
     assert!(dry.uploaded_bytes >= content.len() as u64, "{dry:?}");
-    let before = fx.shard_total();
     let mut o = fx.opts(true);
     o.oracle = Box::new(agreeing_oracle(&scan, &plan));
     let rep = apply(&scan, &plan, &o).unwrap();
-    // Spec N4: the piece holding a retained copy is backed up before removal, never removed as
-    // noise without an archived copy.
     assert_eq!(rep.pieces[1].outcome, "removed", "{rep:?}");
-    assert!(rep.pieces[1].reason.contains("retained copy"), "{rep:?}");
     assert!(rep.pieces[1].reason.contains("backed up"), "{rep:?}");
-    assert!(fx.shard_total() > before, "the retained copy was archived");
-    assert!(!orig.exists());
-    // Both come back from storage, with nothing left of the retained copy on disk.
-    let r = restore(&dup, &ropts(&fx)).unwrap();
-    assert!(r.failed.is_empty(), "{r:?}");
-    assert_eq!(fs::read(&dup).unwrap(), content);
-    let r = restore(&orig, &ropts(&fx)).unwrap();
-    assert!(r.failed.is_empty(), "{r:?}");
-    assert_eq!(fs::read(&orig).unwrap(), content);
-}
-
-/// Codex plan review r7, F3: the retention index keeps the content each duplicate relied on. A
-/// retained copy edited after the duplicate was removed no longer holds that content, so a
-/// later run that would remove it without an archive keeps its piece instead of archiving the
-/// new bytes as if they were the duplicate's.
-#[test]
-fn a_retained_copy_changed_since_its_duplicate_was_removed_is_kept() {
-    let fx = Fx::new();
-    let content = b"the same bytes in three places\n";
-    let orig = fx.write("keep/orig.txt", content);
-    fx.write("dups/copy.txt", content);
-    let mut piece = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
-    piece.evidence = Some(serde_json::json!({
-        "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
-        "retained_copy": orig, "retained_piece": 0
-    }));
+    assert!(
+        holds(&fx.all_shard_bytes(), content),
+        "the duplicate's bytes are stored"
+    );
+    // A later plan removes the retained copy as a duplicate of third.txt: nothing protects it,
+    // and nothing needs to.
     let (scan, plan) = docs(
         &[&fx.data],
-        &[P::tree(&fx.data.join("keep"), "keep"), piece],
-    );
-    let mut o = fx.opts(true);
-    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
-    assert_eq!(
-        apply(&scan, &plan, &o).unwrap().pieces[1].outcome,
-        "removed"
-    );
-    // Between the runs the user edits keep/orig.txt; another file now has the same new bytes,
-    // so a later plan's duplicate proof for orig.txt holds.
-    let edited = b"edited after the duplicate was removed\n";
-    fs::write(&orig, edited).unwrap();
-    let third = fx.write("other/third.txt", edited);
-    let mut piece = P::files(&fx.data.join("keep"), &["orig.txt"], "noise");
-    piece.evidence = Some(serde_json::json!({
-        "kind": "duplicate", "sha256": sha(&third), "size": edited.len(),
-        "retained_copy": third, "retained_piece": 0
-    }));
-    let (scan, plan) = docs(
-        &[&fx.data],
-        &[P::tree(&fx.data.join("other"), "keep"), piece],
+        &[
+            P::tree(&fx.data.join("other"), "keep"),
+            dup_piece(&fx.data.join("keep"), "orig.txt", &third),
+        ],
     );
     let mut o = fx.opts(true);
     o.oracle = Box::new(agreeing_oracle(&scan, &plan));
     let rep = apply(&scan, &plan, &o).unwrap();
-    assert_eq!(rep.pieces[1].outcome, "kept", "{rep:?}");
-    assert!(
-        rep.pieces[1]
-            .reason
-            .contains("changed since that duplicate was removed"),
-        "{rep:?}"
-    );
-    assert_eq!(fs::read(&orig).unwrap(), edited);
+    assert_eq!(rep.pieces[1].outcome, "removed", "{rep:?}");
+    assert!(!orig.exists());
+    // Third goes too, by hand. Both removed files come back from storage alone.
+    fs::remove_file(&third).unwrap();
+    for p in [&dup, &orig] {
+        let r = restore(p, &ropts(&fx)).unwrap();
+        assert!(
+            r.failed.is_empty() && r.restored == vec![p.clone()],
+            "{r:?}"
+        );
+        assert_eq!(fs::read(p).unwrap(), content);
+    }
 }
 
-/// Codex plan review r8, F2: the retained copy is checked again just before removal. The fake
-/// rclone changes or deletes it while the manifest segment is uploaded, which is after the
-/// batch re-check and before the unlink, so only the last check can see it. The duplicate is
-/// kept, its removal is closed (not left open), and a later run removes it once the retained
-/// copy holds the bytes again.
+/// Codex plan review r8, F2 asked for the retained copy to be checked again just before
+/// removal. Under option A the retained copy proves nothing, so changing or deleting it while
+/// the manifest is uploaded changes nothing: the duplicate is removed on its own verified blob
+/// and restores byte for byte.
 #[test]
-fn a_retained_copy_changed_or_deleted_after_preparation_keeps_its_duplicate() {
+fn a_retained_copy_changed_or_deleted_during_the_run_does_not_matter() {
     for action in ["edit", "delete"] {
         let fx = Fx::new();
         let content = b"the same bytes in two places\n";
         let orig = fx.write("keep/orig.txt", content);
         let copy = fx.write("dups/copy.txt", content);
-        let mut piece = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
-        piece.evidence = Some(serde_json::json!({
-            "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
-            "retained_copy": orig, "retained_piece": 0
-        }));
         let (scan, plan) = docs(
             &[&fx.data],
-            &[P::tree(&fx.data.join("keep"), "keep"), piece],
+            &[
+                P::tree(&fx.data.join("keep"), "keep"),
+                dup_piece(&fx.data.join("dups"), "copy.txt", &orig),
+            ],
         );
         let change = match action {
             "edit" => format!("printf 'edited during the upload' > '{}'", orig.display()),
@@ -553,65 +514,49 @@ fn a_retained_copy_changed_or_deleted_after_preparation_keeps_its_duplicate() {
         let mut o = fx.opts(true);
         o.oracle = Box::new(agreeing_oracle(&scan, &plan));
         let rep = apply(&scan, &plan, &o).unwrap();
-        assert_eq!(rep.pieces[1].outcome, "kept", "{action}: {rep:#?}");
-        assert!(
-            rep.pieces[1].reason.contains("just before removal")
-                && rep.pieces[1].reason.contains("retained copy"),
-            "{action}: {}",
-            rep.pieces[1].reason
-        );
-        assert_eq!(fs::read(&copy).unwrap(), content, "{action}");
-        // The removal is closed: a later run with the retained copy back removes the duplicate.
-        fx.set_fake("");
-        fs::write(&orig, content).unwrap();
-        let mut o = fx.opts(true);
-        o.oracle = Box::new(agreeing_oracle(&scan, &plan));
-        let rep = apply(&scan, &plan, &o).unwrap();
         assert_eq!(rep.pieces[1].outcome, "removed", "{action}: {rep:#?}");
         assert!(!copy.exists(), "{action}");
+        fx.set_fake("");
+        let r = restore(&copy, &ropts(&fx)).unwrap();
+        assert!(r.failed.is_empty(), "{action}: {r:?}");
+        assert_eq!(fs::read(&copy).unwrap(), content, "{action}");
     }
 }
 
+/// Main's Q2: a secret-named duplicate is treated exactly like the backup lane. Without
+/// `--secrets upload` it is kept and none of its bytes are stored; with it, it is uploaded,
+/// verified and removed, and restores.
 #[test]
-fn a_retained_copy_with_a_secret_name_is_kept() {
-    // The fallback to the backup lane uses the backup lane's secret rule: a retained copy whose
-    // name is secret-like is never uploaded by default, so its piece is kept.
-    let fx = Fx::new();
-    let content = b"bytes kept under a secret-like name\n";
-    let orig = fx.write("keep/api_token_notes.txt", content);
-    fx.write("dups/copy.txt", content);
-    let third = fx.write("other/third.txt", content);
-    let mut piece = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
-    piece.evidence = Some(serde_json::json!({
-        "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
-        "retained_copy": orig, "retained_piece": 0
-    }));
-    let (scan, plan) = docs(
-        &[&fx.data],
-        &[P::tree(&fx.data.join("keep"), "keep"), piece],
-    );
-    let mut o = fx.opts(true);
-    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
-    assert_eq!(
-        apply(&scan, &plan, &o).unwrap().pieces[1].outcome,
-        "removed"
-    );
-    let mut piece = P::files(&fx.data.join("keep"), &["api_token_notes.txt"], "noise");
-    piece.evidence = Some(serde_json::json!({
-        "kind": "duplicate", "sha256": sha(&third), "size": content.len(),
-        "retained_copy": third, "retained_piece": 0
-    }));
-    let (scan, plan) = docs(
-        &[&fx.data],
-        &[P::tree(&fx.data.join("other"), "keep"), piece],
-    );
-    let mut o = fx.opts(true);
-    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
-    let rep = apply(&scan, &plan, &o).unwrap();
-    assert_eq!(rep.pieces[1].outcome, "kept", "{rep:?}");
-    assert!(rep.pieces[1].reason.contains("retained copy"), "{rep:?}");
-    assert!(rep.pieces[1].reason.contains("secret name"), "{rep:?}");
-    assert!(orig.exists());
+fn a_secret_named_duplicate_is_kept_unless_secrets_are_uploaded() {
+    for upload in [false, true] {
+        let fx = Fx::new();
+        let content = b"bytes kept under a secret-like name\n";
+        let orig = fx.write("keep/orig.txt", content);
+        let dup = fx.write("dups/api_token_notes.txt", content);
+        let (scan, plan) = docs(
+            &[&fx.data],
+            &[
+                P::tree(&fx.data.join("keep"), "keep"),
+                dup_piece(&fx.data.join("dups"), "api_token_notes.txt", &orig),
+            ],
+        );
+        let mut o = fx.opts(true);
+        o.secrets_upload = upload;
+        o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+        let rep = apply(&scan, &plan, &o).unwrap();
+        if upload {
+            assert_eq!(rep.pieces[1].outcome, "removed", "{rep:?}");
+            assert!(holds(&fx.all_shard_bytes(), content));
+            let r = restore(&dup, &ropts(&fx)).unwrap();
+            assert!(r.failed.is_empty(), "{r:?}");
+            assert_eq!(fs::read(&dup).unwrap(), content);
+        } else {
+            assert_eq!(rep.pieces[1].outcome, "kept", "{rep:?}");
+            assert!(rep.pieces[1].reason.contains("secret name"), "{rep:?}");
+            assert!(dup.exists());
+            assert!(!holds(&fx.all_shard_bytes(), content), "never uploaded");
+        }
+    }
 }
 
 // ---- Class 4: an archived shard is reused only when its stored hash matches (NEG-8) ----

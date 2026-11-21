@@ -923,9 +923,8 @@ fn a_derived_piece_of_a_nested_member_is_accepted_and_removes_only_it() {
             "{lane}: {r:?}"
         );
         assert_eq!(fs::read(&d1_path).unwrap(), b"one copy of these bytes\n");
-        if lane == "noise" {
-            assert_eq!(fx.shard_total(), 0, "a duplicate is never uploaded");
-        }
+        // Option A (r10 F1): a duplicate is backed up like the backup lane, once.
+        assert_eq!(fx.shard_total(), 24, "{lane}: its bytes are stored once");
     }
     let fx = Fx::new();
     let s = fx.data.join("s");
@@ -1448,9 +1447,10 @@ fn forged_rule_noise_with_a_secret_is_kept() {
 }
 
 #[test]
-fn duplicate_noise_restores_from_its_retained_copy() {
-    // Spec N4: a duplicate removed as noise comes back from the retained copy while that still
-    // has the content; when it does not and no archived copy exists, restore says so.
+fn duplicate_noise_restores_from_its_own_blob_whatever_its_retained_copy_holds() {
+    // Option A (main's ruling on Codex plan review r10 F1, replacing spec N4): a duplicate is
+    // backed up before removal, so it restores from its own archived bytes, also after its
+    // retained copy is edited.
     let fx = Fx::new();
     let content = b"the same bytes in two places\n";
     let keep = fx.data.join("keep");
@@ -1467,15 +1467,17 @@ fn duplicate_noise_restores_from_its_retained_copy() {
     let rep = apply(&scan, &plan, &o).unwrap();
     assert_eq!(rep.pieces[1].outcome, "removed", "{rep:?}");
     assert!(!dup.exists());
-    assert_eq!(fx.shard_total(), 0, "a duplicate is never uploaded");
+    assert_eq!(fx.shard_total(), content.len() as u64, "stored once");
     let r = restore(&dup, &ropts(&fx)).unwrap();
     assert!(r.failed.is_empty(), "{r:?}");
     assert_eq!(fs::read(&dup).unwrap(), content);
-    // The retained copy changed and nothing is archived: not restorable, and said so.
+    // The retained copy changed: the duplicate still restores, from its own blob.
     fs::remove_file(&dup).unwrap();
     fs::write(&orig, b"edited since").unwrap();
     let r = restore(&dup, &ropts(&fx)).unwrap();
-    assert_eq!(r.failed.len(), 1, "{r:?}");
-    assert!(r.failed[0].1.contains("no archived copy"), "{r:?}");
-    assert!(!dup.exists());
+    assert!(
+        r.failed.is_empty() && r.restored == vec![dup.clone()],
+        "{r:?}"
+    );
+    assert_eq!(fs::read(&dup).unwrap(), content);
 }

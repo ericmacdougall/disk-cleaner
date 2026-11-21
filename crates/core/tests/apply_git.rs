@@ -724,12 +724,12 @@ fn an_existing_recovery_ref_is_never_forced() {
     );
 }
 
-/// N4 (acceptance finding 1) in the vcs lane: an unchanged tracked file normally restores from
-/// the git object store, not from an archived blob, which the duplicate's restore cannot use.
-/// So a file that is the retained copy of a duplicate removed earlier is uploaded raw before
-/// its repository is removed, and both restore with the remote gone.
+/// Option A (main's ruling on Codex plan review r10 F1, replacing N4 in the vcs lane): a
+/// duplicate of a tracked file is backed up itself, so the repository that holds its retained
+/// copy is removed like any other (the tracked file through its git directory backup), and the
+/// duplicate restores from its own blob with the repository and its remote gone.
 #[test]
-fn retained_copy_in_a_git_piece_is_archived_raw() {
+fn a_duplicate_of_a_tracked_file_restores_from_its_own_blob_after_the_repo_goes() {
     let fx = Fx::new();
     let r = repo(&fx);
     let retained = r.dir.join("src/lib.rs");
@@ -745,6 +745,11 @@ fn retained_copy_in_a_git_piece_is_archived_raw() {
     let rep = apply(&scan, &plan, &o).unwrap();
     assert_eq!(outcome(&rep, 1).0, "removed", "{rep:#?}");
     assert!(!dup.exists());
+    let shards = fx.all_shard_bytes();
+    assert!(
+        shards.windows(UNCHANGED.len()).any(|w| w == UNCHANGED),
+        "the duplicate was uploaded"
+    );
 
     let (scan, plan) = docs(&[&fx.data], &[P::git(&r.dir, &[".env"], bundle_block())]);
     let mut o = gopts(&fx, true, true);
@@ -752,24 +757,15 @@ fn retained_copy_in_a_git_piece_is_archived_raw() {
     let rep = apply(&scan, &plan, &o).unwrap();
     let (out, why) = outcome(&rep, 0);
     assert_eq!(out, "removed", "{why}");
-    assert!(why.contains("retained copy"), "{why}");
     assert!(!retained.exists());
-    let shards = fx.all_shard_bytes();
-    assert!(
-        shards.windows(UNCHANGED.len()).any(|w| w == UNCHANGED),
-        "the retained copy was uploaded raw"
-    );
-    let manifest = fs::read_to_string(fx.manifest()).unwrap();
-    let row = manifest
-        .lines()
-        .find(|l| l.contains("\"t\":\"file\"") && l.contains("src/lib.rs"))
-        .expect("a file row for src/lib.rs");
-    assert!(!row.contains("git_oid"), "{row}");
-    // The duplicate restores from the archived blob, with its retained copy gone.
-    let rr = restore(&dup, &ropts(&fx)).unwrap();
-    assert!(rr.failed.is_empty(), "{rr:?}");
-    assert_eq!(fs::read(&dup).unwrap(), UNCHANGED);
+    // The duplicate restores from its own blob, with the repository and its remote gone.
     fs::remove_dir_all(&r.bare).unwrap();
+    let rr = restore(&dup, &ropts(&fx)).unwrap();
+    assert!(
+        rr.failed.is_empty() && rr.restored == vec![dup.clone()],
+        "{rr:?}"
+    );
+    assert_eq!(fs::read(&dup).unwrap(), UNCHANGED);
     let rr = restore(&r.dir, &ropts(&fx)).unwrap();
     assert!(rr.failed.is_empty() && rr.conflicts.is_empty(), "{rr:?}");
     assert_eq!(fs::read(&retained).unwrap(), UNCHANGED);
