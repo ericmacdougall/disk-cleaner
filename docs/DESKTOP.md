@@ -438,8 +438,9 @@ First results with these probes (commit 0588a6e): workflow "desktop" run 4488169
 seven jobs of "e2e-variants" run 44881704164. At that commit the floor ran just before the
 gated steps, and the gated Linux scroll moved on both runner classes against earlier runs: p50
 about 33 rose to 39 to 41 ms, and p50 about 46 rose to 85 to 88 ms. Windows and the 5,000-row
-check did not move. These gated samples may be affected by the probe. The next commit
-restores the registered order: IPC, the gated steps, then the floor, then the profile. Every runner had 4 logical CPUs. Milliseconds,
+check did not move. These gated samples may be affected by the probe. Commit 030f494 restores
+the registered order: IPC, the gated steps, then the floor, then the profile (results below).
+Every runner had 4 logical CPUs. Milliseconds,
 p50/p95. Floor is the empty frame. Load runs from the scroll event to the DOM holding the
 target row (IPC included). Stop runs from that point to the stop (the next frame and the
 post-paint task). The profile runs after the gated steps, further down the tree.
@@ -485,11 +486,49 @@ What the numbers show:
   would fit the CPU dependence. Another is the strace wrapper, which also traces the
   `ftruncate` of WebKit's shared-memory buffers (`/memfd:WebKitSharedMemory`).
 
+Results in the registered order with the probes (commit 030f494): workflow "desktop" run
+44883021601 and the seven jobs of "e2e-variants" run 44883021841. Here the floor runs after
+the gated steps, so it measures frames late in the session, not a fresh frame. The row-cap
+variant fails on its first render and runs no steps, so its floor is a fresh one. Milliseconds;
+floor and gated scroll are p50/p95/max, with the floor's rAF interval p50; profile slices are
+p50/p95.
+
+| Job | CPU | Floor after the steps | rAF | Gated scroll | Profile load | Profile stop | Verdict |
+|---|---|---|---|---|---|---|---|
+| desktop, Linux | AMD EPYC 9V74 | 64/100/122 | 65 | 38/60/68 | 7/11 | 89/130 | fail |
+| focus-broken, Linux | AMD EPYC 9V74 | 62/104/121 | 65 | 40/56/63 | 6/13 | 88/133 | fail |
+| capability-broadened, Linux | Intel Xeon Platinum 8573C | 68/161/206 | 65 | 38/53/67 | 6/11 | 79/126 | fail |
+| modal-trap-removed, Linux | AMD EPYC 7763 | 78/135/157 | 81 | 46/68/84 | 8/14 | 118/176 | fail |
+| offered-check-removed, Linux | AMD EPYC 7763 | 79/124/154 | 81 | 47/66/81 | 7/13 | 118/179 | fail |
+| planted-outside, Linux | AMD EPYC 7763 | 84/130/146 | 81 | 47/65/82 | 7/13 | 121/173 | fail |
+| planted-write, Linux | AMD EPYC 7763 | 82/130/146 | 81 | 45/68/77 | 8/14 | 116/172 | fail |
+| row-cap-removed, Linux (no steps) | AMD EPYC 9V74 | 20/46/56 | 17 | not run | | | fails by design |
+| desktop, Windows | AMD EPYC 9V74 | 15.5/16.7/18.1 | 15.6 | 31.3/32.6/34.9 | 3.5/5.0 | 14.4/15.5 | pass |
+| Playwright, Chromium | (ubuntu-latest) | 16.7/16.8/19.3 | 16.7 | 16.7/17.0/17.7 | 1.3/1.6 | 2.5/3.2 | pass |
+
+What these add:
+
+- No Linux job passed. On the EPYC 7763 the gated scroll was 45 to 47 ms p50 and 65 to 68 ms
+  p95, against 85 to 88 and 120 to 128 ms at 0588a6e on the same CPU model. The floor ahead of
+  the gated steps made them slower; in the registered order they are faster but still over
+  50 ms p95 on these runners.
+- After the gated steps the Linux frame rate has fallen: rAF interval p50 65 to 81 ms, against
+  16 to 20 ms in a fresh session (the 0588a6e floors, and 17 ms for the row-cap variant here).
+  At 0588a6e the 200 unchanged frames also slowed the steps after them. The cost so grows with
+  the frames the session has shown, or with its time; the two are not separated.
+- The gated step medians per 50 steps rise through the run: 41, 46, 49, 59 ms on one EPYC 7763
+  job and 34, 36, 39, 47 ms on the desktop job.
+- Windows does not slow down: medians per 50 steps stay at 31.3 ms and the floor after the
+  steps is one frame period.
+- The page's own work, IPC included, stays at 6 to 8 ms p50 in the profile pass.
+- The cause is still not established. The run without the strace wrapper, above, would
+  separate strace from rendering; it has not been run.
+
 Running-app scroll tally:
 
-- Windows: 4 of 4 passed.
-- Linux, in the registered order (before 0588a6e): 4 of 9 passed (three desktop runs and six
-  tree-neutral variant jobs).
+- Windows: 5 of 5 passed (through 030f494).
+- Linux, in the registered order: 4 of 16 passed. 4 of 9 before 0588a6e (three desktop runs and
+  six tree-neutral variant jobs, CPU not recorded), and 0 of 7 at 030f494.
 - Linux at 0588a6e, with the floor ahead of the gated steps: 0 of 7 passed. Kept apart from
   the tally above, because the procedure differed.
 - The row-cap variant is left out of every count, as it fails by design.
