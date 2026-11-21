@@ -469,7 +469,9 @@ class TestWorkflow(unittest.TestCase):
         self.assertRegex(step, r"shell: pwsh")
         d = tempfile.mkdtemp(prefix="release-zip-")
         self.addCleanup(shutil.rmtree, d, True)
-        tag = "v0.1.0-';Write-Output INJECTED;#"
+        # If the name were parsed as code this would print INJECTED, a word the name itself does not
+        # contain (the step lists the directory, so the name is printed either way).
+        tag = "v0.1.0-';Write-Output ('INJ'+'ECTED');#"
         name = "disk-cleaner-%s-x86_64-pc-windows-msvc" % tag
         os.makedirs(os.path.join(d, "dist", name))
         with open(os.path.join(d, "dist", name, "README.md"), "w") as f:
