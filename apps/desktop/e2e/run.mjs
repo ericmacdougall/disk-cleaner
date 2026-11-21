@@ -584,6 +584,8 @@ const runSteps = (app) =>
     await new Promise((r) => setTimeout(r, 2000));
     before = appPids();
     beforeAll = allPids();
+    // Precondition (recorded, Linux): no other app instance alive at the session's start.
+    if (linux) run.measure({ id: "info.synth_1m.precondition.untraced", others: procStates([...before]) });
     ({ proc: proc2 } = await startDriver({
       nativeDriver: a["native-driver"],
       port: 4446,
@@ -712,6 +714,8 @@ if (linux) {
     await new Promise((r) => setTimeout(r, 2000));
     before = appPids();
     beforeAll = allPids();
+    // Precondition (recorded): no other app instance alive at the session's start.
+    run.measure({ id: "info.synth_1m.precondition.traced", others: procStates([...before]) });
     ({ proc: proc3 } = await startDriver({ nativeDriver: a["native-driver"], port: 4448, nativePort: 4449, env: synthEnv(false) }));
     let shown = 0;
     await run.check("launch.synth_1m_traced", async () => {
@@ -786,6 +790,12 @@ if (linux && process.env.AC9_INVESTIGATE === "1") {
       // The previous session's app must be gone, or its trace state would be read for this one.
       for (let i = 0; i < 30 && livePids().length; i++) await sleep(500);
       const leftover = new Set(livePids());
+      // Precondition: no other app instance alive at the session's start, or the session is
+      // invalid, reported and not measured (an extra instance on the display can slow frames).
+      if (leftover.size) {
+        run.measure({ id, valid: false, untraced, leftover: procStates([...leftover]), error: "another app instance is alive at the session start; not measured" });
+        return;
+      }
       await sleep(2000);
       ({ proc } = await startDriver({ nativeDriver: a["native-driver"], port: 4448, nativePort: 4449, env: synthEnv(untraced) }));
       app = await App.open("http://127.0.0.1:4448", a.app);
