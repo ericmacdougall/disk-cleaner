@@ -91,3 +91,57 @@ jobs:
             !${{ runner.temp }}/e2e/before.json
             !${{ runner.temp }}/e2e/after.json
           retention-days: 14
+
+  # The AC-9 untraced switch (PRUNEDISK_E2E_UNTRACED) planted outside the e2e feature, in a
+  # release build (production config, no e2e feature). e2e/check-shipped.sh must fail on it and
+  # name the switch; the unpatched release binary passing it is desktop.yml's end-to-end job.
+  shipped-switch:
+    name: variant (untraced-switch-shipped)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Apply the broken variant
+        run: git apply --verbose apps/desktop/e2e/variants/untraced-switch-shipped.patch
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            apps/desktop/src-tauri
+            .
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential file libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Frontend and icons
+        working-directory: apps/desktop
+        run: |
+          npm ci --no-audit --no-fund
+          npx tauri icon app-icon.svg
+      - name: Build the release binary of the variant (production config, no e2e feature)
+        working-directory: apps/desktop
+        run: |
+          npx tauri build --ci --no-bundle
+          mkdir -p "$RUNNER_TEMP/shipped"
+          cp src-tauri/target/release/prunedisk-desktop "$RUNNER_TEMP/shipped/prunedisk-desktop"
+      - name: The planted switch must be caught by check-shipped.sh
+        working-directory: apps/desktop
+        run: |
+          status=0
+          bash e2e/check-shipped.sh "$RUNNER_TEMP/shipped" "$RUNNER_TEMP/shipped-work" > "$RUNNER_TEMP/shipped.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/shipped.txt"
+          [ "$status" != 0 ] || { echo "::error::check-shipped.sh passed a release build holding the untraced switch"; exit 1; }
+          grep -F 'holds "PRUNEDISK_E2E_UNTRACED"' "$RUNNER_TEMP/shipped.txt" || { echo "::error::check-shipped.sh failed but did not name PRUNEDISK_E2E_UNTRACED"; exit 1; }
+          echo "variant untraced-switch-shipped: caught"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: e2e-variant-untraced-switch-shipped
+          path: ${{ runner.temp }}/shipped.txt
+          retention-days: 14

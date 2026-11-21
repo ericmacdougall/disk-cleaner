@@ -51,7 +51,8 @@ cp "$E2E_BIN" "$OUT/shipped-e2e/prunedisk-desktop$ext"
 if bash e2e/check-shipped.sh "$OUT/shipped-e2e" "$OUT/shipped-e2e-work" > "$OUT/shipped-control.txt" 2>&1; then
   cat "$OUT/shipped-control.txt"; echo "::error::check-shipped.sh passed the e2e binary (control)"; exit 1
 fi
-want=('holds "PRUNEDISK_E2E_"' 'holds "PruneDisk (end-to-end build)"')
+# The untraced switch (AC-9) by its exact name: the shipped check must scan for it itself.
+want=('holds "PRUNEDISK_E2E_"' 'holds "PRUNEDISK_E2E_UNTRACED"' 'holds "PruneDisk (end-to-end build)"')
 if $win; then want+=('holds "remote-debugging-port"'); fi
 for w in "${want[@]}"; do
   grep -q -F "$w" "$OUT/shipped-control.txt" || { cat "$OUT/shipped-control.txt"; echo "::error::check-shipped.sh did not report: $w (control)"; exit 1; }
@@ -118,19 +119,28 @@ else
   mkdir -p "$OUT/trace"
   CALLS=$("$PY" e2e/trace_report.py --strace-calls)
   # Every launch of the app (the suite starts several) writes its own log: strace.<pid>.log.
-  # One exception, an investigation of the AC-9 timings (docs/DESKTOP.md), never a gate: a
-  # launch with PRUNEDISK_AC9_UNTRACED=1 and PRUNEDISK_E2E_SYNTH_NODES set (only run.mjs's
-  # extra one-million-row sessions) runs without strace, leaves a marker in $OUT/untraced/, and
-  # stays in the sandbox. The suite's other sessions never set it.
-  rm -rf "$OUT/untraced"
-  mkdir -p "$OUT/untraced"
+  # One exception, the AC-9 running-app scroll gate's timed launch (docs/DESKTOP.md): a launch
+  # with PRUNEDISK_E2E_UNTRACED=1 and PRUNEDISK_E2E_SYNTH_NODES set runs without strace, leaves a
+  # marker in $OUT/untraced/, and stays in the sandbox (the snapshot covers it). run.mjs runs the
+  # same steps again in a traced launch, which must leave its trace log (checked below). This
+  # script and its wrapper are CI only and never ship. The wrapper honours the switch only when
+  # E2E_BIN holds its name, which only a --features e2e build does (src-tauri/src/e2e.rs).
+  rm -rf "$OUT/untraced" "$OUT/traced-synth"
+  mkdir -p "$OUT/untraced" "$OUT/traced-synth"
+  UNTRACED_BRANCH=""
+  if grep -a -q PRUNEDISK_E2E_UNTRACED "$E2E_BIN"; then
+    UNTRACED_BRANCH="if [ \"\${PRUNEDISK_E2E_UNTRACED:-}\" = 1 ] && [ -n \"\${PRUNEDISK_E2E_SYNTH_NODES:-}\" ]; then
+  : > \"$OUT/untraced/launch.\$\$\"
+  exec \"$E2E_BIN\" \"\$@\"
+fi"
+  else
+    echo "the e2e binary does not hold PRUNEDISK_E2E_UNTRACED: every launch is traced"
+  fi
   cat > "$APP" << EOF
 #!/bin/sh
 export HOME="$SB/home" XDG_CONFIG_HOME="$SB/config" XDG_DATA_HOME="$SB/data" XDG_CACHE_HOME="$SB/cache" XDG_STATE_HOME="$SB/state" TMPDIR="$SB/tmp"
-if [ "\${PRUNEDISK_AC9_UNTRACED:-}" = 1 ] && [ -n "\${PRUNEDISK_E2E_SYNTH_NODES:-}" ]; then
-  : > "$OUT/untraced/launch.\$\$"
-  exec "$E2E_BIN" "\$@"
-fi
+$UNTRACED_BRANCH
+if [ -n "\${PRUNEDISK_E2E_SYNTH_NODES:-}" ]; then : > "$OUT/traced-synth/launch.\$\$"; fi
 exec strace -f -qq --seccomp-bpf -y -o "$OUT/trace/strace.\$\$.log" -e "trace=$CALLS" "$E2E_BIN" "\$@"
 EOF
   chmod +x "$APP"
@@ -165,7 +175,19 @@ if ! $win; then
   echo "trace logs: ${#logs[@]} (one per traced launch)"
   untraced=("$OUT"/untraced/launch.*)
   [ -e "${untraced[0]}" ] || untraced=()
-  echo "untraced launches (AC-9 investigation sessions, outside this trace): ${#untraced[@]}"
+  echo "untraced launches (the AC-9 timed launch and investigation sessions, outside this trace): ${#untraced[@]}"
+  # Each one-million-row launch that went through strace must have left its log (the wrapper
+  # execs strace in its own process, so the marker and the log share the pid).
+  synth=("$OUT"/traced-synth/launch.*)
+  [ -e "${synth[0]}" ] || synth=()
+  echo "traced one-million-row launches: ${#synth[@]}"
+  if [ "${#synth[@]}" = 0 ]; then
+    echo "::error::no traced one-million-row launch ran: the AC-9 steps were not checked for writes"; trace=1
+  fi
+  for m in "${synth[@]}"; do
+    p=${m##*.}
+    [ -s "$OUT/trace/strace.$p.log" ] || { echo "::error::traced one-million-row launch $p left no trace log"; trace=1; }
+  done
   "$PY" e2e/trace_report.py "${logs[@]}" "${DECLARED[@]}" "${TRACE_IGNORE[@]}" > "$OUT/trace.txt" || trace=$?
   { grep -E '^(OTHER|UNRESOLVED|UNOBSERVABLE|UNPARSED|trace:)' "$OUT/trace.txt" | head -200; } || true
 fi

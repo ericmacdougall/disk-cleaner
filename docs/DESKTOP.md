@@ -429,16 +429,44 @@ What counts as AC-9. The user's AC-9 target, as quoted, is check (3); the owner'
 ruling (no user source for it was shown) is that AC-9 is met by checks (1) and (3) and the DOM
 cap. Check (2) is an additional measurement: its 50 ms threshold is the owner's own
 pre-registration, inferred, not the user's words. Its results are neither an AC-9 miss nor an
-AC-9 pass. It is still a pass gate in `e2e/run.mjs`, as registered, until main rules on its
-form.
+AC-9 pass. It is a pass gate in `e2e/run.mjs`. Since main's ruling after the no-strace controls
+(below), on Linux it is timed in an untraced launch; its threshold, n and no-retry rule are
+unchanged.
 
-1. IPC (Linux; `timing.synth_1m.ipc_tree_page_p95` in `e2e/run.mjs`). A second app session at
-   the end of the WebDriver suite, with its own tauri-driver (ports 4446 and 4447), because the
-   app takes its environment from the driver. In the page, `__TAURI_INTERNALS__.invoke`
+Every check here runs on the one-million-row synthetic tree above (`PRUNEDISK_E2E_SYNTH_NODES`,
+1,000,001 rows), never the 5,000-row fixture of the first session's scroll check.
+
+The sessions, at the end of the WebDriver suite, each with its own tauri-driver because the app
+takes its environment from the driver:
+
+- Linux, the timed launch (ports 4446 and 4447): untraced (below). It must show it is untraced
+  (`trace.synth_1m.timed_launch_untraced`: the app process's `TracerPid` is 0). It records (1)'s
+  pages as information (`info.synth_1m.ipc_untraced`), then runs (2), then the floor and
+  profile probes.
+- Linux, the traced launch (ports 4448 and 4449): under the strace wrapper like every other
+  launch. It runs (1), as registered, then (2)'s steps again, not timed
+  (`steps.synth_1m.traced_scroll`): they must complete within the DOM limit. `e2e/check.sh`
+  requires its strace log, and the write observer and the snapshot cover it.
+- Windows: one session (ports 4446 and 4447) running (2). Windows has no tracer.
+
+The untraced switch. `e2e/run.mjs` sets `PRUNEDISK_E2E_UNTRACED=1` for the timed launch only.
+`e2e/check.sh`'s app wrapper (CI only; it never ships) then starts that launch without strace,
+but only when `PRUNEDISK_E2E_SYNTH_NODES` is set too and the e2e binary holds the switch's name,
+which only a `--features e2e` build does (`src-tauri/src/e2e.rs`). The app checks the claim:
+with the switch set and a tracer attached, it shows no synthetic tree. Each untraced launch
+leaves a marker in `$OUT/untraced/`, each traced one-million-row launch one in
+`$OUT/traced-synth/`, and the trace step fails when a traced one-million-row launch left no
+strace log or none ran. A release binary holds no `PRUNEDISK_E2E_` name (check.sh's string
+check); `e2e/check-shipped.sh` names `PRUNEDISK_E2E_UNTRACED` on its own, check.sh's control
+requires it to report that name on the e2e binary, and the variant `untraced-switch-shipped`
+(below) plants the switch in a release build, which check-shipped.sh must fail.
+
+1. IPC (Linux; `timing.synth_1m.ipc_tree_page_p95` in `e2e/run.mjs`, in the traced launch). In
+   the page, `__TAURI_INTERNALS__.invoke`
    `tree_page` with offset k * 200 and limit 200: 10 warm-up pages, then k = 0..99 timed with
    `performance.now()`. Each page must hold 200 rows at its offset. Pass: p95 < 50 ms over
    100 samples.
-2. Running-app scroll (Linux and Windows; `timing.synth_1m.scroll_p95`, same session). Size
+2. Running-app scroll (Linux and Windows; `timing.synth_1m.scroll_p95`, in the timed launch). Size
    tree, 10 warm-up steps, then 200 steps of 10 rows (280 px). The boundary:
    - the clock starts just before `.tg-scroll`'s `scrollTop` is set;
    - it stops after the first animation frame in which the step's target row
@@ -640,19 +668,18 @@ What these add:
 
 The investigation sessions (registered in the WAL before any sample, informational, never a
 gate). They are opt-in: the e2e-variants workflow's `ac9_investigate` input sets
-`AC9_INVESTIGATE=1`, and `e2e/run.mjs` then runs them on Linux after the gated session, which
-is not changed. Each one is a fresh one-million-row launch, once with the strace wrapper and once
-without:
+`AC9_INVESTIGATE=1`, and `e2e/run.mjs` then runs them on Linux after the gated sessions, which
+they do not change. Each one is a fresh one-million-row launch, once with the strace wrapper and
+once without:
 
 - steps: floor windows of 60 frames at the start, the middle and the end, around the 200 steps;
 - app idle: the tree shown, no steps, only the floor loop, for as long as the steps session took;
 - blank page: the same launch navigated to `about:blank`, so no app code runs in the page, then
   the floor loop for the same time.
 
-`e2e/check.sh`'s app wrapper skips strace only when both `PRUNEDISK_AC9_UNTRACED=1` and
-`PRUNEDISK_E2E_SYNTH_NODES` are set, which only those sessions do. Each untraced launch leaves a
-marker in `$OUT/untraced/`, and the trace step prints how many there were. The write observer
-(PR gate F10) does not see those launches; the sandbox snapshot still covers them. Each session
+They use the untraced switch described above (at cc3e711 it was named `PRUNEDISK_AC9_UNTRACED`
+and honoured for any binary). The write observer (PR gate F10) does not see the untraced
+launches; the sandbox snapshot still covers them. Each session
 reads the app process's `TracerPid` from `/proc` and counts as invalid when it does not match
 its arm. Page functions: `e2e/ac9x.mjs`, which reuses `e2e/ac9.mjs`'s step and floor code.
 
@@ -722,7 +749,8 @@ strace like the app, and nothing slows down without it, so under strace the gate
 harness, not the app. Main's ruling (relayed by the stream owner; its WAL entry is in main's
 WAL, inferred) keeps the threshold (50 ms nearest-rank p95), n (200 after 10 warm-up steps) and
 the no-retry rule, and times the scroll in an untraced launch. Floor-relative thresholds and a
-measure-only gate were rejected. The gate as changed is described below and was registered
+measure-only gate were rejected. The gate as changed is described at the top of this section
+(the sessions and the untraced switch) and was registered
 before its first run (WAL w3bd2a24a6c6, amended in wad2689e80fc before any run).
 
 Both builds showed 1,000,001 rows before measuring in both runs. Linux's WebDriver clock ticks in whole
@@ -746,6 +774,7 @@ guarantee, and `e2e/expect_variant.py` passes only when the check written for it
 | `modal-trap-removed.patch` | the question opens non-modally: no inert background, no Tab trap | `settings.confirm_focus_contained` |
 | `planted-outside.patch` | writes `/tmp/prunedisk-planted-outside`, outside every snapshot root | trace: `OTHER openat: /tmp/prunedisk-planted-outside` (and the manifest must not see it) |
 | `row-cap-removed.patch` | the size tree's row cap is raised to 1000 and the grid renders up to the cap (a 1000-row buffer). Raising or deleting `MAX_DOM_ROWS` alone changes nothing at the app's window height, where the visible height (about 28 rows) is the binding limit, so the patch also renders the cap | `timing.synth_1m.scroll_p95` |
+| `untraced-switch-shipped.patch` | reads `PRUNEDISK_E2E_UNTRACED` outside the e2e feature, so a release build holds the untraced switch (its own job: a release build, no suite) | `e2e/check-shipped.sh`: `holds "PRUNEDISK_E2E_UNTRACED"` |
 
 macOS: no WebDriver exists for an app's WKWebView. Apple's safaridriver drives Safari only,
 and tauri-driver supports Linux and Windows only. On macOS the app is covered by:

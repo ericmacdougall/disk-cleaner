@@ -1,0 +1,15 @@
+diff --git a/apps/desktop/src-tauri/src/lib.rs b/apps/desktop/src-tauri/src/lib.rs
+--- a/apps/desktop/src-tauri/src/lib.rs
++++ b/apps/desktop/src-tauri/src/lib.rs
+@@ -24,6 +24,11 @@
+ /// Start the app.
+ pub fn run() {
+     let inner = Inner::new(None);
++    // Planted by e2e/variants/untraced-switch-shipped.patch: the AC-9 untraced switch outside
++    // the e2e feature, so a release build holds it. e2e/check-shipped.sh must catch it.
++    if std::env::var_os("PRUNEDISK_E2E_UNTRACED").is_some_and(|v| v == "1") {
++        eprintln!("untraced switch set");
++    }
+     #[cfg(feature = "e2e")]
+     e2e_open(&inner);
+     let on_exit = std::sync::Arc::clone(&inner);

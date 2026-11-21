@@ -10,6 +10,8 @@
 //! - `PRUNEDISK_E2E_START`: folders (a path list) to scan, with git facts, as soon as the app
 //!   starts, through the same offer and Start as the chooser (the window-close check,
 //!   e2e/close/check_close.py, which drives the window only through the X server).
+//! - `PRUNEDISK_E2E_SYNTH_NODES` and `PRUNEDISK_E2E_UNTRACED`: the AC-9 timing workload and its
+//!   untraced timed launch (below).
 //!
 //! The run loop also reports the window and exit events it sees on stderr, one line each,
 //! prefixed `e2e: event`, so the window-close check can say which way each route went.
@@ -52,6 +54,25 @@ pub fn next_export() -> Option<Option<PathBuf>> {
     next("PRUNEDISK_E2E_EXPORT", &EXPORTED)
 }
 
+/// The untraced switch (spec AC-9, PR gate F9; CI only). `e2e/run.mjs` sets it to 1 for the
+/// running-app scroll gate's timed launch, and `e2e/check.sh`'s app wrapper then starts that
+/// launch without strace. The wrapper honours it only for a binary that holds this name, so only
+/// for an e2e build: a release build holds no `PRUNEDISK_E2E_` name (check.sh's string check and
+/// `e2e/check-shipped.sh`, which names this one too). The app checks the claim itself: when the
+/// switch is set and a tracer is attached, it shows no synthetic tree, so a traced launch is never
+/// timed as the untraced one.
+const UNTRACED: &str = "PRUNEDISK_E2E_UNTRACED";
+
+/// The pid tracing this process (Linux `TracerPid`; 0 when none), or `None` where it cannot be
+/// read (no `/proc`, as on Windows, which has no tracer in the e2e run).
+fn tracer_pid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("TracerPid:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
 /// Most files `PRUNEDISK_E2E_SYNTH_NODES` may ask for.
 const MAX_SYNTH_NODES: usize = 10_000_000;
 
@@ -73,6 +94,15 @@ pub fn open_synthetic(inner: &crate::state::Inner) {
             return;
         }
     };
+    if std::env::var_os(UNTRACED).is_some_and(|v| v == "1") {
+        match tracer_pid() {
+            Some(0) | None => eprintln!("e2e: {UNTRACED}=1: the untraced timing launch"),
+            Some(pid) => {
+                eprintln!("e2e: {UNTRACED}=1 but traced by pid {pid}: no synthetic tree");
+                return;
+            }
+        }
+    }
     // Held until the job is done, as a scan's thread holds it.
     let ticket = match inner.jobs.start() {
         Ok(t) => t,

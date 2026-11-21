@@ -4,6 +4,8 @@
 # Unpacks the program from every bundle in the folder (.app, .deb, .AppImage, .msi, NSIS .exe;
 # the .dmg is a disk image of the same .app and is not opened) and fails if any program holds a string only an end-to-end build has:
 #   PRUNEDISK_E2E_                  the e2e feature's hooks (src-tauri/src/e2e.rs)
+#   PRUNEDISK_E2E_UNTRACED          the AC-9 untraced switch, named on its own so a change of
+#                                   the prefix above cannot drop it unnoticed
 #   remote-debugging-port           e2e/windows-automation.conf.json
 #   PruneDisk (end-to-end build)    the window title of both automation configs
 # Control: e2e/check.sh runs this script on the e2e binary and requires it to fail, naming
@@ -17,7 +19,7 @@ mkdir -p "$WORK"
 # Absolute paths: the AppImage is run from inside its scratch folder.
 BUNDLE=$(cd "$BUNDLE" && pwd)
 WORK=$(cd "$WORK" && pwd)
-MARKS=(PRUNEDISK_E2E_ remote-debugging-port 'PruneDisk (end-to-end build)')
+MARKS=(PRUNEDISK_E2E_ PRUNEDISK_E2E_UNTRACED remote-debugging-port 'PruneDisk (end-to-end build)')
 checked=0
 bad=0
 
