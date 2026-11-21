@@ -4,6 +4,7 @@
 
 pub mod command_names;
 pub mod commands;
+pub mod dialogs;
 #[cfg(feature = "e2e")]
 mod e2e;
 pub mod state;

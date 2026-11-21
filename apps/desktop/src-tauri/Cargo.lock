@@ -2608,6 +2608,7 @@ name = "prunedisk-desktop"
 version = "0.1.0"
 dependencies = [
  "command-group",
+ "dirs",
  "disk-cleaner-core",
  "disk-cleaner-view",
  "libc",
