@@ -81,9 +81,8 @@ pub fn enumerate(
                     } else {
                         format!("{dir}/{name}")
                     };
-                    if kind == PieceKind::GitNode && rel == ".git" {
-                        continue;
-                    }
+                    // A git-node's members include its git directory (scan rev 5): the
+                    // preserve obligation backs it up with the work tree.
                     if excluded(&rel, excludes) {
                         continue;
                     }

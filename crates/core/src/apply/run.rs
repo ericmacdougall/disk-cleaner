@@ -23,7 +23,6 @@ pub(crate) enum Content {
         target: String,
     },
     /// Raw-identical to a HEAD blob of a git directory that is itself backed up.
-    #[allow(dead_code)] // built by the vcs lane (next commit)
     GitBlob {
         oid: String,
         sha256: String,
@@ -50,6 +49,8 @@ pub(crate) struct Prepared {
     pub extra_rows: Vec<Row>,
     pub restore: String,
     pub reason: String,
+    /// A git piece's recovery work (act only, before the upload).
+    pub git: Option<Box<super::gitlane::GitWork>>,
 }
 
 fn random_id(now: i64) -> String {
@@ -301,10 +302,37 @@ pub fn apply(
         return Ok(ctx.report);
     }
 
-    // 2. Upload every blob not already verified in storage.
+    // 2. Git recovery (act only): push recovery refs to a remote proven private and confirm
+    // them, before anything is uploaded or removed. A failure keeps the piece (F6).
+    let mut recovered = Vec::with_capacity(prepared.len());
+    for pr in prepared {
+        let Some(w) = pr.git.as_deref() else {
+            recovered.push(pr);
+            continue;
+        };
+        let p = &inputs.pieces[pr.piece];
+        match super::gitlane::recover(opts, &run, p, w) {
+            Ok(r) => {
+                if let Some(row) = r.row {
+                    ctx.manifest.append(opts.now, vec![row])?;
+                }
+                set_outcome(&mut ctx.report, pr.piece, "pending", &r.note);
+                recovered.push(pr);
+            }
+            Err(why) => set_outcome(
+                &mut ctx.report,
+                pr.piece,
+                "kept",
+                &format!("recovery failed on a private remote, so nothing is removed: {why}"),
+            ),
+        }
+    }
+    let prepared = recovered;
+
+    // 3. Upload every blob not already verified in storage.
     let available = upload_phase(&mut ctx, &prepared)?;
 
-    // 3. Remove, in batches, every piece whose content is all accounted for.
+    // 4. Remove, in batches, every piece whose content is all accounted for.
     let mut ready: Vec<Prepared> = Vec::new();
     for pr in prepared {
         let missing = pr.members.iter().find(|m| match &m.content {
@@ -464,6 +492,7 @@ fn prepare_backup(p: &PlanPiece, en: &recheck::Enumerated) -> Result<Prepared, S
         extra_rows: Vec::new(),
         restore: "disk-cleaner restore --path <path>".into(),
         reason: String::new(),
+        git: None,
     })
 }
 
@@ -581,6 +610,7 @@ fn prepare_noise(ctx: &Ctx, p: &PlanPiece, en: &recheck::Enumerated) -> Result<P
         extra_rows: extra,
         restore,
         reason: String::new(),
+        git: None,
     })
 }
 
@@ -668,10 +698,11 @@ fn resume_prepared(ctx: &Ctx, p: &PlanPiece, run: &str) -> Result<Prepared, Stri
         piece: p.id,
         members,
         dirs,
-        remove_root: p.kind == PieceKind::Tree,
+        remove_root: matches!(p.kind, PieceKind::Tree | PieceKind::GitNode),
         extra_rows: Vec::new(),
         restore: "disk-cleaner restore --path <path>".into(),
         reason: "resuming an interrupted removal".into(),
+        git: None,
     })
 }
 

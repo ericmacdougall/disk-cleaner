@@ -20,6 +20,8 @@ pub mod fsops;
 #[cfg(unix)]
 mod gitlane;
 #[cfg(unix)]
+pub use gitlane::utc_date;
+#[cfg(unix)]
 pub mod manifest;
 #[cfg(unix)]
 pub mod recheck;
@@ -81,17 +83,51 @@ pub trait PlanOracle: Send + Sync {
     ) -> Option<std::collections::BTreeMap<usize, String>>;
 }
 
-/// The production oracle: core `plan()` does not emit lanes yet (stream A), so nothing can be
-/// re-derived and every noise and git piece is kept.
-pub struct CoreOracle;
+/// The production oracle (spec revision 3, F3): runs core `plan()` again on the scan, with the
+/// plan's own inputs (its time, window, active paths and the choices the user made when planning)
+/// and a process snapshot taken now, then compares each piece's canonical form. Whatever the scan
+/// does not support, or what a process now running changes, differs and is kept. A scan that is
+/// not a full scan result, or a re-derived plan that does not parse, re-derives nothing (every
+/// noise and git piece is then kept).
+pub struct CoreOracle {
+    /// Most allocated bytes of one git directory's own files (config `max_git_admin_bytes`; the
+    /// plan does not record it).
+    pub max_git_admin_bytes: u64,
+    /// The process snapshot for the re-derivation.
+    pub process: ProcessProbe,
+}
+
+impl Default for CoreOracle {
+    fn default() -> Self {
+        CoreOracle {
+            max_git_admin_bytes: crate::config::DEFAULT_MAX_GIT_ADMIN_BYTES,
+            process: Box::new(crate::procs::running_cwds),
+        }
+    }
+}
 
 impl PlanOracle for CoreOracle {
     fn rederive(
         &self,
-        _scan: &str,
-        _plan: &str,
+        scan_text: &str,
+        plan_text: &str,
     ) -> Option<std::collections::BTreeMap<usize, String>> {
-        None
+        let scan = crate::scan_from_json(scan_text).ok()?;
+        let header: crate::Plan = serde_json::from_str(plan_text).ok()?;
+        let opts = crate::PlanOptions {
+            active: header.active.iter().map(PathBuf::from).collect(),
+            active_window_days: header.active_window_days,
+            window_source: header.window_source.clone(),
+            now: header.generated_at,
+            process: (self.process)(),
+            trust_partial_process_check: header.trusted_partial_process_check,
+            accept_incomplete_coverage: header.accepted_incomplete_coverage,
+            max_git_admin_bytes: self.max_git_admin_bytes,
+        };
+        let again = crate::plan(&scan, &opts);
+        let text = serde_json::to_string(&again).ok()?;
+        let inputs = input::parse(scan_text, &text, None, None).ok()?;
+        Some(inputs.pieces.iter().map(|p| (p.id, canonical(p))).collect())
     }
 }
 
@@ -117,7 +153,12 @@ pub fn canonical(p: &input::PlanPiece) -> String {
     let git = p
         .git
         .as_ref()
-        .map(|g| format!("{}:{:?}", g.action, g.recovery))
+        .map(|g| {
+            format!(
+                "{}:{}:{:?}:{:?}",
+                g.action, g.preserve, g.excludes_secret, g.recovery
+            )
+        })
         .unwrap_or_default();
     format!(
         "{}|{}|{:?}|{}|{:?}|{:?}|{}|{}",
@@ -222,7 +263,7 @@ impl ApplyOptions {
             now,
             home: std::env::var_os("HOME").map(PathBuf::from),
             process: Box::new(crate::procs::running_cwds),
-            oracle: Box::new(CoreOracle),
+            oracle: Box::new(CoreOracle::default()),
             #[cfg(feature = "test-hooks")]
             hooks: TestHooks::default(),
         }
@@ -242,7 +283,6 @@ impl ApplyOptions {
         Ok(())
     }
 
-    #[allow(dead_code)] // read by the vcs lane (next commit)
     pub(crate) fn file_remotes_are_network(&self) -> bool {
         #[cfg(feature = "test-hooks")]
         {

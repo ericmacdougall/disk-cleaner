@@ -32,15 +32,33 @@ yes. It prints a summary, or JSON with `--json`, and writes the JSON to a file w
 window (`active_window_days`, default 7, set in the config file or with `--active-window-days`), a
 path you mark with `--active`, or a folder a running process works in is kept. For the rest it
 proposes one action per item: `keep`, `remove-regenerable`, `backup-then-remove`,
-`recover-backup-then-remove` or `ask`, each with a reason in words. The plan is a proposal only;
-nothing applies it yet.
+`recover-backup-then-remove` or `ask`, each with a reason in words. These item actions are a
+proposal only; `apply` executes the plan's lanes (below).
 
 `disk-cleaner apply --scan scan.json --plan plan.json --remote <rclone remote>` executes the lanes
-of a plan made with `scan --lanes`. It is a dry run unless you add `--apply`. In this version only the
-backup lane acts; noise and git pieces are kept with a printed reason. Before it touches a piece it
-re-checks it against the scan, and keeps it if anything changed, if a process works in its project,
-or if a file in it has a secret name (`.env`, keys, credentials). Secret-named files stay on this disk
-unless you pass `--secrets upload` yourself. Each distinct file content is uploaded once, in shards of
+of a plan made with `scan --lanes`. It is a dry run unless you add `--apply`. Before it touches a
+piece it re-checks it against the scan, and keeps it if anything changed, if a process works in its
+project, or if a file in it has a secret name (`.env`, keys, credentials). It also runs the planner
+again on the scan and keeps any noise or git piece the scan does not support. Secret-named files stay
+on this disk unless you pass `--secrets upload` yourself.
+
+- **backup:** uploaded, verified, then removed (below).
+- **noise:** removed only while its evidence holds: a dependency or build folder next to its marker
+  file (restore lists it to regenerate), or a duplicate whose kept copy still has the same content
+  (restore copies it back from there).
+- **git:** a repository is removed only after its `.git` directory and every file that differs from
+  the last commit are backed up; unchanged files come back from the backed-up history. Unsaved work
+  (unpushed commits, plus a snapshot of changed and new files, never secret-named, ignored or very
+  large ones) is first pushed to `refs/recovery/<host>/<date>/...` on its remote, without force, but
+  only when apply has established that the remote is private: you list it in the config key
+  `private_remotes` or with `--private-remote`, or, for github.com, `gh` reports it private. Anything
+  else, a repository config that apply does not trust, or a secret in an unpushed commit, means no
+  push. A push that fails on a private remote keeps the repository. A repository whose config holds a
+  credential (a token in a remote URL, a `credential.*` or `http.*.extraheader` key) is kept unless
+  you pass `--secrets upload`. Git runs without your repository's hooks or config and without your
+  global config, except your credential helper.
+
+Each distinct file content is uploaded once, in shards of
 `--shard-mib` (default 64) through `--jobs` (default 4) rclone uploads at a time, streamed with no
 local copy. A shard is verified in storage by size and hash before any file in it is removed, and a
 shard that fails removes nothing. Every removal is written first to a manifest
@@ -77,8 +95,6 @@ Continuous integration builds and tests it on Linux, macOS and Windows.
 
 None of this exists yet:
 
-- the noise and git lanes of `apply` (recovery of unsaved work, removal of regenerable
-  directories and duplicates);
 - detection and backup of coding-agent sessions and logs, and age and size policies for caches and
   outputs;
 - a desktop app with outline, sunburst, treemap and biggest-files views;
@@ -88,8 +104,8 @@ None of this exists yet:
 ## Safety model in one paragraph
 
 Scanning and planning are read-only. Apply removes nothing unless the tool has shown that it is
-backed up and verified (and, for the lanes still to come, regenerable or present elsewhere), and has
-re-checked that at the moment of removal.
+backed up and verified, regenerable, or present elsewhere, and has re-checked that at the moment of
+removal.
 A check that fails or times out leaves its fact unknown, and an unknown fact never leads the plan to
 propose removal: an idle repo with one is marked `ask`. Every removal is written to a manifest with a restore command.
 

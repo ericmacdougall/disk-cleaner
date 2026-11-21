@@ -186,6 +186,15 @@ impl P {
             ..P::tree(dir, lane)
         }
     }
+    /// A git-node piece of the git lane with this `git` block; `excludes` stay in place.
+    pub fn git(dir: &Path, excludes: &[&str], git: Value) -> P {
+        P {
+            kind: PieceKind::GitNode,
+            excludes: excludes.iter().map(|s| s.to_string()).collect(),
+            git: Some(git),
+            ..P::tree(dir, "git")
+        }
+    }
     /// A derived files piece of one member, cut from scan piece `k`.
     pub fn derived(dir: &Path, name: &str, k: usize, lane: &'static str) -> P {
         P {
@@ -365,13 +374,13 @@ impl PlanOracle for FixtureOracle {
     }
 }
 
-/// The oracle that agrees with every noise and git piece of `plan`.
-pub fn agreeing_oracle(plan: &str) -> FixtureOracle {
-    let v: Value = serde_json::from_str(plan).unwrap();
-    let pieces: Vec<disk_cleaner_core::apply::input::PlanPiece> =
-        serde_json::from_value(v["lanes"]["pieces"].clone()).unwrap();
+/// The oracle that agrees with every noise and git piece of `plan` (canonical forms computed from
+/// apply's own parse of the two documents, as the production oracle does).
+pub fn agreeing_oracle(scan: &str, plan: &str) -> FixtureOracle {
+    let inputs = disk_cleaner_core::apply::input::parse(scan, plan, None, None).unwrap();
     FixtureOracle(
-        pieces
+        inputs
+            .pieces
             .iter()
             .map(|p| (p.id, disk_cleaner_core::apply::canonical(p)))
             .collect(),

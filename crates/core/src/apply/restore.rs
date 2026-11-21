@@ -185,6 +185,49 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
             _ => {}
         }
     }
+    // A HEAD-identical file restores from its git directory (I-1): when that directory is not on
+    // disk and not part of this restore, its rows from the same run are restored first.
+    let mut need: BTreeSet<(String, PathBuf)> = BTreeSet::new();
+    for (run, row) in chosen.values() {
+        if let Row::File {
+            git_oid: Some(_),
+            git_dir: Some(gd),
+            ..
+        } = row
+        {
+            if gd.symlink_metadata().is_err() {
+                need.insert((run.clone(), gd.clone()));
+            }
+        }
+    }
+    for e in &rows {
+        if let Row::File { path, .. } = &e.row {
+            if need
+                .iter()
+                .any(|(r, gd)| *r == e.run && path.starts_with(gd))
+                && !chosen.contains_key(path)
+            {
+                chosen.insert(path.clone(), (e.run.clone(), e.row.clone()));
+            }
+        }
+    }
+    // Duplicates removed as noise (N4): path -> (retained copy, sha256), per run.
+    let mut retains: BTreeMap<(String, PathBuf), (PathBuf, String)> = BTreeMap::new();
+    for e in &rows {
+        if let Row::Retains {
+            path,
+            retained,
+            sha256,
+            ..
+        } = &e.row
+        {
+            retains.insert(
+                (e.run.clone(), path.clone()),
+                (retained.clone(), sha256.clone()),
+            );
+        }
+    }
+    let regen_paths: Vec<PathBuf> = regen.iter().map(|(p, _)| p.clone()).collect();
     let mut rep = RestoreReport {
         regenerate: regen,
         rejected_segments,
@@ -231,6 +274,28 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
                 continue;
             }
         }
+        let _ = git_dir;
+        if sha256.is_none() && link_target.is_none() {
+            // Noise: rule noise is regenerated (listed above), never a failure.
+            if regen_paths.iter().any(|r| path.starts_with(r)) {
+                continue;
+            }
+            if let Some((retained, s)) = retains.get(&(run.clone(), path.clone())) {
+                let res = restore_duplicate(
+                    &rc,
+                    &root,
+                    path,
+                    id.mode,
+                    id.mtime_s,
+                    id.mtime_ns,
+                    retained,
+                    s,
+                    &blobs,
+                );
+                record(&mut rep, path, res);
+                continue;
+            }
+        }
         let res = restore_one(
             &rc,
             &root,
@@ -242,7 +307,6 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
             link_target.as_deref(),
             &blobs,
         );
-        let _ = git_dir;
         let ok = matches!(res, Ok(One::Restored) | Ok(One::Identical));
         if let (true, Some(g)) = (ok, link_group) {
             first_of_group
@@ -397,6 +461,42 @@ where
                 Ok(One::Conflict)
             }
         }
+    }
+}
+
+/// A duplicate removed as noise: copied from its retained copy while that still has `sha256`
+/// (re-hashed on the way), else from an archived blob with that sha256 (N4).
+#[allow(clippy::too_many_arguments)]
+fn restore_duplicate(
+    rc: &Rclone,
+    root: &rustix::fd::OwnedFd,
+    path: &Path,
+    mode: u32,
+    ms: i64,
+    mns: i64,
+    retained: &Path,
+    sha256: &str,
+    blobs: &BTreeMap<String, (u64, Vec<Segment>)>,
+) -> Result<One, String> {
+    let rel = retained
+        .strip_prefix("/")
+        .map(|r| r.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let from_copy = publish_bytes(root, path, mode, ms, mns, sha256, |w| {
+        let (mut f, _) = fsops::open_file_rel(root, &rel).map_err(|e| e.to_string())?;
+        std::io::copy(&mut f, w).map_err(|e| e.to_string())?;
+        Ok(())
+    });
+    match from_copy {
+        Ok(one) => Ok(one),
+        Err(why) if blobs.contains_key(sha256) => {
+            let _ = why;
+            restore_one(rc, root, path, mode, ms, mns, Some(sha256), None, blobs)
+        }
+        Err(why) => Err(format!(
+            "a duplicate of {}, which no longer has that content ({why}), and no archived copy exists",
+            retained.display()
+        )),
     }
 }
 

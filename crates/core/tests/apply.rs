@@ -1115,10 +1115,43 @@ fn forged_rule_noise_with_a_secret_is_kept() {
     pv["items"] = serde_json::json!([{"node": 0, "path": d, "action": "remove-regenerable"}]);
     let plan = pv.to_string();
     let mut o = fx.opts(true);
-    o.oracle = Box::new(agreeing_oracle(&plan));
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
     o.secrets_upload = true;
     let before = tree_digest(&fx.data);
     let rep = apply(&scan, &plan, &o).unwrap();
     assert_eq!(rep.pieces[0].outcome, "kept", "{rep:?}");
     assert_eq!(tree_digest(&fx.data), before);
+}
+
+#[test]
+fn duplicate_noise_restores_from_its_retained_copy() {
+    // Spec N4: a duplicate removed as noise comes back from the retained copy while that still
+    // has the content; when it does not and no archived copy exists, restore says so.
+    let fx = Fx::new();
+    let content = b"the same bytes in two places\n";
+    let keep = fx.data.join("keep");
+    let orig = fx.write("keep/orig.txt", content);
+    let dup = fx.write("dups/copy.txt", content);
+    let mut piece = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
+    piece.evidence = Some(serde_json::json!({
+        "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
+        "retained_copy": orig, "retained_piece": 0
+    }));
+    let (scan, plan) = docs(&[&fx.data], &[P::tree(&keep, "keep"), piece]);
+    let mut o = fx.opts(true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    assert_eq!(rep.pieces[1].outcome, "removed", "{rep:?}");
+    assert!(!dup.exists());
+    assert_eq!(fx.shard_total(), 0, "a duplicate is never uploaded");
+    let r = restore(&dup, &ropts(&fx)).unwrap();
+    assert!(r.failed.is_empty(), "{r:?}");
+    assert_eq!(fs::read(&dup).unwrap(), content);
+    // The retained copy changed and nothing is archived: not restorable, and said so.
+    fs::remove_file(&dup).unwrap();
+    fs::write(&orig, b"edited since").unwrap();
+    let r = restore(&dup, &ropts(&fx)).unwrap();
+    assert_eq!(r.failed.len(), 1, "{r:?}");
+    assert!(r.failed[0].1.contains("no archived copy"), "{r:?}");
+    assert!(!dup.exists());
 }

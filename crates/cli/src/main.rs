@@ -72,12 +72,22 @@ struct ApplyArgs {
     #[arg(long, value_name = "MODE")]
     secrets: Option<String>,
     /// A remote URL (without credentials) you declare private; recovery refs may be pushed to
-    /// it. Repeatable.
+    /// it. Repeatable; added to `private_remotes` from the config file.
     #[arg(long = "private-remote", value_name = "URL")]
     private_remotes: Vec<String>,
+    /// Config file (default: <platform config dir>/disk-cleaner/config.toml). Apply reads
+    /// `private_remotes` and `max_git_admin_bytes` from it.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
     /// The rclone binary.
     #[arg(long, default_value = "rclone")]
     rclone: PathBuf,
+    /// The git binary (2.32 or later).
+    #[arg(long, default_value = "git")]
+    git: PathBuf,
+    /// The GitHub CLI, used only to confirm that a github.com remote is private before a push.
+    #[arg(long, default_value = "gh")]
+    gh: PathBuf,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -336,15 +346,23 @@ fn run_apply(a: ApplyArgs) -> Result<()> {
         .with_context(|| format!("cannot read {}", a.scan.display()))?;
     let plan_text = std::fs::read_to_string(&a.plan)
         .with_context(|| format!("cannot read {}", a.plan.display()))?;
+    let (cfg, _) = config::load(a.config.as_deref()).context("invalid configuration")?;
     let mut opts = ApplyOptions::new(a.remote.clone(), manifest, base.join("state"), now);
+    opts.oracle = Box::new(disk_cleaner_core::apply::CoreOracle {
+        max_git_admin_bytes: cfg.max_git_admin_bytes,
+        ..Default::default()
+    });
     opts.label = label;
     opts.act = a.apply;
     opts.jobs = a.jobs.max(1);
     opts.shard_bytes = a.shard_mib.max(1) << 20;
     opts.shard_timeout = Duration::from_secs(a.shard_timeout_secs.max(10));
     opts.secrets_upload = secrets_upload;
-    opts.private_remotes = a.private_remotes;
+    opts.private_remotes = cfg.private_remotes;
+    opts.private_remotes.extend(a.private_remotes);
     opts.rclone = a.rclone;
+    opts.git = a.git;
+    opts.gh = a.gh;
     let local = PathBuf::from(&a.remote);
     if local.is_absolute() {
         opts.remote_local = Some(local);
