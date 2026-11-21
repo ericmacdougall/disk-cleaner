@@ -69,6 +69,52 @@ pub fn probe_compressible(data: &[u8]) -> bool {
 pub const LEVELS: &[i32] = &[1, 2, 3, 4, 6, 8, 10, 13, 16, 19];
 const DEFAULT_IDX: usize = 2; // level 3
 
+/// zstd's workspace in MiB for one segment of up to 4 MiB at each of [`LEVELS`], rounded up from
+/// `ZSTD_sizeof_CCtx` after a one-shot compression (measured with zstd 1.5 on t2-dev: 0.6, 0.8,
+/// 1.3, 2.6, 3.1, 5.8, 21.5, 34.1, 34.3 and 51.6 MiB; `cctx_table_covers_zstd` re-checks it).
+pub const CCTX_MIB: [u64; 10] = [1, 1, 2, 3, 4, 6, 22, 35, 35, 52];
+/// The output buffer of one compression (the bound of a 4 MiB segment), in MiB.
+const OUT_MIB: u64 = 5;
+
+/// Bytes one compression at level index `i` holds while it runs.
+pub fn cost(i: usize) -> u64 {
+    (CCTX_MIB[i] + OUT_MIB) << 20
+}
+
+/// The smallest compression share: one compression at level 3.
+pub fn min_share() -> u64 {
+    cost(DEFAULT_IDX)
+}
+
+/// A byte semaphore over the compression share.
+struct Share {
+    cap: u64,
+    used: Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+impl Share {
+    fn acquire(&self, n: u64) {
+        let mut u = self.used.lock().expect("share lock");
+        while *u + n > self.cap {
+            u = self.cv.wait(u).expect("share wait");
+        }
+        *u += n;
+    }
+    fn try_acquire(&self, n: u64) -> bool {
+        let mut u = self.used.lock().expect("share lock");
+        if *u + n > self.cap {
+            return false;
+        }
+        *u += n;
+        true
+    }
+    fn release(&self, n: u64) {
+        *self.used.lock().expect("share lock") -= n;
+        self.cv.notify_all();
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Est {
     cps: f64,
@@ -103,6 +149,9 @@ pub struct RateMatcher {
     threads: usize,
     goodput: Arc<AtomicU64>,
     st: Mutex<State>,
+    share: Share,
+    /// the highest level index one compression fits in the share
+    top: usize,
 }
 
 pub struct Compressed {
@@ -111,18 +160,41 @@ pub struct Compressed {
 }
 
 impl RateMatcher {
-    pub fn new(fixed: Option<i32>, threads: usize, goodput: Arc<AtomicU64>) -> Self {
+    /// `share` is the budget's compression share Z: each compression holds its level's
+    /// [`cost`] from it while it runs, so a higher level runs on fewer threads at once, and a
+    /// level whose single compression does not fit is never used (a fixed level is lowered).
+    pub fn new(fixed: Option<i32>, threads: usize, goodput: Arc<AtomicU64>, share: u64) -> Self {
+        let cap = if cfg!(feature = "broken-mem-plan") {
+            u64::MAX / 4 // the broken variant: no compression share at all
+        } else {
+            share.max(min_share())
+        };
+        let top = (0..LEVELS.len())
+            .rev()
+            .find(|&i| cost(i) <= cap)
+            .unwrap_or(0);
         RateMatcher {
             fixed,
             threads: threads.max(1),
             goodput,
             st: Mutex::new(State {
                 est: vec![Est::default(); LEVELS.len()],
-                cur: DEFAULT_IDX,
+                cur: DEFAULT_IDX.min(top),
                 segments: 0,
                 histogram: vec![0; LEVELS.len()],
             }),
+            share: Share {
+                cap,
+                used: Mutex::new(0),
+                cv: std::sync::Condvar::new(),
+            },
+            top,
         }
+    }
+
+    /// Compressions at level index `i` that fit in the share at once.
+    fn parallel(&self, i: usize) -> usize {
+        ((self.share.cap / cost(i)) as usize).min(self.threads)
     }
 
     /// Levels used so far, as (level, segments).
@@ -142,13 +214,13 @@ impl RateMatcher {
         if g <= 0.0 {
             return st.cur;
         }
-        let nc = self.threads as f64;
-        let mut best = st.cur;
+        let mut best = st.cur.min(self.top);
         let mut best_t = -1.0;
-        for (i, e) in st.est.iter().enumerate() {
+        for (i, e) in st.est.iter().enumerate().take(self.top + 1) {
             if e.n == 0 || e.ratio <= 0.0 {
                 continue;
             }
+            let nc = self.parallel(i) as f64;
             let t = (nc * e.cps).min(g / e.ratio);
             // prefer the higher level on (near) ties: same speed, better ratio
             if t > best_t * 1.02 || (t >= best_t * 0.98 && i > best) {
@@ -176,27 +248,40 @@ impl RateMatcher {
                     c
                 }
             };
+            let idx = idx.min(self.top);
             st.histogram[idx] += 1;
             (idx, self.fixed.is_none() && (st.segments % 16 == 1))
         };
+        // a fixed level above what the share allows is lowered to the highest that fits
         let level = match self.fixed {
-            Some(l) => l,
-            None => LEVELS[idx],
+            Some(l) if LEVELS[idx] >= l => l,
+            _ => LEVELS[idx],
         };
+        let held = cost(idx);
+        self.share.acquire(held);
         let t0 = Instant::now();
         let data = zstd::bulk::compress(raw, level).unwrap_or_else(|_| raw.to_vec());
         self.record(idx, raw.len(), data.len(), t0.elapsed().as_secs_f64());
         if probe && raw.len() >= 64 << 10 {
+            // neighbouring levels on a 256 KiB sample; a level up runs only if its extra
+            // workspace is free in the share right now
             let sample = &raw[..raw.len().min(256 << 10)];
             for n in [idx.checked_sub(1), Some(idx + 1)].into_iter().flatten() {
-                if n < LEVELS.len() {
-                    let t = Instant::now();
-                    if let Ok(z) = zstd::bulk::compress(sample, LEVELS[n]) {
-                        self.record(n, sample.len(), z.len(), t.elapsed().as_secs_f64());
-                    }
+                if n > self.top {
+                    continue;
                 }
+                let extra = cost(n).saturating_sub(held);
+                if extra > 0 && !self.share.try_acquire(extra) {
+                    continue;
+                }
+                let t = Instant::now();
+                if let Ok(z) = zstd::bulk::compress(sample, LEVELS[n]) {
+                    self.record(n, sample.len(), z.len(), t.elapsed().as_secs_f64());
+                }
+                self.share.release(extra);
             }
         }
+        self.share.release(held);
         Compressed { level, data }
     }
 
@@ -246,9 +331,10 @@ mod tests {
                 m.seed(i, cps, ratio);
             }
         };
-        let slow = RateMatcher::new(None, 4, Arc::new(AtomicU64::new(12_000_000)));
+        let big = 1 << 30;
+        let slow = RateMatcher::new(None, 4, Arc::new(AtomicU64::new(12_000_000)), big);
         seed(&slow);
-        let fast = RateMatcher::new(None, 4, Arc::new(AtomicU64::new(2_000_000_000)));
+        let fast = RateMatcher::new(None, 4, Arc::new(AtomicU64::new(2_000_000_000)), big);
         seed(&fast);
         let ls = LEVELS[slow.choose(&slow.st.lock().unwrap())];
         let lf = LEVELS[fast.choose(&fast.st.lock().unwrap())];
@@ -257,5 +343,79 @@ mod tests {
             "slow link level {ls} should exceed fast link level {lf}"
         );
         assert!(lf <= 3);
+    }
+
+    /// zstd's workspace for one 4 MiB segment at `level`, as `ZSTD_sizeof_CCtx` reports it after
+    /// a one-shot compression with a fresh context (what `zstd::bulk::compress` does).
+    fn cctx_bytes(level: i32, raw: &[u8]) -> usize {
+        use zstd::zstd_safe::{CCtx, CParameter};
+        let mut c = CCtx::create();
+        c.set_parameter(CParameter::CompressionLevel(level))
+            .expect("level");
+        let mut out = Vec::with_capacity(zstd::zstd_safe::compress_bound(raw.len()));
+        c.compress2(&mut out, raw).expect("compress");
+        c.sizeof()
+    }
+
+    fn segment() -> Vec<u8> {
+        // half text-like, half noise: a typical mixed segment of SEG_MAX bytes
+        let mut raw = b"let x = compute(a, b); // comment 0123456789\n".repeat(48_000);
+        raw.truncate(2 << 20);
+        let mut noise = vec![0u8; 2 << 20];
+        crate::gen::Rng::new(3).fill(&mut noise);
+        raw.extend_from_slice(&noise);
+        raw
+    }
+
+    /// The table the compression share is charged from must not understate zstd's workspace.
+    #[test]
+    fn cctx_table_covers_zstd() {
+        let raw = segment();
+        for &l in &[1, 3, 8, 19] {
+            let i = LEVELS.iter().position(|&x| x == l).expect("level");
+            let got = cctx_bytes(l, &raw) as u64;
+            assert!(
+                got <= CCTX_MIB[i] << 20,
+                "level {l}: zstd used {got} bytes, the table says {} MiB",
+                CCTX_MIB[i]
+            );
+        }
+    }
+
+    /// A share too small for a level keeps it out: the chooser never picks it, a fixed level
+    /// above it is lowered, and higher levels run on fewer threads at once.
+    #[test]
+    fn the_compression_share_bounds_levels_and_threads() {
+        let g = || Arc::new(AtomicU64::new(1_000_000));
+        let m = RateMatcher::new(Some(19), 8, g(), 32 << 20);
+        let top = LEVELS[m.top];
+        assert_eq!(
+            top, 10,
+            "32 MiB fits one level-10 compression (22 + 5 MiB), not level 13"
+        );
+        let raw = segment();
+        assert_eq!(m.compress(&raw).level, 10, "a fixed level 19 is lowered");
+        assert_eq!(m.parallel(LEVELS.iter().position(|&l| l == 3).unwrap()), 4);
+        assert_eq!(m.parallel(m.top), 1);
+        // the chooser, seeded so that level 19 would win on a slow link, stays at or below top
+        let s = RateMatcher::new(None, 8, g(), 32 << 20);
+        for (i, &l) in LEVELS.iter().enumerate() {
+            s.seed(i, 400e6 / (1.0 + l as f64), 0.5 - 0.02 * l as f64);
+        }
+        let c = s.choose(&s.st.lock().unwrap());
+        assert!(
+            c <= s.top,
+            "chose level {} above the share's top",
+            LEVELS[c]
+        );
+    }
+
+    #[test]
+    #[ignore = "prints the measured table; run with --ignored"]
+    fn print_cctx_sizes() {
+        let raw = segment();
+        for &l in LEVELS {
+            eprintln!("CCTX level {l}: {} bytes", cctx_bytes(l, &raw));
+        }
     }
 }

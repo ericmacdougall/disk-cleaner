@@ -167,7 +167,8 @@ fn open(
     ),
     String,
 > {
-    let t = transport::open(&r.repo, &r.rclone, p_max).map_err(|e| e.to_string())?;
+    let heap = budget(r).ok().map(|b| b.rcd_heap());
+    let t = transport::open_limited(&r.repo, &r.rclone, p_max, heap).map_err(|e| e.to_string())?;
     let m = Metered::new(t);
     let c = m.counters.clone();
     Ok((std::sync::Arc::new(m), c))
@@ -217,6 +218,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                     ));
                 }
             }
+            eprintln!("prunedisk-xfer: {}", b.describe());
             let mut o = Options::new(&r.repo, &source, b);
             o.filter = Filter::new(&exclude).map_err(|e| e.to_string())?;
             o.files_from = files_from.as_ref().map(read_files_from).transpose()?;
@@ -336,6 +338,7 @@ fn run(cli: Cli) -> Result<i32, String> {
 }
 
 fn main() -> ExitCode {
+    xfer::util::tune_allocator();
     let cli = Cli::parse();
     let _ = MIB;
     match run(cli) {

@@ -136,6 +136,33 @@ pub fn human(n: u64) -> String {
     }
 }
 
+/// glibc raises its mmap threshold each time a large block is freed (up to 32 MiB), after
+/// which 4 MiB segment buffers come from the heap and stay resident once freed: on t2-dev the
+/// engine sat about 200 MiB above its live data. A fixed threshold keeps every buffer of 1 MiB
+/// or more mmapped, so freeing it returns the memory. Process-wide; call once at start.
+pub fn tune_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if !cfg!(feature = "broken-mem-plan") {
+        // SAFETY: mallopt only sets an allocator parameter.
+        unsafe {
+            libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+        }
+    }
+}
+
+/// Resident set size of a process in bytes, from /proc (Linux; None elsewhere or when gone).
+pub fn rss_of(pid: u32) -> Option<u64> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let kib: u64 = s
+        .lines()
+        .find(|l| l.starts_with("VmRSS:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(kib * 1024)
+}
+
 /// Peak resident set size of this process in bytes (0 when unknown).
 pub fn peak_rss_bytes() -> u64 {
     #[cfg(unix)]

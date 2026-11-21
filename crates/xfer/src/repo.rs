@@ -295,9 +295,19 @@ pub struct Budget {
     pub i: u64,
     /// walk plus the previous run's file table; at restore, one run's file table
     pub w: u64,
+    /// zstd working memory of the compressors (a compression takes its level's workspace and
+    /// output buffer from this share before it starts)
+    pub z: u64,
+    /// rclone rcd's own runtime (its upload buffers are in the 2·P_max of each upload)
+    pub r: u64,
     /// concurrent uploads
     pub k: usize,
 }
+
+/// rcd's resident memory beyond its upload buffers (Go runtime, binary, connections).
+pub const RCD_SHARE: u64 = 64 * MIB;
+/// Of that share, what stays outside rcd's Go heap (binary text, stacks).
+const RCD_NON_HEAP: u64 = 32 * MIB;
 
 impl Budget {
     pub fn compute(total: u64, p_max: u64, k_cap: usize) -> Result<Budget> {
@@ -315,18 +325,22 @@ impl Budget {
         let ser = 32 * MIB;
         let i = (256 * MIB).min(total / 8);
         let w = total / 4;
-        let fixed = c + s + ser + i + w;
+        let z = (total / 20).max(crate::compress::min_share());
+        let r = RCD_SHARE;
+        let fixed = c + s + ser + i + w + z + r;
         let k = total.saturating_sub(fixed) / (2 * p_max);
         let k = (k as usize).min(k_cap.clamp(1, 16));
         if k < 1 || c == 0 || i == 0 || w == 0 {
             return Err(Error::Refused(format!(
-                "--mem-budget {} leaves no room for one upload of {} (shares C {} S {} I {} W {})",
+                "--mem-budget {} leaves no room for one upload of {} (shares C {} S {} I {} W {} Z {} rcd {})",
                 crate::util::human(total),
                 crate::util::human(p_max),
                 crate::util::human(c),
                 crate::util::human(s),
                 crate::util::human(i),
-                crate::util::human(w)
+                crate::util::human(w),
+                crate::util::human(z),
+                crate::util::human(r)
             )));
         }
         Ok(Budget {
@@ -337,8 +351,34 @@ impl Budget {
             ser,
             i,
             w,
+            z,
+            r,
             k,
         })
+    }
+
+    /// The Go heap limit (GOMEMLIMIT) rcd runs under: its K upload buffers of P_max + 1 MiB
+    /// (the streaming cutoff) plus the heap part of its share.
+    pub fn rcd_heap(&self) -> u64 {
+        self.k as u64 * (self.p_max + MIB) + (self.r - RCD_NON_HEAP)
+    }
+
+    /// One line naming what the run may use, for the operator.
+    pub fn describe(&self) -> String {
+        let h = crate::util::human;
+        format!(
+            "memory plan within --mem-budget {}: chunks {} + sealing {} + serialization {} + chunk maps {} + walk {} + compression {} + rcd {} + {} uploads of 2 x {}",
+            h(self.total),
+            h(self.c),
+            h(self.s),
+            h(self.ser),
+            h(self.i),
+            h(self.w),
+            h(self.z),
+            h(self.r),
+            self.k,
+            h(self.p_max)
+        )
     }
 }
 
@@ -927,6 +967,14 @@ mod tests {
             (m.c / MIB, m.s / MIB, m.i / MIB, m.w / MIB, m.k),
             (80, 64, 80, 160, 4)
         );
+        // the compression and rcd shares (after the Mac finding: engine plus rcd at 820 MiB
+        // on a 640 MiB budget) close the sum with K unchanged on both profiles
+        for b in [d, m] {
+            let sum = b.c + b.s + b.ser + b.i + b.w + b.z + b.r + b.k as u64 * 2 * b.p_max;
+            assert!(sum <= b.total, "{b:?}: shares sum to {} MiB", sum / MIB);
+        }
+        assert_eq!((d.z / MIB, m.z / MIB, m.r / MIB), (82, 32, 64));
+        assert_eq!(m.rcd_heap() / MIB, 4 * 17 + 32);
         assert!(Budget::compute(200 * MIB, 32 * MIB, 8).is_err());
         assert!(Budget::compute(4096 * MIB, 129 * MIB, 8).is_err());
     }

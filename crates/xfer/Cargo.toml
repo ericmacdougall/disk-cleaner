@@ -33,6 +33,7 @@ broken-stats-groups = []  # uploads use rcd's default per-call stats group and n
 broken-serial-load = []   # backup's load phase issues its store requests one after another
 broken-commit-pair = []   # readers accept a .files object whose .idx of the same seq is missing
 broken-commit-spacing = [] # the one-second commit spacing runs from the end of a commit
+broken-mem-plan = []      # no compression share, no rcd heap limit, glibc's default mmap threshold
 
 [dependencies]
 blake3 = "1.8"

@@ -127,6 +127,17 @@ impl RcloneRcd {
     }
 
     pub fn start(bin: &str, root: &str, max_pack: u64) -> Result<RcloneRcd> {
+        Self::start_limited(bin, root, max_pack, None)
+    }
+
+    /// As [`RcloneRcd::start`], with rcd's Go heap limited by GOMEMLIMIT (set on rcd's own
+    /// environment only; the value is a size, never a secret).
+    pub fn start_limited(
+        bin: &str,
+        root: &str,
+        max_pack: u64,
+        go_heap: Option<u64>,
+    ) -> Result<RcloneRcd> {
         if root.is_empty() || root.contains("config/") {
             return Err(Error::Refused(format!("refusing repository {root:?}")));
         }
@@ -186,7 +197,16 @@ impl RcloneRcd {
                 "--log-level".into(),
                 "NOTICE".into(),
             ];
-            match Self::spawn(bin, &args, port, &tmpdir, &auth, root, first.clone()) {
+            match Self::spawn(
+                bin,
+                &args,
+                port,
+                &tmpdir,
+                &auth,
+                root,
+                first.clone(),
+                go_heap,
+            ) {
                 Ok(r) => return Ok(r),
                 Err(e) => last_err = e.to_string(),
             }
@@ -197,6 +217,8 @@ impl RcloneRcd {
         )))
     }
 
+    // each argument is one fact about this rcd; a struct for a single private call adds nothing
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         bin: &str,
         args: &[String],
@@ -205,6 +227,7 @@ impl RcloneRcd {
         auth: &str,
         root: &str,
         version: String,
+        go_heap: Option<u64>,
     ) -> Result<RcloneRcd> {
         #[cfg(unix)]
         let mut cmd = {
@@ -218,6 +241,11 @@ impl RcloneRcd {
             c.args(args);
             c
         };
+        if let Some(h) = go_heap {
+            if !cfg!(feature = "broken-mem-plan") {
+                cmd.env("GOMEMLIMIT", format!("{}MiB", h.div_ceil(1 << 20)));
+            }
+        }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

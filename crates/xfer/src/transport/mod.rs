@@ -298,6 +298,17 @@ pub fn verified_put(
 /// Open a transport from a repository string: `local:<dir>` (optionally `?hash=md5&delay_ms=N`)
 /// or any rclone remote path, which starts a private rclone rcd.
 pub fn open(repo: &str, rclone_bin: &str, max_pack: u64) -> Result<Arc<dyn Transport>> {
+    open_limited(repo, rclone_bin, max_pack, None)
+}
+
+/// As [`open`]; an rclone rcd runs with its Go heap limited to `rcd_heap` bytes (the budget's
+/// [`crate::repo::Budget::rcd_heap`]), so its memory stays inside `--mem-budget`.
+pub fn open_limited(
+    repo: &str,
+    rclone_bin: &str,
+    max_pack: u64,
+    rcd_heap: Option<u64>,
+) -> Result<Arc<dyn Transport>> {
     if repo.contains('\n') || repo.contains('\0') {
         return Err(Error::Refused(
             "repository string contains a control character".into(),
@@ -323,8 +334,8 @@ pub fn open(repo: &str, rclone_bin: &str, max_pack: u64) -> Result<Arc<dyn Trans
         let t = local::LocalDir::new(dir, kind)?.with_delay(Duration::from_millis(delay));
         return Ok(Arc::new(t));
     }
-    Ok(Arc::new(rclone::RcloneRcd::start(
-        rclone_bin, repo, max_pack,
+    Ok(Arc::new(rclone::RcloneRcd::start_limited(
+        rclone_bin, repo, max_pack, rcd_heap,
     )?))
 }
 

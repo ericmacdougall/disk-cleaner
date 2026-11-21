@@ -932,7 +932,7 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
         o.streams.is_some(),
         b.p_max,
     );
-    let rm = RateMatcher::new(o.level, o.compressors, shared.goodput.clone());
+    let rm = RateMatcher::new(o.level, o.compressors, shared.goodput.clone(), b.z);
     let sem = ByteSem::new(b.c);
     let seen: Mutex<HashSet<ChunkId>> = Mutex::new(committed.chunks.keys().copied().collect());
     for (_, cs) in &adopted {
