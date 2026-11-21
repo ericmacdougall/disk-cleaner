@@ -633,6 +633,18 @@ describe("Settings form: every ordering of reads, saves, edits and outside chang
     expect(w.shown("git")).toBe("100");
   });
 
+  it("a re-render or Settings shown again while the question is open starts no read; Keep reads", async () => {
+    // The question owns the form, so no answer can change it under the question (I6).
+    const { w } = await run(["type window=7", "save", "saveEnd", "external", "read", "leave", "enter"], "filled", false, true);
+    expect([...new Set(w.violations)]).toEqual([]);
+    expect(w.reads).toHaveLength(0);
+    await step(w, BY_NAME.get("escape")!, "Keep");
+    expect(w.reads).toHaveLength(1);
+    await step(w, BY_NAME.get("readEnd")!, "Keep, then the read");
+    expect([...new Set(w.violations)]).toEqual([]);
+    expect(w.shown("git")).toBe("128");
+  });
+
   it("after a save the fields show what the save returned, also when that is not what was typed (partial save)", async () => {
     const result = payload({ window: 60, git: 64, top: 200, version: 1 }, true);
     const b = mockBackend({
