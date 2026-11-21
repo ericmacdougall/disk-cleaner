@@ -770,7 +770,8 @@ fn upload_phase(ctx: &mut Ctx, prepared: &[Prepared]) -> Result<BTreeSet<String>
 /// Queue for mirroring every local row the remote copy lacks (a run that stopped before its
 /// mirror leaves rows only in the local file). Rows naming another remote stay local.
 fn seed_unmirrored(ctx: &mut Ctx) -> Result<(), ApplyError> {
-    let remote_rows = super::restore::rows_from_remote(&ctx.rc, &ctx.opts.label)?;
+    // Rows of a segment that fails its checks count as absent here: they are mirrored again.
+    let (remote_rows, _rejected) = super::restore::rows_from_remote(&ctx.rc, &ctx.opts.label)?;
     let line = |e: &super::manifest::Envelope| serde_json::to_string(e).unwrap_or_default();
     let have: std::collections::BTreeSet<String> = remote_rows.iter().map(line).collect();
     for e in &ctx.manifest.rows {
@@ -819,6 +820,26 @@ fn mirror(ctx: &mut Ctx) -> Result<(), ApplyError> {
         &UploadHooks::default(),
     )
     .map_err(ApplyError::Storage)?;
+    // The checksum sidecar, written only after the segment verified: restore --from-remote
+    // refuses a segment without a matching one (a stopped run's segment is mirrored again).
+    let sum = format!("{sha256} {}\n", bytes.len()).into_bytes();
+    let sum_name = format!("{name}.sum");
+    let s2 = sum.clone();
+    ctx.rc
+        .rcat(&sum_name, sum.len() as u64, move |w| {
+            w.write_all(&s2).map_err(|e| e.to_string())
+        })
+        .map_err(ApplyError::Storage)?;
+    shard::verify(
+        &ctx.rc,
+        &sum_name,
+        sum.len() as u64,
+        &hex::encode(Sha1::digest(&sum)),
+        &hex::encode(md5::Md5::digest(&sum)),
+        &hex::encode(Sha256::digest(&sum)),
+        &UploadHooks::default(),
+    )
+    .map_err(ApplyError::Storage)?;
     ctx.manifest.unmirrored.clear();
     Ok(())
 }
@@ -835,6 +856,20 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
             p.id,
         )
     });
+    // Inodes with more than one name among everything removed in this run (F8 link groups).
+    let mut seen_inodes: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+    for pr in &ready {
+        for m in &pr.members {
+            if matches!(m.content, Content::Blob { .. }) {
+                *seen_inodes.entry((m.id.dev, m.id.ino)).or_default() += 1;
+            }
+        }
+    }
+    let linked: BTreeSet<(u64, u64)> = seen_inodes
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(k, _)| k)
+        .collect();
     for batch in ready.chunks(64) {
         let mut go: Vec<&Prepared> = Vec::new();
         let mut rows = Vec::new();
@@ -886,7 +921,7 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
                     continue;
                 }
                 for m in &pr.members {
-                    rows.push(file_row(p, pr, m));
+                    rows.push(file_row(p, pr, m, &linked));
                 }
                 for d in &pr.dirs {
                     rows.push(Row::Dir {
@@ -925,7 +960,7 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
     Ok(())
 }
 
-fn file_row(p: &PlanPiece, pr: &Prepared, m: &PMember) -> Row {
+fn file_row(p: &PlanPiece, pr: &Prepared, m: &PMember, linked: &BTreeSet<(u64, u64)>) -> Row {
     let (sha256, git_oid, git_dir, link_target) = match &m.content {
         Content::Blob { sha256 } => (Some(sha256.clone()), None, None, None),
         Content::Link { target } => (None, None, None, Some(target.clone())),
@@ -961,7 +996,9 @@ fn file_row(p: &PlanPiece, pr: &Prepared, m: &PMember) -> Row {
         git_oid,
         git_dir,
         link_target,
-        link_group: None,
+        link_group: (matches!(m.content, Content::Blob { .. })
+            && linked.contains(&(m.id.dev, m.id.ino)))
+        .then(|| format!("{}:{}", m.id.dev, m.id.ino)),
         reason: p.reason.clone(),
         restore,
     }

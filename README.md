@@ -35,6 +35,27 @@ proposes one action per item: `keep`, `remove-regenerable`, `backup-then-remove`
 `recover-backup-then-remove` or `ask`, each with a reason in words. The plan is a proposal only;
 nothing applies it yet.
 
+`disk-cleaner apply --scan scan.json --plan plan.json --remote <rclone remote>` executes the lanes
+of a plan made with `scan --lanes`. It is a dry run unless you add `--apply`. In this version only the
+backup lane acts; noise and git pieces are kept with a printed reason. Before it touches a piece it
+re-checks it against the scan, and keeps it if anything changed, if a process works in its project,
+or if a file in it has a secret name (`.env`, keys, credentials). Secret-named files stay on this disk
+unless you pass `--secrets upload` yourself. Each distinct file content is uploaded once, in shards of
+`--shard-mib` (default 64) through `--jobs` (default 4) rclone uploads at a time, streamed with no
+local copy. A shard is verified in storage by size and hash before any file in it is removed, and a
+shard that fails removes nothing. Every removal is written first to a manifest
+(`~/.disk-cleaner/prunedisk/<host>.jsonl`), which is also copied, with a checksum, to the remote.
+
+### Getting files back
+
+`disk-cleaner restore --path <removed file or folder> --remote <the same remote>` puts removed files
+back byte for byte, with their mode, modification time, symlinks and hard links. It never overwrites:
+a different file already at the path is reported as a conflict and left alone. If the local manifest
+is lost, add `--from-remote` to rebuild the history from the copies in storage; a damaged copy refuses
+the restore unless you add `--accept-partial`. Add `--run <id>` (printed by `apply`) to restore an
+older generation of a path that was backed up more than once. Replacing or downgrading the
+`disk-cleaner` binary never brings data back; `restore` does.
+
 The scan and plan formats, every fact and every rule are described in
 [docs/SCAN-FORMAT.md](docs/SCAN-FORMAT.md). The overall design is in [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -56,8 +77,8 @@ Continuous integration builds and tests it on Linux, macOS and Windows.
 
 None of this exists yet:
 
-- applying a plan: recovery of unsaved work, backup to your own storage (through
-  [rclone](https://rclone.org)), removal with a manifest, and restore;
+- the noise and git lanes of `apply` (recovery of unsaved work, removal of regenerable
+  directories and duplicates);
 - detection and backup of coding-agent sessions and logs, and age and size policies for caches and
   outputs;
 - a desktop app with outline, sunburst, treemap and biggest-files views;
@@ -66,10 +87,11 @@ None of this exists yet:
 
 ## Safety model in one paragraph
 
-Scanning and planning are read-only. The planned apply step will remove nothing unless the tool has
-shown that it is regenerable or exists elsewhere, and has re-checked that at the moment of removal.
+Scanning and planning are read-only. Apply removes nothing unless the tool has shown that it is
+backed up and verified (and, for the lanes still to come, regenerable or present elsewhere), and has
+re-checked that at the moment of removal.
 A check that fails or times out leaves its fact unknown, and an unknown fact never leads the plan to
-propose removal: an idle repo with one is marked `ask`. Every removal will be written to a manifest with a restore command.
+propose removal: an idle repo with one is marked `ask`. Every removal is written to a manifest with a restore command.
 
 ## License
 

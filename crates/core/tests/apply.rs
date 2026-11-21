@@ -13,6 +13,7 @@ use std::time::Duration;
 
 fn ropts(fx: &Fx) -> RestoreOptions {
     RestoreOptions {
+        accept_partial: false,
         remote: fx.remote.to_string_lossy().to_string(),
         rclone: fx.fake.clone(),
         git: "git".into(),
@@ -82,6 +83,16 @@ fn dedup_uploads_once_and_restore_reproduces() {
     assert!(r.failed.is_empty() && r.conflicts.is_empty(), "{r:?}");
     assert_eq!(sha(&fx.data.join("b/y.bin")), ysha);
     assert_eq!(sha(&fx.data.join("b/y-link.bin")), ysha);
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = fs::metadata(fx.data.join("b/y.bin")).unwrap();
+        let b = fs::metadata(fx.data.join("b/y-link.bin")).unwrap();
+        assert_eq!(
+            (a.dev(), a.ino()),
+            (b.dev(), b.ino()),
+            "hard links restored as one inode"
+        );
+    }
     let m = fs::metadata(fx.data.join("b/y.bin")).unwrap();
     assert_eq!(
         m.permissions().mode() & 0o7777,
@@ -999,4 +1010,115 @@ fn resume_rechecks_activity_and_secret_opt_in() {
         assert_eq!(rep.pieces[0].outcome, "kept", "{case}: {rep:?}");
         assert_eq!(tree_digest(&d), left, "{case}: nothing more removed");
     }
+}
+
+fn segments(fx: &Fx) -> Vec<std::path::PathBuf> {
+    let d = fx.remote.join("manifests/testhost");
+    let mut v: Vec<_> = fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn remote_manifest_segments_fail_closed() {
+    use sha2::{Digest, Sha256};
+    for case in ["flip", "truncate", "no-sum", "version"] {
+        let fx = Fx::new();
+        let (scan, plan) = dedup_fixture(&fx);
+        let before = tree_digest(&fx.data);
+        apply(&scan, &plan, &fx.opts(true)).unwrap();
+        fs::remove_file(fx.manifest()).unwrap();
+        let seg = segments(&fx).into_iter().next().unwrap();
+        let sum = seg.with_extension("jsonl.sum");
+        let text = fs::read_to_string(&seg).unwrap();
+        match case {
+            "flip" => fs::write(&seg, text.replacen("\"run\"", "\"rux\"", 1)).unwrap(),
+            "truncate" => fs::write(&seg, &text[..text.len() / 2]).unwrap(),
+            "no-sum" => fs::remove_file(&sum).unwrap(),
+            _ => {
+                // A future manifest version with a matching checksum: only the version check
+                // can refuse it.
+                let t = text.replacen("{\"v\":1,", "{\"v\":99,", 1);
+                fs::write(&seg, &t).unwrap();
+                fs::write(
+                    &sum,
+                    format!(
+                        "{} {}\n",
+                        hex::encode(Sha256::digest(t.as_bytes())),
+                        t.len()
+                    ),
+                )
+                .unwrap();
+            }
+        }
+        let mut ro = ropts(&fx);
+        ro.from_remote = true;
+        let r = restore(&fx.data, &ro);
+        assert!(matches!(r, Err(ApplyError::Manifest(_))), "{case}: {r:?}");
+        assert!(!fx.data.join("a").exists(), "{case}: nothing restored");
+        // The explicit opt-in restores what the passing segments allow and names the rest.
+        ro.accept_partial = true;
+        let r = restore(&fx.data, &ro).unwrap();
+        assert_eq!(r.rejected_segments.len(), 1, "{case}: {r:?}");
+        let _ = &before;
+    }
+}
+
+#[test]
+fn restore_by_run_picks_that_generation() {
+    let fx = Fx::new();
+    let d = fx.data.join("p");
+    fx.write("p/x.txt", b"first generation");
+    let (scan, plan) = docs(&[&fx.data], &[P::tree(&d, "backup")]);
+    let run1 = apply(&scan, &plan, &fx.opts(true)).unwrap().run;
+    restore(&d, &ropts(&fx)).unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    fs::remove_file(d.join("x.txt")).unwrap();
+    fx.write("p/x.txt", b"second generation, longer");
+    std::thread::sleep(Duration::from_millis(1100));
+    let (scan, plan) = docs(&[&fx.data], &[P::tree(&d, "backup")]);
+    let run2 = apply(&scan, &plan, &fx.opts(true)).unwrap().run;
+    assert_ne!(run1, run2);
+    assert!(!d.exists());
+    let mut ro = ropts(&fx);
+    ro.run = Some(run1.clone());
+    let r = restore(&d, &ro).unwrap();
+    assert!(r.failed.is_empty() && r.conflicts.is_empty(), "{r:?}");
+    assert_eq!(fs::read(d.join("x.txt")).unwrap(), b"first generation");
+    fs::remove_file(d.join("x.txt")).unwrap();
+    let r = restore(&d, &ropts(&fx)).unwrap();
+    assert!(r.failed.is_empty(), "{r:?}");
+    assert_eq!(
+        fs::read(d.join("x.txt")).unwrap(),
+        b"second generation, longer",
+        "newest by default"
+    );
+}
+
+#[test]
+fn forged_rule_noise_with_a_secret_is_kept() {
+    // Spec revision 3, F4: a plan that calls a directory with a `.env` regenerable noise and
+    // claims nothing is secret removes nothing, even with an oracle that agrees with the plan.
+    let fx = Fx::new();
+    let d = fx.data.join("proj/node_modules");
+    fx.write("proj/node_modules/pkg/index.js", b"x");
+    fx.write("proj/node_modules/.env", b"CANARY-noise-secret");
+    let mut piece = P::tree(&d, "noise");
+    piece.evidence =
+        Some(serde_json::json!({"kind": "rule", "rule": "node_modules", "markers": [], "node": 0}));
+    let (scan, plan) = docs(&[&fx.data], &[piece]);
+    let mut pv: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    pv["items"] = serde_json::json!([{"node": 0, "path": d, "action": "remove-regenerable"}]);
+    let plan = pv.to_string();
+    let mut o = fx.opts(true);
+    o.oracle = Box::new(agreeing_oracle(&plan));
+    o.secrets_upload = true;
+    let before = tree_digest(&fx.data);
+    let rep = apply(&scan, &plan, &o).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "kept", "{rep:?}");
+    assert_eq!(tree_digest(&fx.data), before);
 }

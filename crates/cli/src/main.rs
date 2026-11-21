@@ -103,6 +103,10 @@ struct RestoreArgs {
     /// Label the backup was written with (default: the short host name).
     #[arg(long, value_name = "LABEL")]
     host_label: Option<String>,
+    /// With --from-remote: restore from the manifest segments that pass their checks even when
+    /// some do not (they are listed, and the exit code is 4).
+    #[arg(long)]
+    accept_partial: bool,
     /// Restore this run's generation instead of the newest.
     #[arg(long, value_name = "RUN")]
     run: Option<String>,
@@ -366,6 +370,7 @@ fn run_restore(a: RestoreArgs) -> Result<()> {
         None => state_base()?.join(format!("{label}.jsonl")),
     };
     let opts = RestoreOptions {
+        accept_partial: a.accept_partial,
         remote: a.remote,
         rclone: a.rclone,
         git: PathBuf::from("git"),
@@ -381,7 +386,7 @@ fn run_restore(a: RestoreArgs) -> Result<()> {
     } else {
         print!("{}", report::restore_summary(&rep));
     }
-    if !rep.failed.is_empty() || !rep.conflicts.is_empty() {
+    if !rep.failed.is_empty() || !rep.conflicts.is_empty() || !rep.rejected_segments.is_empty() {
         std::process::exit(4);
     }
     Ok(())

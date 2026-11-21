@@ -15,6 +15,9 @@ use std::time::Duration;
 
 /// Options for a restore.
 pub struct RestoreOptions {
+    /// With `from_remote`: restore from the segments that pass their checks even when some do
+    /// not (they are listed in the report). Without it any failing segment refuses the restore.
+    pub accept_partial: bool,
     pub remote: String,
     pub rclone: PathBuf,
     pub git: PathBuf,
@@ -36,18 +39,54 @@ pub struct RestoreReport {
     pub conflicts: Vec<PathBuf>,
     pub regenerate: Vec<(PathBuf, String)>,
     pub failed: Vec<(PathBuf, String)>,
+    /// Remote manifest segments that failed their checks (only with `accept_partial`).
+    pub rejected_segments: Vec<(String, String)>,
 }
 
-pub(crate) fn rows_from_remote(rc: &Rclone, label: &str) -> Result<Vec<Envelope>, ApplyError> {
+/// One segment, checked against its `.sum` sidecar (`<sha256> <size>`), then parsed strictly.
+fn verified_segment(rc: &Rclone, dir: &str, name: &str) -> Result<Vec<Envelope>, String> {
+    let sum = rc
+        .cat(&format!("{dir}/{name}.sum"))
+        .map_err(|e| format!("its checksum file cannot be read: {e}"))?;
+    let sum = String::from_utf8_lossy(&sum).to_string();
+    let mut it = sum.split_whitespace();
+    let (Some(want_sha), Some(want_len)) =
+        (it.next(), it.next().and_then(|s| s.parse::<u64>().ok()))
+    else {
+        return Err("its checksum file is malformed".into());
+    };
+    let b = rc.cat(&format!("{dir}/{name}"))?;
+    if b.len() as u64 != want_len {
+        return Err(format!(
+            "it is {} bytes, its checksum file says {want_len}",
+            b.len()
+        ));
+    }
+    if hex::encode(Sha256::digest(&b)) != want_sha {
+        return Err("its sha256 differs from its checksum file".into());
+    }
+    let text = String::from_utf8(b).map_err(|_| "it is not UTF-8".to_string())?;
+    manifest::parse_segment(&text)
+}
+
+/// Rows from verified segments, and the segments that failed their checks (name, why).
+pub(crate) type RemoteRows = (Vec<Envelope>, Vec<(String, String)>);
+
+/// The mirrored manifest rows in storage, every segment verified. Returns the rows and the
+/// segments that failed, with why.
+pub(crate) fn rows_from_remote(rc: &Rclone, label: &str) -> Result<RemoteRows, ApplyError> {
     let dir = format!("manifests/{label}");
     let mut names = rc.list(&dir).map_err(ApplyError::Storage)?;
     names.sort();
-    let mut texts = Vec::new();
+    let mut good = Vec::new();
+    let mut rejected = Vec::new();
     for n in names.iter().filter(|n| n.ends_with(".jsonl")) {
-        let b = rc.cat(&format!("{dir}/{n}")).map_err(ApplyError::Storage)?;
-        texts.push(String::from_utf8_lossy(&b).to_string());
+        match verified_segment(rc, &dir, n) {
+            Ok(rows) => good.push(rows),
+            Err(why) => rejected.push((n.clone(), why)),
+        }
     }
-    Ok(manifest::parse_segments(&texts))
+    Ok((manifest::merge_segments(good), rejected))
 }
 
 fn run_start(run: &str) -> i64 {
@@ -64,8 +103,19 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
         root: opts.remote.clone(),
         timeout: opts.timeout,
     };
+    let mut rejected_segments = Vec::new();
     let rows: Vec<Envelope> = if opts.from_remote {
-        rows_from_remote(&rc, &opts.label)?
+        let (rows, rejected) = rows_from_remote(&rc, &opts.label)?;
+        if !rejected.is_empty() && !opts.accept_partial {
+            let list: Vec<String> = rejected.iter().map(|(n, w)| format!("{n}: {w}")).collect();
+            return Err(ApplyError::Manifest(format!(
+                "{} manifest segment(s) in storage failed their checks, so the history may be incomplete ({}); pass --accept-partial to restore from the segments that pass",
+                rejected.len(),
+                list.join("; ")
+            )));
+        }
+        rejected_segments = rejected;
+        rows
     } else {
         Manifest::load(&opts.manifest, "restore")?.rows
     };
@@ -137,6 +187,7 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
     }
     let mut rep = RestoreReport {
         regenerate: regen,
+        rejected_segments,
         ..Default::default()
     };
     let root = fsops::open_dir_abs(Path::new("/")).map_err(|e| ApplyError::Io(e.to_string()))?;
@@ -152,13 +203,17 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
         }
     }
     let mut git_later = Vec::new();
-    for (path, (_, row)) in &chosen {
+    // Hard links (F8): names of one inode removed together are restored as one inode again. The
+    // first name is restored from storage, the others are linked to it.
+    let mut first_of_group: BTreeMap<(String, String), PathBuf> = BTreeMap::new();
+    for (path, (run, row)) in &chosen {
         let Row::File {
             id,
             sha256,
             git_oid,
             git_dir,
             link_target,
+            link_group,
             ..
         } = row
         else {
@@ -167,6 +222,14 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
         if git_oid.is_some() {
             git_later.push((path.clone(), row.clone()));
             continue;
+        }
+        if let (Some(g), Some(s)) = (link_group, sha256) {
+            let key = (run.clone(), g.clone());
+            if let Some(first) = first_of_group.get(&key) {
+                let res = link_to(&root, first, path, s);
+                record(&mut rep, path, res);
+                continue;
+            }
         }
         let res = restore_one(
             &rc,
@@ -180,6 +243,12 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
             &blobs,
         );
         let _ = git_dir;
+        let ok = matches!(res, Ok(One::Restored) | Ok(One::Identical));
+        if let (true, Some(g)) = (ok, link_group) {
+            first_of_group
+                .entry((run.clone(), g.clone()))
+                .or_insert_with(|| path.clone());
+        }
         record(&mut rep, path, res);
     }
     for (path, row) in git_later {
@@ -213,6 +282,26 @@ enum One {
     Restored,
     Identical,
     Conflict,
+}
+
+/// Restore `path` as a hard link to `first` (already restored with content `sha256`).
+fn link_to(
+    root: &rustix::fd::OwnedFd,
+    first: &Path,
+    path: &Path,
+    sha256: &str,
+) -> Result<One, String> {
+    let (fprel, fleaf) = split(first)?;
+    let (prel, leaf) = split(path)?;
+    let fdir = fsops::mkdirs_rel(root, &fprel, 0o755).map_err(|e| e.to_string())?;
+    let dir = fsops::mkdirs_rel(root, &prel, 0o755).map_err(|e| e.to_string())?;
+    match fsops::publish_link(&fdir, &fleaf, &dir, &leaf).map_err(|e| e.to_string())? {
+        Published::Created => Ok(One::Restored),
+        Published::Exists => match existing_sha(&dir, &leaf) {
+            Some(s) if s == sha256 => Ok(One::Identical),
+            _ => Ok(One::Conflict),
+        },
+    }
 }
 
 fn record(rep: &mut RestoreReport, path: &Path, res: Result<One, String>) {

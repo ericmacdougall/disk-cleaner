@@ -423,16 +423,36 @@ impl Manifest {
     }
 }
 
-/// Parse manifest text (for `restore --from-remote`): rows of every segment, deduplicated.
-pub fn parse_segments(texts: &[String]) -> Vec<Envelope> {
+/// Parse one mirrored segment strictly: every non-empty line must be a row of this manifest
+/// version. A segment is all or nothing (red-team A, Codex F6).
+pub fn parse_segment(text: &str) -> Result<Vec<Envelope>, String> {
+    let mut out = Vec::new();
+    for (i, l) in text.lines().enumerate() {
+        if l.trim().is_empty() {
+            continue;
+        }
+        let env: Envelope =
+            serde_json::from_str(l).map_err(|e| format!("line {} is not a row: {e}", i + 1))?;
+        if env.v != MANIFEST_VERSION {
+            return Err(format!(
+                "line {} has manifest version {}; this build reads {MANIFEST_VERSION}",
+                i + 1,
+                env.v
+            ));
+        }
+        out.push(env);
+    }
+    Ok(out)
+}
+
+/// Rows of several verified segments, de-duplicated by their exact text.
+pub fn merge_segments(segments: Vec<Vec<Envelope>>) -> Vec<Envelope> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    for t in texts {
-        for l in t.lines() {
-            if let Ok(env) = serde_json::from_str::<Envelope>(l) {
-                if seen.insert(l.to_string()) {
-                    out.push(env);
-                }
+    for seg in segments {
+        for env in seg {
+            if seen.insert(serde_json::to_string(&env).unwrap_or_default()) {
+                out.push(env);
             }
         }
     }

@@ -391,6 +391,12 @@ pub fn restore_summary(r: &disk_cleaner_core::apply::restore::RestoreReport) -> 
     for (p, rule) in &r.regenerate {
         let _ = writeln!(o, "  regenerate: {} ({rule})", p.display());
     }
+    for (seg, why) in &r.rejected_segments {
+        let _ = writeln!(
+            o,
+            "  manifest segment skipped (history may be incomplete): {seg}: {why}"
+        );
+    }
     o
 }
 
