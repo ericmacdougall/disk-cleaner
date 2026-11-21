@@ -43,7 +43,7 @@ gh workflow run site.yml
 gh workflow run pages.yml
 ```
 
-Afterwards, disable them again so pushes do not start burning minutes:
+After those runs finish, disable them again. While enabled, every feature-branch push triggers them too:
 
 ```
 gh workflow disable 423127909    # ci
@@ -52,6 +52,6 @@ gh workflow disable 423305490    # Site tests
 
 ## Feature-branch workflows
 
-**This change alone does not stop the feature-branch burn.** Feature branches (`feat/**` and others) still carry their own copies of `ci.yml` (push on `main` and `feat/**`) and `site.yml` (push on any branch). Those copies keep their push triggers until each branch is rebased onto this change; merging to `main` does not change them. In the last 100 runs before this change, 60 were these feature-branch copies (48 `ci`, 12 `Site tests`). That is why `ci` (423127909) and `Site tests` (423305490) were disabled in the Actions settings on 2026-11-21 as well. Rebasing the feature branches onto this change would let them be re-enabled safely.
+Feature branches (`feat/**` and others) carry their own copies of `ci.yml` (push on `main` and `feat/**`) and `site.yml` (push on any branch). Merging this change to `main` does not change those copies; in the last 100 runs before it, 60 were such feature-branch runs (48 `ci`, 12 `Site tests`). `desktop.yml`, `desktop-close.yml`, `mutants.yml`, `e2e-probe.yml`, `e2e-variants.yml`, `macdiag.yml`, `release.yml` and `release-checks.yml` exist only on feature branches.
 
-`desktop.yml`, `desktop-close.yml`, `mutants.yml`, `e2e-probe.yml`, `e2e-variants.yml`, `macdiag.yml`, `release.yml` and `release-checks.yml` exist on feature branches, not on `main`. A change on `main` cannot stop those from firing on those branches. Disable those workflows in the repository's Actions settings (or rebase the branch onto this change and drop the push triggers) to keep them from using minutes. Those eight workflows were disabled in the repository's Actions settings on 2026-11-21 (re-enable with `gh workflow enable <id>`), together with `ci` and `Site tests`: 10 in all.
+**Current state (2026-11-21):** all 10 of these workflows are disabled in the repository's Actions settings, so none of them start on any push. Re-enable one with `gh workflow enable <id>` only for a manual run, and only after the relevant feature branches are rebased onto this change (otherwise their push triggers come back too). Disable it again afterwards.

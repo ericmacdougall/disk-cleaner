@@ -1,10 +1,11 @@
 name: Site tests
 
 # The tests also read the root README, ci.yml, the core's model, plan and facts sources and the CLI's
-# report to check the page's claims against them, so a change to any of those runs them too.
+# report to check the page's claims against them; run ./scripts/local-ci.sh after changing any of those.
 # Push and pull_request triggers were removed so this no longer consumes
 # GitHub-hosted Actions minutes. Run ./scripts/local-ci.sh instead.
-# Manual run: gh workflow run site.yml
+# This workflow is also DISABLED in the Actions settings (2026-11-21). Manual run:
+#   gh workflow enable site.yml && gh workflow run site.yml   (then: gh workflow disable site.yml)
 on:
   workflow_dispatch:
 

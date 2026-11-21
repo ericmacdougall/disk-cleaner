@@ -27,7 +27,8 @@ python3 -m unittest discover -s site/tests -v
 
 They check the page structure, accessibility basics, status wording, absence of external requests, the
 brand tokens against the CSS, and the Pages workflows. Run them locally with `./scripts/local-ci.sh`
-(or `python3 -m unittest discover -s site/tests -v`). The Pages workflow also runs them first when it is started by hand.
+(which also runs fmt, clippy, the Rust tests and the license check), or on their own with
+`python3 -m unittest discover -s site/tests -v`. The Pages workflow also runs them first when it is started by hand.
 
 ## Publishing and rollback
 
@@ -40,11 +41,12 @@ brand tokens against the CSS, and the Pages workflows. Run them locally with `./
   green; if Pages publishes from a branch instead, it is skipped with a warning. Any other answer (a token
   or permission error, an outage) fails the run rather than being read as "not enabled".
 - **After enabling Pages:** nothing deploys until the Pages workflow is run by hand from the Actions tab.
-- **Rehearsal:** when `.github/workflows/site.yml` is started by hand, the `pages-rehearsal` job runs the
+- **Rehearsal:** when `.github/workflows/site.yml` is started by hand (it is disabled in the Actions
+  settings, so `gh workflow enable site.yml` first, and disable it again afterwards), the `pages-rehearsal` job runs the
   same preparation script, packages the artifact without deploying, serves it under `/disk-cleaner/` (how a
   project Pages site is served) and smoke-tests it with curl. Both workflows call the same script, and a
-  test checks that. The `pages-gate` job runs the same gate, so every change shows what the deploy would
-  decide today.
+  test checks that. The `pages-gate` job runs the same gate and shows what the deploy would decide
+  today, but only on those manual runs; it no longer runs on every change.
 - **Roll back:** re-run the previous successful "Pages" workflow run from the Actions tab, or revert the
   commit and push.
 - **Take the site down:** disable Pages in the repository settings.

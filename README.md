@@ -53,7 +53,7 @@ cargo build --release --locked -p disk-cleaner-cli
 
 ## Verify locally
 
-GitHub-hosted CI is `workflow_dispatch` only (the included Actions minutes are exhausted). From the repository root, with a stable Rust toolchain and `python3`:
+GitHub-hosted CI is `workflow_dispatch` only, and the `ci` and `Site tests` workflows are also disabled in the Actions settings (the included Actions minutes are exhausted); a manual run needs `gh workflow enable` first. From the repository root, with a stable Rust toolchain and `python3`:
 
 ```
 ./scripts/local-ci.sh

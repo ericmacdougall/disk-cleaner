@@ -2,7 +2,8 @@ name: ci
 
 # Push and pull_request triggers were removed so this no longer consumes
 # GitHub-hosted Actions minutes. Run ./scripts/local-ci.sh instead.
-# Manual run: gh workflow run ci.yml
+# This workflow is also DISABLED in the Actions settings (2026-11-21). Manual run:
+#   gh workflow enable ci.yml && gh workflow run ci.yml   (then: gh workflow disable ci.yml)
 on:
   workflow_dispatch:
 
