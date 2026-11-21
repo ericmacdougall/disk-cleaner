@@ -124,6 +124,17 @@ def forbidden_hits(text, words):
     return [w for w in words if w.lower() in low]
 
 
+OVERCLAIM = re.compile(
+    r"(secret|\.env|credential|key file)[^.;]{0,60}\b(never|not|isn't|is not|are not)\b[^.;]{0,20}\b(read|opened)\b"
+    r"|\bnever (reads|opens)\b[^.;]{0,40}(secret|\.env|credential|any file|your files)"
+    r"|\bno file is ever (read|opened)\b", re.I)
+
+
+def overclaims(text):
+    """Sentences promising that secret files are never read: the scanner runs git, which reads tracked files."""
+    return [m.group(0) for m in OVERCLAIM.finditer(text)]
+
+
 def top_level_permissions(yml):
     perms, inside = {}, False
     for line in yml.splitlines():
@@ -377,6 +388,12 @@ class TestDetectorsAreNotVacuous(unittest.TestCase):
                          ["prunedisk.com", "fastest"])
         self.assertEqual(forbidden_hits("nothing here", ["fastest"]), [])
 
+    def test_overclaim_detector_fires(self):
+        for bad in ("Secret files are never read.", "PruneDisk never reads your .env file.",
+                    "It never opens a secret file.", "No file is ever read.", "it never reads any file"):
+            self.assertTrue(overclaims(bad), bad)
+        self.assertEqual(overclaims("git reads the files it tracks, a tracked .env included"), [])
+
     def test_structure_detector_fires(self):
         c = Collector()
         c.feed('<div id="a"><p id="a"></div>')
@@ -542,6 +559,14 @@ class TestContent(unittest.TestCase):
         self.assertRegex(flat, r"read-only")
         self.assertIn("merged into the main branch", flat)
         self.assertIn("releases page", flat)
+
+    def test_reading_promise_is_no_stronger_than_the_scanner(self):
+        # The scanner runs git, and git reads the files a repository tracks (a tracked .env included).
+        # The page must say so, and must not promise that secret files are never read.
+        flat = re.sub(r"\s+", " ", self.text)
+        self.assertIn("git reads the files it tracks, as it always does, a tracked .env included", flat)
+        self.assertIn("it never copies what a file contains into its output", flat)
+        self.assertEqual(overclaims(flat), [])
 
     def test_no_stale_review_claims(self):
         # The scanner and planner were merged into main; copy written while they were on a draft pull
