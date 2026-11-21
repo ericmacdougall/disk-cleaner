@@ -70,4 +70,5 @@ jobs:
             ${{ runner.temp }}/close/*/log.txt
             ${{ runner.temp }}/close/*/app.log
             ${{ runner.temp }}/close/*/openbox.log
+            ${{ runner.temp }}/close/*/xvfb.log
           retention-days: 14

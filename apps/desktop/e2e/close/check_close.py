@@ -45,14 +45,18 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-import xlib  # noqa: E402
 
 ID = "io.github.ericmacdougall.prunedisk"
 DEADLINE_S = 10.0
 ROUTES = ["wm-close", "destroy-wm", "destroy-nowm", "kill-client", "sigterm", "sighup", "sigkill"]
 PHASES = ["walk", "analyse"]
 REAPED: dict[int, int] = {}
+
+
+def xq(*args: str) -> subprocess.CompletedProcess:
+    """One Xlib call in its own process (xlib.py), so a lost X connection ends only it."""
+    return subprocess.run([sys.executable, "-I", str(HERE / "xlib.py"), *args],
+                          capture_output=True, text=True, timeout=20)
 
 libc = ctypes.CDLL(None, use_errno=True)
 
@@ -190,14 +194,13 @@ class Case:
         subprocess.run([sys.executable, str(HERE.parent / "manifest.py"), "snapshot",
                         str(self.dir / "before.json"), *self.snapshot_roots], check=True)
         sock = Path(f"/tmp/.X11-unix/X{self.display[1:]}")
-        self.xvfb = subprocess.Popen(["Xvfb", self.display, "-screen", "0", "1280x1024x24", "-nolisten", "tcp"],
+        self.xvfb = subprocess.Popen(["Xvfb", self.display, "-screen", "0", "1280x1024x24", "-nolisten", "tcp", "-noreset"],
                                      stdout=subprocess.DEVNULL, stderr=open(self.dir / "xvfb.log", "w"))
         wait_for(lambda: sock.exists(), 10, "Xvfb socket")
-        self.x = xlib.Display(self.display)
         if self.wm:
             self.openbox = subprocess.Popen(["openbox", "--sm-disable"], env={**os.environ, "DISPLAY": self.display},
                                             stdout=subprocess.DEVNULL, stderr=open(self.dir / "openbox.log", "w"))
-            wait_for(self.x.wm_running, 10, "openbox")
+            wait_for(lambda: xq("wm", self.display).returncode == 0, 10, "openbox")
         env = {
             "PATH": f"{self.args.fakebin}:/usr/bin:/bin",
             "DISPLAY": self.display,
@@ -220,7 +223,8 @@ class Case:
 
     def ready(self) -> dict:
         """Wait for the window and the phase; return what holds at the moment of acting."""
-        wid = wait_for(lambda: self.x.toplevel(self.app.pid), 60, "the app's top-level window")
+        wid = wait_for(lambda: xq("toplevel", self.display, str(self.app.pid)).stdout.strip(), 60,
+                       "the app's top-level window")
         self.wid = wid
         if self.phase == "walk":
             def walking():
@@ -238,7 +242,7 @@ class Case:
         self.track(t)
         w = self.worker(t)
         pre = {
-            "window": hex(wid),
+            "window": hex(int(wid)),
             "worker": w,
             "gits_running": len(self.running_gits(t)),
             "walk_thread": any(n.startswith("scan-") for n in threads(self.app.pid)),
@@ -256,13 +260,13 @@ class Case:
         r = self.route
         info: dict = {}
         if r == "wm-close":
-            assert self.x.wm_running()
-            self.x.request_close(self.wid)
+            assert xq("wm", self.display).returncode == 0
+            xq("close", self.display, self.wid)
         elif r in ("destroy-wm", "destroy-nowm"):
-            self.x.destroy(self.wid)
-            info["window_gone_after_destroy"] = not self.x.exists(self.wid)
+            xq("destroy", self.display, self.wid)
+            info["window_gone_after_destroy"] = xq("exists", self.display, self.wid).returncode == 1
         elif r == "kill-client":
-            self.x.kill_client(self.wid)
+            xq("kill", self.display, self.wid)
         elif r in ("sigterm", "sighup", "sigkill"):
             os.kill(self.app.pid, {"sigterm": signal.SIGTERM, "sighup": signal.SIGHUP, "sigkill": signal.SIGKILL}[r])
         elif r == "none":
@@ -283,6 +287,10 @@ class Case:
             app_alive = self.app.pid in t and self.app.pid not in REAPED
             if not app_alive and times["app_exit_s"] is None:
                 times["app_exit_s"] = el
+            # Whether the X server outlived the app (a server that died first would itself
+            # end the app, which would hide what the route did).
+            if self.xvfb.pid in REAPED and "xserver_gone_s" not in times:
+                times["xserver_gone_s"] = el
             if worker_keys is None:
                 worker_keys = [k for k, v in self.tracked.items() if "--analysis-worker" in v["cmd"]]
             if times["worker_gone_s"] is None and not any(p in t and t[p]["start"] == s for p, s in worker_keys):
@@ -312,10 +320,6 @@ class Case:
                 p.terminate()
         time.sleep(0.5)
         reap()
-        try:
-            self.x.close()
-        except Exception:
-            pass
 
     def run(self) -> dict:
         res: dict = {"case": self.name, "phase": self.phase, "route": self.route,
@@ -355,7 +359,8 @@ class Case:
               and res.get("window_gone_after_destroy", True))
         res["result"] = "PASS" if ok else "FAIL"
         self.say(f"{res['result']}: app exit {res.get('app_exit_s')} s, worker gone {res.get('worker_gone_s')} s, "
-                 f"all gone {res.get('all_gone_s')} s, left {res.get('left_at_end')}, no-write {str(res.get('no_write'))[:80]}, "
+                 f"all gone {res.get('all_gone_s')} s, X server gone {res.get('xserver_gone_s')} s, "
+                 f"app {res.get('app_status')}, left {res.get('left_at_end')}, no-write {str(res.get('no_write'))[:80]}, "
                  f"error {res.get('error')}")
         (self.dir / "result.json").write_text(json.dumps(res, indent=2))
         (self.dir / "log.txt").write_text("\n".join(self.log) + "\n")

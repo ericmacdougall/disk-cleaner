@@ -210,3 +210,32 @@ class Display:
         server going away at logout does to every client)."""
         _x.XKillClient(self.d, w)
         _x.XSync(self.d, 0)
+
+
+def main(argv: list[str]) -> int:
+    """One call per process, so a lost X connection (Xlib then exits) ends only this helper,
+    never the check: xlib.py wm|toplevel|close|destroy|kill|exists DISPLAY [PID|WINDOW]."""
+    cmd, display = argv[0], argv[1]
+    try:
+        x = Display(display)
+    except OSError as e:
+        print(e)
+        return 3
+    if cmd == "wm":
+        return 0 if x.wm_running() else 1
+    if cmd == "toplevel":
+        w = x.toplevel(int(argv[2]))
+        print(w or "")
+        return 0 if w else 1
+    w = int(argv[2])
+    if cmd == "exists":
+        return 0 if x.exists(w) else 1
+    {"close": x.request_close, "destroy": x.destroy, "kill": x.kill_client}[cmd](w)
+    x.close()
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main(sys.argv[1:]))
