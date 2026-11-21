@@ -142,7 +142,7 @@ fn item<'a>(p: &'a disk_cleaner_core::Plan, path: &Path) -> &'a disk_cleaner_cor
 
 #[test]
 fn g4_maven_local_repository_with_a_locally_installed_artifact_is_never_removed() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let home = tmp.path().join("home");
     let repo = home.join(".m2").join("repository");
     // `mvn install:install-file` of a vendor jar that exists nowhere else: no
@@ -173,7 +173,7 @@ fn g4_maven_local_repository_with_a_locally_installed_artifact_is_never_removed(
 fn g4_gradle_user_home_matched_as_a_project_cache_is_never_removed() {
     // Someone ran Gradle in their home directory, so `~/build.gradle` sits beside `~/.gradle`,
     // which is the Gradle user home: init scripts and gradle.properties (often credentials).
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let home = tmp.path().join("home");
     write(&home.join("build.gradle"), "// scratch build\n");
     let gh = home.join(".gradle");
@@ -203,7 +203,7 @@ fn g4_gradle_user_home_matched_as_a_project_cache_is_never_removed() {
 fn g4_gradle_properties_in_the_user_home_is_outside_every_removing_item() {
     // Guard (passes before the fix too): with no build file beside it, only `~/.gradle/caches`
     // is classified, never the directory that holds gradle.properties and init scripts.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let home = tmp.path().join("home");
     let gh = home.join(".gradle");
     write(&gh.join("gradle.properties"), "org.gradle.daemon=true\n");
@@ -229,7 +229,7 @@ fn g4_terraform_directory_with_backend_state_is_never_removed() {
     // `.terraform/terraform.tfstate` records the backend configuration given to `terraform init`
     // (possibly with -backend-config values that exist nowhere else); `environment` records the
     // selected workspace.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = real_tempdir();
     let root = tmp.path().join("scan");
     let proj = root.join("infra");
     write(&proj.join("main.tf"), "terraform {}\n");

@@ -1,0 +1,17 @@
+# NEG-10 (AC-8): a classifier that never chooses the noise lane fails a noise control.
+rule: keep-noise
+mutant: noise lane never chosen (rule 7 decides keep)
+note: interim killing test: the spec names rescue n5 (its node_modules) and the guard, both red at f64a075; artifact_secret's node_modules must be noise and runs green. Add the n5 and guard pairs when they are enabled.
+killing-test: rescue artifact_secret
+assertion: /node_modules/pkg/index.js is Keep secret=None
+--- a/crates/core/src/lanes.rs
++++ b/crates/core/src/lanes.rs
+@@ -741,7 +741,7 @@
+                         "regenerable"
+                     };
+                     return Decision {
+-                        lane: Lane::Noise,
++                        lane: Lane::Keep,
+                         reason: format!(
+                             "a {class} directory (rule {rule}) that can be regenerated: {}",
+                             it.reason

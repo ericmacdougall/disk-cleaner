@@ -28,6 +28,24 @@ pub mod scan;
 mod test_fifo;
 pub mod words;
 
+/// Observation points for tests. Not part of the supported interface.
+#[doc(hidden)]
+pub mod testing {
+    use std::path::{Path, PathBuf};
+
+    /// Start recording every file-content open the library attempts, process-wide. Recording
+    /// stays on; tests tell their own opens apart by their temporary directory.
+    pub fn record_opens() {
+        crate::regular::recorder::start();
+    }
+
+    /// Every attempted open recorded so far whose path lies under `dir` (compared as given:
+    /// pass the real path).
+    pub fn opens_under(dir: &Path) -> Vec<PathBuf> {
+        crate::regular::recorder::under(dir)
+    }
+}
+
 pub use config::{Config, ConfigSource, DEFAULT_ACTIVE_WINDOW_DAYS, DEFAULT_MAX_GIT_ADMIN_BYTES};
 pub use error::{Error, Result};
 pub use facts::{is_network_url, FactsConfig};

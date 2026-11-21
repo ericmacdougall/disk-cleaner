@@ -125,7 +125,10 @@ the directory that holds them); `output_bytes` counts them separately.
   logical length (allocated and compressed size are not read in this phase).
 - A file with more than one hard link is counted once per `(device, inode)`. On Windows hard links
   are not detected and are counted per name.
-- Symlinks are never followed; a symlink counts as the small link object.
+- Symlinks are never followed; a symlink counts as the small link object. The one exception is a
+  scan root spelled through a symlink to a directory: the root is that directory, counted with its
+  own blocks and on its own device (for `--one-file-system`), never as the link object, and its
+  totals equal a scan of the directory itself.
 - `--one-file-system` skips directories on another device than their scan root. It is ignored on
   Windows and a warning says so. A skipped directory's contents are never seen, so the node that
   holds it (or the mount point itself, when a rule matches it) records it in `skipped_mounts` and is
@@ -192,7 +195,11 @@ Classification rules (design section 3): a directory with a `.git` directory is 
 A directory whose name matches a rule in `rules/artifacts.toml` is `regenerable` or `cache` when
 the rule's marker file or directory exists in the directory beside it, that is, its parent (a marker
 further up proves nothing; a rule without markers matches by name alone; ambiguous names such as
-`build` always have markers). Regenerable and cache directories are opaque: nothing inside them is
+`build` always have markers). A rule matches the directory's real names: a scan root spelled
+through a symlink (`.cache` or `.m2` linking to a folder named otherwise) is classified by the
+directory it names, so the link's name never makes a directory regenerable or cache; for the asks
+of nested directories (below) the walked spelling counts too, since an ask only protects.
+Regenerable and cache directories are opaque: nothing inside them is
 classified, so a repo vendored inside `node_modules` is not reported as a node; instead the
 directory gets an `ask_reason`. Opaque does not mean unchecked: while the scan is inside one, the
 rules that carry `ask` or `ask_if_contains` are still evaluated for the directories nested in it,
@@ -1047,7 +1054,7 @@ A **piece**:
 | `newest_mtime` | newest modification time of the members (for `git-node`, of the work tree outside its git directory); absent when it has no members |
 | `walked_at` | unix seconds, rounded down, at the start of the survey walk (before any entry of this piece was read) |
 | `secret` | present on a secret piece: the kind of secret name that matched (`a private SSH key`) |
-| `incomplete` | present when the piece cannot be judged whole, with why: entries that could not be read, a mount point that was not entered, a FIFO, socket or device file, a name that is not valid UTF-8 (it could not be written back exactly) |
+| `incomplete` | present when the piece cannot be judged whole, with why: entries that could not be read, a mount point that was not entered, a FIFO, socket or device file, a path or name that is not valid UTF-8, anywhere in its real or spelled path (it could not be written back exactly), a secret-named file inside a git directory, another scan root inside a `git-node` piece's git directory, or, for a `tree` or `files` piece, lying inside a git directory (a git directory is handled only whole; see "Re-check") |
 
 **Membership is enumerated, never "the directory, recursively".** A piece's members are exactly
 its `members` list, written into the scan file with the identity and metadata each one had. An
@@ -1103,7 +1110,12 @@ result does not depend on which name owns a hard-linked inode) and count members
 matches `[[secret_name]]`, or a directory whose name matches `[[secret_dir]]`, in
 `rules/artifacts.toml` is always its own piece with `secret` set (a `files` piece of one entry, or
 a `tree` piece for the directory), anywhere, including inside git nodes. The enclosing piece
-lists it in `excludes`. Names are compared ignoring ASCII case; nothing is opened, and a secret
+lists it in `excludes`. Names are compared ignoring ASCII case, on the raw bytes of the name,
+never on a conversion to text that can fail: every pattern is ASCII (a rules file with a
+non-ASCII secret pattern, exception or directory name is refused), so a name that is not valid
+UTF-8 is a secret exactly when its valid parts make it one (`id_rsa` followed by an invalid byte
+matches `id_rsa*`; `api`, an invalid byte and `token` holds the word `token`). The same holds for
+`[[secret_word]]` segments, where an invalid byte ends a segment. Nothing is opened, and a secret
 entry is **never hashed** and never appears in `blobs`. The list:
 
 - exact names: `.env`, `.netrc`, `_netrc`, `.pgpass`, `.git-credentials`, `.npmrc`, `.pypirc`,
@@ -1111,12 +1123,74 @@ entry is **never hashed** and never appears in `blobs`. The list:
 - `.env.*` except `.env.example`, `.env.sample`, `.env.template` and `.env.dist`;
 - suffixes: `.pem`, `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`, `.kdbx`, `.tfstate`, `.tfvars`;
 - prefixes: `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `terraform.tfstate.`;
-- substrings `secret`, `credential`, `password`, `passwd`, `token`, applied **outside** artifact
-  nodes only. An artifact node is a node of class `regenerable` or `cache`, including every entry
-  below it. Inside `node_modules`, `.venv` and the like they would match package source such as
-  `tokenizer.js` by the thousand; there the exact, suffix and prefix names still apply, and the
-  scan's state-file rule already makes such artifacts ask;
+- exact name `.htpasswd`;
+- words (`[[secret_word]]`), matched as whole **segments** of the name's stem, never as parts of
+  words. The stem is the name without its last extension; a leading dot belongs to the stem. It is
+  split at every character that is not an ASCII letter or digit, and at each lower-to-upper case
+  change. So `client_secret.json` and `clientSecret.json` hold `secret`, while `tokenizer.rs`,
+  `tokens.ts` and `secretary.txt` hold no word:
+  - `secret`/`secrets`, `credential`/`credentials`, `password`/`passwords`/`passwd`: any segment;
+  - `token`: the last segment (`api_token`, `token.json`, `.token`), or right after one of `api`,
+    `access`, `auth`, `bearer`, `refresh`, `oauth`, `personal`, `github`, `gh`, `gitlab`, `npm`,
+    `pypi`, `slack`, `discord`, `bot`, `session`, `id`, `jwt`, `client`, `service`, `deploy`,
+    `registry`, `hf` (`auth-token-cache.json`); any name with the extension `.token`. So
+    `fix-token-refresh` does not hold it;
+  - in a file with a code or document extension (the loose-code source extensions plus `md`,
+    `markdown`, `mdx`, `rst`, `adoc`, `html`, `htm`, `css`, `scss`, `sass`, `less`, `svg`, `png`,
+    `jpg`, `jpeg`, `gif`, `webp`, `ico`, `mjs`, `cjs`, `vue`, `svelte`, `snap`, `map`, `lock`), a
+    word counts only as the whole stem. For example, `secrets.py` and `credentials.ts` match, but
+    `password_reset.py` and `secret_santa.md` do not. `token` never matches in such a file
+    (`token.rs` is ordinary lexer source);
+  - words apply **outside** artifact nodes only. An artifact node is a node of class
+    `regenerable` or `cache`, including every entry below it; there the exact, suffix and prefix
+    names still apply, and the scan's state-file rule already makes such artifacts ask;
 - directories: `.ssh`, `.gnupg`, `.aws`, `.password-store`, `secrets`.
+
+**Git's bookkeeping names are not secret names.** Inside a git directory, these names were chosen
+by the user for branches, worktrees and submodules, not for file contents. The exemption follows
+git's own layout. A **git top** is where a git directory starts (a repository's `.git`, a bare
+repository), or the admin directory of a linked worktree or submodule: a directory below
+`worktrees` or `modules` of a git top that holds a `HEAD` file. Exempt are:
+- everything below `refs` and `logs` of a git top (ref and reflog names);
+- the names of the directories below `worktrees` and `modules` of a git top, down to each admin
+  directory (worktree names and submodule paths); the files inside an admin directory are not
+  exempt, except its own `refs`, `logs` and `packed-refs`;
+- `packed-refs` directly in a git top.
+
+They never match a secret name, word or directory: for example, `.git/refs/heads/fix-token-refresh`,
+`.git/refs/heads/secrets/rotate` or a linked worktree named `secrets`
+(`.git/worktrees/secrets`). Everywhere else in a git directory the rules apply as above (a
+`server.pem` in `.git/info/logs`, which is not a git top's `logs`, or an `id_rsa` inside
+`.git/worktrees/secrets`), and an enclosing secret directory still covers everything below it.
+
+**Context follows location.** Every directory's context (secret, git directory, artifact, and
+whether its path can be written back exactly) is derived by one rule from where it is, the same
+for a directory the walk enters and for a scan root. A scan root takes its context from every
+component of its real path, its own name included, as if the walk had reached it from above, and
+also from its path as spelled (a symlink alias such as `~/k -> ~/.ssh`). This holds in any root
+order, and whether or not an enclosing root was scanned too: for example, a root walked on its
+own because it is another file system under `--one-file-system`.
+- A directory is in a git directory when it, or any directory above it, is named `.git`
+  (compared ignoring ASCII case), is shaped like one (a `HEAD` file and `objects` and `refs`
+  directories), or is a bare-repo node. This is read from the directories themselves, so it holds
+  inside artifacts (`node_modules/dep/.git`) and for a repository that is not a node. A `.git`
+  file (a linked worktree's or submodule's pointer) belongs to git too.
+- Node and artifact context follow the real path through the scan's nodes only. A root inside a
+  repository or artifact that no scanned root covers has no node there; it is judged as an
+  ungrouped root (`backup`, never `noise` by rule), and secret words apply to its names: both
+  on the safe side.
+- If the directory, or any directory above it, in its real path or as spelled, has a secret
+  directory name (outside the git bookkeeping names above), it is in a secret directory, and so
+  is everything below it. A secret piece starts at the topmost such directory, or at a scan root
+  inside one.
+- A path is exact when every component, in its real path and as spelled, is valid UTF-8.
+
+One check decides every piece as it is emitted: a piece that is not exact (its path or a
+member's name is not valid UTF-8), a `tree` or `files` piece that lies in a git directory or holds
+a file of one, and a `git-node` piece whose git directory holds a secret are `incomplete`; a
+piece in a secret directory, or holding a secret entry, has `secret` set, whether or not it has
+file members. So a removing lane never reaches a path that does not round-trip, a part of a git
+directory or a secret.
 
 Over-matching (a `tokenizer.py` in loose code) keeps a file on disk, the safe side. **Known
 limit:** secrets are found by name only. A secret under an ordinary name (a copied `.env` saved as
@@ -1131,8 +1205,10 @@ SHA-256. Not hashed (counted in `totals.unhashed_candidates`, and never part of 
 file (allocated below half its length), a file whose length, mtime or inode changed while it was
 read, one that could not be opened as a regular file, and every candidate once `max_hash_bytes`
 have been read. An inode that has more hard links than names the survey saw is also left
-unhashed: a name outside the scan roots could be a secret name. A blob is a sha256 with more than
-one copy:
+unhashed: a name outside the scan roots could be a secret name. A file reachable by any name
+whose path is not exact (a component, as spelled or as real, that is not valid UTF-8) is never a
+candidate and is never opened: the rules may not see all of such a name, and its path could not
+be written back exactly. A blob is a sha256 with more than one copy:
 
 | Field | Meaning |
 |---|---|
@@ -1157,10 +1233,15 @@ naming the first path that differs when:
 - a member's status-change time (`ctime`) is at or after `walked_at` (an overwrite of the same
   length with its mtime set back still changes `ctime`);
 - an entry that is not a member and not under `excludes` appeared below a `tree` or `git-node`
-  piece.
+  piece;
+- the piece's directory, or a directory below it that is not under `excludes`, has a
+  status-change time at or after `walked_at` (adding, removing or renaming an entry changes its
+  directory's `ctime`, so a new empty directory is caught too). This is reported after any
+  difference of an entry.
 
 `scope` is `RecheckScope::All` by default. `RecheckScope::WorkTree`, for a `git-node` piece only,
-leaves out its git directory. An apply step uses it only for the second recheck, after its own
+leaves out its git directory: `.git` for a repository or worktree, and the whole piece for a bare
+repository (a `git-node` piece with no `.git` member). An apply step uses it only for the second recheck, after its own
 recovery step has written recovery refs or a bundle into that git directory. The git directory is
 then covered by the preserve obligation instead: it is enumerated again at apply, backed up and
 verified. On a platform without file identity, `recheck` always returns `Drift`. `recheck` does
@@ -1170,7 +1251,10 @@ remove.
 
 A secret inside a git directory (a hook named `token-check`, a `.git/credentials`) is never cut
 out, because the preserve obligation covers every file of the git directory. It makes the
-`git-node` piece `incomplete` instead, so the repository is kept.
+`git-node` piece `incomplete` instead, so the repository is kept. A git directory is handled only
+whole, as part of its repository's `git-node` piece: a `tree` or `files` piece that lies inside a
+git directory (the piece of a scan root inside one) is `incomplete`, and so is a `git-node` piece
+whose git directory holds another scan root, which its own walk does not enter.
 
 Every plan piece carries `scan_piece`, the scan piece it comes from; a plan piece and the
 derived pieces cut from it share it. **An apply step MUST recheck the scan piece `scan_piece`

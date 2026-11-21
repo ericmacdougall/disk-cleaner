@@ -17,7 +17,11 @@ use std::path::Path;
 
 /// Open `path` for reading if it is, at the moment of opening, a regular file. Anything else is
 /// an error whose text is `not a regular file`; an open that fails keeps its own error.
+///
+/// This is the only place the library opens a file's content (a source test holds it to that),
+/// so it is where tests observe what was read: see [`crate::testing`].
 pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
+    recorder::note(path);
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -33,4 +37,34 @@ pub(crate) fn open_regular(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(file)
+}
+
+/// What the library tried to open, for tests: off unless a test turns it on. Every attempt is
+/// noted before the open, so a refused or failed open counts too.
+pub(crate) mod recorder {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static OPENS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    pub(crate) fn note(path: &Path) {
+        if ON.load(Ordering::Relaxed) {
+            if let Ok(mut v) = OPENS.lock() {
+                v.push(path.to_path_buf());
+            }
+        }
+    }
+
+    pub(crate) fn start() {
+        ON.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn under(dir: &Path) -> Vec<PathBuf> {
+        OPENS
+            .lock()
+            .map(|v| v.iter().filter(|p| p.starts_with(dir)).cloned().collect())
+            .unwrap_or_default()
+    }
 }

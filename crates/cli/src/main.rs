@@ -138,7 +138,7 @@ struct RestoreArgs {
 
 #[derive(Args)]
 struct ScanArgs {
-    /// Directories to scan.
+    /// Directories to scan (directories only: a file, or a symlink to one, is refused).
     #[arg(required = true)]
     paths: Vec<PathBuf>,
     /// Print the scan as JSON on stdout instead of a summary.

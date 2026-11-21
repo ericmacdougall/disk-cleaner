@@ -1,0 +1,17 @@
+# NEG-10 (AC-8): a classifier that never chooses the backup lane fails a loose control.
+rule: keep-backup
+mutant: backup lane never chosen (rule 8 decides keep)
+note: interim killing test: the spec names every rescue loose control; at f64a075 the only one that runs green is artifact_secret's ctl folder. Add a pair per loose control as each rescue test is enabled.
+killing-test: rescue artifact_secret
+assertion: /ctl/x.bin is Keep: no rule shows it can be regenerated
+--- a/crates/core/src/lanes.rs
++++ b/crates/core/src/lanes.rs
+@@ -762,7 +762,7 @@
+     }
+     // 8. Backup.
+     Decision {
+-        lane: Lane::Backup,
++        lane: Lane::Keep,
+         reason: "no rule shows it can be regenerated, so it is backed up before it is removed"
+             .to_string(),
+         evidence: None,

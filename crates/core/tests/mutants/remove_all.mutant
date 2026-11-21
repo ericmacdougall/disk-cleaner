@@ -1,0 +1,26 @@
+# A remove-everything classifier must fail: every non-secret piece goes to the backup lane.
+rule: remove-all
+mutant: every non-secret lane backup (decide returns backup right after rule 1)
+note: interim killing test: the spec names rescue a3f2, a3f3 and n4, all red at f64a075; lanes neg8 (an active folder gives only keep pieces) runs green. Add the a3f2, a3f3 and n4 pairs when they are enabled.
+killing-test: lanes neg8_an_active_folder_gives_only_keep_pieces
+assertion: right: Keep
+--- a/crates/core/src/lanes.rs
++++ b/crates/core/src/lanes.rs
+@@ -619,6 +619,17 @@
+             Why::Fleeting,
+         );
+     }
++    if nn < usize::MAX {
++        return Decision {
++            lane: Lane::Backup,
++            reason: "every non-secret lane backup".to_string(),
++            evidence: None,
++            git: None,
++            why: Why::Removed,
++            state: ProjectState::Unknown,
++            state_reason: String::new(),
++        };
++    }
+     // 2. Incomplete.
+     if let Some(why) = &p.incomplete {
+         return keep(
