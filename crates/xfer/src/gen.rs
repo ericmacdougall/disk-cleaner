@@ -92,8 +92,9 @@ impl Rng {
 /// A generated workload. Sizes are totals; see the spec's workload table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Workload {
-    /// Duplicate-heavy mixed tree: text, binary, exact duplicates, near-duplicate large files,
-    /// hard links and symlinks.
+    /// Duplicate-heavy mixed tree in the proportions of the spec's W1 table: archives, a binary
+    /// image, camera raw, small code files, about 42% exact duplicate bytes, hard links and
+    /// symlinks.
     W1,
     /// One large incompressible file.
     W2,
@@ -124,15 +125,31 @@ fn write_file(p: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn write_stream(p: &Path, total: u64, rng: &mut Rng, text: bool) -> Result<()> {
+/// How a generated large file's bytes look to a compressor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// Incompressible (archives, media, camera raw).
+    Random,
+    /// Text, about 3-4x under zstd.
+    Text,
+    /// Binary that compresses a little: 64 KiB blocks, half incompressible and half text.
+    Mixed,
+}
+
+fn write_stream(p: &Path, total: u64, rng: &mut Rng, fill: Fill) -> Result<()> {
     if let Some(d) = p.parent() {
         fs::create_dir_all(d)?;
     }
     let mut f = std::io::BufWriter::with_capacity(1 << 20, fs::File::create(p)?);
-    let mut buf = vec![0u8; 1 << 20];
+    let mut buf = vec![0u8; 64 << 10];
     let mut left = total;
     while left > 0 {
         let n = left.min(buf.len() as u64) as usize;
+        let text = match fill {
+            Fill::Random => false,
+            Fill::Text => true,
+            Fill::Mixed => rng.below(2) == 0,
+        };
         if text {
             rng.fill_text(&mut buf[..n]);
         } else {
@@ -145,30 +162,11 @@ fn write_stream(p: &Path, total: u64, rng: &mut Rng, text: bool) -> Result<()> {
     Ok(())
 }
 
-/// Write a large file made of 1 MiB blocks drawn from a fixed pool, so most of it repeats other
-/// regions (inside the file) and the other copies (across files) at unaligned offsets.
-fn write_repetitive(p: &Path, total: u64, pool: &[Vec<u8>], rng: &mut Rng) -> Result<()> {
-    if let Some(d) = p.parent() {
+fn copy_into(from: &Path, to: &Path) -> Result<()> {
+    if let Some(d) = to.parent() {
         fs::create_dir_all(d)?;
     }
-    let mut f = std::io::BufWriter::with_capacity(1 << 20, fs::File::create(p)?);
-    let mut left = total;
-    let mut noise = vec![0u8; 4096];
-    while left > 0 {
-        let b = &pool[rng.below(pool.len() as u64) as usize];
-        let n = left.min(b.len() as u64) as usize;
-        f.write_all(&b[..n])?;
-        left -= n as u64;
-        if left > 0 && rng.below(4) == 0 {
-            // a small unique insertion shifts every later boundary (fixed-size chunking would lose
-            // all dedup after this point; CDC resynchronises)
-            let k = (rng.below(4096) as usize + 1).min(left as usize);
-            rng.fill(&mut noise[..k]);
-            f.write_all(&noise[..k])?;
-            left -= k as u64;
-        }
-    }
-    f.flush()?;
+    fs::copy(from, to)?;
     Ok(())
 }
 
@@ -179,15 +177,16 @@ pub fn generate(dir: &Path, w: Workload, total: u64, seed: u64) -> Result<u64> {
     let mut files = 0u64;
     match w {
         Workload::W2 => {
-            write_stream(&dir.join("big.bin"), total, &mut rng, false)?;
+            write_stream(&dir.join("big.bin"), total, &mut rng, Fill::Random)?;
             files = 1;
         }
         Workload::W3 => {
-            // 4 KiB to 64 KiB files, 60% text, spread over 256 directories
+            // 512 B to 7.5 KiB files (mean about 4 KiB, so 800 MiB is about 200k files, the
+            // spec's W3), 60% text, spread over 256 directories
             let mut written = 0u64;
-            let mut buf = vec![0u8; 64 << 10];
+            let mut buf = vec![0u8; 8 << 10];
             while written < total {
-                let n = (4096 + rng.below(60 << 10)) as usize;
+                let n = (512 + rng.below(7 << 10)) as usize;
                 let text = rng.below(10) < 6;
                 if text {
                     rng.fill_text(&mut buf[..n]);
@@ -206,78 +205,61 @@ pub fn generate(dir: &Path, w: Workload, total: u64, seed: u64) -> Result<u64> {
             }
         }
         Workload::W1 | Workload::Mac => {
-            // shares of the total: 30% text, 20% unique binary, 40% repetitive large files with
-            // copies, 10% small files; plus exact duplicate copies, hard links and symlinks.
-            let text = total * 3 / 10;
-            let bin = total / 5;
-            let rep = total * 2 / 5;
-            let small = total / 10;
-            let nbig = if w == Workload::Mac { 2 } else { 4 };
-            for i in 0..nbig {
-                write_stream(
-                    &dir.join(format!("logs/log{i}.txt")),
-                    text / nbig,
-                    &mut rng,
-                    true,
-                )?;
+            // The spec's W1 table, modelled on the measured 48 GiB folder. By bytes, duplicates
+            // included: about 56% zip (incompressible), 29% bin (compresses a little), 6% camera
+            // raw (incompressible) and 6% text/code (small files), plus 0.5% logs. About 42% of
+            // all bytes are exact whole-file duplicates of other files in the tree:
+            //   zip:  8 archives = 34%, copies of the first 5 = 21%
+            //   bin:  one image  = 14.5%, one exact copy     = 14.5%
+            //   raw:  8 photos   = 3%,  a copied folder      = 3%
+            //   code: small files = 3%, a copied project     = 3%
+            let pct = |p: u64| total * p / 1000;
+            for i in 0..8 {
+                let p = dir.join(format!("archives/a{i}.zip"));
+                write_stream(&p, pct(340) / 8, &mut rng, Fill::Random)?;
                 files += 1;
-            }
-            for i in 0..nbig {
-                write_stream(
-                    &dir.join(format!("media/clip{i}.mp4")),
-                    bin / nbig,
-                    &mut rng,
-                    false,
-                )?;
-                files += 1;
-            }
-            let mut pool = Vec::new();
-            for _ in 0..48 {
-                let mut b = vec![0u8; 1 << 20];
-                if rng.below(2) == 0 {
-                    rng.fill(&mut b);
-                } else {
-                    rng.fill_text(&mut b);
+                if i < 5 {
+                    copy_into(&p, &dir.join(format!("downloads/a{i} (1).zip")))?;
+                    files += 1;
                 }
-                pool.push(b);
             }
-            // two "VM images" that share most content, then exact copies of the first one
-            let img = rep / 4;
-            write_repetitive(&dir.join("vm/disk-a.img"), img, &pool, &mut rng)?;
-            write_repetitive(&dir.join("vm/disk-b.img"), img, &pool, &mut rng)?;
-            fs::copy(
-                dir.join("vm/disk-a.img"),
-                dir.join("copies/disk-a copy.img"),
+            write_stream(&dir.join("vm/disk-a.img"), pct(145), &mut rng, Fill::Mixed)?;
+            copy_into(
+                &dir.join("vm/disk-a.img"),
+                &dir.join("copies/old/disk-a.img"),
             )?;
-            fs::copy(dir.join("vm/disk-a.img"), dir.join("copies/old/disk-a.img")).or_else(
-                |_| {
-                    fs::create_dir_all(dir.join("copies/old"))?;
-                    fs::copy(dir.join("vm/disk-a.img"), dir.join("copies/old/disk-a.img"))
-                },
-            )?;
-            files += 4;
+            files += 2;
+            for i in 0..8 {
+                let p = dir.join(format!("photos/raw/IMG_{i:04}.CR2"));
+                write_stream(&p, pct(30) / 8, &mut rng, Fill::Random)?;
+                copy_into(&p, &dir.join(format!("photos-copy/raw/IMG_{i:04}.CR2")))?;
+                files += 2;
+            }
+            for i in 0..3 {
+                let p = dir.join(format!("logs/log{i}.txt"));
+                write_stream(&p, pct(5) / 3, &mut rng, Fill::Text)?;
+                files += 1;
+            }
             let mut written = 0u64;
-            let mut buf = vec![0u8; 64 << 10];
-            while written < small {
-                let n = (512 + rng.below(32 << 10)) as usize;
+            let mut buf = vec![0u8; 8 << 10];
+            // 512 B to 7.5 KiB (mean about 4 KiB): about 30k files at 4 GiB, doubled by the copy
+            let mut small = Vec::new();
+            while written < pct(30) {
+                let n = (512 + rng.below(7 << 10)) as usize;
                 rng.fill_text(&mut buf[..n]);
-                write_file(
-                    &dir.join(format!("src/m{:03}/f{:06}.rs", files % 97, files)),
-                    &buf[..n],
-                )?;
+                let rel = format!("m{:03}/f{:06}.rs", small.len() % 97, small.len());
+                write_file(&dir.join("src").join(&rel), &buf[..n])?;
+                small.push(rel);
                 written += n as u64;
                 files += 1;
             }
-            // duplicated small files (a copied project folder)
-            let src = dir.join("src/m001");
-            if src.is_dir() {
-                for e in fs::read_dir(&src)? {
-                    let e = e?;
-                    let to = dir.join("src-backup/m001").join(e.file_name());
-                    fs::create_dir_all(to.parent().expect("parent"))?;
-                    fs::copy(e.path(), &to)?;
-                    files += 1;
-                }
+            // a copied project folder: exact duplicates of every small file
+            for rel in &small {
+                copy_into(
+                    &dir.join("src").join(rel),
+                    &dir.join("src-backup").join(rel),
+                )?;
+                files += 1;
             }
             #[cfg(unix)]
             {
@@ -286,6 +268,19 @@ pub fn generate(dir: &Path, w: Workload, total: u64, seed: u64) -> Result<u64> {
                 std::os::unix::fs::symlink("../logs/log1.txt", dir.join("links/log1-sym.txt"))?;
                 std::os::unix::fs::symlink("does-not-exist", dir.join("links/dangling"))?;
                 files += 3;
+                // about 70 hard links in all (the spec's W1): link the first small files of m002
+                let m = dir.join("src/m002");
+                if m.is_dir() {
+                    let mut names: Vec<_> = fs::read_dir(&m)?
+                        .map(|e| e.map(|e| e.file_name()))
+                        .collect::<std::io::Result<_>>()?;
+                    names.sort();
+                    fs::create_dir_all(dir.join("links/hard"))?;
+                    for n in names.iter().take(69) {
+                        fs::hard_link(m.join(n), dir.join("links/hard").join(n))?;
+                        files += 1;
+                    }
+                }
             }
         }
     }
@@ -293,7 +288,7 @@ pub fn generate(dir: &Path, w: Workload, total: u64, seed: u64) -> Result<u64> {
 }
 
 /// A small change for the second-run workload (W4): append to one text file, rewrite 64 KiB in
-/// the middle of one large file, add one new file and delete one small file.
+/// the middle of one large binary file, add 200 new small files and delete one small file.
 pub fn mutate(dir: &Path, seed: u64) -> Result<()> {
     let mut rng = Rng::new(seed ^ 0xABCD);
     let mut buf = vec![0u8; 64 << 10];
@@ -305,7 +300,7 @@ pub fn mutate(dir: &Path, seed: u64) -> Result<()> {
             .open(&log)?
             .write_all(&buf)?;
     }
-    let img = dir.join("vm/disk-b.img");
+    let img = dir.join("vm/disk-a.img");
     if img.is_file() {
         use std::io::{Seek, SeekFrom};
         let len = fs::metadata(&img)?.len();
@@ -314,12 +309,20 @@ pub fn mutate(dir: &Path, seed: u64) -> Result<()> {
         rng.fill(&mut buf);
         f.write_all(&buf)?;
     }
-    rng.fill_text(&mut buf[..8192]);
-    write_file(&dir.join("new/added.txt"), &buf[..8192])?;
+    // 200 new small files (the spec's W4)
+    for i in 0..200 {
+        let n = 512 + rng.below(7 << 10) as usize;
+        rng.fill_text(&mut buf[..n]);
+        write_file(&dir.join(format!("new/added{i:03}.txt")), &buf[..n])?;
+    }
     let victim = dir.join("src/m000");
     if victim.is_dir() {
-        if let Some(e) = fs::read_dir(&victim)?.next() {
-            fs::remove_file(e?.path())?;
+        let mut names: Vec<_> = fs::read_dir(&victim)?
+            .map(|e| e.map(|e| e.path()))
+            .collect::<std::io::Result<_>>()?;
+        names.sort();
+        if let Some(p) = names.first() {
+            fs::remove_file(p)?;
         }
     }
     Ok(())
@@ -344,5 +347,27 @@ mod tests {
             t.len(),
             c.len()
         );
+    }
+
+    /// Every workload generates into an absent directory, twice with the same bytes, and the
+    /// second-run change applies (the bench generates each workload this way).
+    #[test]
+    fn workloads_generate_and_mutate() {
+        let t = tempfile::tempdir().expect("tmp");
+        for (i, w) in [Workload::W1, Workload::W2, Workload::W3, Workload::Mac]
+            .into_iter()
+            .enumerate()
+        {
+            let a = t.path().join(format!("a{i}"));
+            let b = t.path().join(format!("b{i}"));
+            let na = generate(&a, w, 8 << 20, 7).expect("generate a");
+            let nb = generate(&b, w, 8 << 20, 7).expect("generate b");
+            assert_eq!(na, nb);
+            assert!(na >= 1);
+            if matches!(w, Workload::W1 | Workload::Mac) {
+                mutate(&a, 7).expect("mutate");
+                assert!(a.join("new/added199.txt").is_file());
+            }
+        }
     }
 }
