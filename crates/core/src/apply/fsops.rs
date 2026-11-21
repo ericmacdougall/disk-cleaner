@@ -9,7 +9,7 @@ use rustix::io::Errno;
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// Identity of an entry as stat saw it (lstat semantics: a symlink is itself).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -75,17 +75,35 @@ fn dir_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
-/// Open an absolute directory path, refusing a symlink at every component.
+/// Open an absolute directory path, refusing a symlink at every component. A symlinked
+/// component is named, with what the user can do (main's ruling: a piece kept for it is never
+/// kept silently); the check is an `lstat` of the component, not the errno, which differs
+/// between systems.
 pub fn open_dir_abs(path: &Path) -> io::Result<OwnedFd> {
     if !path.is_absolute() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not absolute"));
     }
     let mut fd = fs::open("/", dir_flags(), Mode::empty()).map_err(e)?;
+    let mut at = PathBuf::from("/");
     for c in path.components() {
         match c {
             Component::RootDir => {}
             Component::Normal(name) => {
-                fd = fs::openat(&fd, name, dir_flags(), Mode::empty()).map_err(e)?;
+                at.push(name);
+                fd = match fs::openat(&fd, name, dir_flags(), Mode::empty()) {
+                    Ok(next) => next,
+                    Err(err) => {
+                        return Err(match fs::statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+                            Ok(st) if ident_of(&st).kind == 'l' => io::Error::other(
+                                format!(
+                                    "the path goes through a link at {}; scan the real folder it points to instead",
+                                    at.display()
+                                ),
+                            ),
+                            _ => e(err),
+                        })
+                    }
+                };
             }
             _ => {
                 return Err(io::Error::new(

@@ -904,3 +904,36 @@ fn unreadable_file_keeps_piece() {
     assert!(ok.exists() && locked.exists());
     assert_eq!(fs::read(&locked).unwrap(), b"UNREADABLE-CANARY");
 }
+
+/// Main's ruling (with stream A's resolved-path contract): a plan piece whose path goes through
+/// a symlinked folder is kept, and its reason names the link and what to do. A plan made from a
+/// scan of a linked root never ends in a run that cleans nothing without saying why.
+#[test]
+fn a_piece_whose_path_goes_through_a_link_is_kept_with_a_reason_to_act_on() {
+    let fx = Fx::new();
+    fx.write("real/p/f.txt", b"behind a link");
+    let link = fx.data.join("link");
+    std::os::unix::fs::symlink(fx.data.join("real"), &link).unwrap();
+    let (scan, plan) = docs(&[&fx.data], &[P::tree(&fx.data.join("real/p"), "backup")]);
+    let from = fx.data.join("real").to_string_lossy().to_string();
+    let to = link.to_string_lossy().to_string();
+    let scan = scan.replace(&from, &to);
+    let plan = rebind(&scan, &plan.replace(&from, &to));
+    assert!(plan.contains(&format!("{to}/p")), "{plan}");
+    for act in [false, true] {
+        let rep = apply(&scan, &plan, &fx.opts(act)).unwrap();
+        let p = &rep.pieces[0];
+        assert_eq!(p.outcome, "kept", "act {act}: {rep:?}");
+        assert!(
+            p.reason
+                .contains(&format!("the path goes through a link at {to}"))
+                && p.reason.contains("scan the real folder"),
+            "act {act}: {}",
+            p.reason
+        );
+    }
+    assert_eq!(
+        fs::read(fx.data.join("real/p/f.txt")).unwrap(),
+        b"behind a link"
+    );
+}
