@@ -434,6 +434,54 @@ The suite now also records, in the same one-million-row session and never as a p
 
 The Playwright job records the floor and the profile too.
 
+First results with these probes (commit 0588a6e): workflow "desktop" run 44881694359 and the
+seven jobs of "e2e-variants" run 44881704164. Every runner had 4 logical CPUs. Milliseconds,
+p50/p95. Floor is the empty frame. Load runs from the scroll event to the DOM holding the
+target row (IPC included). Stop runs from that point to the stop (the next frame and the
+post-paint task). The profile runs after the gated steps, further down the tree.
+
+| Job | CPU | Floor | Gated scroll | Profile load | Profile stop | Verdict |
+|---|---|---|---|---|---|---|
+| desktop, Linux | AMD EPYC 7763 | 22/57 | 85/128 | 8/15 | 121/183 | fail |
+| planted-write, Linux | AMD EPYC 7763 | 23/60 | 88/120 | 11/16 | 116/176 | fail |
+| focus-broken, Linux | AMD EPYC 7763 | 23/59 | 87/126 | 10/16 | 118/175 | fail |
+| planted-outside, Linux | AMD EPYC 9V74 | 22/48 | 66/100 | 9/14 | 84/133 | fail |
+| capability-broadened, Linux | Intel Xeon Platinum 8370C | 18/29 | 51/86 | 7/15 | 77/122 | fail |
+| offered-check-removed, Linux | AMD EPYC 9V45 | 16/25 | 39/59 | 5/11 | 44/69 | fail |
+| modal-trap-removed, Linux | AMD EPYC 9V45 | 17/30 | 41/62 | 5/10 | 47/73 | fail |
+| desktop, Windows | AMD EPYC 7763 | 15.2/16.7 | 31.2/32.7 | 4.2/4.9 | 14.1/15.3 | pass |
+| Playwright, Chromium | (ubuntu-latest) | 16.7/16.9 | 16.6/17.7 | 2.0/2.5 | 3.8/4.9 | pass |
+
+Other measurements:
+
+- Linux: IPC within load was 1 to 2 ms p50, and every step made 2 layout reads and 1 IPC call.
+  The runners' CPU steal and iowait were 0%, and idle was 41 to 52%.
+- Linux: `xdpyinfo` and `xrandr` are not installed on the runner. The page reports a 1280 x 1024
+  screen at depth 24, and the rAF interval p50 was 16 to 20 ms.
+- Windows: Hyper-V video at 1024 x 768, refresh 1 (as reported).
+- The first session's 5,000-row scroll in the same jobs stayed at p95 35 to 43 ms.
+
+What the numbers show:
+
+- On Linux the step's time is almost all in the frame after the DOM change. That frame takes
+  44 to 121 ms (p50), while an unchanged frame takes 16 to 23 ms and the page's own work, IPC
+  included, takes 5 to 11 ms.
+- On Windows, on the same CPU model (EPYC 7763), that frame takes one frame period, 14 ms.
+- The Linux time follows the CPU model: EPYC 9V45 was fastest and EPYC 7763 slowest.
+- Within a session the cost grows. On the desktop Linux job the profile's stop slice rose from
+  107 to 149 ms (median per 40 steps) over its 200 steps.
+- Every Linux job missed at this commit, including those on CPUs like the earlier passing
+  runs. The earlier runs did not record their CPU, so the change cannot be placed. One
+  difference is the 200-frame floor now measured just before the gated steps.
+- The cause of the slow Linux frame is not established. One candidate is WebKitGTK compositing
+  and painting through Mesa's software renderer under Xvfb (the shader cache shows Mesa). That
+  would fit the CPU dependence. Another is the strace wrapper, which also traces the
+  `ftruncate` of WebKit's shared-memory buffers (`/memfd:WebKitSharedMemory`).
+
+Running-app scroll tally through these runs: Windows 4 of 4 passed. Linux 4 of 16 passed:
+four desktop runs, and 12 variant jobs whose patch leaves the size tree untouched (the
+row-cap variant is left out, as it fails by design).
+
 Both builds showed 1,000,001 rows before measuring in both runs. Linux's WebDriver clock ticks in whole
 milliseconds. The variant run is workflow "e2e-variants" run 44877270665 at 86fafdc. In it,
 `row-cap-removed` failed `timing.synth_1m.scroll_p95` on the first render ("1001 .tg-row
