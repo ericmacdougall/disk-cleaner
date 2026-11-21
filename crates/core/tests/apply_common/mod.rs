@@ -3,9 +3,8 @@
 //! documents built with the same fingerprint the scan writes.
 #![allow(dead_code)]
 
-use disk_cleaner_core::apply::fsops::Ident;
 use disk_cleaner_core::apply::input::PieceKind;
-use disk_cleaner_core::apply::recheck::{enumerate, fingerprint};
+use disk_cleaner_core::apply::recheck::enumerate;
 use disk_cleaner_core::apply::{ApplyOptions, PlanOracle};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -153,11 +152,14 @@ pub struct P {
     pub path: PathBuf,
     pub files: Vec<String>,
     pub excludes: Vec<String>,
+    /// Plan only: members moved out to derived pieces.
+    pub moved_out: Vec<String>,
     pub lane: &'static str,
     pub reason: String,
     pub evidence: Option<Value>,
     pub git: Option<Value>,
     pub secret: Option<String>,
+    /// A derived plan piece of scan piece k (its one member is `files[0]`).
     pub scan_piece: Option<usize>,
 }
 
@@ -168,6 +170,7 @@ impl P {
             path: path.to_path_buf(),
             files: vec![],
             excludes: vec![],
+            moved_out: vec![],
             lane,
             reason: format!("{lane} by test"),
             evidence: None,
@@ -183,6 +186,13 @@ impl P {
             ..P::tree(dir, lane)
         }
     }
+    /// A derived files piece of one member, cut from scan piece `k`.
+    pub fn derived(dir: &Path, name: &str, k: usize, lane: &'static str) -> P {
+        P {
+            scan_piece: Some(k),
+            ..P::files(dir, &[name], lane)
+        }
+    }
 }
 
 fn kind_str(k: PieceKind) -> &'static str {
@@ -193,54 +203,112 @@ fn kind_str(k: PieceKind) -> &'static str {
     }
 }
 
-/// Build (scan, plan) texts. A piece with `scan_piece: Some(k)` is a derived plan piece of scan
-/// piece k (it gets no scan piece of its own). Every scan piece is fingerprinted now, with
+fn core_kind(k: PieceKind) -> disk_cleaner_core::PieceKind {
+    match k {
+        PieceKind::Tree => disk_cleaner_core::PieceKind::Tree,
+        PieceKind::Files => disk_cleaner_core::PieceKind::Files,
+        PieceKind::GitNode => disk_cleaner_core::PieceKind::GitNode,
+    }
+}
+
+/// A scan document (schema 16, rev 5) with one scan piece per spec, in order, enumerated now with
 /// `walked_at` after every ctime.
-pub fn docs(roots: &[&Path], pieces: &[P]) -> (String, String) {
-    let mut scan_pieces = Vec::new();
-    let mut plan_pieces = Vec::new();
+pub fn scan_doc(roots: &[&Path], specs: &[P]) -> String {
+    use disk_cleaner_core::pieces::{Member, PieceSurvey, PieceTotals};
     let mut max_ctime = 0i64;
-    let mut fps = Vec::new();
-    let mut scan_index: BTreeMap<usize, usize> = BTreeMap::new();
-    for (i, p) in pieces.iter().enumerate() {
-        if p.scan_piece.is_some() {
-            continue;
-        }
+    let mut pieces = Vec::new();
+    for (k, p) in specs.iter().enumerate() {
         let en = enumerate(p.kind, &p.path, &p.files, &p.excludes).unwrap();
-        for m in &en.members {
-            max_ctime = max_ctime.max(m.id.ctime_s);
-        }
-        let members: Vec<(String, Ident)> =
-            en.members.iter().map(|m| (m.rel.clone(), m.id)).collect();
-        fps.push(fingerprint(members.iter().map(|(r, i)| (r.as_str(), i))));
-        scan_index.insert(i, scan_pieces.len());
-        scan_pieces.push(i);
+        let members: Vec<Member> = en
+            .members
+            .iter()
+            .map(|m| {
+                max_ctime = max_ctime.max(m.id.ctime_s);
+                let kind = match m.id.kind {
+                    'f' => "f",
+                    'l' => "l",
+                    _ => "o",
+                };
+                Member(
+                    m.rel.clone(),
+                    kind.to_string(),
+                    m.id.len,
+                    m.id.mtime_s,
+                    m.id.mtime_ns as u32,
+                    m.id.dev,
+                    m.id.ino,
+                    m.id.len,
+                )
+            })
+            .collect();
+        pieces.push(disk_cleaner_core::Piece {
+            id: k,
+            kind: core_kind(p.kind),
+            path: p.path.to_string_lossy().to_string(),
+            entries: members.len() as u64,
+            members,
+            excludes: p.excludes.clone(),
+            node: None,
+            group: p.path.to_string_lossy().to_string(),
+            bytes: 0,
+            logical_bytes: 0,
+            bytes_linked_outside: 0,
+            newest_mtime: None,
+            walked_at: 0,
+            secret: p.secret.clone(),
+            incomplete: None,
+        });
     }
     let walked = max_ctime.max(now()) + 1;
-    let scan_json: Vec<Value> = scan_pieces
-        .iter()
-        .enumerate()
-        .map(|(k, &i)| {
-            let p = &pieces[i];
-            let mut v = json!({
-                "id": k, "kind": kind_str(p.kind), "path": p.path, "files": p.files,
-                "excludes": p.excludes, "walked_at": walked, "fingerprint": fps[k],
-            });
-            if let Some(s) = &p.secret {
-                v["secret"] = json!(s);
-            }
-            v
-        })
-        .collect();
+    for pc in pieces.iter_mut() {
+        pc.walked_at = walked;
+    }
+    let survey = PieceSurvey {
+        options: Default::default(),
+        pieces,
+        blobs: vec![],
+        totals: PieceTotals::default(),
+    };
+    json!({
+        "schema_version": 16, "generated_at": walked, "roots": roots, "pieces": survey,
+    })
+    .to_string()
+}
+
+/// A plan document bound to `scan` (its `generated_at` and `scan_pieces_sha256`). Non-derived
+/// specs map to scan pieces 0, 1, ... in order; a derived spec names its scan piece.
+pub fn plan_doc(scan: &str, pieces: &[P]) -> String {
+    let sv: Value = serde_json::from_str(scan).unwrap();
+    let survey: disk_cleaner_core::PieceSurvey =
+        serde_json::from_value(sv["pieces"].clone()).unwrap();
+    let digest = disk_cleaner_core::pieces::pieces_digest(&survey);
+    let mut next = 0usize;
+    let mut plan_pieces = Vec::new();
     for (i, p) in pieces.iter().enumerate() {
-        let sp = p.scan_piece.unwrap_or_else(|| scan_index[&i]);
+        let sp = match p.scan_piece {
+            Some(k) => k,
+            None => {
+                next += 1;
+                next - 1
+            }
+        };
+        let scan_excludes = survey
+            .pieces
+            .get(sp)
+            .map(|x| x.excludes.clone())
+            .unwrap_or_default();
         let mut v = json!({
             "id": i, "scan_piece": sp, "kind": kind_str(p.kind), "path": p.path,
-            "files": p.files, "excludes": p.excludes, "lane": p.lane, "reason": p.reason,
-            "entries": 0, "bytes": 0,
+            "group": p.path, "excludes": scan_excludes, "entries": 0, "bytes": 0,
+            "logical_bytes": 0, "lane": p.lane, "reason": p.reason, "state": "idle",
+            "state_reason": "", "reclaimable_bytes": 0, "upload_bytes": 0,
         });
         if p.scan_piece.is_some() {
             v["derived"] = json!(true);
+            v["member"] = json!(p.files[0]);
+        }
+        if !p.moved_out.is_empty() {
+            v["moved_out"] = json!(p.moved_out);
         }
         if let Some(e) = &p.evidence {
             v["evidence"] = e.clone();
@@ -253,16 +321,38 @@ pub fn docs(roots: &[&Path], pieces: &[P]) -> (String, String) {
         }
         plan_pieces.push(v);
     }
-    let scan = json!({
-        "schema_version": 16, "generated_at": walked, "roots": roots,
-        "pieces": {"pieces": scan_json, "blobs": []},
-    });
-    let plan = json!({
-        "schema_version": 16, "generated_at": walked, "scan_generated_at": walked,
+    json!({
+        "schema_version": 16, "generated_at": sv["generated_at"], "scan_generated_at": sv["generated_at"],
         "active_window_days": 7, "active": [], "items": [],
-        "lanes": {"version": 1, "pieces": plan_pieces, "blobs": []},
-    });
-    (scan.to_string(), plan.to_string())
+        "lanes": {"version": 1, "scan_pieces_sha256": digest, "pieces": plan_pieces, "blobs": [],
+                  "totals": {"by_lane": {}, "scanned_bytes": 0, "dir_overhead_bytes": 0,
+                             "duplicate_bytes": 0, "dedup_saved_bytes": 0, "secret_pieces": 0}},
+    })
+    .to_string()
+}
+
+/// Build (scan, plan) texts: one scan piece per non-derived spec (in order), and a plan over all
+/// specs.
+pub fn docs(roots: &[&Path], pieces: &[P]) -> (String, String) {
+    let specs: Vec<P> = pieces
+        .iter()
+        .filter(|p| p.scan_piece.is_none())
+        .cloned()
+        .collect();
+    let scan = scan_doc(roots, &specs);
+    let plan = plan_doc(&scan, pieces);
+    (scan, plan)
+}
+
+/// After a test edited the scan document, re-bind the plan to it (digest and generated_at).
+pub fn rebind(scan: &str, plan: &str) -> String {
+    let sv: Value = serde_json::from_str(scan).unwrap();
+    let survey: disk_cleaner_core::PieceSurvey =
+        serde_json::from_value(sv["pieces"].clone()).unwrap();
+    let mut pv: Value = serde_json::from_str(plan).unwrap();
+    pv["scan_generated_at"] = sv["generated_at"].clone();
+    pv["lanes"]["scan_pieces_sha256"] = json!(disk_cleaner_core::pieces::pieces_digest(&survey));
+    pv.to_string()
 }
 
 /// An oracle that re-derives exactly the given plan (tests of noise and git lanes swap only the
@@ -318,12 +408,4 @@ pub fn tree_digest(dir: &Path) -> Vec<(String, String)> {
     }
     out.sort();
     out
-}
-
-/// Bind a plan built separately to `scan` (same `scan_generated_at`), for derived-piece plans.
-pub fn bind(scan: &str, plan: &str) -> String {
-    let gen = serde_json::from_str::<Value>(scan).unwrap()["generated_at"].clone();
-    let mut pv: Value = serde_json::from_str(plan).unwrap();
-    pv["scan_generated_at"] = gen;
-    pv.to_string()
 }

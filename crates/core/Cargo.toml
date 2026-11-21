@@ -14,10 +14,10 @@ jwalk = "0.9"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 thiserror = "1"
 toml = "0.8"
-sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
 hex = "0.4"

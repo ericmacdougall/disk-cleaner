@@ -95,6 +95,12 @@ pub enum Row {
         plan_piece: usize,
         scan_piece: usize,
         path: PathBuf,
+        /// `lanes.scan_pieces_sha256` of the scan this removal was authorized by.
+        #[serde(default)]
+        scan: String,
+        /// SHA-256 of the plan file this removal was authorized by.
+        #[serde(default)]
+        plan: String,
     },
     Removed {
         plan_piece: usize,
@@ -109,6 +115,13 @@ pub enum Row {
         plan_piece: usize,
         path: PathBuf,
     },
+}
+
+/// An open removal: the run that began it and the plan digest that authorized it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Begun {
+    pub run: String,
+    pub plan: String,
 }
 
 /// A row with its envelope.
@@ -273,10 +286,24 @@ impl Manifest {
         out
     }
 
-    /// Members already removed under `scan_piece` (any run): rel path within the scan piece's
-    /// directory -> identity at removal. A member counts only with both its `file` row and a
-    /// `removed` row for the same path.
-    pub fn removed_under(&self, scan_piece: usize, scan_path: &Path) -> BTreeMap<String, Ident> {
+    /// Members already removed under `scan_piece` by runs authorized by the same scan
+    /// (`scan`, its `scan_pieces_sha256`): rel path within the scan piece's directory -> identity
+    /// at removal. A member counts only with its `file` row, a `removed` row for the same path,
+    /// and a `remove-begin` of that run naming this scan.
+    pub fn removed_under(
+        &self,
+        scan_piece: usize,
+        scan_path: &Path,
+        scan: &str,
+    ) -> BTreeMap<String, Ident> {
+        let runs: BTreeSet<&str> = self
+            .rows
+            .iter()
+            .filter_map(|e| match &e.row {
+                Row::RemoveBegin { scan: s, .. } if s == scan => Some(e.run.as_str()),
+                _ => None,
+            })
+            .collect();
         let removed: BTreeSet<&PathBuf> = self
             .rows
             .iter()
@@ -294,7 +321,7 @@ impl Manifest {
                 ..
             } = &e.row
             {
-                if *sp == scan_piece && removed.contains(path) {
+                if *sp == scan_piece && removed.contains(path) && runs.contains(e.run.as_str()) {
                     if let Ok(rel) = path.strip_prefix(scan_path) {
                         out.insert(rel.to_string_lossy().replace('\\', "/"), *id);
                     }
@@ -305,15 +332,25 @@ impl Manifest {
     }
 
     /// Plan pieces (path, plan piece id) with `remove-begin` and no later `remove-done`, each
-    /// with the run that began it. Derived pieces share a path, so the id is part of the key.
-    pub fn begun(&self) -> BTreeMap<(PathBuf, usize), String> {
+    /// with the run that began it and the plan digest that authorized it. Derived pieces share a
+    /// path, so the id is part of the key.
+    pub fn begun(&self) -> BTreeMap<(PathBuf, usize), Begun> {
         let mut s = BTreeMap::new();
         for e in &self.rows {
             match &e.row {
                 Row::RemoveBegin {
-                    path, plan_piece, ..
+                    path,
+                    plan_piece,
+                    plan,
+                    ..
                 } => {
-                    s.insert((path.clone(), *plan_piece), e.run.clone());
+                    s.insert(
+                        (path.clone(), *plan_piece),
+                        Begun {
+                            run: e.run.clone(),
+                            plan: plan.clone(),
+                        },
+                    );
                 }
                 Row::RemoveDone { path, plan_piece } => {
                     s.remove(&(path.clone(), *plan_piece));
@@ -324,18 +361,27 @@ impl Manifest {
         s
     }
 
-    /// Plan pieces (path, plan piece id) whose latest begin was closed by `remove-done`.
-    pub fn done(&self) -> BTreeSet<(PathBuf, usize)> {
+    /// Plan pieces (path, plan piece id) whose latest begin, under plan digest `plan`, was
+    /// closed by `remove-done`.
+    pub fn done(&self, plan: &str) -> BTreeSet<(PathBuf, usize)> {
         let mut s = BTreeSet::new();
+        let mut last_plan: BTreeMap<(PathBuf, usize), String> = BTreeMap::new();
         for e in &self.rows {
             match &e.row {
                 Row::RemoveBegin {
-                    path, plan_piece, ..
+                    path,
+                    plan_piece,
+                    plan: p,
+                    ..
                 } => {
                     s.remove(&(path.clone(), *plan_piece));
+                    last_plan.insert((path.clone(), *plan_piece), p.clone());
                 }
                 Row::RemoveDone { path, plan_piece } => {
-                    s.insert((path.clone(), *plan_piece));
+                    let k = (path.clone(), *plan_piece);
+                    if last_plan.get(&k).map(|p| p.as_str()) == Some(plan) {
+                        s.insert(k);
+                    }
                 }
                 _ => {}
             }

@@ -104,6 +104,53 @@ impl Rule {
     }
 }
 
+/// A secret file name (`[[secret_name]]`): such an entry is always its own `keep` piece and is
+/// never hashed, uploaded or pushed (docs/SCAN-FORMAT.md, "Secret names"). Matched on the name,
+/// ignoring ASCII case, never on the contents.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretName {
+    /// `name`, `*suffix`, `prefix*` or `*substring*`. A substring pattern applies outside
+    /// regenerable and cache directories only.
+    pub pattern: String,
+    /// What it is, in words.
+    pub kind: String,
+    /// Names that match `pattern` but are not secrets (`.env.example`).
+    #[serde(default)]
+    pub except: Vec<String>,
+}
+
+impl SecretName {
+    fn is_substring(&self) -> bool {
+        self.pattern.len() > 2 && self.pattern.starts_with('*') && self.pattern.ends_with('*')
+    }
+
+    /// Does `name` match, inside (`in_artifact`) or outside an artifact directory?
+    pub fn matches(&self, name: &str, in_artifact: bool) -> bool {
+        if self.except.iter().any(|e| e.eq_ignore_ascii_case(name)) {
+            return false;
+        }
+        if self.is_substring() {
+            if in_artifact {
+                return false;
+            }
+            let sub = self.pattern[1..self.pattern.len() - 1].to_ascii_lowercase();
+            return name.to_ascii_lowercase().contains(&sub);
+        }
+        name_matches(&self.pattern, name)
+    }
+}
+
+/// A secret directory name (`[[secret_dir]]`): everything below it is one `keep` piece.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretDir {
+    /// Exact directory name, ignoring ASCII case.
+    pub name: String,
+    /// What it is, in words.
+    pub kind: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct OutputsCfg {
     #[serde(default)]
@@ -128,6 +175,10 @@ struct RawRules {
     loose_code: LooseCfg,
     #[serde(default)]
     state_file: Vec<StateFile>,
+    #[serde(default)]
+    secret_name: Vec<SecretName>,
+    #[serde(default)]
+    secret_dir: Vec<SecretDir>,
 }
 
 /// A compiled rule set with the lookup tables the scanner needs.
@@ -141,6 +192,8 @@ pub struct RuleSet {
     marker_specs: Vec<String>,
     scan_dir_names: HashSet<String>,
     state_files: Vec<StateFile>,
+    secret_names: Vec<SecretName>,
+    secret_dirs: Vec<SecretDir>,
 }
 
 /// Does a marker spec (`name` or `*.suffix`) match an entry name?
@@ -193,6 +246,34 @@ impl RuleSet {
                 )));
             }
         }
+        for sn in &raw.secret_name {
+            let p = &sn.pattern;
+            let stars = p.matches('*').count();
+            let ok_shape = match stars {
+                0 => true,
+                1 => p.starts_with('*') || p.ends_with('*'),
+                2 => p.len() > 2 && p.starts_with('*') && p.ends_with('*'),
+                _ => false,
+            };
+            if p.is_empty() || p.contains('/') || !ok_shape || sn.kind.trim().is_empty() {
+                return Err(Error::Rules(format!(
+                    "secret_name {p:?}: needs a name, `*suffix`, `prefix*` or `*substring*` \
+                     pattern and a kind"
+                )));
+            }
+        }
+        for sd in &raw.secret_dir {
+            if sd.name.is_empty()
+                || sd.name.contains('/')
+                || sd.name.contains('*')
+                || sd.kind.trim().is_empty()
+            {
+                return Err(Error::Rules(format!(
+                    "secret_dir {:?}: needs a plain directory name and a kind",
+                    sd.name
+                )));
+            }
+        }
         let mut by_last: HashMap<String, Vec<usize>> = HashMap::new();
         let mut marker_specs: Vec<String> = Vec::new();
         let mut scan_dir_names = HashSet::new();
@@ -234,6 +315,8 @@ impl RuleSet {
             marker_specs,
             scan_dir_names,
             state_files: raw.state_file,
+            secret_names: raw.secret_name,
+            secret_dirs: raw.secret_dir,
         })
     }
 
@@ -272,6 +355,28 @@ impl RuleSet {
     /// All state-file patterns.
     pub fn state_files(&self) -> &[StateFile] {
         &self.state_files
+    }
+
+    /// The kind of secret file name `name` is, if any (`in_artifact`: the entry is inside a
+    /// regenerable or cache directory, where substring patterns do not apply).
+    pub fn secret_file(&self, name: &str, in_artifact: bool) -> Option<&str> {
+        self.secret_names
+            .iter()
+            .find(|s| s.matches(name, in_artifact))
+            .map(|s| s.kind.as_str())
+    }
+
+    /// The kind of secret directory name `name` is, if any.
+    pub fn secret_dir(&self, name: &str) -> Option<&str> {
+        self.secret_dirs
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .map(|s| s.kind.as_str())
+    }
+
+    /// All secret file-name patterns.
+    pub fn secret_names(&self) -> &[SecretName] {
+        &self.secret_names
     }
 
     /// Is `name` a project manifest (loose-code evidence)?

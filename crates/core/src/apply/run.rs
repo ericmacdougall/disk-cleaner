@@ -218,7 +218,7 @@ pub fn apply(
         seed_unmirrored(&mut ctx)?;
     }
     let begun = ctx.manifest.begun();
-    let done = ctx.manifest.done();
+    let done = ctx.manifest.done(&inputs.plan_digest);
 
     // 1. Prepare every removing piece.
     let mut prepared: Vec<Prepared> = Vec::new();
@@ -244,8 +244,21 @@ pub fn apply(
             ctx.report.pieces.push(rep);
             continue;
         }
-        let res = if let Some(run) = begun.get(&key) {
-            resume_prepared(&ctx, p, run)
+        // An open removal of this path under another plan is never continued or overlapped by
+        // this plan (Codex plan round 4, F2): keep, and say how to finish it.
+        if let Some(((_, _), b)) = begun.iter().find(|((path, _), b)| {
+            b.plan != inputs.plan_digest && (path.starts_with(&p.path) || p.path.starts_with(path))
+        }) {
+            rep.outcome = "kept".into();
+            rep.reason = format!(
+                "an interrupted removal by another plan (run {}) is open here; re-run apply with that plan, or restore it with `disk-cleaner restore --run {}`",
+                b.run, b.run
+            );
+            ctx.report.pieces.push(rep);
+            continue;
+        }
+        let res = if let Some(b) = begun.get(&key) {
+            resume_checks(&mut ctx, p).and_then(|_| resume_prepared(&ctx, p, &b.run))
         } else {
             prepare(&mut ctx, p, rederived.as_ref())
         };
@@ -385,7 +398,9 @@ fn prepare(
             });
         }
     }
-    let removed = ctx.manifest.removed_under(p.scan_piece, &sp.path);
+    let removed = ctx
+        .manifest
+        .removed_under(p.scan_piece, &sp.path, &ctx.inputs.scan_digest);
     recheck::recheck(sp, &removed).map_err(|d| format!("changed since the scan: {}", d.0))?;
     let en = recheck::enumerate(p.kind, &p.path, &p.files, &p.excludes).map_err(|d| d.0)?;
     if let Some(m) = en.members.iter().find(|m| m.id.kind == 'o') {
@@ -570,6 +585,18 @@ fn prepare_noise(ctx: &Ctx, p: &PlanPiece, en: &recheck::Enumerated) -> Result<P
 }
 
 /// A begun piece (remove-begin without remove-done): continue from its file rows (I-4 resume).
+/// The checks of the current invocation that also bind an interrupted removal (Codex plan round
+/// 4, F7): the secret opt-in and the group's activity, judged now.
+fn resume_checks(ctx: &mut Ctx, p: &PlanPiece) -> Result<(), String> {
+    if p.secret.is_some() && !ctx.opts.secrets_upload {
+        return Err("secret-named, stays local (upload only with --secrets upload)".into());
+    }
+    if let Some(why) = ctx.group_active(p) {
+        return Err(format!("its group is active: {why}"));
+    }
+    Ok(())
+}
+
 fn resume_prepared(ctx: &Ctx, p: &PlanPiece, run: &str) -> Result<Prepared, String> {
     let rows = ctx.manifest.file_rows_for(p.id, run);
     let mut members = Vec::new();
@@ -581,6 +608,8 @@ fn resume_prepared(ctx: &Ctx, p: &PlanPiece, run: &str) -> Result<Prepared, Stri
             id,
             sha256,
             link_target,
+            git_oid,
+            git_dir,
             ..
         } = row
         else {
@@ -590,6 +619,11 @@ fn resume_prepared(ctx: &Ctx, p: &PlanPiece, run: &str) -> Result<Prepared, Stri
             continue;
         }
         let _ = path;
+        if !ctx.opts.secrets_upload && names::rel_is_secret(&rel) {
+            return Err(format!(
+                "{rel} has a secret name and stays local (upload only with --secrets upload)"
+            ));
+        }
         if let Some(rfd) = &r {
             if let Ok(now) = fsops::lstat_rel(rfd, &rel) {
                 if !now.same_loose(&id) {
@@ -603,9 +637,14 @@ fn resume_prepared(ctx: &Ctx, p: &PlanPiece, run: &str) -> Result<Prepared, Stri
                 }
             }
         }
-        let content = match (sha256, link_target) {
-            (Some(s), _) => Content::Blob { sha256: s },
-            (None, Some(t)) => Content::Link { target: t },
+        let content = match (git_oid, git_dir, sha256, link_target) {
+            (Some(oid), Some(gd), Some(s), _) => Content::GitBlob {
+                oid,
+                sha256: s,
+                git_dir: gd,
+            },
+            (_, _, Some(s), _) => Content::Blob { sha256: s },
+            (_, _, None, Some(t)) => Content::Link { target: t },
             _ => Content::Noise,
         };
         members.push(PMember { rel, id, content });
@@ -807,10 +846,23 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
         for pr in batch {
             let p = &ctx.inputs.pieces[pr.piece];
             let begun = begun_now.contains_key(&(p.path.clone(), p.id));
+            if begun {
+                if let Some(why) = ctx.group_active(p) {
+                    set_outcome(
+                        &mut ctx.report,
+                        pr.piece,
+                        "kept",
+                        &format!("active before removal: {why}"),
+                    );
+                    continue;
+                }
+            }
             if !begun {
                 // Second recheck (contract (b)): after the backup, before the first removal.
                 let sp = &ctx.inputs.scan_pieces[p.scan_piece];
-                let removed = ctx.manifest.removed_under(p.scan_piece, &sp.path);
+                let removed =
+                    ctx.manifest
+                        .removed_under(p.scan_piece, &sp.path, &ctx.inputs.scan_digest);
                 #[cfg(feature = "test-hooks")]
                 if let Some(f) = opts.hooks.before_remove {
                     f(&p.path);
@@ -857,6 +909,8 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
                     plan_piece: p.id,
                     scan_piece: p.scan_piece,
                     path: p.path.clone(),
+                    scan: ctx.inputs.scan_digest.clone(),
+                    plan: ctx.inputs.plan_digest.clone(),
                 });
             }
         }

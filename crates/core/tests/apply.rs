@@ -527,7 +527,7 @@ fn hostile_plans_are_refused() {
         ),
         (
             "member escape",
-            mutate(&|v| v["lanes"]["pieces"][0]["excludes"] = serde_json::json!(["../x"])),
+            mutate(&|v| v["lanes"]["pieces"][0]["moved_out"] = serde_json::json!(["../x"])),
         ),
     ];
     for (name, bad) in cases {
@@ -570,6 +570,7 @@ fn symlinked_ancestor_keeps_piece() {
     };
     let plan = swap(v, "/lanes/pieces/0/path");
     let scan = swap(s, "/pieces/pieces/0/path");
+    let plan = rebind(&scan, &plan);
     let rep = apply(&scan, &plan, &fx.opts(true)).unwrap();
     assert_eq!(rep.pieces[0].outcome, "kept", "{rep:?}");
     assert!(real.join("p/f.txt").exists());
@@ -705,18 +706,10 @@ fn derived_siblings_and_residual_converge() {
     fx.write("s/rest/r.txt", b"rest");
     fx.write("s/rest/r2.txt", b"rest two");
     let mut residual = P::tree(&s, "backup");
-    residual.excludes = vec!["d1.bin".into(), "d2.bin".into()];
-    let mut d1 = P::files(&s, &["d1.bin"], "backup");
-    d1.scan_piece = Some(0);
-    let mut d2 = P::files(&s, &["d2.bin"], "backup");
-    d2.scan_piece = Some(0);
-    // The scan piece is the whole directory (no excludes): build it from an unsplit spec.
-    let (scan, _) = docs(&[&fx.data], &[P::tree(&s, "backup")]);
-    let (_, plan) = docs(&[&fx.data], &[residual.clone(), d1.clone(), d2.clone()]);
-    let gen = serde_json::from_str::<serde_json::Value>(&scan).unwrap()["generated_at"].clone();
-    let mut pv: serde_json::Value = serde_json::from_str(&plan).unwrap();
-    pv["scan_generated_at"] = gen;
-    let plan = pv.to_string();
+    residual.moved_out = vec!["d1.bin".into(), "d2.bin".into()];
+    let d1 = P::derived(&s, "d1.bin", 0, "backup");
+    let d2 = P::derived(&s, "d2.bin", 0, "backup");
+    let (scan, plan) = docs(&[&fx.data], &[residual, d1, d2]);
     let before = tree_digest(&s);
     // Crash in the middle of the residual's removal, then converge.
     let mut o = fx.opts(true);
@@ -870,21 +863,17 @@ fn sibling_removed_in_an_earlier_run_passes_recheck() {
     fx.write("s/d1.bin", b"one");
     fx.write("s/d2.bin", b"two");
     fx.write("s/rest/r.txt", b"rest");
-    let (scan, _) = docs(&[&fx.data], &[P::tree(&s, "backup")]);
-    let derived = |names: &[&str]| {
-        let mut p = P::files(&s, names, "backup");
-        p.scan_piece = Some(0);
-        p
-    };
+    let scan = scan_doc(&[&fx.data], &[P::tree(&s, "backup")]);
     // Run 1 removes only d1.
-    let (_, plan_a) = docs(&[&fx.data], &[derived(&["d1.bin"])]);
-    let rep = apply(&scan, &bind(&scan, &plan_a), &fx.opts(true)).unwrap();
+    let plan_a = plan_doc(&scan, &[P::derived(&s, "d1.bin", 0, "backup")]);
+    let rep = apply(&scan, &plan_a, &fx.opts(true)).unwrap();
     assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
-    // Run 2, same scan: the rest must pass recheck with d1 accounted for by the manifest.
+    // Run 2, same scan, another plan: the rest passes recheck with d1 accounted for by the
+    // manifest rows bound to this scan.
     let mut residual = P::tree(&s, "backup");
-    residual.excludes = vec!["d1.bin".into(), "d2.bin".into()];
-    let (_, plan_b) = docs(&[&fx.data], &[residual, derived(&["d2.bin"])]);
-    let rep = apply(&scan, &bind(&scan, &plan_b), &fx.opts(true)).unwrap();
+    residual.moved_out = vec!["d1.bin".into(), "d2.bin".into()];
+    let plan_b = plan_doc(&scan, &[residual, P::derived(&s, "d2.bin", 0, "backup")]);
+    let rep = apply(&scan, &plan_b, &fx.opts(true)).unwrap();
     assert!(
         rep.pieces.iter().all(|p| p.outcome == "removed"),
         "{rep:#?}"
@@ -900,21 +889,114 @@ fn many_derived_pieces_cross_the_batch_boundary() {
     for (k, n) in names.iter().enumerate() {
         fx.write(&format!("s/{n}"), format!("content {k}").as_bytes());
     }
-    let (scan, _) = docs(&[&fx.data], &[P::tree(&s, "backup")]);
+    let scan = scan_doc(&[&fx.data], &[P::tree(&s, "backup")]);
     let pieces: Vec<P> = names
         .iter()
-        .map(|n| {
-            let mut p = P::files(&s, &[n.as_str()], "backup");
-            p.scan_piece = Some(0);
-            p
-        })
+        .map(|n| P::derived(&s, n, 0, "backup"))
         .collect();
-    let (_, plan) = docs(&[&fx.data], &pieces);
-    let rep = apply(&scan, &bind(&scan, &plan), &fx.opts(true)).unwrap();
+    let plan = plan_doc(&scan, &pieces);
+    let rep = apply(&scan, &plan, &fx.opts(true)).unwrap();
     assert_eq!(
         rep.pieces.iter().filter(|p| p.outcome == "removed").count(),
         70,
         "{rep:#?}"
     );
     assert_eq!(fs::read_dir(&s).unwrap().count(), 0);
+}
+
+#[test]
+fn hostile_rev5_bindings_are_refused() {
+    let fx = Fx::new();
+    let d = fx.data.join("p");
+    fx.write("p/f.txt", b"x");
+    let (scan, plan) = docs(&[&fx.data], &[P::tree(&d, "backup")]);
+    let mut v: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    v["lanes"]["scan_pieces_sha256"] = serde_json::json!("00");
+    let r = apply(&scan, &v.to_string(), &fx.opts(true));
+    assert!(matches!(r, Err(ApplyError::Plan(_))), "digest: {r:?}");
+    // A scan member list edited after planning no longer matches the plan's digest.
+    let mut sv: serde_json::Value = serde_json::from_str(&scan).unwrap();
+    sv["pieces"]["pieces"][0]["members"] = serde_json::json!([]);
+    let r = apply(&sv.to_string(), &plan, &fx.opts(true));
+    assert!(
+        matches!(r, Err(ApplyError::Plan(_))),
+        "members edited: {r:?}"
+    );
+    // A derived member that is not a member of its scan piece.
+    let r = apply(
+        &scan,
+        &plan_doc(&scan, &[P::derived(&d, "nope.txt", 0, "backup")]),
+        &fx.opts(true),
+    );
+    assert!(
+        matches!(r, Err(ApplyError::Plan(_))),
+        "foreign member: {r:?}"
+    );
+    assert!(d.join("f.txt").exists());
+}
+
+#[test]
+fn an_open_removal_of_another_plan_is_never_continued() {
+    // Codex plan round 4, F2: plan A is interrupted mid-removal; plan B over the same scan and
+    // indices must not resume or overlap it.
+    let fx = Fx::new();
+    let d = fx.data.join("p");
+    fx.write("p/a.txt", b"a");
+    fx.write("p/b.txt", b"b");
+    fx.write("p/c.txt", b"c");
+    let scan = scan_doc(&[&fx.data], &[P::tree(&d, "backup")]);
+    let plan_a = plan_doc(&scan, &[P::tree(&d, "backup")]);
+    let mut o = fx.opts(true);
+    o.hooks.crash_at = Some(CrashPoint::MidUnlink);
+    assert!(matches!(
+        apply(&scan, &plan_a, &o),
+        Err(ApplyError::InjectedCrash(_))
+    ));
+    let left = tree_digest(&d);
+    let mut other = P::tree(&d, "backup");
+    other.reason = "a different plan".into();
+    let plan_b = plan_doc(&scan, &[other]);
+    assert_ne!(plan_a, plan_b);
+    let rep = apply(&scan, &plan_b, &fx.opts(true)).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "kept", "{rep:?}");
+    assert!(rep.pieces[0].reason.contains("another plan"), "{rep:?}");
+    assert_eq!(tree_digest(&d), left, "nothing more removed");
+    // The original plan finishes it.
+    let rep = apply(&scan, &plan_a, &fx.opts(true)).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
+}
+
+#[test]
+fn resume_rechecks_activity_and_secret_opt_in() {
+    use disk_cleaner_core::ProcessCheck;
+    // F7: an interrupted removal does not continue once a process works in the piece, nor
+    // without the secret opt-in it was started with.
+    for case in ["process", "secret"] {
+        let fx = Fx::new();
+        let d = fx.data.join("p");
+        fx.write("p/a.txt", b"a");
+        fx.write("p/b.txt", b"b");
+        if case == "secret" {
+            fx.write("p/.env", b"CANARY");
+        }
+        let (scan, plan) = docs(&[&fx.data], &[P::tree(&d, "backup")]);
+        let mut o = fx.opts(true);
+        o.secrets_upload = case == "secret";
+        o.hooks.crash_at = Some(CrashPoint::MidUnlink);
+        assert!(
+            matches!(apply(&scan, &plan, &o), Err(ApplyError::InjectedCrash(_))),
+            "{case}"
+        );
+        let left = tree_digest(&d);
+        let mut o = fx.opts(true);
+        if case == "process" {
+            let cwd = d.clone();
+            o.process = Box::new(move || ProcessCheck::Ok {
+                cwds: vec![cwd.clone()],
+            });
+        }
+        let rep = apply(&scan, &plan, &o).unwrap();
+        assert_eq!(rep.pieces[0].outcome, "kept", "{case}: {rep:?}");
+        assert_eq!(tree_digest(&d), left, "{case}: nothing more removed");
+    }
 }

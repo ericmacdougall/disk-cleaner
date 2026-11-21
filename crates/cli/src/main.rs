@@ -145,6 +145,37 @@ struct ScanArgs {
     /// Number of git processes to run at once.
     #[arg(long, default_value_t = 4)]
     git_jobs: usize,
+    /// Also split every byte under the roots into bounded pieces and find duplicate content, so
+    /// `plan` can give each piece a lane (see docs/SCAN-FORMAT.md, "Pieces and lanes").
+    #[arg(long)]
+    lanes: bool,
+    /// With --lanes: most bytes (logical) in one piece, except a single file or a git node.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = disk_cleaner_core::pieces::DEFAULT_MAX_PIECE_BYTES,
+        requires = "lanes"
+    )]
+    max_piece_bytes: u64,
+    /// With --lanes: most entries in one piece, except a git node or a secret directory.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = disk_cleaner_core::pieces::DEFAULT_MAX_PIECE_FILES,
+        requires = "lanes"
+    )]
+    max_piece_files: u64,
+    /// With --lanes: smallest file whose content is compared with others of the same length.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = disk_cleaner_core::pieces::DEFAULT_MIN_DUP_BYTES,
+        requires = "lanes"
+    )]
+    min_dup_bytes: u64,
+    /// With --lanes: stop hashing file content after this many bytes (default: no limit).
+    #[arg(long, value_name = "N", requires = "lanes")]
+    max_hash_bytes: Option<u64>,
 }
 
 #[derive(Args)]
@@ -202,6 +233,14 @@ fn run_scan(a: ScanArgs) -> Result<()> {
     opts.min_output_bytes = a.min_output_bytes;
     opts.collect_facts = !a.no_git;
     opts.git_jobs = a.git_jobs;
+    if a.lanes {
+        opts.lanes = Some(disk_cleaner_core::PieceOptions {
+            max_piece_bytes: a.max_piece_bytes.max(1),
+            max_piece_files: a.max_piece_files.max(1),
+            min_dup_bytes: a.min_dup_bytes,
+            max_hash_bytes: a.max_hash_bytes,
+        });
+    }
     let git = Git::new("git", Duration::from_secs(a.git_timeout_secs.max(1)));
     opts.facts = FactsConfig::default().with_git(git);
     let result = scan(&opts).context("scan failed")?;

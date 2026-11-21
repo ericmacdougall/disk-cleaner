@@ -1,12 +1,8 @@
 //! Enumerating a piece's members and re-checking it against the scan (docs/SCAN-FORMAT.md,
-//! "Re-check"). This adapter implements the documented fingerprint until stream A's
-//! `pieces::recheck` lands; it also accepts members that apply itself removed earlier
-//! (`removed`), whose lines are synthesised from their recorded identity, so a derived sibling's
-//! removal is not mistaken for drift (spec revision 3, F2).
+//! "Re-check") through core's `pieces::recheck`.
 
 use super::fsops::{self, Ident};
 use super::input::{PieceKind, ScanPiece};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -109,59 +105,25 @@ pub fn enumerate(
     Ok(out)
 }
 
-/// One fingerprint line (docs/SCAN-FORMAT.md, "Re-check").
-pub fn line(rel: &str, id: &Ident) -> String {
-    let k = match id.kind {
-        'f' => 'f',
-        'l' => 'l',
-        _ => 'o',
-    };
-    format!(
-        "{rel}\0{k}\0{}\0{}.{:09}\0{}\0{}\n",
-        id.len, id.mtime_s, id.mtime_ns, id.dev, id.ino
-    )
+/// Re-check a scan piece with core's `pieces::recheck` (docs/SCAN-FORMAT.md, "Re-check"),
+/// leaving out the members apply itself removed earlier under the same scan and plan
+/// (`removed`, keyed by relative path), so a derived sibling's removal is not drift (spec
+/// revision 3, F2). A removed member that reappears is a non-member entry: core reports it.
+pub fn recheck(sp: &ScanPiece, removed: &BTreeMap<String, Ident>) -> Result<(), Drift> {
+    recheck_scoped(sp, removed, crate::RecheckScope::All)
 }
 
-/// The fingerprint of a member list (any order).
-pub fn fingerprint<'a>(members: impl Iterator<Item = (&'a str, &'a Ident)>) -> String {
-    let mut lines: Vec<String> = members.map(|(r, i)| line(r, i)).collect();
-    lines.sort();
-    let mut h = Sha256::new();
-    for l in &lines {
-        h.update(l.as_bytes());
-    }
-    hex::encode(h.finalize())
-}
-
-/// Re-check a scan piece: enumerate it, add the members apply removed itself (`removed`: rel ->
-/// identity at removal), compare the fingerprint, and refuse any ctime at or after `walked_at`.
-/// Returns the current enumeration on success.
-pub fn recheck(sp: &ScanPiece, removed: &BTreeMap<String, Ident>) -> Result<Enumerated, Drift> {
-    if let Some(why) = &sp.incomplete {
+/// [`recheck`] with an explicit scope (`WorkTree` only for a git-node after apply's own recovery
+/// step wrote into its git directory).
+pub fn recheck_scoped(
+    sp: &ScanPiece,
+    removed: &BTreeMap<String, Ident>,
+    scope: crate::RecheckScope,
+) -> Result<(), Drift> {
+    if let Some(why) = &sp.core.incomplete {
         return Err(Drift(format!("the scan could not judge it whole: {why}")));
     }
-    let en = enumerate(sp.kind, &sp.path, &sp.files, &sp.excludes)?;
-    for m in &en.members {
-        if removed.contains_key(&m.rel) {
-            return Err(Drift(format!(
-                "{} reappeared after apply removed it",
-                m.rel
-            )));
-        }
-        if m.id.ctime_s >= sp.walked_at {
-            return Err(Drift(format!("{} changed after the scan", m.rel)));
-        }
-    }
-    let fp = fingerprint(
-        en.members
-            .iter()
-            .map(|m| (m.rel.as_str(), &m.id))
-            .chain(removed.iter().map(|(r, i)| (r.as_str(), i))),
-    );
-    if fp != sp.fingerprint {
-        return Err(Drift(
-            "its members differ from the scan (added, missing or changed)".to_string(),
-        ));
-    }
-    Ok(en)
+    let mut piece = sp.core.clone();
+    piece.members.retain(|m| !removed.contains_key(m.path()));
+    crate::pieces::recheck(&piece, scope).map_err(|d| Drift(d.to_string()))
 }
