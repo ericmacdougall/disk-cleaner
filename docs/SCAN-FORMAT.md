@@ -1111,12 +1111,37 @@ entry is **never hashed** and never appears in `blobs`. The list:
 - `.env.*` except `.env.example`, `.env.sample`, `.env.template` and `.env.dist`;
 - suffixes: `.pem`, `.key`, `.p12`, `.pfx`, `.jks`, `.keystore`, `.kdbx`, `.tfstate`, `.tfvars`;
 - prefixes: `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `terraform.tfstate.`;
-- substrings `secret`, `credential`, `password`, `passwd`, `token`, applied **outside** artifact
-  nodes only. An artifact node is a node of class `regenerable` or `cache`, including every entry
-  below it. Inside `node_modules`, `.venv` and the like they would match package source such as
-  `tokenizer.js` by the thousand; there the exact, suffix and prefix names still apply, and the
-  scan's state-file rule already makes such artifacts ask;
+- exact name `.htpasswd`;
+- words (`[[secret_word]]`), matched as whole **segments** of the name's stem, never as parts of
+  words. The stem is the name without its last extension; a leading dot belongs to the stem. It is
+  split at every character that is not an ASCII letter or digit, and at each lower-to-upper case
+  change. So `client_secret.json` and `clientSecret.json` hold `secret`, while `tokenizer.rs`,
+  `tokens.ts` and `secretary.txt` hold no word:
+  - `secret`/`secrets`, `credential`/`credentials`, `password`/`passwords`/`passwd`: any segment;
+  - `token`: the last segment (`api_token`, `token.json`, `.token`), or right after one of `api`,
+    `access`, `auth`, `bearer`, `refresh`, `oauth`, `personal`, `github`, `gh`, `gitlab`, `npm`,
+    `pypi`, `slack`, `discord`, `bot`, `session`, `id`, `jwt`, `client`, `service`, `deploy`,
+    `registry`, `hf` (`auth-token-cache.json`); any name with the extension `.token`. So
+    `fix-token-refresh` does not hold it;
+  - in a file with a code or document extension (the loose-code source extensions plus `md`,
+    `markdown`, `mdx`, `rst`, `adoc`, `html`, `htm`, `css`, `scss`, `sass`, `less`, `svg`, `png`,
+    `jpg`, `jpeg`, `gif`, `webp`, `ico`, `mjs`, `cjs`, `vue`, `svelte`, `snap`, `map`, `lock`), a
+    word counts only as the whole stem. For example, `secrets.py` and `credentials.ts` match, but
+    `password_reset.py` and `secret_santa.md` do not. `token` never matches in such a file
+    (`token.rs` is ordinary lexer source);
+  - words apply **outside** artifact nodes only. An artifact node is a node of class
+    `regenerable` or `cache`, including every entry below it; there the exact, suffix and prefix
+    names still apply, and the scan's state-file rule already makes such artifacts ask;
 - directories: `.ssh`, `.gnupg`, `.aws`, `.password-store`, `secrets`.
+
+**Git's bookkeeping names are not secret names.** Inside a git directory, these names were chosen
+by the user for branches, worktrees and submodules, not for file contents:
+- everything below `refs`, `logs`, `worktrees` and `modules`;
+- `packed-refs`.
+
+They never match a secret name, word or directory: for example, `.git/refs/heads/fix-token-refresh`
+or `.git/refs/heads/secrets/rotate`. Everywhere else in a git directory the rules apply as above,
+and an enclosing secret directory still covers everything below it.
 
 A scan root takes its context from the directories that enclose it, as if the walk had reached
 it from above. This holds in any root order, and whether or not an enclosing root was scanned too:

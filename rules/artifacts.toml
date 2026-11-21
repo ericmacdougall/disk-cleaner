@@ -522,7 +522,8 @@ source_extensions = [
 # names"). With `scan --lanes`, a matching entry is always its own `keep` piece. It is never
 # hashed, and it is never backed up, pushed or removed unless the user explicitly opts in.
 # Patterns are `name`, `*suffix`, `prefix*` or `*substring*`, compared ignoring case. A substring
-# pattern applies only outside regenerable and cache directories. Matching uses names only, so a
+# pattern applies only outside regenerable and cache directories. No substring pattern is used: whole
+# words are [[secret_word]] below. Matching uses names only, so a
 # secret stored under an ordinary name is not detected (goodqa#16530).
 
 [[secret_name]]
@@ -623,24 +624,50 @@ pattern = "terraform.tfstate.*"
 kind = "Terraform state"
 
 [[secret_name]]
-pattern = "*secret*"
+pattern = ".htpasswd"
+kind = "a web server password file"
+
+# [[secret_word]] matches whole segments of a file name's stem, never parts of words: the stem
+# is split at every character that is not a letter or digit and at each lower-to-upper case
+# change, so `client_secret.json` and `clientSecret.json` hold `secret` while `tokenizer.rs`,
+# `tokens.ts` and a branch `fix-token-refresh` do not hold `token`. Words apply outside
+# regenerable and cache directories only, and never to git's own bookkeeping names (refs,
+# reflogs, worktree and submodule names, packed-refs), which are branch and path names. In a
+# file with a code or document extension (below, plus the loose-code source extensions) a word
+# counts only as the whole stem, and only where `whole_stem_in_code` says so.
+
+[secrets]
+plain_extensions = [
+    "md", "markdown", "mdx", "rst", "adoc", "html", "htm", "css", "scss", "sass", "less",
+    "svg", "png", "jpg", "jpeg", "gif", "webp", "ico", "mjs", "cjs", "vue", "svelte", "snap",
+    "map", "lock",
+]
+
+[[secret_word]]
+words = ["secret", "secrets"]
 kind = "a file whose name says it holds a secret"
+whole_stem_in_code = true
 
-[[secret_name]]
-pattern = "*credential*"
+[[secret_word]]
+words = ["credential", "credentials"]
 kind = "a file whose name says it holds credentials"
+whole_stem_in_code = true
 
-[[secret_name]]
-pattern = "*password*"
+[[secret_word]]
+words = ["password", "passwords", "passwd"]
 kind = "a file whose name says it holds a password"
+whole_stem_in_code = true
 
-[[secret_name]]
-pattern = "*passwd*"
-kind = "a file whose name says it holds a password"
-
-[[secret_name]]
-pattern = "*token*"
+[[secret_word]]
+words = ["token"]
 kind = "a file whose name says it holds a token"
+last = true
+after = [
+    "api", "access", "auth", "bearer", "refresh", "oauth", "personal", "github", "gh", "gitlab",
+    "npm", "pypi", "slack", "discord", "bot", "session", "id", "jwt", "client", "service",
+    "deploy", "registry", "hf",
+]
+extensions = ["token"]
 
 [[secret_dir]]
 name = ".ssh"

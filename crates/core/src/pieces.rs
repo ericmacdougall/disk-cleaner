@@ -291,6 +291,10 @@ struct DirRec {
     /// This directory is a scan node's own path.
     is_node: bool,
     in_gitdir: bool,
+    /// Inside a git directory, below `refs`, `logs`, `worktrees` or `modules`: names here are
+    /// branch, worktree and submodule names that git chose from the user's words, never file
+    /// contents, so name-based secret rules do not apply to them.
+    git_named: bool,
     in_artifact: bool,
     /// The topmost secret directory at or above this one: its kind.
     secret_dir: Option<String>,
@@ -373,6 +377,7 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
             node: node_at.get(root).copied(),
             is_node: node_at.contains_key(root),
             in_gitdir: false,
+            git_named: false,
             in_artifact: false,
             secret_dir: None,
             secret_top: false,
@@ -419,6 +424,7 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
                             node: None,
                             is_node: node_at.contains_key(&p),
                             in_gitdir: false,
+                            git_named: false,
                             in_artifact: false,
                             secret_dir: None,
                             secret_top: false,
@@ -514,6 +520,10 @@ fn preorder_ents(t: &Tree) -> Vec<usize> {
     }
     out
 }
+
+/// Directories of a git directory whose entries are named after branches, worktrees and
+/// submodules.
+const GIT_NAMED_DIRS: [&str; 4] = ["refs", "logs", "worktrees", "modules"];
 
 /// The context a directory hands to its children.
 #[derive(Clone, Debug, Default)]
@@ -632,8 +642,19 @@ fn annotate(t: &mut Tree, roots: &[PathBuf], nodes: &[Node], rules: &RuleSet, or
                 && matches!(pclass, Some(Class::Repo) | Some(Class::Worktree)));
         let nclass = t.dirs[d].node.and_then(|n| nodes.get(n)).map(|n| n.class);
         t.dirs[d].in_artifact = part || nclass.map(|c| c.is_artifact()).unwrap_or(false);
+        let pnamed = parent.map(|p| t.dirs[p].git_named).unwrap_or(false);
+        t.dirs[d].git_named = t.dirs[d].in_gitdir
+            && (pnamed
+                || (pgit
+                    && t.dirs[d]
+                        .name
+                        .to_str()
+                        .map(|n| GIT_NAMED_DIRS.contains(&n))
+                        .unwrap_or(false)));
         if psecret.is_some() {
             t.dirs[d].secret_dir = psecret;
+        } else if pnamed {
+            // A branch, worktree or submodule name: never a secret directory by name.
         } else if let Some(kind) = t.dirs[d].name.to_str().and_then(|n| rules.secret_dir(n)) {
             // A scan root with a secret directory name is a secret directory too. Inside a git
             // directory it is not cut out (the git piece stays whole), but its entries are
@@ -658,6 +679,8 @@ fn annotate(t: &mut Tree, roots: &[PathBuf], nodes: &[Node], rules: &RuleSet, or
         let in_gitdir =
             dir.in_gitdir || (parent_is_worktree_node && t.ents[e].name == OsStr::new(".git"));
         let in_artifact = dir.in_artifact;
+        // Git's own bookkeeping names (refs, reflogs, packed-refs) are branch names.
+        let git_named = in_gitdir && (dir.git_named || t.ents[e].name == OsStr::new("packed-refs"));
         let secret = if in_gitdir {
             None
         } else if let Some(k) = &dir.secret_dir {
@@ -671,11 +694,12 @@ fn annotate(t: &mut Tree, roots: &[PathBuf], nodes: &[Node], rules: &RuleSet, or
         };
         t.ents[e].gitdir_secret = in_gitdir
             && (dir.secret_dir.is_some()
-                || t.ents[e]
-                    .name
-                    .to_str()
-                    .and_then(|n| rules.secret_file(n, false))
-                    .is_some());
+                || (!git_named
+                    && t.ents[e]
+                        .name
+                        .to_str()
+                        .and_then(|n| rules.secret_file(n, false))
+                        .is_some()));
         t.ents[e].in_gitdir = in_gitdir;
         t.ents[e].secret = secret;
     }

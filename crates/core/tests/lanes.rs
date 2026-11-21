@@ -102,6 +102,26 @@ fn all_entries(root: &Path) -> BTreeSet<PathBuf> {
 }
 
 /// The invariants every survey and every plan must hold.
+/// Is this member of a `git-node` piece one of git's own bookkeeping names (below `refs`, `logs`,
+/// `worktrees` or `modules` of the git directory, or `packed-refs`)? Those are branch names, to
+/// which name-based secret rules do not apply.
+fn git_bookkeeping_member(sp: &disk_cleaner_core::pieces::Piece, parts: &[&str]) -> bool {
+    if sp.kind != disk_cleaner_core::PieceKind::GitNode {
+        return false;
+    }
+    let bare = !sp.members.iter().any(|m| m.path().starts_with(".git/"));
+    let rest = match parts.iter().position(|p| *p == ".git") {
+        Some(i) => &parts[i + 1..],
+        None if bare => parts,
+        None => return false,
+    };
+    match rest {
+        [first, _, ..] if ["refs", "logs", "worktrees", "modules"].contains(first) => true,
+        ["packed-refs"] => true,
+        _ => false,
+    }
+}
+
 fn check_invariants(res: &ScanResult, p: &Plan) {
     let survey = res.pieces.as_ref().expect("pieces");
     // Ids are indexes.
@@ -162,6 +182,9 @@ fn check_invariants(res: &ScanResult, p: &Plan) {
                 continue;
             }
             let parts: Vec<&str> = m.path().split('/').collect();
+            if git_bookkeeping_member(sp, &parts) {
+                continue;
+            }
             let (last, dirs) = parts.split_last().unwrap();
             assert!(
                 rules.secret_file(last, in_artifact).is_none()
@@ -1615,5 +1638,105 @@ fn partition_a_retained_inner_root_inherits_its_enclosing_node() {
             .filter(|m| *m == inner.join("a.bin"))
             .count();
         assert_eq!(n, 1, "{roots:?}");
+    }
+}
+
+/// Stream B probe (main triage USER_EXPERIENCE): secret words match whole name segments of a
+/// secret-shaped name, never parts of ordinary source, document or branch names. A guard over a
+/// corpus: every negative must stay non-secret and every positive secret.
+#[test]
+fn neg1_secret_words_match_secret_shaped_names_only() {
+    let rules = RuleSet::builtin();
+    let not_secret = [
+        "tokenizer.rs",
+        "tokenizer.js",
+        "tokenize.py",
+        "tokens.ts",
+        "tokens.json",
+        "token.rs",
+        "token.go",
+        "TokenService.java",
+        "fix-token-refresh",
+        "token-refresh.md",
+        "secret_santa.md",
+        "secretary.txt",
+        "password_reset.py",
+        "PasswordField.tsx",
+        "passwordless.md",
+        "credentials_test.go",
+        "README.md",
+        "Cargo.lock",
+    ];
+    for n in not_secret {
+        assert_eq!(rules.secret_file(n, false), None, "{n} is not a secret");
+    }
+    let secret = [
+        ".env",
+        ".env.local",
+        "api_token.txt",
+        "access-token",
+        "token",
+        "token.json",
+        ".token",
+        "deploy.token",
+        "github_token",
+        "auth-token-cache.json",
+        "client_secret.json",
+        "clientSecret.json",
+        "secrets.yaml",
+        "secrets.py",
+        "credentials",
+        "credentials.ts",
+        "db_password",
+        "passwords.txt",
+        ".htpasswd",
+        "id_rsa",
+        "server.key",
+        "cert.pem",
+    ];
+    for n in secret {
+        assert!(rules.secret_file(n, false).is_some(), "{n} is a secret");
+    }
+    // Inside an artifact directory words never apply; exact names still do.
+    assert_eq!(rules.secret_file("api_token.txt", true), None);
+    assert!(rules.secret_file(".env", true).is_some());
+}
+
+/// Stream B probe: a pushed, idle repository whose branches are named `fix-token-refresh`,
+/// `secrets/rotate` and `password-reset`, with a tracked `src/tokenizer.rs`, is an ordinary git
+/// lane repository, with loose and with packed refs. Git's bookkeeping names (refs, reflogs,
+/// packed-refs) are branch names, not secrets.
+#[cfg(unix)]
+#[test]
+fn neg1_branch_names_and_source_names_are_not_secrets() {
+    for pack in [false, true] {
+        let (_tmp, root, remotes) = workspace();
+        let repo = pushed_repo(&root, &remotes, "app");
+        commit_file(&repo, "src/tokenizer.rs", "fn main() {}\n");
+        for b in ["fix-token-refresh", "secrets/rotate", "password-reset"] {
+            git(&repo, &["branch", b]);
+        }
+        git(&repo, &["push", "-q", "origin", "--all"]);
+        if pack {
+            git(&repo, &["pack-refs", "--all"]);
+        }
+        let res = lanes_scan(&root);
+        let p = plan(&res, &idle_opts());
+        check_invariants(&res, &p);
+        let l = lanes_of(&p);
+        let lp = the_piece(&res, l, &repo.join("README.md"));
+        assert_eq!(lp.kind, disk_cleaner_core::PieceKind::GitNode);
+        assert!(lp.secret.is_none(), "pack {pack}: {lp:#?}");
+        assert_eq!(lp.lane, Lane::Git, "pack {pack}: {}", lp.reason);
+        assert_eq!(
+            the_piece(&res, l, &repo.join("src").join("tokenizer.rs")).id,
+            lp.id,
+            "pack {pack}: tokenizer.rs is ordinary source"
+        );
+        if !pack {
+            let r = repo.join(".git/refs/heads/secrets/rotate");
+            assert!(r.exists());
+            assert_eq!(the_piece(&res, l, &r).id, lp.id);
+        }
     }
 }

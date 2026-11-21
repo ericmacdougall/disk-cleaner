@@ -141,6 +141,107 @@ impl SecretName {
     }
 }
 
+/// A secret word (`[[secret_word]]`): a file whose name holds one of `words` as a whole segment
+/// says it holds a secret. Segments are the parts of the name's stem (the name without its last
+/// extension) split at every character that is not a letter or digit and at each lower-to-upper
+/// case change, compared ignoring ASCII case: `client_secret.json` and `clientSecret.json` hold
+/// `secret`, `tokenizer.rs` and `tokens.ts` do not hold `token`. Applied outside regenerable and
+/// cache directories only.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretWord {
+    /// The segment forms that count (`secret`, `secrets`).
+    pub words: Vec<String>,
+    /// What it is, in words.
+    pub kind: String,
+    /// The word must be the stem's last segment (`api_token`, `token.json`) or follow one of
+    /// `after` (`auth-token-cache.json`); `fix-token-refresh` does not hold it.
+    #[serde(default)]
+    pub last: bool,
+    /// Segments after which the word counts anywhere (with `last`).
+    #[serde(default)]
+    pub after: Vec<String>,
+    /// A name with one of these extensions matches outright (`deploy.token`).
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// In a file with a code or document extension (`[secrets] plain_extensions`), the word
+    /// still counts when it is the whole stem (`secrets.py`, `credentials.ts`). Off for words
+    /// that are ordinary file names in code (`token.rs` in a lexer).
+    #[serde(default)]
+    pub whole_stem_in_code: bool,
+}
+
+/// The lower-case segments of `stem` (see [`SecretWord`]).
+fn name_segments(stem: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for ch in stem.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if ch.is_ascii_uppercase() && prev_lower && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        prev_lower = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        cur.push(ch.to_ascii_lowercase());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// `name` split into stem and lower-case last extension; a leading dot is part of the stem
+/// (`.token` has no extension).
+fn stem_and_ext(name: &str) -> (&str, Option<String>) {
+    match name.rfind('.') {
+        Some(i) if i > 0 && i + 1 < name.len() => {
+            (&name[..i], Some(name[i + 1..].to_ascii_lowercase()))
+        }
+        _ => (name, None),
+    }
+}
+
+impl SecretWord {
+    /// Does the file name `name` hold this word? `plain` are the code and document extensions.
+    pub fn matches(&self, name: &str, plain: &HashSet<String>) -> bool {
+        let (stem, ext) = stem_and_ext(name);
+        if let Some(e) = &ext {
+            if self.extensions.iter().any(|x| x.eq_ignore_ascii_case(e)) {
+                return true;
+            }
+        }
+        let segs = name_segments(stem);
+        let is_word = |s: &str| self.words.iter().any(|w| w.eq_ignore_ascii_case(s));
+        if ext.as_ref().map(|e| plain.contains(e)).unwrap_or(false) {
+            return self.whole_stem_in_code && segs.len() == 1 && is_word(&segs[0]);
+        }
+        segs.iter().enumerate().any(|(i, s)| {
+            is_word(s)
+                && (!self.last
+                    || i + 1 == segs.len()
+                    || (i > 0
+                        && self
+                            .after
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(&segs[i - 1]))))
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretsCfg {
+    /// Code and document extensions, where a secret word counts only as the whole stem.
+    #[serde(default)]
+    plain_extensions: Vec<String>,
+}
+
 /// A secret directory name (`[[secret_dir]]`): everything below it is one `keep` piece.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -179,6 +280,10 @@ struct RawRules {
     secret_name: Vec<SecretName>,
     #[serde(default)]
     secret_dir: Vec<SecretDir>,
+    #[serde(default)]
+    secret_word: Vec<SecretWord>,
+    #[serde(default)]
+    secrets: SecretsCfg,
 }
 
 /// A compiled rule set with the lookup tables the scanner needs.
@@ -194,6 +299,9 @@ pub struct RuleSet {
     state_files: Vec<StateFile>,
     secret_names: Vec<SecretName>,
     secret_dirs: Vec<SecretDir>,
+    secret_words: Vec<SecretWord>,
+    /// Code and document extensions plus the loose-code source extensions.
+    plain_ext: HashSet<String>,
 }
 
 /// Does a marker spec (`name` or `*.suffix`) match an entry name?
@@ -262,6 +370,21 @@ impl RuleSet {
                 )));
             }
         }
+        for sw in &raw.secret_word {
+            let bad = |w: &String| w.is_empty() || !w.chars().all(|c| c.is_ascii_alphanumeric());
+            if sw.words.is_empty()
+                || sw.words.iter().any(bad)
+                || sw.after.iter().any(bad)
+                || sw.extensions.iter().any(bad)
+                || sw.kind.trim().is_empty()
+            {
+                return Err(Error::Rules(format!(
+                    "secret_word {:?}: needs words, `after` and extensions of letters and digits, \
+                     and a kind",
+                    sw.words
+                )));
+            }
+        }
         for sd in &raw.secret_dir {
             if sd.name.is_empty()
                 || sd.name.contains('/')
@@ -317,6 +440,14 @@ impl RuleSet {
             state_files: raw.state_file,
             secret_names: raw.secret_name,
             secret_dirs: raw.secret_dir,
+            secret_words: raw.secret_word,
+            plain_ext: raw
+                .secrets
+                .plain_extensions
+                .iter()
+                .chain(raw.loose_code.source_extensions.iter())
+                .map(|e| e.to_ascii_lowercase())
+                .collect(),
         })
     }
 
@@ -358,12 +489,27 @@ impl RuleSet {
     }
 
     /// The kind of secret file name `name` is, if any (`in_artifact`: the entry is inside a
-    /// regenerable or cache directory, where substring patterns do not apply).
+    /// regenerable or cache directory, where substring patterns and secret words do not apply).
     pub fn secret_file(&self, name: &str, in_artifact: bool) -> Option<&str> {
-        self.secret_names
+        if let Some(s) = self
+            .secret_names
             .iter()
             .find(|s| s.matches(name, in_artifact))
-            .map(|s| s.kind.as_str())
+        {
+            return Some(s.kind.as_str());
+        }
+        if in_artifact {
+            return None;
+        }
+        self.secret_words
+            .iter()
+            .find(|w| w.matches(name, &self.plain_ext))
+            .map(|w| w.kind.as_str())
+    }
+
+    /// All secret words.
+    pub fn secret_words(&self) -> &[SecretWord] {
+        &self.secret_words
     }
 
     /// The kind of secret directory name `name` is, if any.
