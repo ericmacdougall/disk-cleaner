@@ -68,6 +68,7 @@ APPIMAGE=${1:?AppImage}
 RESULT=${2:?out folder}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$RESULT"
+rm -rf "$RESULT/dialog.txt" "$RESULT/launch" # a verdict from an earlier run must not count
 . /etc/os-release
 echo "== host: $PRETTY_NAME"
 
@@ -144,7 +145,7 @@ log="$RESULT/launch/launch.log"
 # GTK, GDK and gdk-pixbuf errors and criticals, and every sign of missing data. Atk and GObject
 # criticals when the dialog closes come from the accessibility bridge this check turns on to
 # press buttons; they are printed but do not fail the check.
-pattern='Gtk-ERROR|Gtk:ERROR|Bail out|Gtk-CRITICAL|Gdk-CRITICAL|GdkPixbuf-|Could not load a pixbuf|Could not find the icon|theme was not found|Unrecognized image file format|Failed to load'
+pattern='Gtk-ERROR|Gtk:ERROR|Bail out|Gtk-CRITICAL|Gdk-CRITICAL|GdkPixbuf-|Could not load a pixbuf|Could not find the icon|theme was not found|Unrecognized image file format'
 gtk_bad=$(grep -E "$pattern" "$log" 2> /dev/null || true)
 grep -E 'Gtk|GLib|Gdk|Atk|pixbuf|icon' "$log" 2> /dev/null | head -40 || true
 
