@@ -1,0 +1,15 @@
+# NEG-19 (AC-12): content is opened only through the read gate (crate::regular).
+rule: source rule
+mutant: an extra std::fs::read in scan.rs read_small_regular_file, before its gated open
+killing-test: source_rules content_is_opened_and_processes_started_only_at_the_gates
+assertion: content opened or a process started outside the gates
+--- a/crates/core/src/scan.rs
++++ b/crates/core/src/scan.rs
+@@ -2400,6 +2400,7 @@
+     if md.len() > MAX_SMALL_FILE {
+         return Err("file is too large".to_string());
+     }
++    let _ = std::fs::read(path);
+     let file = crate::regular::open_regular(path).map_err(|e| e.to_string())?;
+     let mut buf = String::new();
+     file.take(MAX_SMALL_FILE)

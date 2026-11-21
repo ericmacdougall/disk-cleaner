@@ -1,0 +1,10 @@
+rule: self-check: a hunk whose original lines are not in the file is an ERROR
+killing-test: rescue cta3
+assertion: are not the scan's
+--- a/crates/core/src/pieces.rs
++++ b/crates/core/src/pieces.rs
+@@ -364,3 +364,3 @@
+         let root_dev = md.dev;
+-        let root_alloc = no_such_line_in_the_file;
++        let root_alloc = 0;
+         let idx = t.dirs.len();

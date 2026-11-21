@@ -1,0 +1,18 @@
+# NEG-10 (AC-8): a keep-everything classifier fails a named control.
+rule: keep-all
+mutant: every lane keep (decide returns keep before rule 1)
+note: interim killing test: the spec names every rescue control; at f64a075 the only rescue control that runs green is artifact_secret's loose ctl folder. Add a pair per control as each rescue test is enabled.
+killing-test: rescue artifact_secret
+assertion: /ctl/x.bin is Keep:
+--- a/crates/core/src/lanes.rs
++++ b/crates/core/src/lanes.rs
+@@ -611,6 +611,9 @@
+ fn decide<F: Fn(usize) -> Option<usize>>(i: DecideIn<'_, F>) -> Decision {
+     let p = i.p;
+     let nn = i.scan.nodes.len();
++    if nn < usize::MAX {
++        return keep("every lane keep".to_string(), Why::Fleeting);
++    }
+     let node = p.node.filter(|n| *n < nn);
+     // 1. Secret.
+     if let Some(kind) = &p.secret {

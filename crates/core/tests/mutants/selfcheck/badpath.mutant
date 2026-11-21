@@ -1,0 +1,8 @@
+rule: self-check: a diff whose path leaves crates/ is an ERROR
+killing-test: rescue cta3
+assertion: are not the scan's
+--- a/crates/../Cargo.toml
++++ b/crates/../Cargo.toml
+@@ -1,1 +1,1 @@
+-[workspace]
++[workspace] # self-check

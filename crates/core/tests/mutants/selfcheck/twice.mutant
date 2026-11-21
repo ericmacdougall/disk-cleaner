@@ -1,0 +1,8 @@
+rule: self-check: a hunk whose original lines occur more than once is an ERROR
+killing-test: rescue cta3
+assertion: are not the scan's
+--- a/crates/core/src/lanes.rs
++++ b/crates/core/src/lanes.rs
+@@ -762,1 +762,1 @@
+-    }
++    } // self-check

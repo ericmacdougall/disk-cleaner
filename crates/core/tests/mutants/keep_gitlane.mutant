@@ -1,0 +1,18 @@
+# NEG-10 (AC-8): a classifier that never chooses the git lane fails a git control.
+rule: keep-git
+mutant: git lane never chosen (rule 6 never matches a removing item, so the repository is kept)
+note: interim killing test: the spec names rescue n6 (its control repository) and the guard, both red at f64a075; lanes lane_git_for_a_pushed_idle_repo runs green. Add the n6 and guard pairs when they are enabled.
+killing-test: lanes lane_git_for_a_pushed_idle_repo
+assertion: right: Git
+--- a/crates/core/src/lanes.rs
++++ b/crates/core/src/lanes.rs
+@@ -682,7 +682,8 @@
+         let item = node.and_then(|n| i.item_of[n]);
+         return match item {
+             Some(it)
+-                if matches!(
++                if false
++                    && matches!(
+                     it.action,
+                     Action::BackupThenRemove | Action::RecoverBackupThenRemove
+                 ) =>
