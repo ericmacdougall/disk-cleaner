@@ -21,9 +21,10 @@
 #      folder to appear in the app's chosen list, checking the app is alive after each step;
 #   5. fails if the app exited, the dialog did not open or return the folder, or GTK logged an
 #      error, a critical, or a missing pixbuf, icon or icon theme.
-# Two verdicts are printed, the dialog check (CT-F1) and the write observer (F10). Exit 0 when
-# both pass, 1 when the dialog check fails, 3 when only the write observer fails, 2 on a host
-# that is not bare or bad usage. The first argument may also be an extracted AppImage (AppDir).
+# Three verdicts are printed, the dialog check (CT-F1), the write observer (F10) and the screen
+# reader roles of the start screen (e2e/a11y/roles_atspi.py, written to roles.txt; it does not
+# change the exit code). Exit 0 when the first two pass, 1 when the dialog check fails, 3 when
+# only the write observer fails, 2 on a host that is not bare or bad usage. The first argument may also be an extracted AppImage (AppDir).
 set -euo pipefail
 
 if [ "${1:-}" = --driver ]; then
@@ -34,6 +35,10 @@ if [ "${1:-}" = --driver ]; then
   step() { echo "$*" | tee -a "$V"; }
   bad() { step "FAIL: $*"; exit 1; }
   alive || bad "the app is not running before the dialog"
+  # The roles a screen reader gets for the start screen, read before the dialog. They have their
+  # own verdict (roles.txt, printed by the main mode), so a wrong role does not stop the dialog check.
+  python3 "$HERE/a11y/roles_atspi.py" dump prunedisk > "$RESULT/roles-dump.txt" 2>&1 || true
+  python3 "$HERE/a11y/roles_atspi.py" check prunedisk > "$RESULT/roles.txt" 2>&1 || true
   python3 "$HERE/atspi.py" press prunedisk "Add folders..." 60 || bad "no Add folders... button"
   opened=no
   for _ in $(seq 1 40); do
@@ -68,7 +73,7 @@ APPIMAGE=${1:?AppImage}
 RESULT=${2:?out folder}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$RESULT"
-rm -rf "$RESULT/dialog.txt" "$RESULT/launch" # a verdict from an earlier run must not count
+rm -rf "$RESULT/dialog.txt" "$RESULT/roles.txt" "$RESULT/roles-dump.txt" "$RESULT/launch" # a verdict from an earlier run must not count
 . /etc/os-release
 echo "== host: $PRETTY_NAME"
 
@@ -143,9 +148,16 @@ $RUN_DIR/at-spi2-XXXXXX"
 bash "$HERE/idle-launch.sh" "$W/squashfs-root/AppRun" "$RESULT/launch"
 EOF
 observer=0
+# Processes the trace does not follow (dconf-service, started by the session bus) write to the
+# tester's real home and runtime folder: list both before and after, for the F10 record.
+outside() { find /home/tester "$RUN_DIR" -mindepth 1 -printf '%y %s %p\n' 2> /dev/null | sort; }
+outside > "$RESULT/outside-before.txt"
 su tester -s /bin/bash -c "export XDG_RUNTIME_DIR=$RUN_DIR; xvfb-run -a -s '-screen 0 1440x900x24' dbus-run-session -- bash '$W/session.sh'" \
   > "$RESULT/session.log" 2>&1 || observer=$?
 cat "$RESULT/session.log"
+outside > "$RESULT/outside-after.txt"
+echo "== outside the sandbox: the tester's home and $RUN_DIR, after minus before"
+diff "$RESULT/outside-before.txt" "$RESULT/outside-after.txt" | tee "$RESULT/outside-diff.txt" || true
 
 echo "== GTK messages of the app"
 log="$RESULT/launch/launch.log"
@@ -167,5 +179,12 @@ else
   [ -z "$gtk_bad" ] || printf 'GTK logged:\n%s\n' "$gtk_bad"
 fi
 if [ "$observer" = 0 ]; then echo "write observer (F10): PASS"; else echo "::error::write observer (F10): FAIL (idle-launch.sh exit $observer)"; fi
+# The roles a screen reader gets (read by the driver before the dialog; e2e/a11y/roles_atspi.py).
+# Its own verdict, in roles.txt; desktop.yml checks it as a separate step.
+if grep -qx 'roles: every checked element has its role' "$RESULT/roles.txt" 2> /dev/null; then
+  echo "screen reader roles: PASS"
+else
+  echo "::error::screen reader roles: FAIL"; cat "$RESULT/roles.txt" 2> /dev/null || echo "(no roles.txt)"
+fi
 [ "$dialog" = pass ] || exit 1
 [ "$observer" = 0 ] || exit 3

@@ -614,6 +614,16 @@ jobs:
         shell: bash
         run: |
           [ "${{ steps.run.outputs.code }}" = 0 ] || { echo "::error::undeclared writes: trace.txt in the artifact"; exit 1; }
+      - name: Screen reader roles of the start screen (AT-SPI)
+        # Each element of the start screen must reach the host's accessibility bus with the AT-SPI
+        # role of its tag (a heading as heading, not document frame). WebKitGTK 2.50.0 to 2.50.4
+        # number every role from paragraph on one too low (docs/DESKTOP.md, "Linux AppImage").
+        if: ${{ !matrix.control }}
+        shell: bash
+        run: |
+          cat "$RUNNER_TEMP/out/roles.txt" 2> /dev/null || true
+          grep -qx 'roles: every checked element has its role' "$RUNNER_TEMP/out/roles.txt" \
+            || { echo "::error::wrong screen reader roles (roles.txt and roles-dump.txt in the artifact)"; exit 1; }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
