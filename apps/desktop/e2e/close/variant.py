@@ -9,9 +9,8 @@ usage: variant.py NAME   (from apps/desktop; never run in a developer checkout)
   worker-ignores-eof   the worker's watchdog no longer ends it when its input closes (the
                        parent-death backstop): every route where the app dies without running
                        its shutdown must fail during the analysis
-  exit-skips-shutdown  the run loop's Exit no longer runs end_app (Inner::shutdown)
-  no-destroy-hook      the Linux destroy-event handler is not connected (the code before the
-                       fix: for comparison, run with --informational)
+  exit-skips-shutdown  the run loop's Exit no longer runs end_app (Inner::shutdown): every
+                       route that ends through Exit must fail
 """
 
 from __future__ import annotations
@@ -31,12 +30,6 @@ VARIANTS = {
         SRC / "lib.rs",
         "        if let tauri::RunEvent::Exit = event {\n            end_app(&on_exit);\n",
         "        if let tauri::RunEvent::Exit = event {\n            let _ = &on_exit;\n",
-    )],
-    "no-destroy-hook": [(
-        SRC / "lib.rs",
-        "            #[cfg(target_os = \"linux\")]\n"
-        "            quit_when_the_window_is_destroyed(_app, std::sync::Arc::clone(&on_setup));\n",
-        "",
     )],
 }
 

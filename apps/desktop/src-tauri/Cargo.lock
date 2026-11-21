@@ -2610,7 +2610,6 @@ dependencies = [
  "command-group",
  "disk-cleaner-core",
  "disk-cleaner-view",
- "gtk",
  "libc",
  "rlimit",
  "serde",

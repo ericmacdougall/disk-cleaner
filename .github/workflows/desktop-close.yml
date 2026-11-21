@@ -36,12 +36,12 @@ jobs:
         include:
           - variant: app
             check: ""
+          # The worker's backstop: every route where the app dies without its own shutdown.
           - variant: worker-ignores-eof
-            check: --expect-fail analyse:kill-client,analyse:sigterm,analyse:sighup,analyse:sigkill
+            check: --expect-fail analyse:kill-client,analyse:sigterm,analyse:sighup,analyse:sigkill,analyse:destroy-nowm
+          # The app's own shutdown: every route that ends through the run loop's Exit.
           - variant: exit-skips-shutdown
-            check: --expect-fail walk:wm-close,analyse:wm-close
-          - variant: no-destroy-hook
-            check: --informational
+            check: --expect-fail walk:wm-close,analyse:wm-close,walk:destroy-wm,analyse:destroy-wm
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
