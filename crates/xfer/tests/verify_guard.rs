@@ -125,7 +125,17 @@ fn failed_commit_put(prefix: &str, orphans: bool) {
     let again = faulty(&env, FaultConfig::default());
     let (rep2, rs2) = run_with(&env, again.clone());
     assert_eq!(rep2.exit_code, 0, "{rep2:#?}");
-    assert_eq!(rep2.adopted_packs > 0, orphans, "{prefix}: {rep2:#?}");
+    if orphans {
+        // no .idx was committed, so every pack is an orphan the rerun must adopt
+        assert!(rep2.adopted_packs > 0, "{prefix}: {rep2:#?}");
+    } else {
+        // the committed .idx covers its packs; only a pack sealed after it (a slow runner can
+        // have one in flight when the .files put fails) is an orphan to adopt
+        assert!(
+            (rep2.adopted_packs as usize) < packs_first,
+            "{prefix}: all {packs_first} packs adopted although an .idx was committed {rep2:#?}"
+        );
+    }
     let packs_again = again
         .put_keys
         .lock()
