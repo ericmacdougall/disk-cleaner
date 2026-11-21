@@ -40,7 +40,7 @@ The scan and plan formats, every fact and every rule are described in
 
 ## Download a release
 
-Prebuilt programs are published on the
+Once the maintainer publishes a release, prebuilt programs are on the
 [releases page](https://github.com/ericmacdougall/disk-cleaner/releases). Each published release
 carries one archive for each of Linux (x86-64), macOS (Apple Silicon and Intel) and Windows (x86-64),
 plus a `SHA256SUMS` file. Tagging a version only prepares a draft, which the maintainer reads and then

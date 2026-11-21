@@ -1016,7 +1016,9 @@ class TestReleaseWording(unittest.TestCase):
     TAG_MAKES_RELEASE = re.compile(
         r"(?i)(when|once|after) a version is tagged|appear on the releases page once|"
         r"attached to [^.]*releases page[^.]* when a version is tagged|releases page carries")
-    PRESENT_TENSE_DOWNLOAD = re.compile(r"(?i)the program is a single file you unpack and run")
+    PRESENT_TENSE_DOWNLOAD = re.compile(
+        r"(?i)the program is a single file you unpack and run|"
+        r"(?<!, )\bprebuilt (command-line )?programs are (published|attached|available)")
 
     @classmethod
     def setUpClass(cls):
@@ -1035,6 +1037,7 @@ class TestReleaseWording(unittest.TestCase):
         for name in ("README.md", "site/index.html"):
             flat = self.texts[name]
             self.assertIn("Tagging a version only prepares a draft", flat, name)
+            self.assertIn("Once the maintainer publishes a release, prebuilt", flat, name)
             self.assertIn("lists no release yet", flat, name)
 
     def test_verification_is_not_oversold(self):
