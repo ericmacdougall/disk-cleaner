@@ -10,7 +10,9 @@
 # copy of AT-SPI's role list, so every role from paragraph on reaches the reader one too low
 # (a heading as "document frame"; https://bugs.webkit.org/show_bug.cgi?id=300090, fixed in 2.50.5).
 set -euo pipefail
-app=${1:?AppImage}
+# Absolute: the AppImage is run from inside the scratch folder below.
+app=$(readlink -f "${1:?AppImage}")
+[ -f "$app" ] || { echo "::error::no AppImage at $1"; exit 1; }
 record=${2:?record file}
 w=$(mktemp -d)
 trap 'rm -rf "$w"' EXIT
