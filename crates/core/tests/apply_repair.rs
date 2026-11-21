@@ -119,6 +119,60 @@ fn a_swap_that_takes_both_names_leaves_both_files() {
     assert_eq!(fs::read(&f).unwrap(), b"NEW-AT-ORIGINAL-NAME");
 }
 
+/// Codex plan review r7, F1: without an atomic no-replace rename there is no check-then-rename
+/// fallback that could overwrite a file created in between. The member stays, byte for byte,
+/// and a real apply keeps it with the reason.
+#[test]
+fn without_an_atomic_no_replace_rename_nothing_is_removed() {
+    let fx = Fx::new();
+    let f = fx.write("g/f.txt", b"original");
+    let root = fsops::open_dir_abs(&fx.data.join("g")).unwrap();
+    let id = fsops::lstat_rel(&root, "f.txt").unwrap();
+    fsops::NOREPLACE_UNSUPPORTED.with(|c| c.set(true));
+    let r = fsops::remove_member(&root, "f.txt", &id, false);
+    fsops::NOREPLACE_UNSUPPORTED.with(|c| c.set(false));
+    let err = r.expect_err("no removal without an atomic rename");
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
+    assert_eq!(fs::read(&f).unwrap(), b"original");
+    assert!(leftovers(&fx.data).is_empty(), "{:?}", leftovers(&fx.data));
+
+    let fx = Fx::new();
+    let f1 = fx.write("p/f1.txt", b"one");
+    let (scan, plan) = docs(&[&fx.data], &[P::tree(&fx.data.join("p"), "backup")]);
+    fsops::NOREPLACE_UNSUPPORTED.with(|c| c.set(true));
+    let rep = apply(&scan, &plan, &fx.opts(true));
+    fsops::NOREPLACE_UNSUPPORTED.with(|c| c.set(false));
+    let rep = rep.unwrap();
+    assert_ne!(rep.pieces[0].outcome, "removed", "{rep:?}");
+    assert_eq!(fs::read(&f1).unwrap(), b"one");
+    let m = fs::read_to_string(fx.manifest()).unwrap();
+    assert!(m.contains(fsops::NO_ATOMIC_RENAME), "{m}");
+    assert!(leftovers(&fx.data).is_empty());
+}
+
+/// A file created at the quarantine name before the capture is never replaced: the capture
+/// fails, the member stays, and the other file keeps its bytes.
+#[test]
+fn a_file_created_at_the_quarantine_name_is_never_replaced() {
+    let fx = Fx::new();
+    let f = fx.write("g/f.txt", b"original");
+    let root = fsops::open_dir_abs(&fx.data.join("g")).unwrap();
+    let id = fsops::lstat_rel(&root, "f.txt").unwrap();
+    let q = fx.data.join("g").join(fsops::quarantine_name("f.txt"));
+    let qq = q.clone();
+    set_hook(move |stage, _| {
+        if stage == RemoveStage::BeforeQuarantine {
+            fs::write(&qq, b"SOMEONE-ELSES-FILE").unwrap();
+        }
+        Ok(())
+    });
+    let r = fsops::remove_member(&root, "f.txt", &id, false);
+    clear_hook();
+    assert!(r.is_err(), "{r:?}");
+    assert_eq!(fs::read(&f).unwrap(), b"original");
+    assert_eq!(fs::read(&q).unwrap(), b"SOMEONE-ELSES-FILE");
+}
+
 #[test]
 fn a_swapped_member_survives_a_real_apply() {
     let fx = Fx::new();
@@ -414,6 +468,58 @@ fn retained_copy_protected_in_later_run() {
     let r = restore(&orig, &ropts(&fx)).unwrap();
     assert!(r.failed.is_empty(), "{r:?}");
     assert_eq!(fs::read(&orig).unwrap(), content);
+}
+
+/// Codex plan review r7, F3: the retention index keeps the content each duplicate relied on. A
+/// retained copy edited after the duplicate was removed no longer holds that content, so a
+/// later run that would remove it without an archive keeps its piece instead of archiving the
+/// new bytes as if they were the duplicate's.
+#[test]
+fn a_retained_copy_changed_since_its_duplicate_was_removed_is_kept() {
+    let fx = Fx::new();
+    let content = b"the same bytes in three places\n";
+    let orig = fx.write("keep/orig.txt", content);
+    fx.write("dups/copy.txt", content);
+    let mut piece = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
+    piece.evidence = Some(serde_json::json!({
+        "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
+        "retained_copy": orig, "retained_piece": 0
+    }));
+    let (scan, plan) = docs(
+        &[&fx.data],
+        &[P::tree(&fx.data.join("keep"), "keep"), piece],
+    );
+    let mut o = fx.opts(true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    assert_eq!(
+        apply(&scan, &plan, &o).unwrap().pieces[1].outcome,
+        "removed"
+    );
+    // Between the runs the user edits keep/orig.txt; another file now has the same new bytes,
+    // so a later plan's duplicate proof for orig.txt holds.
+    let edited = b"edited after the duplicate was removed\n";
+    fs::write(&orig, edited).unwrap();
+    let third = fx.write("other/third.txt", edited);
+    let mut piece = P::files(&fx.data.join("keep"), &["orig.txt"], "noise");
+    piece.evidence = Some(serde_json::json!({
+        "kind": "duplicate", "sha256": sha(&third), "size": edited.len(),
+        "retained_copy": third, "retained_piece": 0
+    }));
+    let (scan, plan) = docs(
+        &[&fx.data],
+        &[P::tree(&fx.data.join("other"), "keep"), piece],
+    );
+    let mut o = fx.opts(true);
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let rep = apply(&scan, &plan, &o).unwrap();
+    assert_eq!(rep.pieces[1].outcome, "kept", "{rep:?}");
+    assert!(
+        rep.pieces[1]
+            .reason
+            .contains("changed since that duplicate was removed"),
+        "{rep:?}"
+    );
+    assert_eq!(fs::read(&orig).unwrap(), edited);
 }
 
 #[test]

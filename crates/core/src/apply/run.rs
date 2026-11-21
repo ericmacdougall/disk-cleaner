@@ -295,7 +295,7 @@ pub fn apply(
     }
 
     // 1b. The retention index (N4, acceptance finding 1).
-    let retained = ctx.manifest.retained_paths();
+    let retained = ctx.manifest.retained_index();
     let mut retention_notes: BTreeMap<usize, String> = BTreeMap::new();
     prepared.retain_mut(|pr| match protect_retained(&ctx, &retained, pr) {
         Ok(None) => true,
@@ -417,7 +417,7 @@ pub fn apply(
 /// possible: a resumed removal, a secret name, or a member that changed.
 fn protect_retained(
     ctx: &Ctx,
-    retained: &BTreeSet<PathBuf>,
+    retained: &BTreeMap<PathBuf, BTreeSet<String>>,
     pr: &mut Prepared,
 ) -> Result<Option<String>, String> {
     let p = &ctx.inputs.pieces[pr.piece];
@@ -427,9 +427,9 @@ fn protect_retained(
             continue;
         }
         let path = rel_join(&p.path, &m.rel);
-        if !retained.contains(&path) {
+        let Some(relied_on) = retained.get(&path) else {
             continue;
-        }
+        };
         let keep = |why: &str| {
             Err(format!(
                 "{} is the retained copy of a duplicate removed earlier, and {why}",
@@ -450,6 +450,12 @@ fn protect_retained(
         let (sha, id) = shard::hash_file(&p.path, &m.rel)?;
         if !id.same_strict(&m.id) {
             return keep("it changed while it was being checked");
+        }
+        if !relied_on.contains(&sha) {
+            return keep(
+                "it changed since that duplicate was removed, so the duplicate's content is no \
+                 longer on disk to back up",
+            );
         }
         m.content = Content::Blob { sha256: sha };
         moved.push(path.display().to_string());

@@ -17,7 +17,10 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// Fixture git: no system or global config.
+/// Fixture git: no system or global config, and no automatic maintenance. A commit otherwise
+/// starts a detached `git maintenance run --auto` that can hold `objects/maintenance.lock`
+/// after the fixture has scanned, which apply then rightly sees as a change (macOS CI run
+/// 44873056033, `unpushed_commit_with_a_secret_is_not_pushed`).
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -29,6 +32,10 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "user.email=t@t",
             "-c",
             "protocol.file.allow=always",
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
         ])
         .arg("-C")
         .arg(dir)

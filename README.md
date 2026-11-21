@@ -77,7 +77,8 @@ Each file is removed by first renaming it to a hidden name in its own folder
 (`.pd-rm-<hash>`), checking that it is still the file that was backed up, then deleting it; anything
 else is put back. A crash between those steps can leave such a name behind, and the next run
 finishes it. One that is reported as "left at" a `.pd-rm-` path is a different file that took the
-name and was not removed.
+name and was not removed. On a file system that cannot rename without replacing another file,
+nothing is removed.
 
 Removing part of a folder changes that folder, so a later `apply` with the same scan file keeps
 the rest of it with the reason "an earlier apply run changed this folder; scan again to continue".

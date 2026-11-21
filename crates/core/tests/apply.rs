@@ -941,6 +941,56 @@ fn a_piece_kept_after_an_earlier_run_of_the_same_scan_says_scan_again() {
     }
 }
 
+/// AC-8 as amended in Revision 6 (Codex plan review r7, F2): a begun removal resumes to the
+/// end; untouched siblings of a scan piece that an earlier run changed are kept until a new scan
+/// and plan, which then complete; every removed generation restores from the remote manifest
+/// alone. The chmod stands in for the folder status change stream A's re-check reads.
+#[test]
+fn crash_resume_rescan_then_complete_and_restore_from_remote() {
+    let fx = Fx::new();
+    let s = fx.data.join("s");
+    fx.write("s/d1.bin", b"one");
+    fx.write("s/d2.bin", b"two");
+    fx.write("s/rest/r.txt", b"rest");
+    let scan = scan_doc(&[&fx.data], &[P::tree(&s, "backup")]);
+    // 1. A removal is begun, the process "dies", and the same plan resumes it to the end.
+    let plan_a = plan_doc(&scan, &[P::derived(&s, "d1.bin", 0, "backup")]);
+    let mut o = fx.opts(true);
+    o.hooks.crash_at = Some(CrashPoint::AfterRemoveBegin);
+    assert!(matches!(
+        apply(&scan, &plan_a, &o),
+        Err(ApplyError::InjectedCrash(_))
+    ));
+    let rep = apply(&scan, &plan_a, &fx.opts(true)).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "removed", "{rep:#?}");
+    assert!(!s.join("d1.bin").exists());
+    // 2. The folder has changed since the scan: its other pieces are kept, scan again.
+    std::thread::sleep(Duration::from_millis(1100));
+    fs::set_permissions(s.join("rest/r.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+    let mut residual = P::tree(&s, "backup");
+    residual.moved_out = vec!["d1.bin".into(), "d2.bin".into()];
+    let plan_b = plan_doc(&scan, &[residual, P::derived(&s, "d2.bin", 0, "backup")]);
+    let rep = apply(&scan, &plan_b, &fx.opts(true)).unwrap();
+    assert!(rep.pieces.iter().all(|p| p.outcome == "kept"), "{rep:#?}");
+    assert_eq!(rep.rescan_needed.len(), 2, "{rep:#?}");
+    // 3. A new scan and plan complete the folder.
+    let scan2 = scan_doc(&[&fx.data], &[P::tree(&s, "backup")]);
+    let plan_c = plan_doc(&scan2, &[P::tree(&s, "backup")]);
+    let rep = apply(&scan2, &plan_c, &fx.opts(true)).unwrap();
+    assert_eq!(rep.pieces[0].outcome, "removed", "{rep:#?}");
+    assert!(rep.rescan_needed.is_empty());
+    assert!(!s.exists());
+    // 4. Everything removed, in both generations, restores from the remote manifest alone.
+    fs::remove_file(fx.manifest()).unwrap();
+    let mut ro = ropts(&fx);
+    ro.from_remote = true;
+    let r = restore(&s, &ro).unwrap();
+    assert!(r.failed.is_empty() && r.conflicts.is_empty(), "{r:?}");
+    assert_eq!(fs::read(s.join("d1.bin")).unwrap(), b"one");
+    assert_eq!(fs::read(s.join("d2.bin")).unwrap(), b"two");
+    assert_eq!(fs::read(s.join("rest/r.txt")).unwrap(), b"rest");
+}
+
 #[test]
 fn many_derived_pieces_cross_the_batch_boundary() {
     let fx = Fx::new();
