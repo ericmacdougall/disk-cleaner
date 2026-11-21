@@ -29,7 +29,13 @@ This is **less** coverage than the former `ci` and `Site tests` workflows. These
 - `ci` / `binaries`: the release-mode build of the `disk-cleaner` binary for Linux x86_64, macOS arm64 and Windows x86_64.
 - `Site tests` / `pages-gate` and `pages-rehearsal`: the curl smoke test and `smoke.py` against the built site.
 
-They remain in the workflow files. If Actions minutes return, they can be run by hand: **enable the workflow first** (`gh workflow enable`; a disabled workflow cannot be dispatched), then `gh workflow run`, then disable it again (see [Manual GitHub runs](#manual-github-runs-optional)).
+They remain in the workflow files. If Actions minutes return, they can be run by hand, but **enable first**, because a disabled workflow cannot be dispatched:
+
+1. `gh workflow enable ci.yml` (and/or `site.yml`)
+2. `gh workflow run ci.yml` (and/or `site.yml`)
+3. `gh workflow disable ci.yml` (and/or `site.yml`) as soon as the run finishes. While a workflow is enabled, every push triggers it too.
+
+The [Manual GitHub runs](#manual-github-runs-optional) section below has the full commands.
 
 ## Manual GitHub runs (optional)
 
