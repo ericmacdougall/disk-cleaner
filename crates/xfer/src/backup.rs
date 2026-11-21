@@ -552,13 +552,20 @@ fn packer(
             Ok(bytes)
         });
         match r {
-            Ok(bytes) => tx
-                .send(Sealed {
-                    key: pack_key(&bytes),
-                    bytes,
-                    chunks,
-                })
-                .is_ok(),
+            Ok(bytes) => {
+                let t = Instant::now();
+                let ok = tx
+                    .send(Sealed {
+                        key: pack_key(&bytes),
+                        bytes,
+                        chunks,
+                    })
+                    .is_ok();
+                shared
+                    .blocked_ns
+                    .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                ok
+            }
             Err(e) => {
                 let _ = ev_tx.send(Event::Failed(format!("pack failed its decode check: {e}")));
                 true
@@ -622,7 +629,6 @@ fn uploader(
                 return;
             }
         };
-        shared.queued.store(rx.len(), Ordering::Relaxed);
         let r = verified_put(t, &p.key, &p.bytes, policy, &|e| {
             if e.is_throttle() {
                 shared.throttled();
@@ -843,7 +849,7 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
     // Pipeline.
     let k_cap = o.streams.unwrap_or(b.k).min(b.k).max(1);
     let shared = Shared::new(
-        o.streams.unwrap_or(4.min(k_cap)),
+        o.streams.unwrap_or(k_cap),
         k_cap,
         o.streams.is_some(),
         b.p_max,
@@ -1104,14 +1110,17 @@ impl Committer<'_> {
                 }
                 Err(_) => {}
             }
-            // at most one commit attempt per second; each scans the waiting list once
+            // At most one commit attempt per second; each scans the waiting list once. Freed
+            // space first: commit as soon as files worth 5% of the freeable bytes could be
+            // receipted, besides the byte, count and time triggers.
             let due = last.elapsed() >= Duration::from_secs(1)
                 && (self.pending_pack_bytes >= commit_bytes
                     || self.waiting.len() + self.ready.len() >= FILES_PER_COMMIT
                     || (last.elapsed() >= every
                         && (!self.waiting.is_empty()
                             || !self.ready.is_empty()
-                            || !self.new_packs.is_empty())));
+                            || !self.new_packs.is_empty()))
+                    || (self.freeable > 0 && self.ready_alloc() * 20 >= self.freeable));
             if closed {
                 // final commits (possibly several, each bounded); hard links follow their data
                 while self.commit_once()? {
@@ -1141,6 +1150,17 @@ impl Committer<'_> {
                 last = Instant::now();
             }
         }
+    }
+
+    /// Allocated bytes of the files a commit now would receipt.
+    fn ready_alloc(&self) -> u64 {
+        let w: u64 = self
+            .waiting
+            .iter()
+            .filter(|(e, _)| e.chunks.iter().all(|c| self.has_chunk(c)))
+            .map(|(e, _)| e.alloc)
+            .sum();
+        w + self.ready.iter().map(|e| e.alloc).sum::<u64>()
     }
 
     fn any_ready(&self) -> bool {

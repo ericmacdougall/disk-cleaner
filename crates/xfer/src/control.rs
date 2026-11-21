@@ -1,8 +1,11 @@
 //! Goodput controller: the number of concurrent pack uploads K and the target pack size P.
 //!
-//! Each epoch (5 s) the controller measures verified upload goodput. It hill-climbs K one step at
-//! a time while a step gains at least 5%, reverses a step that does not, and halves K on any
-//! throttling signal (multiplicative decrease). P follows per-stream goodput: about 4 s of upload
+//! K starts at the memory-derived cap: object stores reward parallel requests, and the cap
+//! already bounds what K can cost. Each epoch (5 s) the controller measures verified upload
+//! goodput. It halves K on any throttling signal (multiplicative decrease), then hill-climbs back
+//! one step at a time while a step gains at least 5% and reverses a step that does not. An epoch
+//! counts only when uploads were the bottleneck (the packer waited for a slot), so a slow reader
+//! never moves K. P follows per-stream goodput: about 4 s of upload
 //! per request, clamped to [16 MiB, max_pack], so per-request latency stays a small fraction.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -21,8 +24,9 @@ pub struct Shared {
     pub throttles: AtomicU64,
     /// Link goodput in bytes/s (EWMA), read by the compression level chooser.
     pub goodput: Arc<AtomicU64>,
-    /// Packs waiting for an upload slot (set by the uploaders).
-    pub queued: AtomicUsize,
+    /// Nanoseconds the packer spent blocked handing a sealed pack to the uploaders: the signal
+    /// that uploads, not reading or compression, are the bottleneck.
+    pub blocked_ns: AtomicU64,
     pub stop: AtomicBool,
     in_flight: Mutex<usize>,
     cv: Condvar,
@@ -43,7 +47,7 @@ impl Shared {
             uploaded: AtomicU64::new(0),
             throttles: AtomicU64::new(0),
             goodput: Arc::new(AtomicU64::new(0)),
-            queued: AtomicUsize::new(0),
+            blocked_ns: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             in_flight: Mutex::new(0),
             cv: Condvar::new(),
@@ -136,6 +140,7 @@ pub fn run(shared: Arc<Shared>, epoch: Duration) {
     let mut climb = Climb::new(shared.k.load(Ordering::Relaxed), shared.max_k);
     let mut last_bytes = 0u64;
     let mut last_throttles = 0u64;
+    let mut last_blocked = 0u64;
     let mut last_t = Instant::now();
     let mut ewma = 0f64;
     while !shared.stop.load(Ordering::Relaxed) {
@@ -157,7 +162,10 @@ pub fn run(shared: Arc<Shared>, epoch: Duration) {
             ewma = if ewma == 0.0 { g } else { 0.5 * g + 0.5 * ewma };
             shared.goodput.store(ewma as u64, Ordering::Relaxed);
         }
-        let busy = shared.queued.load(Ordering::Relaxed) > 0;
+        // upload-bound when the packer waited for an upload slot for a fifth of the epoch or more
+        let blocked = shared.blocked_ns.load(Ordering::Relaxed);
+        let busy = (blocked - last_blocked) as f64 >= 0.2 * dt * 1e9;
+        last_blocked = blocked;
         let k = if shared.fixed {
             shared.k.load(Ordering::Relaxed)
         } else {

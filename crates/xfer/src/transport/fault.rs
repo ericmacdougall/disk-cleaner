@@ -30,6 +30,9 @@ pub struct FaultConfig {
     pub die_after_puts: Option<u64>,
     /// list() reports no checksums at all.
     pub list_without_hashes: bool,
+    /// Every put of a key starting with `slow_prefix` takes this long (a slow link).
+    pub put_delay: Option<std::time::Duration>,
+    pub slow_prefix: String,
 }
 
 pub struct Faulty {
@@ -89,10 +92,14 @@ impl Transport for Faulty {
             return Err(Error::Transport("transport died".into()));
         }
         let n = self.puts.fetch_add(1, Ordering::SeqCst);
-        let (throttle, lose) = {
+        let (throttle, lose, delay) = {
             let c = self.cfg.lock().expect("fault cfg");
-            (n < c.throttle_first, c.lose_response.contains(&n))
+            let delay = c.put_delay.filter(|_| key.starts_with(&c.slow_prefix));
+            (n < c.throttle_first, c.lose_response.contains(&n), delay)
         };
+        if let Some(d) = delay {
+            std::thread::sleep(d);
+        }
         if throttle {
             return Err(Error::Throttled("429 Too Many Requests (injected)".into()));
         }
