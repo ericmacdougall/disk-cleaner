@@ -9,13 +9,16 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "perf:build": "vite build --config perf/vite.config.ts",
+    "perf:tree": "npm run perf:build && playwright test -c perf/playwright.config.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "2.12.5",
     "d3-hierarchy": "3.1.2"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "@tauri-apps/cli": "2.12.6",
     "@types/d3-hierarchy": "3.1.7",
     "axe-core": "4.14.0",

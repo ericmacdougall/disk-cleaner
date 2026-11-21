@@ -207,6 +207,47 @@ jobs:
         if: ${{ !cancelled() }}
       - run: npm run build
 
+  tree-scroll-1m:
+    # Spec AC-9 at one million rows (PR gate F9), check (3): the real size tree over the mocked
+    # backend's 1,000,000 rows in headless Chromium; same steps, boundary and threshold as the
+    # running-app check in e2e/run.mjs (e2e/ac9.mjs). docs/DESKTOP.md, "Timings".
+    name: size tree scroll at one million rows (playwright, chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - run: npm ci --no-audit --no-fund
+      - name: Chromium for Playwright (the version @playwright/test pins)
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright --version
+      - name: Scroll timing and its controls
+        run: npm run perf:tree
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Size tree scroll, 1,000,000 mocked rows (headless Chromium)"
+            echo
+            echo '```'
+            node -e 'const r = require("./perf-results/ac9-playwright.json"); console.log(JSON.stringify({ browser: r.browser, scroll: r.scroll, control: r.control }, null, 2))' || echo "no results"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: tree-scroll-1m
+          path: |
+            apps/desktop/perf-results/
+            apps/desktop/test-results/perf/
+          retention-days: 30
+
   desktop-check:
     name: desktop backend (linux)
     needs: lockfiles

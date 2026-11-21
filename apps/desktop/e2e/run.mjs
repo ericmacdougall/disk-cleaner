@@ -15,6 +15,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { App, Run, args, startDriver, stopDriver } from "./driver.mjs";
 import { KEY } from "./webdriver.mjs";
+import { AC9, judge, measureScroll, scrollOptions, scrollVerdict } from "./ac9.mjs";
 
 // Registered before the first measurement (WAL w0ce4fd7355e): p95 by nearest rank.
 const THRESHOLDS = { ipcP95Ms: 50, scrollP95Ms: 50, samples: 200, warmup: 10 };
@@ -473,5 +474,99 @@ try {
 } finally {
   if (app) await app.close();
   stopDriver(proc);
+}
+
+// Spec AC-9 at one million rows (PR gate F9), as registered in WAL w8d2cd55d39e (built to a
+// quoted excerpt of spec v6 AC-9; the spec text was not re-read). A second app session, started
+// with PRUNEDISK_E2E_SYNTH_NODES so the e2e build opens on a size tree of one folder holding
+// 1,000,000 files (root expanded: 1,000,001 rows). Its own tauri-driver, because the app takes
+// its environment from the driver, on its own ports so nothing of the first session is in the
+// way. Steps, boundary and verdict: e2e/ac9.mjs, shared with the Playwright check (perf/).
+{
+  const rows = AC9.nodes + 1;
+  let proc2;
+  let app2;
+  try {
+    await new Promise((r) => setTimeout(r, 2000));
+    ({ proc: proc2 } = await startDriver({
+      nativeDriver: a["native-driver"],
+      port: 4446,
+      nativePort: 4447,
+      env: { ...env, PRUNEDISK_E2E_SYNTH_NODES: String(AC9.nodes) },
+    }));
+    let shown = 0;
+    await run.check("launch.synth_1m", async () => {
+      app2 = await App.open("http://127.0.0.1:4446", a.app);
+      shown = await app2.s.until(
+        "const s = document.querySelector('.tg-scroll'); return s && document.getElementById('tg-row-0') ? Number(s.getAttribute('aria-rowcount')) - 1 : 0;",
+        120_000,
+      );
+      if (shown !== rows) throw new Error(`${shown} rows shown, wanted ${rows}; not measured`);
+      const tab = await app2.s.exec("return document.querySelector('[role=tab][aria-selected=true]')?.textContent ?? null");
+      return { rows: shown, tab };
+    });
+    const ready = () => {
+      if (shown !== rows) throw new Error(`the one-million-row tree is not shown (${shown} rows); not measured`);
+    };
+
+    // (1) IPC, Linux: tree_page offset k*200 limit 200, 10 warm-up pages, then k = 0..99.
+    if (process.platform === "linux") {
+      await run.check("timing.synth_1m.ipc_tree_page_p95", async () => {
+        ready();
+        const r = await app2.invoke("current_state");
+        if (!r.ok) throw new Error(`current_state: ${r.error}`);
+        const view = r.value.view;
+        const out = await app2.s.execAsync(
+          `const [view, warm, n, limit, done] = arguments;
+           (async () => {
+             const inv = window.__TAURI_INTERNALS__.invoke;
+             for (let k = 0; k < warm; k++) await inv("tree_page", { view, offset: k * limit, limit });
+             const ms = [];
+             for (let k = 0; k < n; k++) {
+               const t = performance.now();
+               const p = await inv("tree_page", { view, offset: k * limit, limit });
+               ms.push(performance.now() - t);
+               if (p.rows.length !== limit || p.offset !== k * limit) throw new Error("page " + k + ": " + p.rows.length + " rows at " + p.offset);
+             }
+             return ms;
+           })().then(done, (e) => done({ error: String(e) }));`,
+          300_000,
+          view,
+          AC9.ipcWarmup,
+          AC9.ipcSamples,
+          AC9.pageLimit,
+        );
+        if (!Array.isArray(out)) throw new Error(JSON.stringify(out));
+        if (out.length !== AC9.ipcSamples) throw new Error(`${out.length} samples, wanted ${AC9.ipcSamples}`);
+        const m = { ...judge("synth_1m_ipc_tree_page", out, AC9.ipcP95Ms), rows, pageLimit: AC9.pageLimit };
+        run.measure(m);
+        if (judge(m.id, out, 0).pass) throw new Error("control: a 0 ms threshold passed these samples");
+        if (!m.pass) throw new Error(`p95 ${m.p95.toFixed(1)} ms, not under ${AC9.ipcP95Ms} ms`);
+        return m;
+      });
+    }
+
+    // (2) Running-app scroll, Linux and Windows: 10 warm-up steps, then 200 steps of 10 rows.
+    await run.check("timing.synth_1m.scroll_p95", async () => {
+      ready();
+      const r = await app2.s.execAsync(
+        `const [o, done] = arguments;
+         (${measureScroll.toString()})(o).then(done, (e) => done({ error: String(e), samples: [] }));`,
+        600_000,
+        scrollOptions(),
+      );
+      if (r && Array.isArray(r.samples) && r.samples.length) run.measure({ ...judge("synth_1m_scroll_partial", r.samples, AC9.scrollP95Ms), partial: !!r.error });
+      const m = { ...scrollVerdict("synth_1m_scroll_rows_shown", r), rows };
+      run.measure(m);
+      if (!m.pass) throw new Error(`p95 ${m.p95.toFixed(1)} ms, not under ${AC9.scrollP95Ms} ms`);
+      return m;
+    });
+  } catch (e) {
+    run.results.push({ id: "suite.synth_1m", ok: false, ms: 0, detail: String(e?.stack ?? e) });
+    console.log(`FAIL suite.synth_1m ${String(e?.message ?? e)}`);
+  } finally {
+    if (app2) await app2.close().catch(() => {});
+    if (proc2) stopDriver(proc2);
+  }
 }
 process.exitCode = run.write(a.out ?? "e2e-result.json") ? 1 : 0;

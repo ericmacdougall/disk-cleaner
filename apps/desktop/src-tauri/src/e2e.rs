@@ -40,3 +40,46 @@ pub fn next_open() -> Option<Option<PathBuf>> {
 pub fn next_export() -> Option<Option<PathBuf>> {
     next("PRUNEDISK_E2E_EXPORT", &EXPORTED)
 }
+
+/// Most files `PRUNEDISK_E2E_SYNTH_NODES` may ask for.
+const MAX_SYNTH_NODES: usize = 10_000_000;
+
+/// `PRUNEDISK_E2E_SYNTH_NODES` (spec AC-9 timings, PR gate F9): at start, show a synthetic size
+/// tree of one folder holding this many files (`synth::wide_tree`, seed 16452), its root
+/// expanded, through the scan path: a job is started as Start starts one, the tree is installed
+/// with `show_walk`, and a one-folder synthetic scan finishes the job (`show_scan`), so the
+/// window opens on the results, not on Analysing. No command is added and nothing is read from
+/// or written to disk for the tree.
+pub fn open_synthetic(inner: &crate::state::Inner) {
+    use disk_cleaner_view::synth;
+    let Some(v) = std::env::var_os("PRUNEDISK_E2E_SYNTH_NODES") else {
+        return;
+    };
+    let n = match v.to_str().and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if (1..=MAX_SYNTH_NODES).contains(&n) => n,
+        _ => {
+            eprintln!("e2e: PRUNEDISK_E2E_SYNTH_NODES must be 1 to {MAX_SYNTH_NODES}");
+            return;
+        }
+    };
+    // Held until the job is done, as a scan's thread holds it.
+    let ticket = match inner.jobs.start() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("e2e: cannot start the synthetic job: {e}");
+            return;
+        }
+    };
+    let tree = synth::wide_tree(n, synth::SEED);
+    let Some(view) = inner.show_walk(ticket.id, tree, &[PathBuf::from("/wide")]) else {
+        eprintln!("e2e: the synthetic job is no longer current");
+        return;
+    };
+    let scan = std::sync::Arc::new(synth::synthetic_scan(1, synth::SEED));
+    match inner.show_scan(ticket.id, view, scan) {
+        Ok(true) => {}
+        Ok(false) => eprintln!("e2e: the synthetic view was replaced"),
+        Err(e) => eprintln!("e2e: cannot finish the synthetic job: {e}"),
+    }
+    drop(ticket);
+}

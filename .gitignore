@@ -10,3 +10,8 @@ dist/
 # Desktop app: generated at build time (icons come from apps/desktop/app-icon.svg)
 apps/desktop/src-tauri/icons/
 apps/desktop/src-tauri/gen/
+
+# Desktop app: the AC-9 test page build and its Playwright results (apps/desktop/perf)
+apps/desktop/dist-perf/
+apps/desktop/perf-results/
+apps/desktop/test-results/

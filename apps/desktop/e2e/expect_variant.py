@@ -21,6 +21,8 @@ EXPECT = {
     "focus-broken": (["settings.save_confirm_keep_escape"], None),
     # PR gate F8: the question opened without showModal, inert or the Tab trap.
     "modal-trap-removed": (["settings.confirm_focus_contained"], None),
+    # PR gate F9: the size tree renders up to 1000 rows, not at most 200 (spec AC-9).
+    "row-cap-removed": (["timing.synth_1m.scroll_p95"], None),
     # PR gate F10: a write outside every snapshot root; only the trace can see it.
     "planted-outside": ([], None),
 }

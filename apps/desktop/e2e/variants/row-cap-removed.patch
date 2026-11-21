@@ -1,0 +1,21 @@
+diff --git a/apps/desktop/src/views/tree.ts b/apps/desktop/src/views/tree.ts
+--- a/apps/desktop/src/views/tree.ts
++++ b/apps/desktop/src/views/tree.ts
+@@ -9,7 +9,7 @@ import { h, replace } from "../dom";
+ import { formatBytes, formatCount, formatDate, formatPercent } from "../format";
+
+ export const ROW_HEIGHT = 28;
+-export const MAX_DOM_ROWS = 200;
++export const MAX_DOM_ROWS = 1000;
+
+ const COLUMNS: { key: SortKey | null; label: string; cls: string }[] = [
+   { key: "name", label: "Name", cls: "c-name" },
+@@ -72,7 +72,7 @@ export class TreeGrid {
+   /** Visible row count for the scroller's height. */
+   private visibleRows(): number {
+     const height = this.scroller.clientHeight || ROW_HEIGHT * 30;
+-    return Math.min(MAX_DOM_ROWS, Math.ceil(height / ROW_HEIGHT) + 10);
++    return Math.max(MAX_DOM_ROWS, Math.ceil(height / ROW_HEIGHT) + 10);
+   }
+
+   async load(): Promise<void> {

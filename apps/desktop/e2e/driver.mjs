@@ -20,8 +20,9 @@ export function args(argv) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Start tauri-driver on `port`; resolves once it answers /status. */
-export async function startDriver({ driver = "tauri-driver", port = 4444, nativeDriver, env }) {
+/** Start tauri-driver on `port` (its native driver on `nativePort`, tauri-driver's default
+ * 4445 when unset); resolves once it answers /status. */
+export async function startDriver({ driver = "tauri-driver", port = 4444, nativePort, nativeDriver, env }) {
   // Windows runners name the Edge driver's folder in EDGEWEBDRIVER (Git Bash does not pass it
   // on reliably; Node reads it case-insensitively).
   if (!nativeDriver && process.platform === "win32" && process.env.EDGEWEBDRIVER) {
@@ -30,6 +31,7 @@ export async function startDriver({ driver = "tauri-driver", port = 4444, native
   if (nativeDriver) console.log(`native driver: ${nativeDriver}`);
   const argv = ["--port", String(port)];
   if (nativeDriver) argv.push("--native-driver", nativeDriver);
+  if (nativePort) argv.push("--native-port", String(nativePort));
   const proc = spawn(driver, argv, { env, stdio: ["ignore", "inherit", "inherit"] });
   const base = `http://127.0.0.1:${port}`;
   for (let i = 0; i < 100; i++) {

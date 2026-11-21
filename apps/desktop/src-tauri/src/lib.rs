@@ -69,6 +69,8 @@ fn e2e_open(inner: &Inner) {
             eprintln!("e2e: cannot open the scan file: {e}");
         }
     }
+    // PR gate F9: the one-million-row size tree of the AC-9 timings.
+    e2e::open_synthetic(inner);
 }
 
 #[cfg(test)]
