@@ -55,6 +55,40 @@ flag (`xattr -dr com.apple.quarantine PruneDisk.app`) and, on Apple silicon, sig
 (`codesign --force --deep --sign - PruneDisk.app`) before opening. Windows SmartScreen asks
 before running an unsigned installer.
 
+### Linux AppImage
+
+The AppImage carries GTK, gdk-pixbuf and its loaders, and its AppRun hook (written by
+linuxdeploy's GTK plugin, which Tauri embeds) points `XDG_DATA_DIRS`,
+`GDK_PIXBUF_MODULE_FILE`, `GSETTINGS_SCHEMA_DIR`, `GIO_MODULE_DIR` and `GTK_PATH` inside
+the image. The plugin bundles no shared-mime-info database and no icon theme, so the
+image adds them (`bundle.linux.appimage.files` in `src-tauri/tauri.conf.json`, staged
+from the build host by `src-tauri/appimage/stage-data.mjs`, Tauri's
+`beforeBundleCommand`):
+
+- the compiled shared-mime-info database (`usr/share/mime`). Ubuntu's gdk-pixbuf chooses an
+  image loader by content-type sniffing, which reads this database. Without it, even GTK's
+  built-in fallback icon is an "Unrecognized image file format".
+- Adwaita without its sizes above 48 px and without `icon-theme.cache`, plus hicolor's
+  `index.theme`. Without an icon theme, the folder dialog falls back to that fallback icon.
+- each package's copyright file (`usr/share/doc`).
+
+Without them, "Add folders..." aborted the whole app ("Bail out! Gtk:ERROR ...
+image-missing.png: Unrecognized image file format") on any host without
+`/usr/share/mime` (CT-F1, GoodQA #16452). The bundle job fails if the AppImage lacks any of
+these files.
+
+The job "AppImage without host GTK" runs the shipped AppImage in bare `fedora:41` and
+`debian:bookworm-slim` containers (`e2e/appimage-dialog.sh`). The containers have no GTK,
+gdk-pixbuf, mime database or icon theme; the script refuses a host that has any of them. The
+test opens the dialog through the accessibility tree, picks a folder by path and requires the
+folder in the app with the app alive. It fails on a GTK error, critical or missing icon. It
+runs under `e2e/idle-launch.sh`, so the write observer sees the dialog's writes. A control
+leg deletes the added data from the same AppImage and requires the check to fail.
+
+The `.deb` needs none of this: it depends on `libgtk-3-0`, which brings shared-mime-info,
+Adwaita and hicolor even without recommended packages. On Debian 12 with
+`--no-install-recommends`, the 682a0ff `.deb` opened the dialog and returned a folder.
+
 To run from source (needs Rust, Node 22 and the Tauri system libraries):
 
 ```

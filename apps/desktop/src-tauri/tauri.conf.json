@@ -7,7 +7,8 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "npm run build",
+    "beforeBundleCommand": "node src-tauri/appimage/stage-data.mjs"
   },
   "app": {
     "windows": [
@@ -40,6 +41,18 @@
     ],
     "macOS": {
       "signingIdentity": "-"
+    },
+    "linux": {
+      "appimage": {
+        "files": {
+          "/usr/share/mime": "gen/appimage-data/mime",
+          "/usr/share/icons/Adwaita": "gen/appimage-data/icons/Adwaita",
+          "/usr/share/icons/hicolor/index.theme": "gen/appimage-data/icons/hicolor/index.theme",
+          "/usr/share/doc/shared-mime-info/copyright": "gen/appimage-data/doc/shared-mime-info/copyright",
+          "/usr/share/doc/adwaita-icon-theme/copyright": "gen/appimage-data/doc/adwaita-icon-theme/copyright",
+          "/usr/share/doc/hicolor-icon-theme/copyright": "gen/appimage-data/doc/hicolor-icon-theme/copyright"
+        }
+      }
     }
   }
 }
