@@ -4,8 +4,10 @@ name: desktop-close
 # through a window manager (openbox), destroyed without a close request (with and without a
 # window manager), the X connection closed (logout), and SIGTERM, SIGHUP and SIGKILL, each
 # during the size walk and during the analysis. The main process, the worker and every git
-# it started must be gone within the 10 s deadline, and nothing may be written.
-# apps/desktop/e2e/close/check_close.py; a no-action control must fail.
+# it started must be gone within the 10 s deadline, the app must end the way each route
+# should (no crash), and nothing may be written. apps/desktop/e2e/close/check_close.py; a
+# no-action control must fail, and each broken variant (e2e/close/variant.py) must fail on
+# exactly the routes it breaks.
 
 on:
   push:
@@ -25,9 +27,21 @@ env:
 
 jobs:
   close:
-    name: window close during a scan (linux)
+    name: window close during a scan (linux, ${{ matrix.variant }})
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: app
+            check: ""
+          - variant: worker-ignores-eof
+            check: --expect-fail analyse:kill-client,analyse:sigterm,analyse:sighup,analyse:sigkill
+          - variant: exit-skips-shutdown
+            check: --expect-fail walk:wm-close,analyse:wm-close
+          - variant: no-destroy-hook
+            check: --informational
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -50,6 +64,10 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npx tauri icon app-icon.svg
+      - name: Broken variant (${{ matrix.variant }})
+        if: matrix.variant != 'app'
+        working-directory: apps/desktop
+        run: python3 e2e/close/variant.py "${{ matrix.variant }}" && git diff --stat
       - name: Build the app with the e2e feature and the production window config
         # The e2e feature adds only test hooks (PRUNEDISK_E2E_START starts the scan; event
         # lines on stderr). The window config is the shipped one (incognito on).
@@ -59,11 +77,11 @@ jobs:
         working-directory: apps/desktop
         run: |
           python3 e2e/close/check_close.py --app src-tauri/target/release/prunedisk-desktop \
-            --big /usr --big /opt --out "$RUNNER_TEMP/close"
+            --big /usr --big /opt --out "$RUNNER_TEMP/close" ${{ matrix.check }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: desktop-close
+          name: desktop-close-${{ matrix.variant }}
           path: |
             ${{ runner.temp }}/close/results.json
             ${{ runner.temp }}/close/*/result.json

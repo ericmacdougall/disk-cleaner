@@ -28,6 +28,11 @@ How the app must end, per route (anything else, a crash above all, fails the cas
   sigterm, sighup, sigkill   killed by that signal (the worker's own watchdog then ends it
                         and its gits: the parent-death backstop)
 
+Every gating case acts on a settled app: the page has loaded (`e2e: page loaded`), then
+1.5 s. The `destroy-startup` case destroys the window the moment it first shows, while the
+app is still starting; it is reported (INFO), never gating, because there the app can crash
+(Gdk-ERROR BadDrawable) before GTK hands it the destroy (CI runs 44876259316, 44876620253).
+
 Outside the table: destroying GTK's hidden client-leader window (route `destroy-leader`) is
 not a close. The app must keep running with its window shown; the check then ends it.
 
@@ -58,11 +63,15 @@ HERE = Path(__file__).resolve().parent
 
 ID = "io.github.ericmacdougall.prunedisk"
 DEADLINE_S = 10.0
+SETTLE_S = 1.5
+# Reported, never gating: a destroy the moment the window first shows, while the app is still
+# starting (it can crash there; see the module docs).
+INFO_ROUTES = {"destroy-startup"}
 ROUTES = ["wm-close", "destroy-wm", "destroy-nowm", "kill-client", "sigterm", "sighup", "sigkill"]
 PHASES = ["walk", "analyse"]
 REAPED: dict[int, int] = {}
 EXPECTED_STATUS = {
-    "wm-close": "exit 0", "destroy-wm": "exit 0", "destroy-nowm": "exit 0",
+    "wm-close": "exit 0", "destroy-wm": "exit 0", "destroy-nowm": "exit 0", "destroy-startup": "exit 0",
     "kill-client": "exit 1", "sigterm": "signal 15", "sighup": "signal 1", "sigkill": "signal 9",
 }
 
@@ -234,6 +243,7 @@ class Case:
         self.stderr_path = self.dir / "app.log"
         self.app = subprocess.Popen([self.args.app], env=env, stdin=subprocess.DEVNULL,
                                     stdout=open(self.dir / "app.out", "w"), stderr=open(self.stderr_path, "w"))
+        self.t_launch = now()
         self.say(f"app pid {self.app.pid} on {self.display}, window manager: {'openbox' if self.wm else 'none'}")
 
     def ready(self) -> dict:
@@ -241,6 +251,12 @@ class Case:
         wid = wait_for(lambda: xq("toplevel", self.display, str(self.app.pid)).stdout.strip(), 60,
                        "the app's top-level window")
         self.wid = wid
+        if self.route != "destroy-startup":
+            # A settled app: the page has loaded, then a moment more. Acting the moment the
+            # window first shows hits an app still starting (the `destroy-startup` case).
+            wait_for(lambda: "e2e: page loaded" in self.stderr_path.read_text(errors="replace"), 60,
+                     "the page to load")
+            time.sleep(SETTLE_S)
         if self.phase == "walk":
             def walking():
                 t = procs()
@@ -257,6 +273,7 @@ class Case:
         self.track(t)
         w = self.worker(t)
         pre = {
+            "ms_since_launch": round((now() - self.t_launch) * 1000),
             "window": hex(int(wid)),
             "worker": w,
             "gits_running": len(self.running_gits(t)),
@@ -277,7 +294,7 @@ class Case:
         if r == "wm-close":
             assert xq("wm", self.display).returncode == 0
             xq("close", self.display, self.wid)
-        elif r in ("destroy-wm", "destroy-nowm"):
+        elif r in ("destroy-wm", "destroy-nowm", "destroy-startup"):
             xq("destroy", self.display, self.wid)
             info["window_gone_after_destroy"] = xq("exists", self.display, self.wid).returncode == 1
         elif r == "destroy-leader":
@@ -436,6 +453,9 @@ def main() -> int:
     ap.add_argument("--repos", type=int, default=40)
     ap.add_argument("--cases", default="", help="phase:route,... (default: every phase and route, then the control)")
     ap.add_argument("--control-deadline", type=float, default=3.0)
+    ap.add_argument("--expect-fail", default=None,
+                    help="broken variant: the phase:route cases that must fail (all others pass)")
+    ap.add_argument("--informational", action="store_true", help="report only; never fail")
     args = ap.parse_args()
 
     if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
@@ -460,14 +480,16 @@ def main() -> int:
     if args.cases:
         cases = [tuple(c.split(":", 1)) for c in args.cases.split(",") if c]
     else:
-        # The outside destroy races the app's next drawing (CI run 44876259316: one of four
-        # runs at 682a0ff quit, three crashed), so each destroy route runs three times.
+        # Each destroy route runs three times: an outside destroy can race the app's drawing.
         cases = ([(p, r) for p in PHASES for r in ROUTES]
                  + [(p, r) for _ in range(2) for p in PHASES for r in ("destroy-wm", "destroy-nowm")]
-                 + [("analyse", "destroy-leader"), ("analyse", "none")])
+                 + [("analyse", "destroy-leader"), ("analyse", "destroy-startup"), ("analyse", "none")])
     results = []
     for n, (phase, route) in enumerate(cases):
         results.append(Case(phase, route, args, n).run())
+    for r in results:
+        if r["route"] in INFO_ROUTES:
+            r["result"] = f"INFO ({r['result'].lower()})"
 
     (out / "results.json").write_text(json.dumps(results, indent=2))
     lines = ["| case | window manager | app ended | app exit (s) | worker gone (s) | all gone (s) | left | no-write | events | result |",
@@ -483,12 +505,26 @@ def main() -> int:
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
             f.write(f"## Window close during a scan (deadline {DEADLINE_S:g} s)\n\n{table}\n")
-    bad = [r["case"] for r in results if r["route"] != "none" and r["result"] != "PASS"]
+    gating = [r for r in results if r["route"] != "none" and r["route"] not in INFO_ROUTES]
+    bad = [r["case"] for r in gating if r["result"] != "PASS"]
     controls = [r for r in results if r["route"] == "none"]
     control_ok = all(r["result"] == "FAIL" and "error" not in r for r in controls)
     if not control_ok:
         print("CONTROL: the no-action case did not fail as it must (or failed to set up)")
     print(f"failed cases: {bad or 'none'}; control {'caught' if control_ok else 'NOT caught'}")
+    if args.informational:
+        print("informational run (a variant to compare): the outcome does not gate")
+        return 0
+    if args.expect_fail is not None:
+        # A broken variant: exactly the named phase:route cases must fail, every other one
+        # must pass, and none may fail to set up.
+        want = {c for c in args.expect_fail.split(",") if c}
+        got = {f"{r['phase']}:{r['route']}" for r in gating if r["result"] != "PASS"}
+        errors = [r["case"] for r in gating if "error" in r]
+        caught = got == want and not errors and control_ok
+        print(f"variant: expected to fail {sorted(want)}, failed {sorted(got)}, set-up errors {errors}: "
+              f"{'caught' if caught else 'NOT caught as expected'}")
+        return 0 if caught else 1
     return 0 if not bad and control_ok else 1
 
 

@@ -27,7 +27,15 @@ pub fn run() {
     e2e_open(&inner);
     let on_exit = std::sync::Arc::clone(&inner);
     let on_setup = std::sync::Arc::clone(&inner);
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Test-only: say when the page has loaded, so the window-close check acts on a settled app.
+    #[cfg(feature = "e2e")]
+    let builder = builder.on_page_load(|_, payload| {
+        if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+            eprintln!("e2e: page loaded");
+        }
+    });
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .setup(move |_app| {
             #[cfg(target_os = "linux")]
