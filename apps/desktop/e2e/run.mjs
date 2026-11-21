@@ -16,7 +16,7 @@ import path from "node:path";
 import { App, Run, args, startDriver, stopDriver } from "./driver.mjs";
 import { KEY } from "./webdriver.mjs";
 import { AC9, judge, measureFloor, measureScroll, profileScroll, scrollOptions, scrollVerdict, summarizeProfile } from "./ac9.mjs";
-import { cpuShares, machine, snapshot, tracerState } from "./runner_info.mjs";
+import { cpuShares, machine, procStates, procsSince, psTree, snapshot, tracerState } from "./runner_info.mjs";
 
 // Registered before the first measurement (WAL w0ce4fd7355e): p95 by nearest rank.
 const THRESHOLDS = { ipcP95Ms: 50, scrollP95Ms: 50, samples: 200, warmup: 10 };
@@ -545,6 +545,27 @@ const ipcPages = async (app) => {
   if (out.length !== AC9.ipcSamples) throw new Error(`${out.length} samples, wanted ${AC9.ipcSamples}`);
   return out;
 };
+// Linux, informational (the side finding of the AC-9 sessions): what is left of a session's
+// processes after it closed, at 2 s and at 10 s (the window-close check's limit for the app's
+// tree), with state, parent and open-file count, and the process tree around them.
+const LEFT_PROCS = [...SYNTH_PROCS, "strace"];
+const allPids = () => new Set((tracerState(LEFT_PROCS)?.procs ?? []).map((p) => p.pid));
+const afterClose = async (label, pids) => {
+  if (!linux) return;
+  const id = `info.synth_1m.after_close.${label}`;
+  try {
+    const at = [];
+    let waited = 0;
+    for (const t of [2000, 10_000]) {
+      await new Promise((r) => setTimeout(r, t - waited));
+      waited = t;
+      at.push({ ms: t, procs: procStates(pids), ps: psTree(/e2e|WebKit|strace|tauri-driver|Xvfb/) });
+    }
+    run.measure({ id, pids, at, gate: false });
+  } catch (e) {
+    run.measure({ id, pids, error: String(e?.message ?? e) });
+  }
+};
 const runSteps = (app) =>
   app.s.execAsync(
     `const [o, done] = arguments;
@@ -557,9 +578,12 @@ const runSteps = (app) =>
   let proc2;
   let app2;
   let before = new Set();
+  let beforeAll = new Set();
+  let sessionPids = [];
   try {
     await new Promise((r) => setTimeout(r, 2000));
     before = appPids();
+    beforeAll = allPids();
     ({ proc: proc2 } = await startDriver({
       nativeDriver: a["native-driver"],
       port: 4446,
@@ -580,6 +604,7 @@ const runSteps = (app) =>
       const tab = await app2.s.exec("return document.querySelector('[role=tab][aria-selected=true]')?.textContent ?? null");
       return { rows: shown, tab };
     });
+    if (linux) sessionPids = procsSince(LEFT_PROCS, beforeAll);
     // Linux: the timed launch must not be traced (the app refuses the tree if it is, and this
     // reads its TracerPid from /proc).
     let untraced = !linux;
@@ -669,6 +694,7 @@ const runSteps = (app) =>
   } finally {
     if (app2) await app2.close().catch(() => {});
     if (proc2) stopDriver(proc2);
+    await afterClose("untraced", sessionPids);
   }
 }
 
@@ -680,9 +706,12 @@ if (linux) {
   let proc3;
   let app3;
   let before = new Set();
+  let beforeAll = new Set();
+  let sessionPids = [];
   try {
     await new Promise((r) => setTimeout(r, 2000));
     before = appPids();
+    beforeAll = allPids();
     ({ proc: proc3 } = await startDriver({ nativeDriver: a["native-driver"], port: 4448, nativePort: 4449, env: synthEnv(false) }));
     let shown = 0;
     await run.check("launch.synth_1m_traced", async () => {
@@ -699,6 +728,7 @@ if (linux) {
       if (untraced.length) throw new Error(`not traced: ${JSON.stringify(untraced)}`);
       return { rows: shown, apps };
     });
+    sessionPids = procsSince(LEFT_PROCS, beforeAll);
     const ready = () => {
       if (shown !== rows) throw new Error(`the one-million-row tree is not shown (${shown} rows); not measured`);
     };
@@ -729,6 +759,7 @@ if (linux) {
   } finally {
     if (app3) await app3.close().catch(() => {});
     if (proc3) stopDriver(proc3);
+    await afterClose("traced", sessionPids);
   }
 }
 

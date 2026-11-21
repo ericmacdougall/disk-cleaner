@@ -15,11 +15,11 @@ if (process.platform === "win32") {
   childEnv = { ...process.env, APPDATA: scratch, LOCALAPPDATA: scratch };
 }
 
-const run = (cmd, argv, ms = 15_000) => {
+const run = (cmd, argv, ms = 15_000, max = 2000) => {
   try {
     const r = spawnSync(cmd, argv, { encoding: "utf8", timeout: ms, env: childEnv });
     if (r.error) return { error: String(r.error.code ?? r.error.message) };
-    return { status: r.status, out: (r.stdout || "").trim().slice(0, 2000) };
+    return { status: r.status, out: (r.stdout || "").trim().slice(0, max) };
   } catch (e) {
     return { error: String(e?.message ?? e) };
   }
@@ -107,6 +107,50 @@ export function tracerState(names) {
     procs.push({ pid: Number(pid), name, tracerPid: Number(/^TracerPid:\s*(\d+)/m.exec(st)?.[1] ?? NaN) });
   }
   return { procs, traced: procs.filter((p) => p.tracerPid > 0).length, untraced: procs.filter((p) => p.tracerPid === 0).length };
+}
+
+/**
+ * Linux: the processes `names` names (comm) that are not in `before` (a Set of pids). For the
+ * side finding of the AC-9 sessions: what is left of a session after it closed.
+ */
+export function procsSince(names, before) {
+  return (tracerState(names)?.procs ?? []).filter((p) => !before.has(p.pid)).map((p) => p.pid);
+}
+
+/**
+ * Linux: for each pid, whether it still exists and, if so, its state and parent from
+ * /proc/<pid>/stat (state Z is a zombie), the parent's name, its TracerPid, and how many files it
+ * holds open (/proc/<pid>/fd, a count only). Elsewhere: null.
+ */
+export function procStates(pids) {
+  if (process.platform !== "linux") return null;
+  return pids.map((pid) => {
+    const stat = read(`/proc/${pid}/stat`);
+    if (!stat) return { pid, alive: false };
+    // comm is in parentheses and may hold spaces; the fields after the last ')' are fixed.
+    const close = stat.lastIndexOf(")");
+    const comm = stat.slice(stat.indexOf("(") + 1, close);
+    const [state, ppid] = stat.slice(close + 2).split(" ");
+    const parent = read(`/proc/${ppid}/stat`);
+    const ppidComm = parent ? parent.slice(parent.indexOf("(") + 1, parent.lastIndexOf(")")) : null;
+    const tracerPid = Number(/^TracerPid:\s*(\d+)/m.exec(read(`/proc/${pid}/status`) ?? "")?.[1] ?? NaN);
+    let fds;
+    try {
+      fds = { count: readdirSync(`/proc/${pid}/fd`).length };
+    } catch (e) {
+      fds = { error: String(e.code ?? e.message) };
+    }
+    return { pid, alive: true, statLine: stat.trim().slice(0, 300), comm, state, ppid: Number(ppid), ppidComm, tracerPid, fds };
+  });
+}
+
+/** Linux: `ps -eo pid,ppid,stat,args`, the lines matching `re` (the header kept). */
+export function psTree(re) {
+  if (process.platform !== "linux") return null;
+  const r = run("ps", ["-eo", "pid,ppid,stat,args"], 15_000, 1_000_000);
+  if (!r.out) return r;
+  const lines = r.out.split("\n");
+  return [lines[0], ...lines.slice(1).filter((l) => re.test(l))].map((l) => l.slice(0, 300));
 }
 
 /** CPU time shares between two snapshots (Linux), in percent of all CPU time. */
