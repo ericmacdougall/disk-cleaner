@@ -9,9 +9,9 @@
 //
 // usage: node e2e/run.mjs --app <binary built with --features e2e> --fixture <root>
 //          --big <a large folder to cancel during> --valid <scan.json> --malformed <file>
-//          --export <path the save dialog names> --out <result.json>
+//          --export <an empty folder the export folder dialog picks> --out <result.json>
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { App, Run, args, startDriver, stopDriver } from "./driver.mjs";
 import { KEY } from "./webdriver.mjs";
@@ -32,9 +32,15 @@ const env = {
   PRUNEDISK_E2E_FOLDERS: [a.fixture, a.big].join(path.delimiter),
   // Valid, then malformed, then the list is used up: the third Open is a cancel.
   PRUNEDISK_E2E_OPEN: [a.valid, a.malformed].join(path.delimiter),
-  // One export; the second is a cancel.
+  // One export folder; the second export is a cancel. The app names the file in it (N2).
   PRUNEDISK_E2E_EXPORT: a.export,
 };
+const EXPORT_LABEL = "Export plan to a folder...";
+
+/** `YYYYMMDD-HHMMSS` (UTC), as the app stamps an exported plan. */
+function stampOf(ms) {
+  return new Date(ms).toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+}
 
 /** Nearest-rank percentile: the smallest sample with at least `q` of the samples at or below it. */
 function rank(xs, q) {
@@ -154,7 +160,7 @@ try {
     await app.s.until("return document.querySelectorAll('ul.chosen li').length === 1", 10_000);
     await app.s.clickText("Scan");
     await app.s.until("return [...document.querySelectorAll('.bar span')].some((e) => e.textContent.startsWith('Scan complete.'))", 120_000);
-    await app.s.until("return [...document.querySelectorAll('.bar button')].some((b) => b.textContent === 'Export plan...' && !b.disabled)", 120_000);
+    await app.s.until(`return [...document.querySelectorAll('.bar button')].some((b) => b.textContent === '${EXPORT_LABEL}' && !b.disabled)`, 120_000);
     return state();
   });
 
@@ -468,21 +474,45 @@ try {
   });
 
   await run.check("flow.export_plan", async () => {
-    if (existsSync(a.export)) throw new Error(`${a.export} exists before the export`);
-    await app.s.clickText("Export plan...");
+    // Click-test N2: Export picks a folder and the app names the file, so no dialog can offer to
+    // replace one. Every stamped name the export can use in the next two minutes is taken
+    // beforehand by a planted file the user owns: the app must write the "-2" name beside it and
+    // leave every planted file as it was.
+    mkdirSync(a.export, { recursive: true });
+    if (readdirSync(a.export).length) throw new Error(`${a.export} is not empty before the export`);
+    const planted = new Map();
+    const t0 = Date.now();
+    for (let s = -5; s <= 120; s++) {
+      const name = `prunedisk-plan-${stampOf(t0 + s * 1000)}.json`;
+      const bytes = `planted by the end-to-end suite: ${name}\n`;
+      writeFileSync(path.join(a.export, name), bytes, { flag: "wx" });
+      planted.set(name, bytes);
+    }
+    await app.s.clickText(EXPORT_LABEL);
     await app.s.until("return document.querySelector('p.live')?.textContent.startsWith('Plan exported to ')", 30_000);
-    const text = readFileSync(a.export, "utf8");
-    const plan = JSON.parse(text);
     const status = await live();
     // CT-c: the confirmation names the file and says nothing else changed.
-    if (!/^Plan exported to .+\. Nothing else was changed\.$/.test(status)) throw new Error(`export said: ${status}`);
+    const m = /^Plan exported to (.+)\. Nothing else was changed\.$/.exec(status);
+    if (!m) throw new Error(`export said: ${status}`);
+    const written = m[1];
+    const same = (x, y) => (process.platform === "win32" ? x.toLowerCase() === y.toLowerCase() : x === y);
+    if (!same(path.resolve(path.dirname(written)), path.resolve(a.export))) throw new Error(`exported outside the picked folder: ${written}`);
+    if (!/^prunedisk-plan-\d{8}-\d{6}-2\.json$/.test(path.basename(written))) throw new Error(`a planted name was not skipped: ${written}`);
+    const text = readFileSync(written, "utf8");
+    const plan = JSON.parse(text);
+    for (const [name, bytes] of planted) {
+      if (readFileSync(path.join(a.export, name), "utf8") !== bytes) throw new Error(`the export changed ${name}`);
+    }
+    const now = readdirSync(a.export).sort();
+    const want = [...planted.keys(), path.basename(written)].sort();
+    if (JSON.stringify(now) !== JSON.stringify(want)) throw new Error(`the export folder holds ${JSON.stringify(now)}`);
     // CT-F6, first sequence: the confirmation is gone on the chooser after New scan. (No
     // clearing of the status from here: that hid this defect.)
     await app.s.clickText("New scan");
     await waitH2("Choose what to scan");
     const onChooser = await live();
     if (onChooser !== "") throw new Error(`after New scan the chooser shows: ${onChooser}`);
-    return { status, onChooser, bytes: text.length, keys: Object.keys(plan).slice(0, 12) };
+    return { status, written, planted: planted.size, onChooser, bytes: text.length, keys: Object.keys(plan).slice(0, 12) };
   });
 
   await run.check("flow.open_valid_scan_file", async () => {
@@ -493,12 +523,14 @@ try {
     if (afterImport !== "") throw new Error(`after the import the status says: ${afterImport}`);
     const tabs = await app.s.exec("return [...document.querySelectorAll('[role=tab]')].map((t) => t.textContent)");
     if (tabs.includes("Size tree")) throw new Error(`an imported scan shows ${JSON.stringify(tabs)}`);
-    // The save dialog's list is used up: this second export is a cancel, writes nothing and
+    // The export folder list is used up: this second export is a cancel, writes nothing and
     // says nothing.
-    await app.s.clickText("Export plan...");
+    const before = readdirSync(a.export).length;
+    await app.s.clickText(EXPORT_LABEL);
     await new Promise((r) => setTimeout(r, 1500));
     const second = await live();
     if (second !== "") throw new Error(`a cancelled export said: ${second}`);
+    if (readdirSync(a.export).length !== before) throw new Error("a cancelled export wrote a file");
     return { tabs, afterImport, second };
   });
   await axe("axe.imported_developer_view", "body");
