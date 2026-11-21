@@ -155,6 +155,8 @@ pub(crate) struct Ctx<'a> {
     pub procs: crate::ProcessCheck,
     /// (dev, ino) of entries unlinked in this run (hard-link ctime drift).
     pub unlinked_inodes: std::collections::BTreeSet<(u64, u64)>,
+    /// The head the next manifest write stores (A-5), read from storage once per run.
+    pub head: Option<super::restore::Head>,
     pub report: ApplyReport,
 }
 
@@ -236,6 +238,7 @@ pub fn apply(
         group_cache: BTreeMap::new(),
         procs: (opts.process)(),
         unlinked_inodes: Default::default(),
+        head: None,
         report: ApplyReport {
             dry_run: !opts.act,
             run: run.clone(),
@@ -1024,7 +1027,7 @@ fn seed_unmirrored(ctx: &mut Ctx) -> Result<(), ApplyError> {
     // Rows of a segment that is not committed count as absent here: they are mirrored again, in
     // local order and in one segment, which is what lets restore skip the interrupted upload
     // (`restore::covered`).
-    let remote = super::restore::remote_manifest(&ctx.rc, &ctx.opts.label)?;
+    let remote = load_head(ctx)?;
     let line = |e: &super::manifest::Envelope| serde_json::to_string(e).unwrap_or_default();
     for e in &ctx.manifest.rows {
         let other_remote = match &e.row {
@@ -1060,27 +1063,70 @@ fn upload_verified(rc: &Rclone, name: &str, bytes: &[u8]) -> Result<(), ApplyErr
     .map_err(ApplyError::Storage)
 }
 
+/// Read the label's manifest history in storage once per run: the head the next write stores,
+/// and the gaps found (reported, A-6). Returns the reading for the caller's own use.
+fn load_head(ctx: &mut Ctx) -> Result<super::restore::RemoteManifest, ApplyError> {
+    let remote = super::restore::remote_manifest(&ctx.rc, &ctx.opts.label)?;
+    ctx.head = Some(remote.next_head.clone());
+    ctx.report.history_gaps = remote
+        .gaps
+        .iter()
+        .map(|(n, why)| format!("{n}: {why}"))
+        .collect();
+    Ok(remote)
+}
+
+/// Store `head` in the slot its generation selects, verified. A failed write is an error, never
+/// skipped: restore needs the head to tell a missing segment from one never written.
+fn write_head(ctx: &Ctx, head: &super::restore::Head, gen: u64) -> Result<(), ApplyError> {
+    let slot = super::restore::HEAD_SLOTS[(gen % 2) as usize];
+    let text = super::restore::format_head(gen, &head.segs, &head.lost);
+    upload_verified(
+        &ctx.rc,
+        &format!("manifests/{}/{slot}", ctx.opts.label),
+        text.as_bytes(),
+    )
+}
+
 /// Upload the manifest rows not yet mirrored as a new immutable segment. A segment is committed
-/// history only once its checksum sidecar is stored and verified.
+/// history only once its checksum sidecar is stored and verified; then the head lists it (A-5).
+/// A label's first head, empty, is stored before its first segment, so a committed segment
+/// with no head beside it is never a state a crash leaves.
 fn mirror(ctx: &mut Ctx) -> Result<(), ApplyError> {
     if ctx.manifest.unmirrored.is_empty() {
         return Ok(());
     }
+    if ctx.head.is_none() {
+        load_head(ctx)?;
+    }
+    let mut head = ctx.head.clone().unwrap_or_default();
+    let gen = match head.gen {
+        Some(g) => g,
+        None => {
+            write_head(ctx, &head, 0)?;
+            head.gen = Some(0);
+            ctx.head = Some(head.clone());
+            0
+        }
+    };
     let mut text = ctx.manifest.unmirrored.join("\n");
     text.push('\n');
     let seq = ctx.manifest.rows.len();
-    let name = format!(
-        "manifests/{}/{}-{:08}.jsonl",
-        ctx.opts.label, ctx.manifest.run, seq
-    );
+    let file = format!("{}-{:08}.jsonl", ctx.manifest.run, seq);
+    let name = format!("manifests/{}/{file}", ctx.opts.label);
     let bytes = text.into_bytes();
     upload_verified(&ctx.rc, &name, &bytes)?;
     ctx.opts.crash(CrashPoint::AfterSegmentUpload)?;
     // The checksum sidecar, written only after the segment verified: restore --from-remote
     // treats a segment without a well-formed one as an interrupted upload, not as history.
-    let sum = format!("{} {}\n", hex::encode(Sha256::digest(&bytes)), bytes.len());
+    let sum = super::restore::format_sidecar(&file, &bytes);
     upload_verified(&ctx.rc, &format!("{name}.sum"), sum.as_bytes())?;
     ctx.manifest.unmirrored.clear();
+    ctx.opts.crash(CrashPoint::AfterSidecarUpload)?;
+    head.segs.insert(file, hex::encode(Sha256::digest(&bytes)));
+    write_head(ctx, &head, gen + 1)?;
+    head.gen = Some(gen + 1);
+    ctx.head = Some(head);
     Ok(())
 }
 

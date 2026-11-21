@@ -382,6 +382,7 @@ fn resume_after_crash_at_every_boundary() {
         CrashPoint::AfterMirror,
         CrashPoint::MidUnlink,
         CrashPoint::AfterSegmentUpload,
+        CrashPoint::AfterSidecarUpload,
     ] {
         let fx = Fx::new();
         let (scan, plan) = dedup_fixture(&fx);
@@ -396,6 +397,8 @@ fn resume_after_crash_at_every_boundary() {
         let shards_after_crash = fx.shard_total();
         let rep = apply(&scan, &plan, &fx.opts(true)).unwrap();
         assert!(rep.shards_failed.is_empty(), "{at:?}");
+        // No crash leaves a history gap (A-5): only a loss in storage does.
+        assert!(rep.history_gaps.is_empty(), "{at:?}: {rep:?}");
         assert_eq!(
             fx.shard_total(),
             shards_after_crash,
@@ -1171,9 +1174,10 @@ fn remote_manifest_segments_fail_closed() {
                 fs::write(
                     &sum,
                     format!(
-                        "{} {}\n",
+                        "{} {}\nname {}\nend\n",
                         hex::encode(Sha256::digest(t.as_bytes())),
-                        t.len()
+                        t.len(),
+                        seg.file_name().unwrap().to_string_lossy()
                     ),
                 )
                 .unwrap();

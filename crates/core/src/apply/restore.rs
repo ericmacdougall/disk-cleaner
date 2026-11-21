@@ -46,15 +46,91 @@ pub struct RestoreReport {
     pub abandoned_segments: Vec<String>,
 }
 
-/// `<sha256> <size>`, as a `.sum` sidecar holds it.
-fn parse_sum(text: &str) -> Option<(String, u64)> {
-    let mut it = text.split_whitespace();
-    let sha = it.next()?;
-    let len = it.next()?.parse::<u64>().ok()?;
-    if it.next().is_some() || sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+fn is_sha256(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// A segment's `.sum` sidecar: `<sha256> <size>`, `name <segment>`, `end`, one per line. The
+/// name binds the pair to its object name, so a pair copied over another name is damaged, and
+/// the end line tells a sidecar cut mid-write (interrupted) from a whole one.
+pub(crate) fn format_sidecar(name: &str, bytes: &[u8]) -> String {
+    format!(
+        "{} {}\nname {name}\nend\n",
+        hex::encode(Sha256::digest(bytes)),
+        bytes.len()
+    )
+}
+
+fn parse_sidecar(text: &str) -> Option<(String, u64, String)> {
+    let mut lines = text.strip_suffix('\n')?.split('\n');
+    let mut first = lines.next()?.split(' ');
+    let (sha, len) = (first.next()?, first.next()?.parse::<u64>().ok()?);
+    let name = lines.next()?.strip_prefix("name ")?;
+    if first.next().is_some() || !is_sha256(sha) || lines.next()? != "end" || lines.next().is_some()
+    {
         return None;
     }
-    Some((sha.to_ascii_lowercase(), len))
+    Some((sha.to_string(), len, name.to_string()))
+}
+
+/// The two head slots (A-5). The head lists every committed segment of the label by name and
+/// sha256, and every gap found earlier (`lost`). Writes alternate between the slots and carry a
+/// generation, so a head cut mid-write leaves the other slot whole; the reader uses the
+/// highest generation that parses.
+pub(crate) const HEAD_SLOTS: [&str; 2] = ["head.0", "head.1"];
+
+/// A parsed head, and also the writer's next head.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Head {
+    /// `None`: no head that parses is stored.
+    pub gen: Option<u64>,
+    pub segs: BTreeMap<String, String>,
+    pub lost: Vec<String>,
+}
+
+pub(crate) fn format_head(gen: u64, segs: &BTreeMap<String, String>, lost: &[String]) -> String {
+    let mut t = format!("disk-cleaner manifest head\ngen {gen}\n");
+    for (n, sha) in segs {
+        t.push_str(&format!("seg {n} {sha}\n"));
+    }
+    for l in lost {
+        let one: String = l
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        t.push_str(&format!("lost {one}\n"));
+    }
+    t.push_str("end\n");
+    t
+}
+
+fn parse_head(text: &str) -> Option<Head> {
+    let mut lines = text.strip_suffix('\n')?.split('\n');
+    if lines.next()? != "disk-cleaner manifest head" {
+        return None;
+    }
+    let gen = lines.next()?.strip_prefix("gen ")?.parse::<u64>().ok()?;
+    let mut h = Head {
+        gen: Some(gen),
+        ..Default::default()
+    };
+    for l in lines.by_ref() {
+        if l == "end" {
+            return lines.next().is_none().then_some(h);
+        }
+        if let Some(rest) = l.strip_prefix("seg ") {
+            let (n, sha) = rest.rsplit_once(' ')?;
+            if !n.ends_with(".jsonl") || n.contains('/') || !is_sha256(sha) {
+                return None;
+            }
+            h.segs.insert(n.to_string(), sha.to_string());
+        } else {
+            h.lost.push(l.strip_prefix("lost ")?.to_string());
+        }
+    }
+    None
 }
 
 /// What a remote manifest segment is (Codex plan review r8, F1).
@@ -103,7 +179,7 @@ fn segment_state(rc: &Rclone, dir: &str, name: &str, names: &BTreeSet<String>) -
     let sum_name = format!("{name}.sum");
     let sidecar = if names.contains(&sum_name) {
         match read(&sum_name) {
-            Ok(b) => parse_sum(&String::from_utf8_lossy(&b)),
+            Ok(b) => parse_sidecar(&String::from_utf8_lossy(&b)),
             Err(e) => return SegState::Damaged(format!("its checksum file cannot be read: {e}")),
         }
     } else {
@@ -113,9 +189,14 @@ fn segment_state(rc: &Rclone, dir: &str, name: &str, names: &BTreeSet<String>) -
         Ok(b) => b,
         Err(e) => return SegState::Damaged(e),
     };
-    let Some((want_sha, want_len)) = sidecar else {
+    let Some((want_sha, want_len, want_name)) = sidecar else {
         return SegState::Interrupted(b);
     };
+    if want_name != name {
+        return SegState::Damaged(format!(
+            "its checksum file belongs to another segment, {want_name} (copied over it?)"
+        ));
+    }
     if b.len() as u64 != want_len {
         return SegState::Damaged(format!(
             "it is {} bytes, its checksum file says {want_len}",
@@ -142,17 +223,49 @@ pub(crate) struct RemoteManifest {
     pub rows: Vec<Envelope>,
     /// Every line of every committed segment, as stored.
     pub lines: BTreeSet<String>,
-    /// Segments that are not committed history and whose rows committed history does not hold:
-    /// damaged ones, and interrupted ones not covered (name, why).
+    /// Segments that are not committed history and whose rows committed history does not hold,
+    /// and history the head shows missing (name, why): every entry in `gaps`, plus interrupted
+    /// uploads not covered (which the next acting run stores again).
     pub rejected: Vec<(String, String)>,
+    /// History that no later run can bring back from the local manifest alone: damaged
+    /// segments, segments the head lists that are missing, changed or not committed, gaps an
+    /// earlier run recorded, and a missing head while segments exist.
+    pub gaps: Vec<(String, String)>,
     /// Interrupted uploads whose rows committed history holds ([`covered`]): skipped.
     pub abandoned: Vec<String>,
+    /// The head the next write must store (A-5): the stored head's entries, never dropped, plus
+    /// every committed segment present, plus each new gap as a `lost` entry.
+    pub next_head: Head,
 }
 
 const INTERRUPTED: &str = "its upload was interrupted before its checksum file was written, and no committed segment holds its rows; the next acting apply run stores them again from the local manifest";
 
+/// The stored head: the slot with the highest generation that parses. `Err` when slots exist
+/// and none parses or can be read.
+fn read_head(rc: &Rclone, dir: &str, set: &BTreeSet<String>) -> Result<Option<Head>, String> {
+    let mut best: Option<Head> = None;
+    let mut present = 0;
+    for slot in HEAD_SLOTS.iter().filter(|s| set.contains(**s)) {
+        present += 1;
+        let Ok(b) = rc.cat(&format!("{dir}/{slot}")) else {
+            continue;
+        };
+        if let Some(h) = parse_head(&String::from_utf8_lossy(&b)) {
+            if best.as_ref().is_none_or(|x| h.gen > x.gen) {
+                best = Some(h);
+            }
+        }
+    }
+    match (best, present) {
+        (Some(h), _) => Ok(Some(h)),
+        (None, 0) => Ok(None),
+        (None, _) => Err("no head slot can be read and parsed".into()),
+    }
+}
+
 /// Every manifest segment in storage, classified; only committed segments give rows. Two
-/// passes: committed history first, then each interrupted upload judged against it.
+/// passes: committed history first, then each interrupted upload judged against it. Then the
+/// head: every segment it lists must be present, committed and byte for byte the one listed.
 pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest, ApplyError> {
     let dir = format!("manifests/{label}");
     let mut names = rc.list(&dir).map_err(ApplyError::Storage)?;
@@ -160,19 +273,70 @@ pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest
     let set: BTreeSet<String> = names.iter().cloned().collect();
     let mut good = Vec::new();
     let mut texts = Vec::new();
+    let mut committed: BTreeMap<String, String> = BTreeMap::new();
     let mut interrupted = Vec::new();
     let mut out = RemoteManifest::default();
-    for n in names.iter().filter(|n| n.ends_with(".jsonl")) {
+    let segments: Vec<&String> = names.iter().filter(|n| n.ends_with(".jsonl")).collect();
+    for n in &segments {
         match segment_state(rc, &dir, n, &set) {
             SegState::Committed(rows, b) => {
+                committed.insert(n.to_string(), hex::encode(Sha256::digest(&b)));
                 good.push(rows);
                 texts.push(b);
             }
-            SegState::Damaged(why) => out.rejected.push((n.clone(), why)),
-            SegState::Interrupted(b) => interrupted.push((n.clone(), b)),
+            SegState::Damaged(why) => out.gaps.push((n.to_string(), why)),
+            SegState::Interrupted(b) => interrupted.push((n.to_string(), b)),
         }
     }
+    // The head (A-5).
+    let (head, mut new_lost) = match read_head(rc, &dir, &set) {
+        Ok(Some(h)) => (h, Vec::new()),
+        Ok(None) if segments.is_empty() => (Head::default(), Vec::new()),
+        Ok(None) => (
+            Head::default(),
+            vec!["the storage head that lists the committed segments was missing while segments were stored, so segments missing before then cannot be named".to_string()],
+        ),
+        Err(_) if segments.is_empty() => (Head::default(), Vec::new()),
+        Err(why) => (
+            Head::default(),
+            vec![format!("the storage head was unreadable while segments were stored ({why}), so segments missing before then cannot be named")],
+        ),
+    };
+    let damaged: BTreeSet<String> = out.gaps.iter().map(|(n, _)| n.clone()).collect();
+    for (n, sha) in &head.segs {
+        let why = match committed.get(n) {
+            Some(have) if have == sha => continue,
+            // Already named, with the reason.
+            None if damaged.contains(n) => continue,
+            Some(_) => "it differs from the copy the storage head lists (replaced?)",
+            None if set.contains(n) => {
+                "the storage head lists it as committed, but its checksum file is missing or cut"
+            }
+            None => "the storage head lists it, but it is missing from storage",
+        };
+        out.gaps.push((n.clone(), why.to_string()));
+    }
+    for l in &head.lost {
+        out.gaps.push((
+            "history".into(),
+            format!("an earlier apply run found a gap: {l}"),
+        ));
+    }
+    for l in &new_lost {
+        out.gaps.push(("history".into(), l.clone()));
+    }
+    let mut next = head.clone();
+    for (n, sha) in &committed {
+        next.segs.entry(n.clone()).or_insert_with(|| sha.clone());
+    }
+    next.lost.append(&mut new_lost);
+    out.next_head = next;
+    out.rejected = out.gaps.clone();
     for (n, b) in interrupted {
+        if head.segs.contains_key(&n) {
+            // Listed as committed: a loss in storage, already a gap, never a crash to skip.
+            continue;
+        }
         if covered(&b, &texts) {
             out.abandoned.push(n);
         } else {
@@ -677,7 +841,33 @@ fn restore_git_blob(
 
 #[cfg(test)]
 mod tests {
-    use super::covered;
+    use super::{covered, format_head, format_sidecar, parse_head, parse_sidecar};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn heads_and_sidecars_parse_only_whole() {
+        let sha = "ab".repeat(32);
+        let mut segs = BTreeMap::new();
+        segs.insert("1-2-00000003.jsonl".to_string(), sha.clone());
+        let t = format_head(7, &segs, &["a gap\nwith a newline".into()]);
+        let h = parse_head(&t).unwrap();
+        assert_eq!(
+            (h.gen, h.segs, h.lost),
+            (Some(7), segs, vec!["a gap with a newline".into()])
+        );
+        // Cut anywhere, it does not parse: the reader falls back to the other slot.
+        for cut in 1..t.len() {
+            assert!(parse_head(&t[..cut]).is_none(), "{cut}");
+        }
+        assert!(parse_head(&t.replace("seg 1-2", "seg ../1-2")).is_none());
+        assert!(parse_head(&t.replace("lost ", "other ")).is_none());
+        let s = format_sidecar("x.jsonl", b"rows\n");
+        assert_eq!(parse_sidecar(&s).unwrap().2, "x.jsonl");
+        for cut in 1..s.len() {
+            assert!(parse_sidecar(&s[..cut]).is_none(), "{cut}");
+        }
+        assert!(parse_sidecar(&s.to_uppercase()).is_none());
+    }
 
     fn seg(lines: &[&str]) -> Vec<u8> {
         let mut t = lines.join("\n");

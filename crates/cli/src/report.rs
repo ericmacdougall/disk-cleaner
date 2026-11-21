@@ -374,6 +374,15 @@ pub fn apply_summary(r: &disk_cleaner_core::apply::ApplyReport) -> String {
             "Manifest copy in storage is behind: {e}. The local manifest has every row; run apply again to store it (restore --from-remote does not see this run until then)."
         );
     }
+    if !r.history_gaps.is_empty() {
+        let _ = writeln!(
+            o,
+            "Manifest history in storage has gaps that apply cannot repair; restore --from-remote refuses until you add --accept-partial, which restores what is stored:"
+        );
+        for g in &r.history_gaps {
+            let _ = writeln!(o, "  {g}");
+        }
+    }
     if !r.rescan_needed.is_empty() {
         let _ = writeln!(
             o,

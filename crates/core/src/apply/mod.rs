@@ -72,6 +72,8 @@ pub enum CrashPoint {
     MidUnlink,
     /// A manifest segment is stored and verified, its checksum sidecar not yet written.
     AfterSegmentUpload,
+    /// A segment and its sidecar are stored, the head does not list it yet (A-5).
+    AfterSidecarUpload,
 }
 
 /// Re-derives the lanes of noise and git pieces from the scan (spec revision 3, F3). Returns,
@@ -281,6 +283,7 @@ impl ApplyOptions {
                 CrashPoint::AfterMirror => "after the manifest mirror",
                 CrashPoint::MidUnlink => "in the middle of unlinking",
                 CrashPoint::AfterSegmentUpload => "after a manifest segment, before its sidecar",
+                CrashPoint::AfterSidecarUpload => "after a manifest sidecar, before the head",
             }));
         }
         Ok(())
@@ -364,6 +367,11 @@ pub struct ApplyReport {
     /// storage is behind until the next acting run stores it (restore from storage alone would
     /// miss this run). The CLI exits with its own status when this is set.
     pub mirror_failed: Option<String>,
+    /// Manifest history in storage that this host cannot bring back (A-5, A-6): segments the
+    /// storage head lists that are missing, changed or not committed, damaged segments, and
+    /// gaps recorded earlier. Restore from storage refuses without `--accept-partial` while any
+    /// remain. Removal is not blocked; the CLI exits with the mirror status when this is set.
+    pub history_gaps: Vec<String>,
 }
 
 /// The reason given for a piece kept because an earlier run of the same scan changed its
