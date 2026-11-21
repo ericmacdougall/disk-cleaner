@@ -7,8 +7,18 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-/// The schema this module reads.
+/// The schema this module reads. Kept apart from [`crate::SCHEMA_VERSION`] on purpose: apply
+/// refuses any other version, so a scan or plan schema change must be read here before apply
+/// accepts it.
 pub const LANES_SCHEMA: u64 = 16;
+
+// A schema bump fails the build until someone has checked what apply reads and moved
+// `LANES_SCHEMA` (main's ruling, 2026-11-21): never a silent exit 2 on every scan, never a
+// silent acceptance of a changed field shape.
+const _: () = assert!(
+    LANES_SCHEMA == crate::SCHEMA_VERSION as u64,
+    "SCHEMA_VERSION changed: check what apply reads (crates/core/src/apply/input.rs), then move LANES_SCHEMA"
+);
 
 /// Piece kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
