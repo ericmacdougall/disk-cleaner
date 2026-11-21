@@ -541,7 +541,8 @@ fn annotate(t: &mut Tree, nodes: &[Node], rules: &RuleSet, order: &[usize]) {
         t.dirs[d].in_artifact = part || nclass.map(|c| c.is_artifact()).unwrap_or(false);
         if psecret.is_some() {
             t.dirs[d].secret_dir = psecret;
-        } else if !t.dirs[d].in_gitdir && parent.is_some() {
+        } else if !t.dirs[d].in_gitdir {
+            // A scan root with a secret directory name is a secret directory too.
             if let Some(kind) = t.dirs[d].name.to_str().and_then(|n| rules.secret_dir(n)) {
                 t.dirs[d].secret_dir = Some(kind.to_string());
                 t.dirs[d].secret_top = true;
@@ -613,9 +614,17 @@ fn own_inodes(
         if (list.len() as u64) < t.ents[owner].m.nlink {
             t.ents[owner].linked_outside = true;
         }
-        if list.iter().any(|&e| t.ents[e].secret.is_some()) {
+        // Secrecy belongs to the inode, whichever side of a git-directory boundary its names
+        // are on: a name in a git directory makes its git piece incomplete, any other name is a
+        // secret piece of its own.
+        if list
+            .iter()
+            .any(|&e| t.ents[e].secret.is_some() || t.ents[e].gitdir_secret)
+        {
             for &e in list {
-                if t.ents[e].secret.is_none() && !t.ents[e].in_gitdir {
+                if t.ents[e].in_gitdir {
+                    t.ents[e].gitdir_secret = true;
+                } else if t.ents[e].secret.is_none() {
                     t.ents[e].secret = Some("a hard link to a secret-named file".to_string());
                 }
             }
@@ -893,7 +902,7 @@ impl<'a> Cutter<'a> {
             .iter()
             .rev()
             .map(|&r| {
-                if self.t.dirs[r].is_node {
+                if self.t.dirs[r].is_node || self.t.dirs[r].secret_top {
                     Task::Boundary(r)
                 } else {
                     Task::Cut(r)
@@ -1138,6 +1147,7 @@ fn blobs(
         er.ok
             && er.m.kind == b'f'
             && er.secret.is_none()
+            && !er.gitdir_secret
             && er.counted_logical > 0
             && !er.linked_outside
             && !(has_identity() && er.m.alloc.saturating_mul(2) < er.m.len)
@@ -1145,7 +1155,12 @@ fn blobs(
     let mut by_len: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     let mut multi: HashSet<usize> = HashSet::new();
     for (e, er) in t.ents.iter().enumerate() {
-        if er.counted_logical == 0 || !er.ok || er.m.kind != b'f' || er.secret.is_some() {
+        if er.counted_logical == 0
+            || !er.ok
+            || er.m.kind != b'f'
+            || er.secret.is_some()
+            || er.gitdir_secret
+        {
             continue; // not an owner name, or not a regular non-secret file
         }
         if er.m.len >= opts.min_dup_bytes {

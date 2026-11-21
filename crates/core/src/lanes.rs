@@ -483,18 +483,35 @@ pub(crate) fn build(
         dedup_saved = dedup_saved.saturating_add(saved);
     }
 
-    // Bytes of removing pieces whose inode also has a name in a `keep` piece.
+    // Bytes of removing pieces whose inode also has a name in a `keep` piece, from the members'
+    // device and inode (not from blobs: an unhashed inode still has its kept name).
     let mut kept_alias: Vec<u64> = vec![0; pieces.len()];
-    for blob in &blobs {
-        let kept_inodes: HashSet<u32> = blob
-            .copies
-            .iter()
-            .filter(|c| c.lane == Lane::Keep)
-            .map(|c| c.inode)
-            .collect();
-        for c in &blob.copies {
-            if c.lane.removes() && kept_inodes.contains(&c.inode) {
-                kept_alias[c.piece] = kept_alias[c.piece].saturating_add(c.bytes);
+    {
+        // The plan piece of each member: its derived piece when moved out, else its scan piece.
+        let mut moved: HashMap<(usize, &str), usize> = HashMap::new();
+        for lp in pieces.iter().filter(|p| p.derived) {
+            if let Some(m) = lp.member.as_deref() {
+                moved.insert((lp.scan_piece, m), lp.id);
+            }
+        }
+        let holder =
+            |sp: usize, m: &Member| -> usize { moved.get(&(sp, m.path())).copied().unwrap_or(sp) };
+        let mut kept: HashSet<(u64, u64)> = HashSet::new();
+        for sp in &survey.pieces {
+            for m in &sp.members {
+                if m.6 != 0 && pieces[holder(sp.id, m)].lane == Lane::Keep {
+                    kept.insert((m.5, m.6));
+                }
+            }
+        }
+        if !kept.is_empty() {
+            for sp in &survey.pieces {
+                for m in &sp.members {
+                    let id = holder(sp.id, m);
+                    if m.bytes() > 0 && pieces[id].lane.removes() && kept.contains(&(m.5, m.6)) {
+                        kept_alias[id] = kept_alias[id].saturating_add(m.bytes());
+                    }
+                }
             }
         }
     }

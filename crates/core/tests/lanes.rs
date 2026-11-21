@@ -4,6 +4,8 @@
 //! `dedup`, `recheck`, `contract`; `neg…` for the negative cases. Every fixture is synthetic and
 //! built in a temporary directory.
 
+#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
+
 mod common;
 
 use common::*;
@@ -327,6 +329,8 @@ fn split_large_folders_into_bounded_pieces() {
 // ----------------------------------------------------------------------------------------------
 // AC-4: one lane per piece.
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn lane_backup_for_idle_loose_files() {
     let (_tmp, root, _) = workspace();
@@ -345,6 +349,8 @@ fn lane_backup_for_idle_loose_files() {
     assert_eq!(lp.reclaimable_bytes, lp.bytes);
 }
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn lane_noise_by_rule_for_a_marked_node_modules() {
     let (_tmp, root, _) = workspace();
@@ -380,6 +386,8 @@ fn lane_noise_by_rule_for_a_marked_node_modules() {
     assert_eq!(src.lane, Lane::Backup);
 }
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn neg4_noise_without_evidence_falls_back_to_backup() {
     let (_tmp, root, _) = workspace();
@@ -413,6 +421,8 @@ fn neg4_noise_without_evidence_falls_back_to_backup() {
     assert!(l.pieces.iter().all(|p| p.lane != Lane::Noise));
 }
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn lane_git_for_a_pushed_idle_repo() {
     let (_tmp, root, remotes) = workspace();
@@ -444,6 +454,8 @@ fn unpushed_repo(root: &Path, remotes: &Path, url: &str) -> PathBuf {
     repo
 }
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn neg2_wip_repo_never_gets_an_unconditional_push() {
     let (_tmp, root, remotes) = workspace();
@@ -482,6 +494,8 @@ fn neg2_wip_repo_never_gets_an_unconditional_push() {
     }
 }
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn neg2_wip_repo_without_a_pushable_remote_bundles() {
     let (_tmp, root, remotes) = workspace();
@@ -499,6 +513,8 @@ fn neg2_wip_repo_without_a_pushable_remote_bundles() {
     assert_eq!(lp.git.as_ref().unwrap().recovery, Recovery::BundleToBackup);
 }
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn neg1_secrets_are_kept_and_excluded_everywhere() {
     let (_tmp, root, remotes) = workspace();
@@ -560,6 +576,8 @@ fn neg1_secrets_are_kept_and_excluded_everywhere() {
     assert!(l.totals.secret_pieces >= secrets.len() as u64);
 }
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn neg7_process_check_partial_or_unknown_keeps_every_piece() {
     let (_tmp, root, remotes) = workspace();
@@ -596,6 +614,8 @@ fn neg7_process_check_partial_or_unknown_keeps_every_piece() {
     assert!(lanes_of(&p).pieces.iter().any(|lp| lp.lane != Lane::Keep));
 }
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn neg10_one_fresh_file_keeps_its_whole_group() {
     let (_tmp, root, _) = workspace();
@@ -664,6 +684,8 @@ fn neg8_an_active_folder_gives_only_keep_pieces() {
 // ----------------------------------------------------------------------------------------------
 // AC-5: dedup.
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn dedup_upload_once_within_the_backup_lane() {
     let (_tmp, root, _) = workspace();
@@ -691,6 +713,8 @@ fn dedup_upload_once_within_the_backup_lane() {
     assert!(l.pieces.iter().all(|p| p.lane != Lane::Noise));
 }
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn dedup_copy_of_a_file_in_a_kept_repo_is_noise() {
     let (_tmp, root, remotes) = workspace();
@@ -743,6 +767,88 @@ fn dedup_copy_of_a_file_in_a_kept_repo_is_noise() {
     assert_eq!(the_piece(&res, l, &copy).lane, Lane::Backup);
 }
 
+/// Code inspection F1: a scan root with a secret directory name is a secret directory.
+#[test]
+fn neg1_a_secret_directory_scanned_as_the_root_stays_secret() {
+    for name in ["secrets", ".aws"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(name);
+        write_bytes(&root.join("data.bin"), 100 * KIB);
+        write_bytes(&root.join("sub").join("copy.bin"), 100 * KIB);
+        let res = lanes_scan(&root);
+        let p = plan(&res, &idle_opts());
+        check_invariants(&res, &p);
+        let l = lanes_of(&p);
+        for f in [root.join("data.bin"), root.join("sub").join("copy.bin")] {
+            let lp = the_piece(&res, l, &f);
+            assert_eq!(lp.lane, Lane::Keep, "{name}: {}", f.display());
+            assert!(lp.secret.is_some(), "{name}: {}", f.display());
+        }
+        assert!(
+            res.pieces.as_ref().unwrap().blobs.is_empty(),
+            "{name}: never hashed"
+        );
+    }
+}
+
+/// Code inspection F2: secrecy crosses the git-directory boundary in both directions and both
+/// walk orders, and a secret inode is never hashed.
+#[cfg(unix)]
+#[test]
+fn neg12_secret_inode_across_the_git_directory_boundary() {
+    // The loose directory before and after the repository in walk order.
+    for loose_name in ["a-loose", "z-loose"] {
+        // A secret name inside the git directory, an ordinary name outside.
+        let (_tmp, root, remotes) = workspace();
+        let repo = pushed_repo(&root, &remotes, "m-repo");
+        let loose = root.join(loose_name);
+        fs::create_dir_all(&loose).unwrap();
+        write_bytes(&repo.join(".git").join("credentials"), 100 * KIB);
+        fs::hard_link(
+            repo.join(".git").join("credentials"),
+            loose.join("data.bin"),
+        )
+        .unwrap();
+        let res = lanes_scan(&root);
+        let p = plan(&res, &idle_opts());
+        check_invariants(&res, &p);
+        let l = lanes_of(&p);
+        let lp = the_piece(&res, l, &loose.join("data.bin"));
+        assert_eq!(lp.lane, Lane::Keep, "{loose_name}: {}", lp.reason);
+        assert!(lp.secret.is_some(), "{loose_name}");
+        let gp = the_piece(&res, l, &repo.join("README.md"));
+        assert_eq!(gp.lane, Lane::Keep, "{loose_name}: {}", gp.reason);
+        assert!(res.pieces.as_ref().unwrap().pieces[gp.scan_piece]
+            .incomplete
+            .is_some());
+        assert!(
+            res.pieces.as_ref().unwrap().blobs.is_empty(),
+            "{loose_name}"
+        );
+
+        // A secret name in the work tree, an ordinary name inside the git directory.
+        let (_tmp, root, remotes) = workspace();
+        let repo = pushed_repo(&root, &remotes, "m-repo");
+        let loose = root.join(loose_name);
+        write_bytes(&loose.join(".env"), 100 * KIB);
+        fs::hard_link(loose.join(".env"), repo.join(".git").join("data.bin")).unwrap();
+        let res = lanes_scan(&root);
+        let p = plan(&res, &idle_opts());
+        check_invariants(&res, &p);
+        let l = lanes_of(&p);
+        let gp = the_piece(&res, l, &repo.join("README.md"));
+        assert_eq!(gp.lane, Lane::Keep, "{loose_name}: {}", gp.reason);
+        assert!(res.pieces.as_ref().unwrap().pieces[gp.scan_piece]
+            .incomplete
+            .is_some());
+        assert!(the_piece(&res, l, &loose.join(".env")).secret.is_some());
+        assert!(
+            res.pieces.as_ref().unwrap().blobs.is_empty(),
+            "{loose_name}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn neg5_a_hardlink_kept_elsewhere_frees_nothing() {
@@ -765,13 +871,32 @@ fn neg5_a_hardlink_kept_elsewhere_frees_nothing() {
 #[cfg(unix)]
 #[test]
 fn neg5_reclaim_leaves_out_an_inode_named_in_a_keep_piece() {
+    // With and without hashing: an inode left unhashed (hash budget spent) still has its kept
+    // name, so the accounting must not depend on blobs.
+    for budget in [None, Some(0)] {
+        neg5_reclaim_case(budget);
+    }
+}
+
+#[cfg(unix)]
+fn neg5_reclaim_case(max_hash_bytes: Option<u64>) {
     let (_tmp, root, _) = workspace();
     let idle = root.join("a-idle");
     let busy = root.join("b-busy");
     write_bytes(&idle.join("shared.bin"), 100 * KIB);
     fs::create_dir_all(&busy).unwrap();
     fs::hard_link(idle.join("shared.bin"), busy.join("shared-link.bin")).unwrap();
-    let res = lanes_scan(&root);
+    let po = PieceOptions {
+        max_hash_bytes,
+        ..PieceOptions::default()
+    };
+    let res = lanes_scan_with(&root, network_everywhere(), po);
+    if max_hash_bytes == Some(0) {
+        assert!(
+            res.pieces.as_ref().unwrap().blobs.is_empty(),
+            "nothing hashed"
+        );
+    }
     let mut o = idle_opts();
     o.active = vec![fs::canonicalize(&busy).unwrap()];
     let p = plan(&res, &o);
@@ -1079,6 +1204,8 @@ fn keys(v: &serde_json::Value) -> BTreeSet<String> {
     v.as_object().expect("object").keys().cloned().collect()
 }
 
+// Unix only: without file identity every lane is keep (asserted by the partition test).
+#[cfg(unix)]
 #[test]
 fn contract_fields_documented() {
     let doc = include_str!("../../../docs/SCAN-FORMAT.md");
