@@ -306,8 +306,9 @@ async function openDefault(port) {
 }
 /** The default scan: Add folders, the git-facts box as the app starts it (it must be on, the
  *  default: never clicked here, so a changed default shows), the scan conditions read, Scan, the
- *  scan complete and the plan ready (Export enabled, as the main session waits), then into the
- *  wide folder. */
+ *  scan complete and the analysis done (the export button enabled, as the main session waits;
+ *  matched by "Export plan" alone, since its label is the main session's check, N2), then into
+ *  the wide folder. */
 async function defaultScan(x) {
   await x.s.clickText("Add folders...");
   await x.s.until("return document.querySelectorAll('ul.chosen li').length === 1", 10_000);
@@ -316,7 +317,7 @@ async function defaultScan(x) {
   const scan = await scanConditions(x);
   await x.s.clickText("Scan");
   await x.s.until("return [...document.querySelectorAll('.bar span')].some((e) => e.textContent.startsWith('Scan complete.'))", 120_000);
-  await x.s.until(`return [...document.querySelectorAll('.bar button')].some((b) => b.textContent === '${EXPORT_LABEL}' && !b.disabled)`, 120_000);
+  await x.s.until("return [...document.querySelectorAll('.bar button')].some((b) => b.textContent.startsWith('Export plan') && !b.disabled)", 120_000);
   return { scan, rows: await drillIntoWide(x) };
 }
 
