@@ -59,7 +59,7 @@ GitHub-hosted CI is `workflow_dispatch` only (the included Actions minutes are e
 ./scripts/local-ci.sh
 ```
 
-That runs format, clippy, the workspace tests and the site tests. See [docs/LOCAL-CI.md](docs/LOCAL-CI.md).
+That runs format, clippy, the workspace tests, the cargo-deny license check and the site tests. It covers less than the old GitHub workflows (no mount tests, no Linux/Windows matrix, no release binaries, no Pages smoke tests); see [docs/LOCAL-CI.md](docs/LOCAL-CI.md) for the full list.
 
 ## Planned
 
