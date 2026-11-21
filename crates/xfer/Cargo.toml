@@ -24,6 +24,7 @@ broken-fixed-chunks = []  # fixed 1 MiB blocks instead of content-defined chunks
 broken-identity = []      # Receipt::still_matches accepts any existing path
 broken-exclusion = []     # hard-link groups and symlinks reaching an excluded path are kept
 broken-read-guard = []    # reads follow symlinks and skip the before/after identity checks
+broken-deep = []          # verify --deep stops at the shallow listing check
 
 [dependencies]
 blake3 = "1.8"

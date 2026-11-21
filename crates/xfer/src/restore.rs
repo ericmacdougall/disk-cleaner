@@ -496,7 +496,8 @@ pub fn verify(
         }
     }
     rep.packs = needed.len() as u64;
-    if deep && rep.errors.is_empty() {
+    // the broken-deep variant stops at the shallow check (failing-first evidence only)
+    if deep && rep.errors.is_empty() && !cfg!(feature = "broken-deep") {
         // check every pack once, then each file in order with a small pack cache
         for &pi in &needed {
             let pr = &map.packs[pi as usize];

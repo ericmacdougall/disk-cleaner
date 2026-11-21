@@ -138,3 +138,71 @@ fn rcd_refuses_old_or_missing_binary() {
     let r = RcloneRcd::start("/nonexistent/rclone", "/tmp/x", 32 << 20);
     assert!(matches!(r, Err(Error::Transport(_))));
 }
+
+/// Code lines (comments stripped) that would reach rclone's configuration: an rc `config/<method>`
+/// call, its config file, its config environment variables, the `--config` flag or the `config`
+/// and `obscure` subcommands.
+fn config_hits(text: &str) -> Vec<String> {
+    const BANNED: [&str; 5] = [
+        "rclone.conf",
+        "RCLONE_CONFIG",
+        "\"--config",
+        "\"config\"",
+        "\"obscure\"",
+    ];
+    let mut hits = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        let method = code.match_indices("\"config/").any(|(i, m)| {
+            code[i + m.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic())
+        });
+        if method || BANNED.iter().any(|b| code.contains(b)) {
+            hits.push(format!("{}: {}", n + 1, line.trim()));
+        }
+    }
+    hits
+}
+
+#[test]
+fn the_engine_source_never_reaches_rclone_config() {
+    // the control: the scanner finds each forbidden form
+    for bad in [
+        r#"t.rc("config/dump", json!({}))"#,
+        r#"let p = home.join(".config/rclone/rclone.conf");"#,
+        r#"cmd.env("RCLONE_CONFIG_B2_KEY", k);"#,
+        r#"cmd.args(["--config", path]);"#,
+        r#"cmd.args(["config", "show"]);"#,
+        r#"cmd.args(["obscure", s]);"#,
+    ] {
+        assert!(!config_hits(bad).is_empty(), "scanner missed {bad}");
+    }
+    // the allowlist's own refusal check names the bare prefix and is not a call
+    assert!(config_hits(r#"if root.contains("config/") {"#).is_empty());
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stack = vec![src];
+    let (mut files, mut hits) = (0, Vec::new());
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).expect("read_dir") {
+            let p = e.expect("entry").path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                files += 1;
+                let text = std::fs::read_to_string(&p).expect("read");
+                for h in config_hits(&text) {
+                    hits.push(format!("{}:{h}", p.display()));
+                }
+            }
+        }
+    }
+    assert!(files >= 10, "scanned only {files} files");
+    assert!(
+        hits.is_empty(),
+        "config access in src:\n{}",
+        hits.join("\n")
+    );
+}
