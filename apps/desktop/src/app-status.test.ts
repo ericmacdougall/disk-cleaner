@@ -40,14 +40,14 @@ function button(app: App, text: string): HTMLButtonElement {
 describe("status line (CT-F6, CT-c)", () => {
   it("the export confirmation names the file and says nothing else changed (CT-c)", async () => {
     const app = await mount({ currentState: async () => LOADED, exportPlan: async () => "/out/plan2.json" });
-    button(app, "Export plan...").click();
+    button(app, "Export plan to a folder...").click();
     await flush(5);
     expect(live(app)).toBe("Plan exported to /out/plan2.json. Nothing else was changed.");
   });
 
   it("'Plan exported' does not stay on the chooser after New scan (CT-F6, first sequence)", async () => {
     const app = await mount({ currentState: async () => LOADED, exportPlan: async () => "/out/plan2.json" });
-    button(app, "Export plan...").click();
+    button(app, "Export plan to a folder...").click();
     await flush(5);
     expect(live(app)).toContain("Plan exported to");
     button(app, "New scan").click();
@@ -82,21 +82,37 @@ describe("status line (CT-F6, CT-c)", () => {
         return d.promise;
       },
     });
-    button(app, "Export plan...").click();
-    button(app, "Export plan...").click();
+    button(app, "Export plan to a folder...").click();
+    button(app, "Export plan to a folder...").click();
     await flush(5);
     expect(calls).toBe(1);
-    expect(button(app, "Export plan...").disabled).toBe(true);
+    expect(button(app, "Export plan to a folder...").disabled).toBe(true);
     d.resolve("/out/one.json");
     await flush(5);
-    expect(button(app, "Export plan...").disabled).toBe(false);
+    expect(button(app, "Export plan to a folder...").disabled).toBe(false);
     expect(live(app)).toBe("Plan exported to /out/one.json. Nothing else was changed.");
+  });
+
+  it("Export says it asks for a folder, and a refused folder is announced with nothing written (N2)", async () => {
+    const app = await mount({
+      currentState: async () => LOADED,
+      exportPlan: async () => {
+        throw { kind: "refused", message: "cannot create /ro/prunedisk-plan-20261121-083833.json: Permission denied (os error 13); nothing was written" };
+      },
+    });
+    const exportButtons = [...app.el.querySelectorAll("button")].filter((b) => /^Export/.test(b.textContent ?? ""));
+    expect(exportButtons.map((b) => b.textContent)).toEqual(["Export plan to a folder..."]);
+    button(app, "Export plan to a folder...").click();
+    await flush(5);
+    expect(live(app)).toBe("Not exported: cannot create /ro/prunedisk-plan-20261121-083833.json: Permission denied (os error 13); nothing was written");
+    const p = app.el.querySelector("p.live");
+    expect(p?.getAttribute("role") === "status" || p?.getAttribute("aria-live") === "polite").toBe(true);
   });
 
   it("a slow export that finishes after New scan writes nothing under the chooser", async () => {
     const d = deferred<string | null>();
     const app = await mount({ currentState: async () => LOADED, exportPlan: () => d.promise });
-    button(app, "Export plan...").click();
+    button(app, "Export plan to a folder...").click();
     await flush(2);
     button(app, "New scan").click();
     await flush(2);
@@ -109,7 +125,7 @@ describe("status line (CT-F6, CT-c)", () => {
   it("a slow export that fails after New scan writes nothing under the chooser", async () => {
     const d = deferred<string | null>();
     const app = await mount({ currentState: async () => LOADED, exportPlan: () => d.promise });
-    button(app, "Export plan...").click();
+    button(app, "Export plan to a folder...").click();
     await flush(2);
     button(app, "New scan").click();
     await flush(2);
@@ -191,7 +207,7 @@ describe("status line (CT-F6, CT-c)", () => {
 
   it("a plan-export confirmation stays while the user changes tab in the same results", async () => {
     const app = await mount({ currentState: async () => LOADED, exportPlan: async () => "/out/p.json" });
-    button(app, "Export plan...").click();
+    button(app, "Export plan to a folder...").click();
     await flush(5);
     ([...app.el.querySelectorAll("[role=tab]")].find((t) => t.textContent === "Treemap") as HTMLButtonElement).click();
     await flush(5);

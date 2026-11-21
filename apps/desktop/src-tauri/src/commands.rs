@@ -7,7 +7,7 @@
 use crate::dialogs;
 use crate::state::{AppError, Emit, Inner, SaveReport, ScanEvent, ScanSettings};
 use disk_cleaner_view::dev::{DevItem, DevSummary};
-use disk_cleaner_view::export::{stamp, write_plan_new};
+use disk_cleaner_view::export::export_to_dir;
 use disk_cleaner_view::jobs::{JobId, JobState};
 use disk_cleaner_view::sanitize::display_name;
 use disk_cleaner_view::sessions::SessionFolder;
@@ -190,8 +190,10 @@ pub async fn open_scan_file(app: AppHandle, state: State<'_, AppState>) -> Res<O
     .await
 }
 
-/// Save the shown plan as JSON to a new file the user names. An existing file is never
-/// replaced (spec NEG-6).
+/// Save the shown plan as JSON to a new file in a folder the user picks. The app names the file
+/// (`prunedisk-plan-<stamp>.json`, then `-2`, `-3`...), so no dialog on any system can ask to
+/// replace a file the app would then refuse to touch (click-test N2). An existing file is never
+/// replaced (spec NEG-6). The folder is not remembered.
 #[tauri::command]
 pub async fn export_plan(app: AppHandle, state: State<'_, AppState>, view: u64) -> Res<Option<String>> {
     let inner = Arc::clone(&state.0);
@@ -204,10 +206,11 @@ pub async fn export_plan(app: AppHandle, state: State<'_, AppState>, view: u64) 
                 .ok_or_else(|| AppError::refused("the plan is not ready yet"))?;
             Arc::clone(&a.plan)
         };
-        let Some(path) = pick_export_file(&app)? else {
+        let Some(dir) = pick_export_folder(&app)? else {
             return Ok(None);
         };
-        write_plan_new(&path, &plan).map_err(|e| AppError::refused(e.to_string()))?;
+        let path = export_to_dir(&dir, &plan, disk_cleaner_view::units::now())
+            .map_err(|e| AppError::refused(e.to_string()))?;
         Ok(Some(display_name(&path.to_string_lossy())))
     })
     .await
@@ -231,24 +234,24 @@ fn pick_scan_file(app: &AppHandle) -> Res<Option<PathBuf>> {
         .map_err(|e| AppError::refused(format!("cannot use that file: {e}")))
 }
 
-/// The save dialog, or (test builds with the `e2e` feature) the next file it is told to name.
-fn pick_export_file(app: &AppHandle) -> Res<Option<PathBuf>> {
+/// The folder dialog for the export, or (test builds with the `e2e` feature) the next folder it
+/// is told to pick. A folder dialog, not a save dialog: a save dialog asks "replace?" for a
+/// taken name on every system and that cannot be turned off (rfd's GTK backend sets it
+/// unconditionally; Windows and macOS ask by default).
+fn pick_export_folder(app: &AppHandle) -> Res<Option<PathBuf>> {
     #[cfg(feature = "e2e")]
     if let Some(answer) = crate::e2e::next_export() {
         return Ok(answer);
     }
-    let name = format!("prunedisk-plan-{}.json", stamp(disk_cleaner_view::units::now()));
-    let Some(picked) = dialogs::file_dialog(app, "Export the plan")
-        .set_file_name(&name)
-        .add_filter("JSON", &["json"])
-        .blocking_save_file()
+    let Some(picked) = dialogs::file_dialog(app, "Export the plan to a folder")
+        .blocking_pick_folder()
     else {
         return Ok(None);
     };
     picked
         .into_path()
         .map(Some)
-        .map_err(|e| AppError::refused(format!("cannot use that file: {e}")))
+        .map_err(|e| AppError::refused(format!("cannot use that folder: {e}")))
 }
 
 #[tauri::command]

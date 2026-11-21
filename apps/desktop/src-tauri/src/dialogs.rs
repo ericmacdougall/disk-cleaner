@@ -68,7 +68,32 @@ mod tests {
         assert_eq!(
             code(&commands).matches("dialogs::file_dialog(").count(),
             3,
-            "the folder, open and save dialogs"
+            "the scan folders, open and export folder dialogs"
         );
+    }
+
+    /// Click-test N2: a save dialog asks "replace?" for a taken name (GTK always, through rfd;
+    /// Windows and macOS by default), and the app never replaces a file (NEG-6), so the app has
+    /// no save dialog at all. Export picks a folder and the app names the file.
+    #[test]
+    fn no_dialog_can_offer_to_replace_a_file() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for e in std::fs::read_dir(&src).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&p).unwrap();
+            let c = code(&text);
+            for word in ["save_file", "set_file_name"] {
+                assert!(!c.contains(word), "{} uses {word}", p.display());
+            }
+        }
+        let commands = std::fs::read_to_string(src.join("commands.rs")).unwrap();
+        let c = code(&commands);
+        let export = &c[c.find("fn pick_export_folder").expect("the export folder dialog")..];
+        let export = &export[..export.find("\n}\n").unwrap()];
+        assert!(export.contains(".blocking_pick_folder()"), "{export}");
+        assert!(c.contains("export_to_dir(&dir"), "the app names the exported file");
     }
 }

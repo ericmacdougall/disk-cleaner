@@ -38,7 +38,7 @@ pub fn write_plan_new(path: &Path, plan: &Plan) -> Result<(), ExportError> {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 ExportError::Exists(format!("{shown} already exists; nothing was written"))
             } else {
-                ExportError::Io(format!("cannot create {shown}: {e}"))
+                ExportError::Io(format!("cannot create {shown}: {e}; nothing was written"))
             }
         })?;
     let done = file
@@ -49,10 +49,16 @@ pub fn write_plan_new(path: &Path, plan: &Plan) -> Result<(), ExportError> {
         drop(file);
         // Only the file this call just created.
         let _ = std::fs::remove_file(path);
-        return Err(ExportError::Io(format!("cannot write {shown}: {e}")));
+        return Err(ExportError::Io(format!(
+            "cannot write {shown}: {e}; nothing was kept"
+        )));
     }
     Ok(())
 }
+
+/// How many names `export_to_dir` tries before it gives up: the stamped name, then `-2` up to
+/// this. A folder that already holds this many plans for one second is refused.
+pub const EXPORT_NAME_TRIES: u32 = 1000;
 
 /// `YYYYMMDD-HHMMSS` (UTC) for unix seconds.
 pub fn stamp(unix: i64) -> String {
@@ -76,16 +82,40 @@ pub fn stamp(unix: i64) -> String {
     )
 }
 
-/// Export into `dir` under `prunedisk-plan-<stamp>.json`, or `-2`, `-3`... when taken.
+/// Export into `dir` under `prunedisk-plan-<stamp>.json`, or `-2`, `-3`... when taken. The app
+/// names the file, so no dialog ever asks to replace one (click-test N2). A name that is taken
+/// by anything (a file, a folder, a symlink, even a dangling one) is skipped, never followed or
+/// replaced; `write_plan_new`'s create-new open stays the final guard against a name taken in
+/// between (two exports in the same second). Nothing outside `dir` is written.
 pub fn export_to_dir(dir: &Path, plan: &Plan, now: i64) -> Result<PathBuf, ExportError> {
+    export_to_dir_within(dir, plan, now, EXPORT_NAME_TRIES)
+}
+
+fn export_to_dir_within(
+    dir: &Path,
+    plan: &Plan,
+    now: i64,
+    tries: u32,
+) -> Result<PathBuf, ExportError> {
+    let shown = display_name(&dir.to_string_lossy());
+    if !dir.is_dir() {
+        return Err(ExportError::Io(format!(
+            "{shown} is not a folder; nothing was written"
+        )));
+    }
     let base = format!("prunedisk-plan-{}", stamp(now));
-    for n in 1..=1000u32 {
+    for n in 1..=tries {
         let name = if n == 1 {
             format!("{base}.json")
         } else {
             format!("{base}-{n}.json")
         };
         let path = dir.join(name);
+        // Taken by anything, including a symlink to nowhere: next name. (On Windows a folder
+        // with the name fails create-new as "access denied", not "exists".)
+        if path.symlink_metadata().is_ok() {
+            continue;
+        }
         match write_plan_new(&path, plan) {
             Ok(()) => return Ok(path),
             Err(ExportError::Exists(_)) => continue,
@@ -93,8 +123,7 @@ pub fn export_to_dir(dir: &Path, plan: &Plan, now: i64) -> Result<PathBuf, Expor
         }
     }
     Err(ExportError::Io(format!(
-        "no free file name for the plan in {}",
-        display_name(&dir.to_string_lossy())
+        "no free file name for the plan in {shown} ({tries} names tried); nothing was written"
     )))
 }
 
@@ -142,6 +171,142 @@ mod tests {
             write_plan_new(&first, &p),
             Err(ExportError::Exists(_))
         ));
+    }
+
+    /// The names in `dir`, sorted.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn nth(n: u32) -> String {
+        if n == 1 {
+            format!("prunedisk-plan-{}.json", stamp(EPOCH))
+        } else {
+            format!("prunedisk-plan-{}-{n}.json", stamp(EPOCH))
+        }
+    }
+
+    #[test]
+    fn the_name_and_its_first_suffix_taken_gives_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(nth(1)), b"one").unwrap();
+        std::fs::write(dir.path().join(nth(2)), b"two").unwrap();
+        let got = export_to_dir(dir.path(), &plan(), EPOCH).unwrap();
+        assert_eq!(got, dir.path().join(nth(3)));
+        assert_eq!(std::fs::read(dir.path().join(nth(1))).unwrap(), b"one");
+        assert_eq!(std::fs::read(dir.path().join(nth(2))).unwrap(), b"two");
+        let mut want = vec![nth(1), nth(2), nth(3)];
+        want.sort();
+        assert_eq!(names(dir.path()), want);
+    }
+
+    #[test]
+    fn a_folder_with_the_name_is_skipped_and_left_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(nth(1))).unwrap();
+        let got = export_to_dir(dir.path(), &plan(), EPOCH).unwrap();
+        assert_eq!(got, dir.path().join(nth(2)));
+        assert!(names(&dir.path().join(nth(1))).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_with_the_name_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // A dangling link (create-new through it would create the target) and a link to a
+        // file outside (writing through it would change that file).
+        let missing = outside.path().join("would-be-created");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&missing, dir.path().join(nth(1))).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join(nth(2))).unwrap();
+        let got = export_to_dir(dir.path(), &plan(), EPOCH).unwrap();
+        assert_eq!(got, dir.path().join(nth(3)));
+        assert!(
+            missing.symlink_metadata().is_err(),
+            "the dangling link's target was created"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert_eq!(names(outside.path()), vec!["victim".to_string()]);
+        assert_eq!(
+            std::fs::read_link(dir.path().join(nth(1))).unwrap(),
+            missing
+        );
+    }
+
+    #[test]
+    fn two_exports_in_the_same_second_write_two_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = std::sync::Arc::new(plan());
+        let path = dir.path().to_path_buf();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (p, path) = (std::sync::Arc::clone(&p), path.clone());
+                std::thread::spawn(move || export_to_dir(&path, &p, EPOCH).unwrap())
+            })
+            .collect();
+        let mut got: Vec<PathBuf> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        got.sort();
+        got.dedup();
+        assert_eq!(got.len(), 8, "two exports shared a file: {got:?}");
+        for f in &got {
+            let back: Plan = serde_json::from_str(&std::fs::read_to_string(f).unwrap()).unwrap();
+            assert!(back.dry_run);
+        }
+        assert_eq!(names(dir.path()).len(), 8);
+    }
+
+    #[test]
+    fn the_name_search_is_bounded_and_writes_nothing_when_all_are_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 1..=3 {
+            std::fs::write(dir.path().join(nth(n)), b"taken").unwrap();
+        }
+        let before = names(dir.path());
+        let e = export_to_dir_within(dir.path(), &plan(), EPOCH, 3).unwrap_err();
+        assert!(e.to_string().contains("3 names tried"), "{e}");
+        assert!(e.to_string().ends_with("nothing was written"), "{e}");
+        assert_eq!(names(dir.path()), before);
+        assert_eq!(EXPORT_NAME_TRIES, 1000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_written_gives_a_clear_message_and_no_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("read-only");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root (some containers) ignores the mode: nothing to check there.
+        let probe = ro.join("probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            std::fs::remove_file(&probe).unwrap();
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let e = export_to_dir(&ro, &plan(), EPOCH).unwrap_err();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let m = e.to_string();
+        assert!(m.starts_with("cannot create "), "{m}");
+        assert!(m.ends_with("nothing was written"), "{m}");
+        assert!(names(&ro).is_empty());
+    }
+
+    #[test]
+    fn a_file_picked_as_the_folder_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-folder");
+        std::fs::write(&file, b"x").unwrap();
+        let e = export_to_dir(&file, &plan(), EPOCH).unwrap_err();
+        assert!(e.to_string().contains("is not a folder"), "{e}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
     }
 
     #[test]

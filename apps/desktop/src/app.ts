@@ -261,7 +261,7 @@ export class App {
       s.phase === "analysing"
         ? h("span", {}, "Analysing repositories and building the plan... ", h("button", { type: "button", onclick: () => this.scan.cancel() }, "Cancel"))
         : h("span", {}, s.imported ? "Imported scan file. " : "Scan complete. "),
-      (this.exportButton = h("button", { type: "button", disabled: !s.analysed || this.exporting, onclick: () => void this.exportPlan(view) }, "Export plan...")),
+      (this.exportButton = h("button", { type: "button", disabled: !s.analysed || this.exporting, onclick: () => void this.exportPlan(view) }, EXPORT_LABEL)),
       " ",
       h("button", { type: "button", disabled: s.phase === "analysing", onclick: () => this.scan.newScan() }, "New scan"),
     );
@@ -372,6 +372,10 @@ export class App {
     if (b?.isConnected) b.disabled = this.exporting || !this.scan.snapshot.analysed;
   }
 }
+
+/** The Export control says what it does (click-test N2): it asks for a folder, and the app
+ * names a new file in it. There is no save dialog, so nothing can offer to replace a file. */
+export const EXPORT_LABEL = "Export plan to a folder...";
 
 /** The export confirmation (CT-c): the file written, and that nothing else changed. */
 export function exportedText(where: string): string {
