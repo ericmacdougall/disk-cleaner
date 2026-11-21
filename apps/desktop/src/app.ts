@@ -106,9 +106,10 @@ export class App {
     this.line.enter("chooser");
     this.shownView = null;
     this.views = {};
+    // role "list": WebKit drops a <ul>'s list role when its list style is removed (styles.css).
     const list = h(
       "ul",
-      { class: "places", "aria-label": "Drives" },
+      { class: "places", role: "list", "aria-label": "Drives" },
       ...this.volumes.map((v) => {
         const id = `vol-${v.path}`;
         const box = h("input", {
@@ -127,7 +128,7 @@ export class App {
     );
     const chosenList = h(
       "ul",
-      { class: "chosen", "aria-label": "Chosen folders" },
+      { class: "chosen", role: "list", "aria-label": "Chosen folders" },
       ...[...this.chosen.values()].map((p) =>
         h("li", {}, p.label, " ", h("button", { type: "button", class: "link", "aria-label": `Remove ${p.label}`, onclick: () => { this.chosen.delete(p.path); this.renderChooser(); } }, "Remove")),
       ),
