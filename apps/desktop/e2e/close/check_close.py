@@ -21,6 +21,16 @@ Routes:
   kill-client   the app's X connection is closed (xkill; the server going away at logout)
   sigterm, sighup, sigkill   the signal, to the app's own pid
 
+How the app must end, per route (anything else, a crash above all, fails the case):
+  wm-close, destroy-*   exit 0 through the run loop's exit (the `e2e: event exit` line), which
+                        ends the worker (Inner::shutdown)
+  kill-client           exit 1 (GTK ends a program whose display connection is gone)
+  sigterm, sighup, sigkill   killed by that signal (the worker's own watchdog then ends it
+                        and its gits: the parent-death backstop)
+
+Outside the table: destroying GTK's hidden client-leader window (route `destroy-leader`) is
+not a close. The app must keep running with its window shown; the check then ends it.
+
 The harness is a child subreaper, so a process orphaned by its parent's exit stays visible to
 it (and is reaped by it) instead of escaping to init. "Gone" means absent from /proc after
 reaping: a zombie still waiting for a live parent is not gone.
@@ -51,6 +61,10 @@ DEADLINE_S = 10.0
 ROUTES = ["wm-close", "destroy-wm", "destroy-nowm", "kill-client", "sigterm", "sighup", "sigkill"]
 PHASES = ["walk", "analyse"]
 REAPED: dict[int, int] = {}
+EXPECTED_STATUS = {
+    "wm-close": "exit 0", "destroy-wm": "exit 0", "destroy-nowm": "exit 0",
+    "kill-client": "exit 1", "sigterm": "signal 15", "sighup": "signal 1", "sigkill": "signal 9",
+}
 
 
 def xq(*args: str) -> subprocess.CompletedProcess:
@@ -138,6 +152,7 @@ class Case:
         self.dir = Path(args.out) / self.name
         self.display = f":{90 + n}"
         self.wm = route in ("wm-close", "destroy-wm", "kill-client")
+        self.keeps_running = route == "destroy-leader"
         self.deadline = args.control_deadline if route == "none" else DEADLINE_S
         self.tracked: dict[tuple[int, int], dict] = {}
         self.app = self.xvfb = self.openbox = None
@@ -265,6 +280,13 @@ class Case:
         elif r in ("destroy-wm", "destroy-nowm"):
             xq("destroy", self.display, self.wid)
             info["window_gone_after_destroy"] = xq("exists", self.display, self.wid).returncode == 1
+        elif r == "destroy-leader":
+            lead = xq("leader", self.display, str(self.app.pid)).stdout.strip()
+            if not lead:
+                raise RuntimeError("no client-leader window found")
+            info["leader"] = hex(int(lead))
+            xq("destroy", self.display, lead)
+            info["window_gone_after_destroy"] = xq("exists", self.display, lead).returncode == 1
         elif r == "kill-client":
             xq("kill", self.display, self.wid)
         elif r in ("sigterm", "sighup", "sigkill"):
@@ -330,7 +352,13 @@ class Case:
             self.say(f"acting: {json.dumps(res['before'])}")
             t0 = now()
             res.update(self.act())
-            res.update(self.watch(t0))
+            if self.keeps_running:
+                time.sleep(5)
+                reap()
+                res["app_running_after_5_s"] = self.app.pid not in REAPED and self.app.pid in procs()
+                res["toplevel_still_shown"] = xq("exists", self.display, self.wid).returncode == 0
+            else:
+                res.update(self.watch(t0))
             st = REAPED.get(self.app.pid)
             if st is not None:
                 res["app_status"] = (f"exit {os.WEXITSTATUS(st)}" if os.WIFEXITED(st)
@@ -353,14 +381,23 @@ class Case:
                                 *sum((["--declared", str(d)] for d in declared), [])],
                                capture_output=True, text=True)
             res["no_write"] = "clean" if c.returncode == 0 and cmp.returncode == 0 else c.stdout[-2000:]
-        ok = ("error" not in res and res.get("all_gone_s") is not None
-              and res["all_gone_s"] <= self.deadline and res.get("app_exit_s") is not None
-              and res.get("no_write") == "clean"
-              and res.get("window_gone_after_destroy", True))
+        want = EXPECTED_STATUS.get(self.route)
+        res["expected_status"] = want
+        ended_cleanly = (want is None or res.get("app_status") == want) and (
+            want != "exit 0" or "e2e: event exit" in res.get("events", []))
+        if self.keeps_running:
+            ok = bool("error" not in res and res.get("app_running_after_5_s")
+                      and res.get("toplevel_still_shown") and res.get("window_gone_after_destroy")
+                      and res.get("no_write") == "clean")
+        else:
+            ok = ("error" not in res and res.get("all_gone_s") is not None
+                  and res["all_gone_s"] <= self.deadline and res.get("app_exit_s") is not None
+                  and res.get("no_write") == "clean" and ended_cleanly
+                  and res.get("window_gone_after_destroy", True))
         res["result"] = "PASS" if ok else "FAIL"
         self.say(f"{res['result']}: app exit {res.get('app_exit_s')} s, worker gone {res.get('worker_gone_s')} s, "
                  f"all gone {res.get('all_gone_s')} s, X server gone {res.get('xserver_gone_s')} s, "
-                 f"app {res.get('app_status')}, left {res.get('left_at_end')}, no-write {str(res.get('no_write'))[:80]}, "
+                 f"app {res.get('app_status')} (want {res.get('expected_status')}), left {res.get('left_at_end')}, no-write {str(res.get('no_write'))[:80]}, "
                  f"error {res.get('error')}")
         (self.dir / "result.json").write_text(json.dumps(res, indent=2))
         (self.dir / "log.txt").write_text("\n".join(self.log) + "\n")
@@ -423,17 +460,19 @@ def main() -> int:
     if args.cases:
         cases = [tuple(c.split(":", 1)) for c in args.cases.split(",") if c]
     else:
-        cases = [(p, r) for p in PHASES for r in ROUTES] + [("analyse", "none")]
+        cases = ([(p, r) for p in PHASES for r in ROUTES]
+                 + [("analyse", "destroy-leader"), ("analyse", "none")])
     results = []
     for n, (phase, route) in enumerate(cases):
         results.append(Case(phase, route, args, n).run())
 
     (out / "results.json").write_text(json.dumps(results, indent=2))
-    lines = ["| case | window manager | app exit (s) | worker gone (s) | all gone (s) | left | no-write | events | result |",
-             "|---|---|---|---|---|---|---|---|---|"]
+    lines = ["| case | window manager | app ended | app exit (s) | worker gone (s) | all gone (s) | left | no-write | events | result |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for r in results:
         ev = "; ".join(e.replace("e2e: event ", "") for e in r.get("events", []) if e.startswith("e2e: event"))
-        lines.append(f"| {r['case']} | {r['window_manager'] or 'none'} | {r.get('app_exit_s')} | {r.get('worker_gone_s')} | "
+        ended = r.get("app_status") or ("still running (wanted)" if r.get("app_running_after_5_s") else "-")
+        lines.append(f"| {r['case']} | {r['window_manager'] or 'none'} | {ended} | {r.get('app_exit_s')} | {r.get('worker_gone_s')} | "
                      f"{r.get('all_gone_s')} | {len(r.get('left_at_end', [])) if 'left_at_end' in r else r.get('error', '')} | "
                      f"{'clean' if r.get('no_write') == 'clean' else 'CHANGED' if 'no_write' in r else 'n/a'} | {ev or '-'} | {r['result']} |")
     table = "\n".join(lines)

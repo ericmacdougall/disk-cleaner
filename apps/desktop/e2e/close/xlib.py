@@ -227,6 +227,13 @@ def main(argv: list[str]) -> int:
         w = x.toplevel(int(argv[2]))
         print(w or "")
         return 0 if w else 1
+    if cmd == "leader":
+        # GTK's hidden client-leader window (WM_CLIENT_LEADER of the top-level): it carries
+        # the app's pid as well, but is never shown.
+        top = x.toplevel(int(argv[2]))
+        lead = x._prop(top, "WM_CLIENT_LEADER", XA_WINDOW) if top else []
+        print(lead[0] if lead and lead[0] != top else "")
+        return 0 if lead and lead[0] != top else 1
     w = int(argv[2])
     if cmd == "exists":
         return 0 if x.exists(w) else 1
