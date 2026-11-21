@@ -27,8 +27,23 @@ pub fn run() {
     #[cfg(feature = "e2e")]
     e2e_open(&inner);
     let on_exit = std::sync::Arc::clone(&inner);
-    let app = tauri::Builder::default()
+    #[cfg(feature = "e2e")]
+    let on_setup = std::sync::Arc::clone(&inner);
+    let builder = tauri::Builder::default();
+    // Test-only: say when the page has loaded, so the window-close check acts on a settled app.
+    #[cfg(feature = "e2e")]
+    let builder = builder.on_page_load(|_, payload| {
+        if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+            eprintln!("e2e: page loaded");
+        }
+    });
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
+        .setup(move |_app| {
+            #[cfg(feature = "e2e")]
+            e2e_start(_app.handle(), &on_setup);
+            Ok(())
+        })
         .manage(AppState(inner))
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
@@ -54,11 +69,26 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("PruneDisk could not start");
     app.run(move |_, event| {
+        #[cfg(feature = "e2e")]
+        e2e_log(&event);
         if let tauri::RunEvent::Exit = event {
-            // End any analysis worker and the git commands it started.
-            on_exit.shutdown();
+            end_app(&on_exit);
         }
     });
+}
+
+/// The one way out of the app while it still runs code: the run loop's Exit, which a close
+/// request (the close button, the window manager's close, Alt+F4), the last window being
+/// destroyed and a quit all reach. It ends the analysis worker and every git command it
+/// started ([`Inner::shutdown`], safe to run more than once). Ways out that run no code in the
+/// app (a signal that kills it, a lost display connection, a crash) are left to the worker,
+/// which ends itself and its gits when its input closes (worker.rs). The window-close check
+/// (e2e/close/check_close.py, workflow desktop-close) exercises each route, with broken
+/// variants of both halves.
+fn end_app(inner: &Inner) {
+    inner.shutdown();
+    #[cfg(feature = "e2e")]
+    eprintln!("e2e: shutdown done");
 }
 
 /// Test-only (the `e2e` feature, never in release bundles): open the scan file named by
@@ -70,6 +100,54 @@ fn e2e_open(inner: &Inner) {
             eprintln!("e2e: cannot open the scan file: {e}");
         }
     }
+}
+
+/// Test-only (the `e2e` feature): scan the folders named by `PRUNEDISK_E2E_START` at start,
+/// through the same offer and Start as the chooser, with git facts.
+#[cfg(feature = "e2e")]
+fn e2e_start(app: &tauri::AppHandle, inner: &std::sync::Arc<Inner>) {
+    use tauri::Emitter;
+    let Some(roots) = e2e::start_roots() else {
+        return;
+    };
+    let roots: Vec<String> = roots
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect();
+    inner.offer_roots(roots.iter().map(String::as_str));
+    let handle = app.clone();
+    let emit: state::Emit = std::sync::Arc::new(move |e: &state::ScanEvent| {
+        let _ = handle.emit("scan", e);
+    });
+    let settings = state::ScanSettings {
+        collect_git_facts: true,
+    };
+    match inner.start_scan(&roots, settings, emit) {
+        Ok(job) => eprintln!("e2e: started scan job {job:?}"),
+        Err(e) => eprintln!("e2e: cannot start the scan: {e}"),
+    }
+}
+
+/// Test-only (the `e2e` feature): one stderr line per window or exit event of the run loop.
+#[cfg(feature = "e2e")]
+fn e2e_log(event: &tauri::RunEvent) {
+    use tauri::{RunEvent, WindowEvent};
+    let what = match event {
+        RunEvent::Exit => "exit".to_string(),
+        RunEvent::ExitRequested { code, .. } => format!("exit requested (code {code:?})"),
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { .. },
+            ..
+        } => format!("window {label} close requested"),
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Destroyed,
+            ..
+        } => format!("window {label} destroyed"),
+        _ => return,
+    };
+    eprintln!("e2e: event {what}");
 }
 
 #[cfg(test)]
