@@ -29,22 +29,24 @@ A chunk is about 1 MiB of a large file on average (FastCDC, 256 KiB to 4 MiB); a
 1 MiB is one chunk. So the number of chunks is roughly the data size in MiB, plus one per small
 file.
 
-Every pack the repository holds also costs the share twice, about 400 bytes in the chunk map
-and about 400 in the pack listing held beside it. With large files a pack holds about one
-chunk per MiB of `--max-pack` (16 on the Mac profile, 32 by default), so a chunk costs about
-90 bytes on the Mac profile and 65 by default. With small files a pack holds thousands of
-chunks, and a chunk costs about 40 bytes.
+Every pack the repository holds also costs the share twice, about 550 bytes in the chunk map
+and about 550 in the pack listing held beside it. (The figure is measured: on macOS the many
+small strings of a pack listing fragment the allocator, and a pack cost about 930 bytes in all
+where 804 had been charged.) With large files a pack holds about one chunk per MiB of
+`--max-pack` (16 on the Mac profile, 32 by default), so a chunk costs about 110 bytes on the
+Mac profile and 75 by default. With small files a pack holds thousands of chunks, and a chunk
+costs about 40 bytes.
 
 | Profile | `--mem-budget` | Index share | Backup: large files | Backup: small files | Restore: large / small | New chunks at a time |
 |---|---|---|---|---|---|---|
-| Mac | 640Mi | 80 MiB | 730,517 chunks (about 710 GiB) | 1,648,229 files | 926,580 / 2,090,598 | 229,376 |
-| Default | 1640Mi | 205 MiB | 3,022,957 (about 2.9 TiB) | 4,921,753 | 3,296,674 / 5,367,398 | 229,376 |
-| Largest share | 2048Mi or more | 256 MiB | 3,844,107 (about 3.7 TiB) | 6,258,687 | 4,117,824 / 6,704,332 | 229,376 |
+| Mac | 640Mi | 80 MiB | 604,855 chunks (about 590 GiB) | 1,648,229 files | 767,192 / 2,090,598 | 229,376 |
+| Default | 1640Mi | 205 MiB | 2,642,552 (about 2.5 TiB) | 4,921,753 | 2,881,824 / 5,367,398 | 229,376 |
+| Largest share | 2048Mi or more | 256 MiB | 3,360,369 (about 3.2 TiB) | 6,258,687 | 3,599,641 / 6,704,332 | 229,376 |
 
 These figures are the arithmetic of `map_fit`, `backup_map_fit`, `chunk_map_fit` and
-`hot_room` in `src/repo.rs` (the unit test `supported_sizes_per_profile` pins the small-file
-ones). The measured cost per chunk is in the next section. MEASUREMENT PENDING: the table
-is confirmed only once that section carries the measured numbers.
+`hot_room` in `src/repo.rs`, and the unit test `supported_sizes_per_profile` pins them. The
+measured cost per chunk is in the next section. MEASUREMENT PENDING: the table is confirmed
+only once that section carries the measured numbers on Linux and macOS.
 
 When a limit is reached:
 

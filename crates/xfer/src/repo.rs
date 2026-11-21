@@ -502,13 +502,19 @@ impl Meter {
 pub const MAP_ENTRY: u64 = 40;
 
 /// What one pack held by a chunk map costs: its `ObjRef` in the pack list (two strings and a
-/// size) and its key again in the pack lookup table, with allocator and table slack.
+/// size) and its key again in the pack lookup table, with allocator and table slack. The slack
+/// is measured, not modelled: on macOS CI (8c0a21b) a share filled at 16 chunks a pack cost
+/// about 930 bytes a pack for the map and the listing together, against 804 charged at a slack
+/// of 200 (small strings fragment the allocator's regions there). 350 charges 1104.
 pub fn pack_cost(p: &ObjRef) -> u64 {
-    2 * p.key.len() as u64 + p.hash.len() as u64 + 200
+    2 * p.key.len() as u64 + p.hash.len() as u64 + PACK_SLACK
 }
 
+/// Allocator and table slack per pack (see [`pack_cost`]).
+pub const PACK_SLACK: u64 = 350;
+
 /// The cost of a typical pack (a 81-byte key and a 40-character sha1).
-pub const PACK_COST: u64 = 2 * 81 + 40 + 200;
+pub const PACK_COST: u64 = 2 * 81 + 40 + PACK_SLACK;
 
 /// The most chunks a map with share `bytes` holds when packs carry `per_pack` chunks each:
 /// each pack costs its place in the map and its entry in the pack listing.
@@ -1723,6 +1729,12 @@ mod tests {
             ),
             (6_258_687, 6_704_332)
         );
+        // large files: about one chunk per MiB of --max-pack in each pack (16 on the Mac
+        // profile, 32 by default), every pack charged in the map and in the listing
+        let big = |i: u64, per: u64| (map_fit(i - hot_table(i).1, per), map_fit(i, per));
+        assert_eq!(big(mac, 16), (604_855, 767_192));
+        assert_eq!(big(def, 32), (2_642_552, 2_881_824));
+        assert_eq!(big(INDEX_SHARE_MAX, 32), (3_360_369, 3_599_641));
         // the advice names a budget that holds the map, and the next MiB down does not
         let need = 3_000_000 * MAP_ENTRY + slots_bytes(INDEX_SHARE_MAX);
         let m = budget_for_map(need, true).expect("a budget holds 3M chunks");
