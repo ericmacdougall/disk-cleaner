@@ -18,6 +18,20 @@ pub struct RemoteObject {
     pub hash: Option<String>,
 }
 
+/// Every transport refuses keys that could escape the repository root or be read differently by
+/// another backend: empty, absolute, `.`/`..` or empty components, backslashes, control bytes.
+pub fn check_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || key.starts_with('/')
+        || key.contains('\\')
+        || key.bytes().any(|b| b < 0x20 || b == 0x7f)
+        || key.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        return Err(Error::Refused(format!("bad object key {key:?}")));
+    }
+    Ok(())
+}
+
 /// Keys are relative to the repository root and use `/` separators.
 pub trait Transport: Send + Sync {
     /// The checksum the store reports for stored objects, if any.

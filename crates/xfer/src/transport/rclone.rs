@@ -9,7 +9,7 @@
 //!   and low-level retries. Backend cutoffs are pinned at 200 MiB so every pack is single-part.
 //! - The engine never calls `config/*` and never reads rclone's config file.
 
-use super::{RemoteObject, Transport};
+use super::{check_key, RemoteObject, Transport};
 use crate::error::{looks_throttled, Error, Result};
 use crate::hash::HashKind;
 use crate::util;
@@ -113,6 +113,10 @@ impl RcloneRcd {
     }
     pub fn base_url(&self) -> &str {
         &self.base
+    }
+    /// The private directory holding the htpasswd file (for the hygiene test).
+    pub fn private_dir(&self) -> &std::path::Path {
+        &self.tmpdir
     }
 
     pub fn start(bin: &str, root: &str, max_pack: u64) -> Result<RcloneRcd> {
@@ -261,7 +265,9 @@ impl RcloneRcd {
             root: root.to_string(),
             agent,
             kind: None,
-            tmpdir: tmpdir.to_path_buf(),
+            // start() owns the tmpdir until this rcd is proven ready (set below), so a failed
+            // attempt does not delete the htpasswd file the next attempt needs.
+            tmpdir: PathBuf::new(),
             version,
             log,
             args: args.to_vec(),
@@ -312,6 +318,7 @@ impl RcloneRcd {
         } else {
             None
         };
+        me.tmpdir = tmpdir.to_path_buf();
         Ok(me)
     }
 
@@ -323,15 +330,26 @@ impl RcloneRcd {
     }
 
     fn map_err(&self, what: &str, e: ureq::Error) -> Error {
-        let text = match e {
+        // Classify on the status code and rclone's own `error` field only: the rest of an rc
+        // error body echoes our input, and hex keys may contain "429" or "503".
+        let (text, throttled) = match e {
             ureq::Error::Status(code, resp) => {
                 let mut body = String::new();
                 let _ = resp.into_reader().take(64 << 10).read_to_string(&mut body);
-                format!("{what}: HTTP {code}: {body}")
+                let err = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or(body);
+                let throttled = code == 429 || code == 503 || looks_throttled(&err);
+                (format!("{what}: HTTP {code}: {err}"), throttled)
             }
-            ureq::Error::Transport(t) => format!("{what}: {t}"),
+            ureq::Error::Transport(t) => {
+                let s = format!("{what}: {t}");
+                let th = looks_throttled(&s);
+                (s, th)
+            }
         };
-        if looks_throttled(&text) {
+        if throttled {
             Error::Throttled(text)
         } else {
             Error::Transport(text)
@@ -386,6 +404,7 @@ impl Transport for RcloneRcd {
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        check_key(key)?;
         let (dir, name) = key.rsplit_once('/').unwrap_or(("", key));
         if name.is_empty()
             || !name
@@ -425,6 +444,7 @@ impl Transport for RcloneRcd {
     }
 
     fn stat(&self, key: &str) -> Result<Option<RemoteObject>> {
+        check_key(key)?;
         let v = self.rc(
             "operations/stat",
             json!({"fs": self.root, "remote": key, "opt": {"showHash": true, "noMimeType": true}}),
@@ -436,6 +456,9 @@ impl Transport for RcloneRcd {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<RemoteObject>> {
+        if !prefix.is_empty() {
+            check_key(prefix)?;
+        }
         let r = self.rc(
             "operations/list",
             json!({"fs": self.root, "remote": prefix, "opt": {
@@ -458,11 +481,16 @@ impl Transport for RcloneRcd {
         let mut out = Vec::with_capacity(items.len());
         for it in items {
             let p = it.get("Path").and_then(Value::as_str).unwrap_or("");
-            let key = if prefix.is_empty() {
-                p.to_string()
-            } else {
-                format!("{}/{}", prefix.trim_end_matches('/'), p)
-            };
+            // rc operations/list reports Path from the fs root, prefix included (observed on
+            // 1.60 in rcd_hygiene). Anything outside the prefix means that assumption broke:
+            // fail loudly rather than guess a key.
+            let pre = format!("{}/", prefix.trim_end_matches('/'));
+            if !prefix.is_empty() && !p.starts_with(&pre) {
+                return Err(Error::Transport(format!(
+                    "list {prefix}: item {p:?} is outside the prefix"
+                )));
+            }
+            let key = p.to_string();
             if let Some(o) = self.obj(&key, &it, self.kind) {
                 out.push(o);
             }
@@ -472,6 +500,7 @@ impl Transport for RcloneRcd {
     }
 
     fn get(&self, key: &str, max: u64) -> Result<Vec<u8>> {
+        check_key(key)?;
         let url = format!(
             "{}{}/{}",
             self.base,
@@ -517,7 +546,9 @@ impl Drop for RcloneRcd {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&self.tmpdir);
+        if !self.tmpdir.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.tmpdir);
+        }
     }
 }
 

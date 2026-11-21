@@ -44,15 +44,42 @@ impl Error {
     }
 }
 
+/// A status code as a standalone token (not inside a hex key such as `.../ab429f...`).
+fn has_code(t: &str, code: &str) -> bool {
+    let b = t.as_bytes();
+    t.match_indices(code).any(|(i, m)| {
+        let before = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        let j = i + m.len();
+        let after = j >= b.len() || !b[j].is_ascii_alphanumeric();
+        before && after
+    })
+}
+
 /// True when an error text from rclone or a store signals throttling (429, 503, B2 too_busy).
 pub fn looks_throttled(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
-    t.contains("429")
-        || t.contains("503")
+    has_code(&t, "429")
+        || has_code(&t, "503")
         || t.contains("too many requests")
         || t.contains("too_busy")
         || t.contains("slowdown")
         || t.contains("slow down")
         || t.contains("service unavailable")
         || t.contains("service_unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn throttle_text_is_matched_on_tokens_not_inside_keys() {
+        assert!(looks_throttled("HTTP 429: too many"));
+        assert!(looks_throttled("status 503"));
+        assert!(looks_throttled("b2: too_busy (429)"));
+        assert!(looks_throttled("SlowDown: please reduce your request rate"));
+        assert!(!looks_throttled(
+            "failed to upload v1/packs/ab/ab429f03c5031e.pack: corrupted"
+        ));
+        assert!(!looks_throttled("object 5034290 not found"));
+    }
 }

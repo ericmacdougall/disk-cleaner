@@ -2,7 +2,7 @@
 //! writes are atomic (tmp + rename), and stat/list report a checksum computed from the stored
 //! bytes, as B2 (sha1) or S3 (md5) would.
 
-use super::{RemoteObject, Transport};
+use super::{check_key, RemoteObject, Transport};
 use crate::error::{Error, Result};
 use crate::hash::HashKind;
 use std::fs;
@@ -14,19 +14,6 @@ pub struct LocalDir {
     root: PathBuf,
     kind: HashKind,
     delay: Duration,
-}
-
-fn check_key(key: &str) -> Result<()> {
-    if key.is_empty()
-        || key.starts_with('/')
-        || key.contains('\\')
-        || key
-            .split('/')
-            .any(|c| c.is_empty() || c == "." || c == "..")
-    {
-        return Err(Error::Refused(format!("bad object key {key:?}")));
-    }
-    Ok(())
 }
 
 impl LocalDir {
