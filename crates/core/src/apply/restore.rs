@@ -41,12 +41,12 @@ pub struct RestoreReport {
     pub failed: Vec<(PathBuf, String)>,
     /// Remote manifest segments that failed their checks (only with `accept_partial`).
     pub rejected_segments: Vec<(String, String)>,
-    /// Interrupted manifest uploads that a later acting run stored again and retired (their
-    /// rows are in committed segments, so they are skipped without loss).
+    /// Interrupted manifest uploads whose rows a later acting run stored again in committed
+    /// segments, so they are skipped without loss.
     pub abandoned_segments: Vec<String>,
 }
 
-/// `<sha256> <size>`, as a `.sum` sidecar and (after `abandoned `) a `.abandoned` record hold it.
+/// `<sha256> <size>`, as a `.sum` sidecar holds it.
 fn parse_sum(text: &str) -> Option<(String, u64)> {
     let mut it = text.split_whitespace();
     let sha = it.next()?;
@@ -59,16 +59,43 @@ fn parse_sum(text: &str) -> Option<(String, u64)> {
 
 /// What a remote manifest segment is (Codex plan review r8, F1).
 enum SegState {
-    /// Its sidecar is well formed and matches: committed history.
-    Committed(Vec<Envelope>),
+    /// Its sidecar is well formed and matches: committed history (its rows and its bytes).
+    Committed(Vec<Envelope>, Vec<u8>),
     /// Its sidecar is well formed and does not match: damaged committed history (rejected).
     Damaged(String),
-    /// No well-formed sidecar: the run that uploaded it stopped before committing it. Its
-    /// bytes, for `retire_orphans`.
+    /// No well-formed sidecar: the run that uploaded it stopped before committing it. Its bytes,
+    /// judged by [`covered`] against the committed segments.
     Interrupted(Vec<u8>),
-    /// Interrupted, and a later acting run recorded (`.abandoned`, bound to these exact bytes)
-    /// that every row in it is stored again in committed segments.
-    Abandoned,
+}
+
+/// Whether committed history holds every row of an interrupted upload (A-4). The upload's bytes
+/// must be the start of a committed segment's text at a line boundary: its complete lines
+/// exactly and in order, and a cut last line as the start of the line that follows them there.
+/// A later acting run stores the rows of an interrupted upload again in that same order, in
+/// one segment, so a segment whose rows were stored again always passes. An upload cut inside
+/// its first line has nothing to anchor a cut line to and is never covered; an empty one holds
+/// no rows and always is. The one reader decides this from storage alone: nothing written
+/// beside the upload (or missing from beside it) changes the answer.
+pub(crate) fn covered(orphan: &[u8], committed: &[Vec<u8>]) -> bool {
+    if orphan.is_empty() {
+        return true;
+    }
+    if !orphan.contains(&b'\n') {
+        return false;
+    }
+    committed.iter().any(|t| {
+        let mut start = 0;
+        while start < t.len() {
+            if t[start..].starts_with(orphan) {
+                return true;
+            }
+            match t[start..].iter().position(|&b| b == b'\n') {
+                Some(i) => start += i + 1,
+                None => break,
+            }
+        }
+        false
+    })
 }
 
 fn segment_state(rc: &Rclone, dir: &str, name: &str, names: &BTreeSet<String>) -> SegState {
@@ -87,21 +114,6 @@ fn segment_state(rc: &Rclone, dir: &str, name: &str, names: &BTreeSet<String>) -
         Err(e) => return SegState::Damaged(e),
     };
     let Some((want_sha, want_len)) = sidecar else {
-        let ab = format!("{name}.abandoned");
-        if names.contains(&ab) {
-            if let Ok(rec) = read(&ab) {
-                let rec = String::from_utf8_lossy(&rec);
-                let bound = rec
-                    .strip_prefix("abandoned ")
-                    .and_then(parse_sum)
-                    .is_some_and(|(sha, len)| {
-                        len == b.len() as u64 && sha == hex::encode(Sha256::digest(&b))
-                    });
-                if bound {
-                    return SegState::Abandoned;
-                }
-            }
-        }
         return SegState::Interrupted(b);
     };
     if b.len() as u64 != want_len {
@@ -113,12 +125,12 @@ fn segment_state(rc: &Rclone, dir: &str, name: &str, names: &BTreeSet<String>) -
     if hex::encode(Sha256::digest(&b)) != want_sha {
         return SegState::Damaged("its sha256 differs from its checksum file".into());
     }
-    let text = match String::from_utf8(b) {
+    let text = match std::str::from_utf8(&b) {
         Ok(t) => t,
         Err(_) => return SegState::Damaged("it is not UTF-8".into()),
     };
-    match manifest::parse_segment(&text) {
-        Ok(rows) => SegState::Committed(rows),
+    match manifest::parse_segment(text) {
+        Ok(rows) => SegState::Committed(rows, b),
         Err(e) => SegState::Damaged(e),
     }
 }
@@ -128,36 +140,55 @@ fn segment_state(rc: &Rclone, dir: &str, name: &str, names: &BTreeSet<String>) -
 pub(crate) struct RemoteManifest {
     /// Rows of every committed segment, merged.
     pub rows: Vec<Envelope>,
-    /// Segments that are not committed history and are not known to be stored again: damaged
-    /// ones, and interrupted ones not yet retired (name, why).
+    /// Every line of every committed segment, as stored.
+    pub lines: BTreeSet<String>,
+    /// Segments that are not committed history and whose rows committed history does not hold:
+    /// damaged ones, and interrupted ones not covered (name, why).
     pub rejected: Vec<(String, String)>,
-    /// Interrupted uploads, with their bytes (they are also in `rejected`).
-    pub interrupted: Vec<(String, Vec<u8>)>,
-    /// Interrupted uploads that a later acting run retired.
+    /// Interrupted uploads whose rows committed history holds ([`covered`]): skipped.
     pub abandoned: Vec<String>,
 }
 
-const INTERRUPTED: &str = "its upload was interrupted before its checksum file was written; the next acting apply run stores its rows again and retires it";
+const INTERRUPTED: &str = "its upload was interrupted before its checksum file was written, and no committed segment holds its rows; the next acting apply run stores them again from the local manifest";
 
-/// Every manifest segment in storage, classified; only committed segments give rows.
+/// Every manifest segment in storage, classified; only committed segments give rows. Two
+/// passes: committed history first, then each interrupted upload judged against it.
 pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest, ApplyError> {
     let dir = format!("manifests/{label}");
     let mut names = rc.list(&dir).map_err(ApplyError::Storage)?;
     names.sort();
     let set: BTreeSet<String> = names.iter().cloned().collect();
     let mut good = Vec::new();
+    let mut texts = Vec::new();
+    let mut interrupted = Vec::new();
     let mut out = RemoteManifest::default();
     for n in names.iter().filter(|n| n.ends_with(".jsonl")) {
         match segment_state(rc, &dir, n, &set) {
-            SegState::Committed(rows) => good.push(rows),
-            SegState::Damaged(why) => out.rejected.push((n.clone(), why)),
-            SegState::Interrupted(b) => {
-                out.rejected.push((n.clone(), INTERRUPTED.into()));
-                out.interrupted.push((n.clone(), b));
+            SegState::Committed(rows, b) => {
+                good.push(rows);
+                texts.push(b);
             }
-            SegState::Abandoned => out.abandoned.push(n.clone()),
+            SegState::Damaged(why) => out.rejected.push((n.clone(), why)),
+            SegState::Interrupted(b) => interrupted.push((n.clone(), b)),
         }
     }
+    for (n, b) in interrupted {
+        if covered(&b, &texts) {
+            out.abandoned.push(n);
+        } else {
+            out.rejected.push((n, INTERRUPTED.into()));
+        }
+    }
+    out.lines = texts
+        .iter()
+        .flat_map(|t| {
+            String::from_utf8_lossy(t)
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|l| !l.is_empty())
+        .collect();
     out.rows = manifest::merge_segments(good);
     Ok(out)
 }
@@ -642,4 +673,50 @@ fn restore_git_blob(
     publish_bytes(root, path, mode, ms, mns, sha, move |w| {
         w.write_all(&out).map_err(|e| e.to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::covered;
+
+    fn seg(lines: &[&str]) -> Vec<u8> {
+        let mut t = lines.join("\n");
+        t.push('\n');
+        t.into_bytes()
+    }
+
+    #[test]
+    fn an_interrupted_upload_is_covered_only_by_its_rows_in_order() {
+        let (r1, r2, r3, r40, r5) = (
+            r#"{"r":"a","k":1}"#,
+            r#"{"r":"a","k":2}"#,
+            r#"{"r":"a","k":3}"#,
+            r#"{"r":"a","k":40}"#,
+            r#"{"r":"a","k":5}"#,
+        );
+        let committed = vec![seg(&[r1, r2]), seg(&[r3, r40, r5])];
+        // Whole, at a line boundary, in order; and an empty upload holds no rows.
+        assert!(covered(&seg(&[r3, r40]), &committed));
+        assert!(covered(b"", &committed));
+        // A cut last line: the start of the line that follows its complete lines there.
+        assert!(covered(
+            br#"{"r":"a","k":3}
+{"r":"a","k":4"#,
+            &committed
+        ));
+        // Cut a few bytes into a row stored nowhere, though it is the start of a stored row.
+        assert!(!covered(
+            br#"{"r":"a","k":1}
+{"r":"a","k":4"#,
+            &committed
+        ));
+        // Cut inside its first line: nothing to anchor the cut line to.
+        assert!(!covered(br#"{"r":"a","k":4"#, &committed));
+        // A row stored nowhere, rows out of order, rows across two segments, a mid-line start.
+        assert!(!covered(&seg(&[r3, r#"{"r":"a","k":6}"#]), &committed));
+        assert!(!covered(&seg(&[r2, r1]), &committed));
+        assert!(!covered(&seg(&[r2, r3]), &committed));
+        assert!(!covered(b"\"k\":2}\n", &committed));
+        assert!(!covered(&seg(&[r1]), &[]));
+    }
 }

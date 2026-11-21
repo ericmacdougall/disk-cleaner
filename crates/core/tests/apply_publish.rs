@@ -1,6 +1,6 @@
 //! Manifest publication (Codex plan review r8, F1). A segment is committed history once its
-//! checksum sidecar is stored; an interrupted upload is retired only after its rows are stored
-//! again in committed segments, and damaged committed history is still refused.
+//! checksum sidecar is stored; an interrupted upload is skipped only while committed segments
+//! hold its rows, and damaged committed history is still refused.
 #![cfg(unix)]
 
 mod apply_common;
@@ -127,7 +127,7 @@ fn an_interrupted_segment_whose_rows_are_not_stored_again_is_still_refused() {
             apply(&scan, &plan, &fx.opts(true)).unwrap();
         } else {
             fx.set_fake(
-                // Segments and their sidecars fail; a retirement record would still be stored.
+                // Segments and their sidecars fail; any other manifest object would be stored.
                 "if [ \"$cmd\" = rcat ]; then case \"$*\" in *manifests/*.jsonl|*manifests/*.jsonl.sum) echo refused >&2; exit 1;; esac; fi",
             );
             assert!(apply(&scan, &plan, &fx.opts(true)).is_err(), "{case}");
@@ -146,22 +146,20 @@ fn an_interrupted_segment_whose_rows_are_not_stored_again_is_still_refused() {
     }
 }
 
-/// A retired upload is skipped only while it holds exactly the bytes it was retired with, and
-/// a committed segment whose bytes no longer match its sidecar is refused as before.
+/// A skipped interrupted upload is skipped only while committed segments hold every row in it,
+/// and a committed segment whose bytes no longer match its sidecar is refused as before.
 #[test]
-fn a_retired_segment_that_changes_and_damaged_committed_history_are_refused() {
+fn a_skipped_upload_that_changes_and_damaged_committed_history_are_refused() {
     let fx = Fx::new();
     let (scan, plan) = fixture(&fx);
     let mut o = fx.opts(true);
     o.hooks.crash_at = Some(CrashPoint::AfterSegmentUpload);
     let _ = apply(&scan, &plan, &o);
+    let orphan = orphans(&fx);
+    assert_eq!(orphan.len(), 1, "{:?}", segments(&fx));
+    let orphan = orphan[0].clone();
     apply(&scan, &plan, &fx.opts(true)).unwrap();
     let all = segments(&fx);
-    let retired: Vec<_> = all
-        .iter()
-        .filter(|p| p.to_string_lossy().ends_with(".abandoned"))
-        .collect();
-    assert_eq!(retired.len(), 1, "{all:?}");
     fs::remove_file(fx.manifest()).unwrap();
     // The history restores without --accept-partial, and says what it skipped.
     let r = restore(&fx.data, &ropts(&fx)).unwrap();
@@ -170,8 +168,7 @@ fn a_retired_segment_that_changes_and_damaged_committed_history_are_refused() {
         r.failed.is_empty() && r.rejected_segments.is_empty(),
         "{r:?}"
     );
-    // The retired upload changes: no longer bound to its record, so refused again.
-    let orphan = PathBuf::from(retired[0].to_string_lossy().trim_end_matches(".abandoned"));
+    // The skipped upload gains a row that no committed segment holds: refused again.
     let mut b = fs::read(&orphan).unwrap();
     b.extend_from_slice(b"{}\n");
     fs::write(&orphan, &b).unwrap();
@@ -192,4 +189,99 @@ fn a_retired_segment_that_changes_and_damaged_committed_history_are_refused() {
     fs::write(committed, &c).unwrap();
     let e = restore(&fx.data, &ropts(&fx)).unwrap_err();
     assert!(format!("{e:?}").contains("sha256 differs"), "{e:?}");
+}
+
+/// Interrupted uploads, as they lie in storage after a crash between a segment and its sidecar.
+fn orphans(fx: &Fx) -> Vec<PathBuf> {
+    let all = segments(fx);
+    all.iter()
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "jsonl")
+                && !all.contains(&PathBuf::from(format!("{}.sum", p.display())))
+        })
+        .cloned()
+        .collect()
+}
+
+/// H1 (plan review r9 preparation): an interrupted upload is skipped only when storage holds its
+/// rows in committed segments. Nothing placed beside it (here a retirement record bound to its
+/// exact bytes, as anyone who can read the bucket can write) makes restore skip rows that no
+/// committed segment holds.
+#[test]
+fn an_interrupted_segment_is_skipped_only_when_committed_segments_hold_its_rows() {
+    use sha2::{Digest, Sha256};
+    let fx = Fx::new();
+    let (scan, plan) = fixture(&fx);
+    let mut o = fx.opts(true);
+    o.hooks.crash_at = Some(CrashPoint::AfterSegmentUpload);
+    assert!(matches!(
+        apply(&scan, &plan, &o),
+        Err(ApplyError::InjectedCrash(_))
+    ));
+    let orphan = orphans(&fx);
+    assert_eq!(orphan.len(), 1, "{:?}", segments(&fx));
+    let b = fs::read(&orphan[0]).unwrap();
+    let rec = format!(
+        "abandoned {} {}\n",
+        hex::encode(Sha256::digest(&b)),
+        b.len()
+    );
+    fs::write(format!("{}.abandoned", orphan[0].display()), rec).unwrap();
+    // Its rows are in no committed segment: refused, whatever lies beside it.
+    let local = fs::read(fx.manifest()).unwrap();
+    fs::remove_file(fx.manifest()).unwrap();
+    let e = restore(&fx.data, &ropts(&fx)).unwrap_err();
+    assert!(format!("{e:?}").contains("interrupted"), "{e:?}");
+    // Once a later run stores its rows again, it is skipped without loss, and listed.
+    fs::write(fx.manifest(), local).unwrap();
+    apply(&scan, &plan, &fx.opts(true)).unwrap();
+    fs::remove_file(fx.manifest()).unwrap();
+    let r = restore(&fx.data, &ropts(&fx)).unwrap();
+    assert_eq!(r.abandoned_segments.len(), 1, "{r:?}");
+    assert!(
+        r.failed.is_empty() && r.rejected_segments.is_empty(),
+        "{r:?}"
+    );
+}
+
+/// H2 (plan review r9 preparation): no storage write that restore relies on may fail silently.
+/// For each kind of manifest object, the retry after a crash between a segment and its sidecar
+/// cannot store that kind. The retry either fails (or reports that storage is behind), or the
+/// history in storage restores everything, with the local manifest gone.
+#[test]
+fn a_retry_that_cannot_store_one_kind_of_manifest_object_never_reports_a_silent_success() {
+    let kinds = [
+        ("segments", "*manifests/*.jsonl"),
+        ("sidecars", "*manifests/*.jsonl.sum"),
+        ("retirement records", "*manifests/*.abandoned"),
+        ("heads", "*manifests/*/head*"),
+    ];
+    for (kind, pat) in kinds {
+        let fx = Fx::new();
+        let (scan, plan) = fixture(&fx);
+        let before = tree_digest(&fx.data);
+        let mut o = fx.opts(true);
+        o.hooks.crash_at = Some(CrashPoint::AfterSegmentUpload);
+        let _ = apply(&scan, &plan, &o);
+        fx.set_fake(&format!(
+            "if [ \"$cmd\" = rcat ]; then case \"$*\" in {pat}) echo refused >&2; exit 1;; esac; fi"
+        ));
+        let retry = apply(&scan, &plan, &fx.opts(true));
+        fx.set_fake("");
+        match &retry {
+            Err(_) => continue,
+            Ok(rep) if rep.mirror_failed.is_some() => continue,
+            Ok(_) => {}
+        }
+        fs::remove_file(fx.manifest()).unwrap();
+        let r = match restore(&fx.data, &ropts(&fx)) {
+            Ok(r) => r,
+            Err(e) => panic!("{kind} refused: the retry reported success ({retry:?}) but restore from storage refused: {e:?}"),
+        };
+        assert!(
+            r.failed.is_empty() && r.rejected_segments.is_empty(),
+            "{kind}: {r:?}"
+        );
+        assert_eq!(tree_digest(&fx.data), before, "{kind}");
+    }
 }

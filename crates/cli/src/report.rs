@@ -418,7 +418,7 @@ pub fn restore_summary(r: &disk_cleaner_core::apply::restore::RestoreReport) -> 
     for seg in &r.abandoned_segments {
         let _ = writeln!(
             o,
-            "  manifest segment skipped (an interrupted upload whose rows are stored again): {seg}"
+            "  manifest segment skipped (an interrupted upload whose rows storage holds in a committed segment): {seg}"
         );
     }
     o

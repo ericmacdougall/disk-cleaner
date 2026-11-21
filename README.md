@@ -105,8 +105,8 @@ back byte for byte, with their mode, modification time, symlinks and hard links.
 a different file already at the path is reported as a conflict and left alone. If the local manifest
 is lost, add `--from-remote` to rebuild the history from the copies in storage; a damaged copy refuses
 the restore unless you add `--accept-partial`. A copy whose upload was interrupted also refuses it
-until a later `apply --apply` run has stored its rows again; that run marks the interrupted copy as
-retired, and restore then skips it and says so. Add `--run <id>` (printed by `apply`) to restore an
+until a later `apply --apply` run has stored its rows again (from the local manifest); restore then
+sees that storage holds them, skips the interrupted copy and says so. Add `--run <id>` (printed by `apply`) to restore an
 older generation of a path that was backed up more than once. Replacing or downgrading the
 `disk-cleaner` binary never brings data back; `restore` does.
 

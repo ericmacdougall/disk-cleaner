@@ -155,11 +155,6 @@ pub(crate) struct Ctx<'a> {
     pub procs: crate::ProcessCheck,
     /// (dev, ino) of entries unlinked in this run (hard-link ctime drift).
     pub unlinked_inodes: std::collections::BTreeSet<(u64, u64)>,
-    /// Every row line known to be in a committed manifest segment in storage (read at the
-    /// start, plus the segments this run committed).
-    pub committed_lines: BTreeSet<String>,
-    /// Interrupted segment uploads found at the start, not yet retired (name, bytes).
-    pub orphans: Vec<(String, Vec<u8>)>,
     pub report: ApplyReport,
 }
 
@@ -241,8 +236,6 @@ pub fn apply(
         group_cache: BTreeMap::new(),
         procs: (opts.process)(),
         unlinked_inodes: Default::default(),
-        committed_lines: BTreeSet::new(),
-        orphans: Vec::new(),
         report: ApplyReport {
             dry_run: !opts.act,
             run: run.clone(),
@@ -1028,23 +1021,21 @@ fn upload_phase(ctx: &mut Ctx, prepared: &[Prepared]) -> Result<BTreeSet<String>
 /// Queue for mirroring every local row the remote copy lacks (a run that stopped before its
 /// mirror leaves rows only in the local file). Rows naming another remote stay local.
 fn seed_unmirrored(ctx: &mut Ctx) -> Result<(), ApplyError> {
-    // Rows of a segment that is not committed count as absent here: they are mirrored again.
+    // Rows of a segment that is not committed count as absent here: they are mirrored again, in
+    // local order and in one segment, which is what lets restore skip the interrupted upload
+    // (`restore::covered`).
     let remote = super::restore::remote_manifest(&ctx.rc, &ctx.opts.label)?;
     let line = |e: &super::manifest::Envelope| serde_json::to_string(e).unwrap_or_default();
-    ctx.committed_lines = remote.rows.iter().map(line).collect();
-    ctx.orphans = remote.interrupted;
     for e in &ctx.manifest.rows {
         let other_remote = match &e.row {
             Row::Shard { remote, .. } | Row::Blob { remote, .. } => remote != &ctx.opts.remote,
             _ => false,
         };
         let l = line(e);
-        if !other_remote && !ctx.committed_lines.contains(&l) {
+        if !other_remote && !remote.lines.contains(&l) {
             ctx.manifest.unmirrored.push(l);
         }
     }
-    // An earlier run may have stored an orphan's rows again and stopped before retiring it.
-    retire_orphans(ctx);
     Ok(())
 }
 
@@ -1069,56 +1060,8 @@ fn upload_verified(rc: &Rclone, name: &str, bytes: &[u8]) -> Result<(), ApplyErr
     .map_err(ApplyError::Storage)
 }
 
-/// Retire each interrupted segment upload whose rows are all in committed segments (Codex plan
-/// review r8, F1): a `.abandoned` record bound to its exact sha256 and size tells restore to
-/// skip it. Every complete line must be a committed row line, and an unterminated last line
-/// (an upload cut mid-row) must be the start of one. Judged against verified storage only,
-/// never the local manifest, so a crash before the rows are stored again retires nothing. A
-/// segment that is not retired stays rejected, and restore --from-remote refuses the history
-/// until it is (or `--accept-partial`). Failures here are not errors: they retire nothing.
-fn retire_orphans(ctx: &mut Ctx) {
-    let committed = &ctx.committed_lines;
-    let covered = |b: &[u8]| -> bool {
-        let Ok(text) = std::str::from_utf8(b) else {
-            return false;
-        };
-        let (whole, tail) = match text.rfind('\n') {
-            Some(i) => (&text[..i], &text[i + 1..]),
-            None => ("", text),
-        };
-        let lines_ok = whole
-            .split('\n')
-            .filter(|l| !l.is_empty())
-            .all(|l| committed.contains(l));
-        let tail_ok = tail.is_empty()
-            || committed
-                .range(tail.to_string()..)
-                .next()
-                .is_some_and(|l| l.starts_with(tail));
-        lines_ok && tail_ok
-    };
-    let mut keep = Vec::new();
-    for (name, bytes) in std::mem::take(&mut ctx.orphans) {
-        if !covered(&bytes) {
-            keep.push((name, bytes));
-            continue;
-        }
-        let rec = format!(
-            "abandoned {} {}\n",
-            hex::encode(Sha256::digest(&bytes)),
-            bytes.len()
-        );
-        let at = format!("manifests/{}/{name}.abandoned", ctx.opts.label);
-        if upload_verified(&ctx.rc, &at, rec.as_bytes()).is_err() {
-            keep.push((name, bytes));
-        }
-    }
-    ctx.orphans = keep;
-}
-
 /// Upload the manifest rows not yet mirrored as a new immutable segment. A segment is committed
-/// history only once its checksum sidecar is stored and verified; then any interrupted segment
-/// whose rows are now all in committed segments is retired.
+/// history only once its checksum sidecar is stored and verified.
 fn mirror(ctx: &mut Ctx) -> Result<(), ApplyError> {
     if ctx.manifest.unmirrored.is_empty() {
         return Ok(());
@@ -1137,9 +1080,7 @@ fn mirror(ctx: &mut Ctx) -> Result<(), ApplyError> {
     // treats a segment without a well-formed one as an interrupted upload, not as history.
     let sum = format!("{} {}\n", hex::encode(Sha256::digest(&bytes)), bytes.len());
     upload_verified(&ctx.rc, &format!("{name}.sum"), sum.as_bytes())?;
-    let done = std::mem::take(&mut ctx.manifest.unmirrored);
-    ctx.committed_lines.extend(done);
-    retire_orphans(ctx);
+    ctx.manifest.unmirrored.clear();
     Ok(())
 }
 
