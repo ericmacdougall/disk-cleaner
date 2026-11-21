@@ -119,6 +119,10 @@ impl Receipt {
         crate::walk::validate_rel(&rel).map_err(|_| Why::BadPath)?;
         let p = root.join(crate::walk::rel_path(&rel));
         let md = std::fs::symlink_metadata(&p).map_err(|_| Why::Missing)?;
+        if cfg!(feature = "broken-identity") {
+            // the broken variant: existence is taken as identity (failing-first evidence only)
+            return Ok(());
+        }
         let st = stat_of(&md);
         let want = match self.kind {
             Kind::Hardlink => Kind::File,
