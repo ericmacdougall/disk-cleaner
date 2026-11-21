@@ -94,7 +94,7 @@ case " $ID ${ID_LIKE:-} " in
     { apt-get update && apt-get install -y --no-install-recommends \
       xvfb xauth xdotool dbus dbus-bin at-spi2-core python3 python3-gi gir1.2-atspi-2.0 strace procps \
       libgl1 libegl1 libgles2 libgl1-mesa-dri libfontconfig1 libfreetype6 libharfbuzz0b fonts-dejavu-core \
-      libfribidi0 libgpg-error0 libcom-err2; } \
+      libfribidi0 libgpg-error0 libcom-err2 dconf-cli; } \
       > "$RESULT/install.log" 2>&1 || { tail -30 "$RESULT/install.log"; exit 2; }
     dpkg-query -W -f '${Package} ${Version}\n' | sort > "$RESULT/packages.txt"
     ;;
@@ -178,6 +178,13 @@ cat "$RESULT/session.log"
 outside > "$RESULT/outside-after.txt"
 echo "== outside the sandbox: the tester's home and $RUN_DIR, after minus before"
 diff "$RESULT/outside-before.txt" "$RESULT/outside-after.txt" | tee "$RESULT/outside-diff.txt" || true
+# Which keys went into that dconf database: the tester is new, so all of them come from this run.
+# Debian's packages above bring dconf-service, so dconf-cli is added there to read it; Fedora's do
+# not (GSettings keeps a keyfile in the sandbox), so it gets no dconf at all.
+if command -v dconf > /dev/null; then
+  echo "== dconf keys in the tester's database after the run"
+  su tester -s /bin/bash -c "export XDG_RUNTIME_DIR=$RUN_DIR; dconf dump /" 2>&1 | tee "$RESULT/dconf-dump.txt" || true
+fi
 
 echo "== GTK messages of the app"
 log="$RESULT/launch/launch.log"
