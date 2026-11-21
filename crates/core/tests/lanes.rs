@@ -490,6 +490,58 @@ fn neg12_a_git_directory_inside_an_artifact_keeps_its_piece_only() {
     check_invariants(&res, &p);
 }
 
+/// The same, for every `[[rule]]` in rules/artifacts.toml: an artifact that holds a dependency
+/// checkout with its own `.git` is never `noise` (the scan makes it ask), the piece holding the
+/// git directory is kept, and no removing piece holds a file of the git directory.
+#[cfg(unix)]
+#[test]
+fn neg12_every_artifact_rule_keeps_a_nested_git_directory() {
+    let (_tmp, root, _) = workspace();
+    let rules = RuleSet::builtin();
+    let mut cases = Vec::new();
+    for (i, rule) in rules.rules().iter().enumerate() {
+        let base = root.join(format!("r{i:02}"));
+        let dir = base.join(&rule.name);
+        if let Some(m) = rule.markers.first() {
+            let marker = m.replace('*', "m");
+            write(&dir.parent().unwrap().join(marker), "{}");
+        }
+        write_bytes(&dir.join("big.bin"), 100 * KIB);
+        let dep = dir.join("gitdep");
+        write(&dep.join("index.js"), "x");
+        init_repo(&dep);
+        cases.push((rule.name.clone(), dir, dep));
+    }
+    let po = PieceOptions {
+        max_piece_bytes: 64 * KIB as u64,
+        ..PieceOptions::default()
+    };
+    let res = lanes_scan_with(&root, network_everywhere(), po);
+    let p = plan(&res, &idle_opts());
+    let l = lanes_of(&p);
+    let mut unclassified = Vec::new();
+    let mut lanes_seen = BTreeSet::new();
+    for (name, dir, dep) in &cases {
+        let classified = res
+            .nodes
+            .iter()
+            .any(|n| Path::new(&n.path) == dir && n.class.is_artifact());
+        if !classified {
+            unclassified.push(name.clone());
+        }
+        let held = the_piece(&res, l, &dep.join(".git").join("HEAD"));
+        assert_eq!(held.lane, Lane::Keep, "{name}: {}", held.reason);
+        let sibling = the_piece(&res, l, &dir.join("big.bin"));
+        assert_ne!(sibling.id, held.id, "{name}");
+        assert_ne!(sibling.lane, Lane::Noise, "{name}: {}", sibling.reason);
+        lanes_seen.insert(format!("{:?}", sibling.lane));
+    }
+    // Not vacuous: every rule's directory was classified as the artifact it describes.
+    assert!(unclassified.is_empty(), "not classified: {unclassified:?}");
+    eprintln!("sibling lanes over {} rules: {lanes_seen:?}", cases.len());
+    check_invariants(&res, &p);
+}
+
 // Unix only: without file identity every lane is keep (asserted by the partition test).
 #[cfg(unix)]
 #[test]
