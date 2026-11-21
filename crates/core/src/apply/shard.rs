@@ -233,6 +233,36 @@ pub fn verify(
     })
 }
 
+/// The only test of whether a shard recorded as verified can still be relied on (I-1,
+/// acceptance finding 2): it must exist now with the recorded size and the recorded hash. A
+/// `sha1:`/`md5:`/`sha256:` record needs the backend to report that same hash now; a
+/// `readback-sha256:` record (the backend reports no hash) is read back and hashed again. Any
+/// other record, a missing hash or an error is not trusted, so the bytes are uploaded again.
+pub fn shard_still_verified(rc: &Rclone, id: &str, size: u64, verified_by: &str) -> bool {
+    let Some((kind, want)) = verified_by.split_once(':') else {
+        return false;
+    };
+    if want.is_empty() {
+        return false;
+    }
+    let Ok(Some(l)) = rc.stat(id) else {
+        return false;
+    };
+    if l.size != size {
+        return false;
+    }
+    match kind {
+        "sha1" | "md5" | "sha256" => l
+            .hashes
+            .get(kind)
+            .is_some_and(|theirs| theirs.eq_ignore_ascii_case(want)),
+        "readback-sha256" => rc.cat(id).is_ok_and(|back| {
+            back.len() as u64 == size && hex::encode(Sha256::digest(&back)) == want
+        }),
+        _ => false,
+    }
+}
+
 /// Upload shards with `jobs` concurrent pipelines. Returns one result per shard, in order.
 pub fn upload_all(
     rc: &Rclone,

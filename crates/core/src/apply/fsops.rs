@@ -153,7 +153,7 @@ pub fn open_file_rel(base: &OwnedFd, rel: &str) -> io::Result<(std::fs::File, Id
     Ok((std::fs::File::from(fd), id))
 }
 
-/// Outcome of a guarded unlink.
+/// Outcome of a guarded removal.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Unlinked {
     Done,
@@ -161,11 +161,103 @@ pub enum Unlinked {
     Absent,
     /// The entry is not the one expected; left in place.
     Changed(Ident),
+    /// Another entry was swapped in while the member was being removed. It was not removed and
+    /// could not be put back (its name was taken), so it is left under this relative path.
+    Displaced(String),
 }
 
-/// Unlink `rel` below `base` only if it still has identity `expect` (strict, or loose when
-/// `loose`). Never follows a symlink: a symlink member is unlinked itself.
-pub fn unlink_guarded(
+/// Stages of a removal a test can act at (feature `test-hooks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveStage {
+    /// After the identity check, before the entry is moved to its quarantine name.
+    BeforeQuarantine,
+    /// After the move, before the moved entry is checked and unlinked.
+    AfterQuarantine,
+}
+
+#[cfg(feature = "test-hooks")]
+type RemoveHook = Box<dyn FnMut(RemoveStage, &str) -> io::Result<()>>;
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// Called with the member's relative path at each stage; an error aborts the removal.
+    pub static REMOVE_HOOK: std::cell::RefCell<Option<RemoveHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The error message a hook returns to simulate a crash at a removal stage.
+pub const INJECTED_CRASH: &str = "pd-injected-crash";
+
+#[cfg(feature = "test-hooks")]
+fn hook(stage: RemoveStage, rel: &str) -> io::Result<()> {
+    REMOVE_HOOK.with(|h| match h.borrow_mut().as_mut() {
+        Some(f) => f(stage, rel),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(feature = "test-hooks"))]
+#[inline]
+fn hook(_stage: RemoveStage, _rel: &str) -> io::Result<()> {
+    Ok(())
+}
+
+/// The quarantine name of `leaf`: fixed for a given leaf, so a resumed run finds an entry an
+/// interrupted run moved and did not unlink.
+pub fn quarantine_name(leaf: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(leaf.as_bytes());
+    let hex: String = h.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!(".pd-rm-{hex}")
+}
+
+/// Rename within `d` without replacing an existing target. On a file system without no-replace
+/// support (`EINVAL`, `ENOSYS`, `ENOTSUP`) it checks the target is absent, then renames.
+fn rename_noreplace(d: &OwnedFd, from: &str, to: &str) -> io::Result<()> {
+    match fs::renameat_with(
+        d,
+        OsStr::new(from),
+        d,
+        OsStr::new(to),
+        fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(()),
+        Err(Errno::INVAL) | Err(Errno::NOSYS) | Err(Errno::NOTSUP) => {
+            match fs::statat(d, OsStr::new(to), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(_) => Err(e(Errno::EXIST)),
+                Err(Errno::NOENT) => {
+                    fs::renameat(d, OsStr::new(from), d, OsStr::new(to)).map_err(e)
+                }
+                Err(err) => Err(e(err)),
+            }
+        }
+        Err(err) => Err(e(err)),
+    }
+}
+
+fn rel_with_leaf(dir: &str, leaf: &str) -> String {
+    if dir.is_empty() {
+        leaf.to_string()
+    } else {
+        format!("{dir}/{leaf}")
+    }
+}
+
+/// The only way the crate removes a member (I-1, r6b F1). It removes `rel` below `base` only
+/// if it is still the entry with identity `expect` (strict, or loose when `loose`), and never
+/// removes an entry swapped in at the last moment:
+///
+/// 1. lstat the leaf and compare it with `expect`;
+/// 2. rename it, replacing nothing, to its quarantine name in the same directory;
+/// 3. lstat the quarantined entry: it must be the inode of step 1 with the same kind, size and
+///    mtime (a rename moves ctime, so ctime is not compared here);
+/// 4. unlink it. On a mismatch the entry is renamed back; if its name was taken meanwhile, it
+///    stays under the quarantine name and is reported, never removed.
+///
+/// A run interrupted between 2 and 4 leaves the quarantine name. A resumed run finds it when
+/// the leaf is absent and finishes (same identity) or leaves it (anything else). Never follows
+/// a symlink: a symlink member is removed itself.
+pub fn remove_member(
     base: &OwnedFd,
     rel: &str,
     expect: &Ident,
@@ -177,9 +269,25 @@ pub fn unlink_guarded(
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Unlinked::Absent),
         Err(err) => return Err(err),
     };
+    let q = quarantine_name(leaf);
     let st = match fs::statat(&d, OsStr::new(leaf), AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) => st,
-        Err(Errno::NOENT) => return Ok(Unlinked::Absent),
+        Err(Errno::NOENT) => {
+            // Resume: an interrupted run may have moved it to the quarantine name.
+            return match fs::statat(&d, OsStr::new(&q), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(qst) => {
+                    let qid = ident_of(&qst);
+                    if qid.same_loose(expect) && qid.kind != 'd' {
+                        fs::unlinkat(&d, OsStr::new(&q), AtFlags::empty()).map_err(e)?;
+                        Ok(Unlinked::Done)
+                    } else {
+                        Ok(Unlinked::Displaced(rel_with_leaf(dir, &q)))
+                    }
+                }
+                Err(Errno::NOENT) => Ok(Unlinked::Absent),
+                Err(err) => Err(e(err)),
+            };
+        }
         Err(err) => return Err(e(err)),
     };
     let now = ident_of(&st);
@@ -191,8 +299,23 @@ pub fn unlink_guarded(
     if !same || now.kind == 'd' {
         return Ok(Unlinked::Changed(now));
     }
-    fs::unlinkat(&d, OsStr::new(leaf), AtFlags::empty()).map_err(e)?;
-    Ok(Unlinked::Done)
+    hook(RemoveStage::BeforeQuarantine, rel)?;
+    match rename_noreplace(&d, leaf, &q) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Unlinked::Absent),
+        Err(err) => return Err(err),
+    }
+    hook(RemoveStage::AfterQuarantine, rel)?;
+    let moved = ident_of(&fs::statat(&d, OsStr::new(&q), AtFlags::SYMLINK_NOFOLLOW).map_err(e)?);
+    if moved.same_loose(&now) && moved.kind != 'd' {
+        fs::unlinkat(&d, OsStr::new(&q), AtFlags::empty()).map_err(e)?;
+        return Ok(Unlinked::Done);
+    }
+    // Not the entry that was checked: put it back, never over something else.
+    match rename_noreplace(&d, &q, leaf) {
+        Ok(()) => Ok(Unlinked::Changed(moved)),
+        Err(_) => Ok(Unlinked::Displaced(rel_with_leaf(dir, &q))),
+    }
 }
 
 /// Remove the directory `rel` below `base` if it is empty; any other outcome leaves it.

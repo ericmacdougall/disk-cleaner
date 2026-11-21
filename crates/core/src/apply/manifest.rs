@@ -147,6 +147,86 @@ pub struct Manifest {
     appended: usize,
 }
 
+/// The only way the manifest is opened for writing (r6b F2). Called by the first append of an
+/// acting run, which holds the apply lock. A torn last line (what `load` ignores) would turn
+/// into a corrupt middle line once more rows follow, so before appending:
+///
+/// - an unterminated last line that parses is a whole row missing its newline: the newline is
+///   added;
+/// - a last line that does not parse is copied to `<manifest>.torn-<now>[-n]` (0600, fsynced)
+///   and cut off, and the manifest is fsynced.
+///
+/// A failure anywhere stops the run before any unlink and leaves the manifest as it was (the
+/// copy is written before the cut). Dry runs never call this.
+pub fn open_for_append(path: &Path, now: i64) -> Result<File, ApplyError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let err = |e: std::io::Error| ApplyError::Manifest(format!("{}: {e}", path.display()));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(err)?;
+    }
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(err)?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).map_err(err)?;
+    let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    let start = body.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let last = &body[start..];
+    let terminated = bytes.ends_with(b"\n");
+    let parses = !last.iter().all(u8::is_ascii_whitespace)
+        && serde_json::from_slice::<Envelope>(last).is_ok_and(|e| e.v == MANIFEST_VERSION);
+    let blank = last.iter().all(u8::is_ascii_whitespace);
+    if !bytes.is_empty() && !terminated && (parses || blank) {
+        f.seek(SeekFrom::End(0)).map_err(err)?;
+        f.write_all(b"\n").and_then(|_| f.sync_all()).map_err(err)?;
+    } else if !bytes.is_empty() && !parses && !blank {
+        let mut side = path.as_os_str().to_owned();
+        side.push(format!(".torn-{now}"));
+        let mut side = PathBuf::from(side);
+        let mut n = 0;
+        let mut out = loop {
+            use std::os::unix::fs::OpenOptionsExt;
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&side)
+            {
+                Ok(o) => break o,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 100 => {
+                    n += 1;
+                    let mut s = path.as_os_str().to_owned();
+                    s.push(format!(".torn-{now}-{n}"));
+                    side = PathBuf::from(s);
+                }
+                Err(e) => {
+                    return Err(ApplyError::Manifest(format!(
+                        "cannot save the torn last line of {} before repairing it: {e}",
+                        path.display()
+                    )))
+                }
+            }
+        };
+        out.write_all(&bytes[start..])
+            .and_then(|_| out.sync_all())
+            .map_err(|e| ApplyError::Manifest(format!("{}: {e}", side.display())))?;
+        f.set_len(start as u64)
+            .and_then(|_| f.sync_all())
+            .map_err(err)?;
+        eprintln!(
+            "warning: cut a torn last line from {} (saved to {})",
+            path.display(),
+            side.display()
+        );
+    }
+    drop(f);
+    OpenOptions::new().append(true).open(path).map_err(err)
+}
+
 impl Manifest {
     /// Read `path` (absent is empty) for `run`. Does not create the file (dry run).
     pub fn load(path: &Path, run: &str) -> Result<Manifest, ApplyError> {
@@ -206,12 +286,7 @@ impl Manifest {
                 std::fs::create_dir_all(dir)
                     .map_err(|e| ApplyError::Manifest(format!("{}: {e}", dir.display())))?;
             }
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .map_err(|e| ApplyError::Manifest(format!("{}: {e}", self.path.display())))?;
-            self.file = Some(f);
+            self.file = Some(open_for_append(&self.path, now)?);
         }
         let mut text = String::new();
         let mut envs = Vec::new();
@@ -267,19 +342,19 @@ impl Manifest {
         out
     }
 
-    /// Verified shards for `remote`: id -> size.
-    pub fn shards(&self, remote: &str) -> BTreeMap<String, u64> {
+    /// Verified shards for `remote`: id -> (size, how it was verified).
+    pub fn shards(&self, remote: &str) -> BTreeMap<String, (u64, String)> {
         let mut out = BTreeMap::new();
         for e in &self.rows {
             if let Row::Shard {
                 remote: r,
                 id,
                 size,
-                ..
+                verified_by,
             } = &e.row
             {
                 if r == remote {
-                    out.insert(id.clone(), *size);
+                    out.insert(id.clone(), (*size, verified_by.clone()));
                 }
             }
         }

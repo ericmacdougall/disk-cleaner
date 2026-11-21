@@ -783,7 +783,7 @@ fn unlink_guard_keeps_changed_and_swapped() {
     std::thread::sleep(Duration::from_millis(20));
     fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(matches!(
-        fsops::unlink_guarded(&root, "sub/f.txt", &id, false).unwrap(),
+        fsops::remove_member(&root, "sub/f.txt", &id, false).unwrap(),
         fsops::Unlinked::Changed(_)
     ));
     assert!(p.exists());
@@ -794,7 +794,7 @@ fn unlink_guard_keeps_changed_and_swapped() {
     let id2 = fsops::lstat_rel(&root, "sub/f.txt").unwrap();
     fs::rename(fx.data.join("g/sub"), fx.data.join("g/sub.moved")).unwrap();
     std::os::unix::fs::symlink(&sentinel, fx.data.join("g/sub")).unwrap();
-    let r = fsops::unlink_guarded(&root, "sub/f.txt", &id2, false);
+    let r = fsops::remove_member(&root, "sub/f.txt", &id2, false);
     assert!(
         r.is_err() || matches!(r, Ok(fsops::Unlinked::Changed(_))),
         "{r:?}"

@@ -268,6 +268,14 @@ pub fn apply(
                 rep.restore = pr.restore.clone();
                 rep.outcome = if opts.act {
                     "pending".into()
+                } else if p.lane == Lane::Noise
+                    && pr
+                        .members
+                        .iter()
+                        .any(|m| matches!(m.content, Content::Blob { .. }))
+                {
+                    // Noise that fell back to backup (AC-7).
+                    dry_word(Lane::Backup).into()
                 } else {
                     dry_word(p.lane).into()
                 };
@@ -283,6 +291,36 @@ pub fn apply(
         }
         ctx.report.pieces.push(rep);
     }
+
+    // 1b. The retention index (N4, acceptance finding 1): a file kept as the retained copy of
+    // a duplicate removed by any earlier run is the only copy of that duplicate's bytes. A piece
+    // that would remove it without archiving its content (noise, a git HEAD blob, another
+    // duplicate) is kept, whatever its lane. Backed-up members are archived, so restore can use
+    // the archived blob instead.
+    let retained = ctx.manifest.retained_paths();
+    prepared.retain(|pr| {
+        let p = &inputs.pieces[pr.piece];
+        let hit = pr.members.iter().find(|m| {
+            !matches!(m.content, Content::Blob { .. })
+                && retained.contains(&rel_join(&p.path, &m.rel))
+        });
+        match hit {
+            None => true,
+            Some(m) => {
+                set_outcome(
+                    &mut ctx.report,
+                    pr.piece,
+                    "kept",
+                    &format!(
+                        "{} is the retained copy of a duplicate removed earlier; it is never \
+                         removed without a backup",
+                        rel_join(&p.path, &m.rel).display()
+                    ),
+                );
+                false
+            }
+        }
+    });
 
     if !opts.act {
         // Dry run: count what would be uploaded against the local manifest only (no network).
@@ -443,7 +481,20 @@ fn prepare(
     }
     match p.lane {
         Lane::Backup => prepare_backup(p, &en),
-        Lane::Noise => prepare_noise(ctx, p, &en),
+        // AC-7: noise whose evidence no longer holds is treated as backup: its bytes are
+        // archived and verified before removal, under the backup lane's secret rules.
+        Lane::Noise => prepare_noise(ctx, p, &en).or_else(|why| {
+            if !ctx.opts.secrets_upload {
+                if let Some(s) = secret_member(&en.members, Lane::Backup) {
+                    return Err(format!(
+                        "{why}; and {s} has a secret name, so it is not backed up instead"
+                    ));
+                }
+            }
+            let mut pr = prepare_backup(p, &en)?;
+            pr.reason = format!("{why}; backed up and verified before removal instead");
+            Ok(pr)
+        }),
         Lane::Git => super::gitlane::prepare(ctx.opts, ctx.inputs, p, &en),
         Lane::Keep => Err("kept".into()),
     }
@@ -733,11 +784,11 @@ fn upload_phase(ctx: &mut Ctx, prepared: &[Prepared]) -> Result<BTreeSet<String>
         let reuse = known_blobs.get(&sha).is_some_and(|(_, segs)| {
             segs.iter().all(|s| {
                 *confirmed.entry(s.shard.clone()).or_insert_with(|| {
-                    let want = known_shards.get(&s.shard).copied();
-                    match (want, ctx.rc.stat(&s.shard)) {
-                        (Some(w), Ok(Some(l))) => l.size == w,
-                        _ => false,
-                    }
+                    known_shards
+                        .get(&s.shard)
+                        .is_some_and(|(size, verified_by)| {
+                            shard::shard_still_verified(&ctx.rc, &s.shard, *size, verified_by)
+                        })
                 })
             })
         });
@@ -1075,7 +1126,23 @@ fn unlink_piece(ctx: &mut Ctx, pr: &Prepared) -> Result<(), ApplyError> {
         // Unlinking one name of a hard-linked inode moves the ctime of its other names: compare
         // those without ctime (dev, ino, size and mtime still must match).
         let linked = ctx.unlinked_inodes.contains(&(m.id.dev, m.id.ino));
-        match fsops::unlink_guarded(&root, &m.rel, &m.id, loose || linked) {
+        match fsops::remove_member(&root, &m.rel, &m.id, loose || linked) {
+            #[cfg(feature = "test-hooks")]
+            Err(e) if e.to_string().contains(fsops::INJECTED_CRASH) => {
+                return Err(ApplyError::InjectedCrash("after quarantine"));
+            }
+            Ok(Unlinked::Displaced(at)) => {
+                kept += 1;
+                rows.push(Row::Kept {
+                    plan_piece: p.id,
+                    path,
+                    reason: format!(
+                        "another file was swapped in during removal; it was not removed and is \
+                         left at {}",
+                        rel_join(&p.path, &at).display()
+                    ),
+                });
+            }
             Ok(Unlinked::Done) | Ok(Unlinked::Absent) => {
                 ctx.unlinked_inodes.insert((m.id.dev, m.id.ino));
                 ctx.report.removed_entries += 1;

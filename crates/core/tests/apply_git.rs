@@ -688,6 +688,35 @@ fn secret_tracked_in_head_is_not_in_the_wip_tree() {
     assert!(r.dir.join(".env").exists());
 }
 
+/// C4 (acceptance finding 5): a recovery ref already on the remote at another commit is never
+/// forced; the remote keeps its commit and the reason says so.
+#[test]
+fn an_existing_recovery_ref_is_never_forced() {
+    let fx = Fx::new();
+    let r = repo(&fx);
+    let old = git(&r.dir, &["rev-parse", "HEAD~1"]);
+    let head = git(&r.dir, &["rev-parse", "HEAD"]);
+    assert_ne!(old, head);
+    let (scan, plan) = docs(
+        &[&fx.data],
+        &[P::git(&r.dir, &[".env"], push_block(&r.url))],
+    );
+    let mut o = gopts(&fx, true, false);
+    o.private_remotes = vec![r.url.clone()];
+    o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+    let date = disk_cleaner_core::apply::utc_date(o.now);
+    let main_ref = format!("refs/recovery/testhost/{date}/main");
+    git(&r.bare, &["update-ref", &main_ref, &old]);
+    let rep = apply(&scan, &plan, &o).unwrap();
+    let (_, why) = outcome(&rep, 0);
+    assert!(why.contains("not forced"), "{why}");
+    assert!(
+        recovery_refs(&r.bare).contains(&(main_ref, old)),
+        "{:?}",
+        recovery_refs(&r.bare)
+    );
+}
+
 #[test]
 fn token_in_git_config_keeps_repo() {
     for (name, setup) in [
