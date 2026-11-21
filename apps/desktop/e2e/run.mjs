@@ -58,7 +58,6 @@ function rank(xs, q) {
   return s[Math.ceil(q * s.length) - 1];
 }
 
-const { proc, base } = await startDriver({ nativeDriver: a["native-driver"], env });
 let app;
 const h2 = () => app.s.exec("return document.querySelector('main h2, #app h2, h2')?.textContent ?? null");
 const live = () => app.s.exec("return document.querySelector('p.live')?.textContent ?? ''");
@@ -213,7 +212,142 @@ async function defaultTimings(x, total, ready) {
     return m;
   });
 }
+/** Just before a Scan click: the chosen folders, the git-facts box and the settings the app
+ *  reports (the scan reads them from the settings file), so two sessions' scans can be compared. */
+async function scanConditions(x) {
+  const r = await x.invoke("get_settings");
+  if (!r.ok) throw new Error(`get_settings: ${r.error}`);
+  const ui = await x.s.exec(
+    "return { roots: [...document.querySelectorAll('ul.chosen li')].map((l) => l.firstChild.textContent), gitFacts: document.getElementById('git-facts').checked };",
+  );
+  return { ...ui, settings: r.value };
+}
 
+// Linux: the app's processes in /proc, for the timed sessions' preconditions and the records of
+// what a session left after it closed.
+const SYNTH_PROCS = ["e2e", "WebKitWebProces", "WebKitNetworkPr"];
+// An app instance: the e2e build (comm "e2e", as e2e/check.sh runs it) or the shipped binary.
+const APP_NAMES = ["e2e", "prunedisk-deskt"];
+/** The app processes started since `before` (pids of the e2e binary), with their TracerPid. */
+const newApps = (before) => (tracerState(SYNTH_PROCS)?.procs ?? []).filter((p) => p.name === "e2e" && !before.has(p.pid));
+const appPids = () => new Set((tracerState(SYNTH_PROCS)?.procs ?? []).filter((p) => p.name === "e2e").map((p) => p.pid));
+/** Precondition of every timed session (pre-registered in WAL w4b6f0f8e4fa): no other app
+ *  instance at its start, any /proc entry of the app's names counted, zombies too (as the AC-9
+ *  investigation sessions count them). Read once at the session's start, recorded as `id`, never
+ *  read again: returns the reason its timings are not measured, or null when it holds. Windows has
+ *  no /proc, so it is not checkable there (recorded as such). */
+const othersAtStart = (id) => {
+  if (!linux) {
+    run.measure({ id, checkable: false, reason: "no /proc on this platform" });
+    return null;
+  }
+  const others = (procStates((tracerState(APP_NAMES)?.procs ?? []).map((p) => p.pid)) ?? []).filter((p) => p.alive);
+  run.measure({ id, holds: others.length === 0, others });
+  if (!others.length) return null;
+  return `another app instance is alive at the session start (${others.map((p) => `pid ${p.pid} ${p.comm} state ${p.state}`).join("; ")}); not measured`;
+};
+// Linux, informational (the side finding of the AC-9 sessions): what is left of a session's
+// processes after it closed, at 2 s and at 10 s (the window-close check's limit for the app's
+// tree), with state, parent and open-file count, and the process tree around them.
+const LEFT_PROCS = [...SYNTH_PROCS, "strace"];
+const allPids = () => new Set((tracerState(LEFT_PROCS)?.procs ?? []).map((p) => p.pid));
+const afterClose = async (label, pids, group = "synth_1m") => {
+  if (!linux) return;
+  const id = `info.${group}.after_close.${label}`;
+  try {
+    const at = [];
+    let waited = 0;
+    for (const t of [2000, 10_000]) {
+      await new Promise((r) => setTimeout(r, t - waited));
+      waited = t;
+      at.push({ ms: t, procs: procStates(pids), ps: psTree(/e2e|WebKit|strace|tauri-driver|Xvfb/) });
+    }
+    run.measure({ id, pids, at, gate: false });
+  } catch (e) {
+    run.measure({ id, pids, error: String(e?.message ?? e) });
+  }
+};
+/** Linux: whether this launch's app processes (since `before`) are all untraced (TracerPid 0).
+ *  Throws, so a check fails, when none is found or any is traced: never time a traced app. */
+const shownUntraced = (before) => {
+  const apps = newApps(before);
+  if (!apps.length) throw new Error(`no app process of this launch found in /proc; ${NOT_UNTRACED}`);
+  const traced = apps.filter((p) => p.tracerPid !== 0);
+  if (traced.length) throw new Error(`traced: ${JSON.stringify(traced)}; ${NOT_UNTRACED}`);
+  return apps;
+};
+
+// Linux: the default fixture's timings (timing.ipc_tree_page_p95, timing.scroll_p95), taken in a
+// launch of their own with the untraced switch, BEFORE the main session: the same fixture, the
+// same scan (git facts on, as the main session scans it), the same wide folder, the same steps,
+// thresholds, n and no retry. First, because the main session's Settings checks save the active
+// window to the sandbox's settings file, so a launch after them would scan under other settings
+// than the main session's rescan, which runs before them on the defaults.
+// flow.default_scan_settings_match compares the two scans. The sandbox snapshot covers this launch.
+let untracedScan = null;
+if (linux) {
+  let procU;
+  let appU;
+  let before = new Set();
+  let beforeAll = new Set();
+  let sessionPids = [];
+  let untraced = false;
+  let notAlone = null;
+  let totalU = 0;
+  try {
+    before = appPids();
+    beforeAll = allPids();
+    notAlone = othersAtStart("info.default.precondition.untraced");
+    const envU = { ...env, PRUNEDISK_E2E_FOLDERS: a.fixture, [UNTRACED_VAR]: "1" };
+    delete envU.PRUNEDISK_E2E_OPEN;
+    delete envU.PRUNEDISK_E2E_EXPORT;
+    delete envU.PRUNEDISK_E2E_SYNTH_NODES;
+    ({ proc: procU } = await startDriver({ nativeDriver: a["native-driver"], port: 4450, nativePort: 4451, env: envU }));
+    await run.check("launch.default_untraced", async () => {
+      appU = await App.open("http://127.0.0.1:4450", a.app);
+      await appU.s.cmd("POST", "/timeouts", { script: 600_000 });
+      await appU.s.until("return [...document.querySelectorAll('h2')].some((e) => e.textContent === 'Choose what to scan')", 60_000);
+      return { title: await appU.s.cmd("GET", "/title") };
+    });
+    sessionPids = procsSince(LEFT_PROCS, beforeAll);
+    await run.check("trace.default.timed_launch_untraced", async () => {
+      const apps = shownUntraced(before);
+      untraced = true;
+      return { apps };
+    });
+    await run.check("flow.default_untraced_scan", async () => {
+      if (!appU) throw new Error("the untraced launch did not open");
+      await appU.s.clickText("Add folders...");
+      await appU.s.until("return document.querySelectorAll('ul.chosen li').length === 1", 10_000);
+      // Git facts on, as the main session scans the fixture (the box starts on; made sure here).
+      await appU.s.exec("const b = document.getElementById('git-facts'); if (!b.checked) b.click();");
+      untracedScan = await scanConditions(appU);
+      await appU.s.clickText("Scan");
+      await appU.s.until("return [...document.querySelectorAll('.bar span')].some((e) => e.textContent.startsWith('Scan complete.'))", 120_000);
+      totalU = await drillIntoWide(appU);
+      return { rows: totalU, scan: untracedScan };
+    });
+    await defaultTimings(appU, totalU, () => {
+      // The trace state first: a traced app is never timed, whatever else is wrong.
+      if (!untraced) throw new Error(`the timing launch is ${NOT_UNTRACED}`);
+      if (notAlone) throw new Error(notAlone);
+      wideShown(totalU);
+    });
+  } catch (e) {
+    run.results.push({ id: "suite.default_untraced", ok: false, ms: 0, detail: String(e?.stack ?? e) });
+    console.log(`FAIL suite.default_untraced ${String(e?.message ?? e)}`);
+  } finally {
+    if (appU) await appU.close().catch(() => {});
+    if (procU) stopDriver(procU);
+    await afterClose("untraced", sessionPids, "default");
+  }
+}
+
+// The main session (traced on Linux).
+const beforeAllMain = allPids();
+let mainPids = [];
+let mainScan = null;
+const { proc, base } = await startDriver({ nativeDriver: a["native-driver"], env });
 try {
   await run.check("launch", async () => {
     app = await App.open(base, a.app);
@@ -221,6 +355,7 @@ try {
     return { title: await app.s.cmd("GET", "/title") };
   });
   if (!app) throw new Error("the app did not open");
+  mainPids = procsSince(LEFT_PROCS, beforeAllMain);
 
   await axe("axe.chooser", "body");
 
@@ -286,11 +421,25 @@ try {
     );
     if (n !== 1) throw new Error(`${n} chosen entries match ${big}`);
     await app.s.until("return document.querySelectorAll('ul.chosen li').length === 1", 10_000);
+    mainScan = await scanConditions(app);
     await app.s.clickText("Scan");
     await app.s.until("return [...document.querySelectorAll('.bar span')].some((e) => e.textContent.startsWith('Scan complete.'))", 120_000);
     await app.s.until(`return [...document.querySelectorAll('.bar button')].some((b) => b.textContent === '${EXPORT_LABEL}' && !b.disabled)`, 120_000);
     return state();
   });
+  if (linux) {
+    // The untraced timing session scanned the same fixture under the same settings (owner point
+    // 3): the chosen folders, the git-facts box and the settings the app reports, read just
+    // before each Scan, are the same bytes as JSON.
+    await run.check("flow.default_scan_settings_match", async () => {
+      if (!untracedScan) throw new Error("the untraced timing session recorded no scan settings, so its scan cannot be compared");
+      if (!mainScan) throw new Error("the main session recorded no scan settings");
+      const u = JSON.stringify(untracedScan);
+      const m = JSON.stringify(mainScan);
+      if (u !== m) throw new Error(`the untraced timing session scanned under other settings: untraced ${u}, main ${m}`);
+      return { scan: mainScan, bytes: m.length };
+    });
+  }
 
   // Each view, its axe check, and the tablist's arrow keys.
   for (const [label, ready] of [
@@ -330,7 +479,7 @@ try {
   });
   if (linux) {
     // Linux: this session is traced, so its numbers are not judged; the timings are taken in the
-    // untraced session after it (on the same fixture). The same steps run here, under the write
+    // untraced session before it (on the same fixture). The same steps run here, under the write
     // observer: they must complete, and their numbers are recorded as information only.
     await run.check("steps.ipc_tree_page_traced", async () => {
       wideShown(total);
@@ -638,6 +787,7 @@ try {
 } finally {
   if (app) await app.close();
   stopDriver(proc);
+  await afterClose("traced", mainPids, "default");
 }
 
 // Spec AC-9 at one million rows (PR gate F9), as registered in WAL w8d2cd55d39e (built to a
@@ -655,16 +805,12 @@ try {
 // second, traced launch then runs the same IPC pages and scroll steps, not timed: they must
 // complete within the DOM limit, under the write observer. Windows has no tracer: one session,
 // as registered.
-const SYNTH_PROCS = ["e2e", "WebKitWebProces", "WebKitNetworkPr"];
 const synthEnv = (untraced) => {
   const e = { ...env, PRUNEDISK_E2E_SYNTH_NODES: String(AC9.nodes) };
   if (untraced) e[UNTRACED_VAR] = "1";
   else delete e[UNTRACED_VAR];
   return e;
 };
-/** The app processes started since `before` (pids of the e2e binary), with their TracerPid. */
-const newApps = (before) => (tracerState(SYNTH_PROCS)?.procs ?? []).filter((p) => p.name === "e2e" && !before.has(p.pid));
-const appPids = () => new Set((tracerState(SYNTH_PROCS)?.procs ?? []).filter((p) => p.name === "e2e").map((p) => p.pid));
 /** (1)'s pages in the page: offset k*200 limit 200, 10 warm-up pages, then k = 0..99 timed. */
 const ipcPages = async (app) => {
   const r = await app.invoke("current_state");
@@ -693,27 +839,6 @@ const ipcPages = async (app) => {
   if (out.length !== AC9.ipcSamples) throw new Error(`${out.length} samples, wanted ${AC9.ipcSamples}`);
   return out;
 };
-// Linux, informational (the side finding of the AC-9 sessions): what is left of a session's
-// processes after it closed, at 2 s and at 10 s (the window-close check's limit for the app's
-// tree), with state, parent and open-file count, and the process tree around them.
-const LEFT_PROCS = [...SYNTH_PROCS, "strace"];
-const allPids = () => new Set((tracerState(LEFT_PROCS)?.procs ?? []).map((p) => p.pid));
-const afterClose = async (label, pids) => {
-  if (!linux) return;
-  const id = `info.synth_1m.after_close.${label}`;
-  try {
-    const at = [];
-    let waited = 0;
-    for (const t of [2000, 10_000]) {
-      await new Promise((r) => setTimeout(r, t - waited));
-      waited = t;
-      at.push({ ms: t, procs: procStates(pids), ps: psTree(/e2e|WebKit|strace|tauri-driver|Xvfb/) });
-    }
-    run.measure({ id, pids, at, gate: false });
-  } catch (e) {
-    run.measure({ id, pids, error: String(e?.message ?? e) });
-  }
-};
 const runSteps = (app) =>
   app.s.execAsync(
     `const [o, done] = arguments;
@@ -721,75 +846,6 @@ const runSteps = (app) =>
     600_000,
     scrollOptions(),
   );
-/** Linux: whether this launch's app processes (since `before`) are all untraced (TracerPid 0).
- *  Throws, so a check fails, when none is found or any is traced: never time a traced app. */
-const shownUntraced = (before) => {
-  const apps = newApps(before);
-  if (!apps.length) throw new Error(`no app process of this launch found in /proc; ${NOT_UNTRACED}`);
-  const traced = apps.filter((p) => p.tracerPid !== 0);
-  if (traced.length) throw new Error(`traced: ${JSON.stringify(traced)}; ${NOT_UNTRACED}`);
-  return apps;
-};
-
-// Linux: the default fixture's timings (timing.ipc_tree_page_p95, timing.scroll_p95), taken in a
-// launch of their own with the untraced switch, after the main session closed: the same fixture
-// scanned, the same wide folder, the same steps, thresholds, n and no retry. The scan here does
-// not collect git facts (the size tree does not use them), so the untraced launch starts no git;
-// the main session's traced scan does. The sandbox snapshot still covers this launch.
-if (linux) {
-  let procU;
-  let appU;
-  let before = new Set();
-  let beforeAll = new Set();
-  let sessionPids = [];
-  let untraced = false;
-  let totalU = 0;
-  try {
-    await new Promise((r) => setTimeout(r, 2000));
-    before = appPids();
-    beforeAll = allPids();
-    // Precondition (recorded): no other app instance alive at the session's start.
-    run.measure({ id: "info.default.precondition.untraced", others: procStates([...before]) });
-    const envU = { ...env, PRUNEDISK_E2E_FOLDERS: a.fixture, [UNTRACED_VAR]: "1" };
-    delete envU.PRUNEDISK_E2E_OPEN;
-    delete envU.PRUNEDISK_E2E_EXPORT;
-    delete envU.PRUNEDISK_E2E_SYNTH_NODES;
-    ({ proc: procU } = await startDriver({ nativeDriver: a["native-driver"], port: 4450, nativePort: 4451, env: envU }));
-    await run.check("launch.default_untraced", async () => {
-      appU = await App.open("http://127.0.0.1:4450", a.app);
-      await appU.s.cmd("POST", "/timeouts", { script: 600_000 });
-      await appU.s.until("return [...document.querySelectorAll('h2')].some((e) => e.textContent === 'Choose what to scan')", 60_000);
-      return { title: await appU.s.cmd("GET", "/title") };
-    });
-    sessionPids = procsSince(LEFT_PROCS, beforeAll);
-    await run.check("trace.default.timed_launch_untraced", async () => {
-      const apps = shownUntraced(before);
-      untraced = true;
-      return { apps };
-    });
-    await run.check("flow.default_untraced_scan", async () => {
-      if (!appU) throw new Error("the untraced launch did not open");
-      await appU.s.clickText("Add folders...");
-      await appU.s.until("return document.querySelectorAll('ul.chosen li').length === 1", 10_000);
-      await appU.s.clickText("Scan");
-      await appU.s.until("return [...document.querySelectorAll('.bar span')].some((e) => e.textContent.startsWith('Scan complete.'))", 120_000);
-      totalU = await drillIntoWide(appU);
-      return { rows: totalU };
-    });
-    await defaultTimings(appU, totalU, () => {
-      // The trace state first: a traced app is never timed, whatever else is wrong.
-      if (!untraced) throw new Error(`the timing launch is ${NOT_UNTRACED}`);
-      wideShown(totalU);
-    });
-  } catch (e) {
-    run.results.push({ id: "suite.default_untraced", ok: false, ms: 0, detail: String(e?.stack ?? e) });
-    console.log(`FAIL suite.default_untraced ${String(e?.message ?? e)}`);
-  } finally {
-    if (appU) await appU.close().catch(() => {});
-    if (procU) stopDriver(procU);
-    await afterClose("default_untraced", sessionPids);
-  }
-}
 
 {
   const rows = AC9.nodes + 1;
@@ -802,8 +858,9 @@ if (linux) {
     await new Promise((r) => setTimeout(r, 2000));
     before = appPids();
     beforeAll = allPids();
-    // Precondition (recorded, Linux): no other app instance alive at the session's start.
-    if (linux) run.measure({ id: "info.synth_1m.precondition.untraced", others: procStates([...before]) });
+    // Precondition (Linux; WAL w4b6f0f8e4fa): no other app instance alive at the session's start,
+    // or none of its timings is measured.
+    const notAlone = othersAtStart("info.synth_1m.precondition.untraced");
     ({ proc: proc2 } = await startDriver({
       nativeDriver: a["native-driver"],
       port: 4446,
@@ -838,6 +895,7 @@ if (linux) {
     const ready = () => {
       // The trace state first: a traced app is never timed, whatever else is wrong.
       if (!untraced) throw new Error(`the timed launch is ${NOT_UNTRACED}`);
+      if (notAlone) throw new Error(notAlone);
       if (shown !== rows) throw new Error(`the one-million-row tree is not shown (${shown} rows); not measured`);
     };
     // Informational, never a pass gate: a probe that fails is recorded, not counted as a failure.
@@ -935,8 +993,8 @@ if (linux) {
     await new Promise((r) => setTimeout(r, 2000));
     before = appPids();
     beforeAll = allPids();
-    // Precondition (recorded): no other app instance alive at the session's start.
-    run.measure({ id: "info.synth_1m.precondition.traced", others: procStates([...before]) });
+    // Recorded only: this launch is not timed, so the other-instance precondition does not gate it.
+    othersAtStart("info.synth_1m.precondition.traced");
     ({ proc: proc3 } = await startDriver({ nativeDriver: a["native-driver"], port: 4448, nativePort: 4449, env: synthEnv(false) }));
     let shown = 0;
     await run.check("launch.synth_1m_traced", async () => {
