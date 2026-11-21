@@ -467,6 +467,12 @@ class Lines(unittest.TestCase):
         self.check(['1234  openat(AT_FDCWD</>, "/home/u/x", O_WRONLY = 3'], 1, r"UNPARSED .*")
         self.check(['1234  this line is not strace\'s'], 1, r"UNPARSED line: .*")
 
+    def test_an_unreadable_line_says_where_it_is(self):
+        out = self.check(['1234  close(3) = 0', "1234  this line is not strace's", '1234  close(4) = 0'], 1,
+                         r"UNPARSED line: this line is not strace's .*")
+        self.assertRegex(out, r"(?m)^  at \S+:3, process 1234; before it: line 2: close\(3\) = 0; after it: line 4: close\(4\) = 0; "
+                              r"line 5: \+\+\+ exited with 0 \+\+\+$")
+
     def test_a_log_that_misses_the_start_or_an_end_fails(self):
         self.check(['1234  close(3) = 0'], 1, r"LATE close: .*", start=False)
         self.check(['1234  close(3) = 0'], 1, r"LOST trace: process 1234 .*", end=False)
@@ -785,6 +791,160 @@ class Lines(unittest.TestCase):
 
     def test_escaped_paths_are_decoded(self):
         self.check(['1234  mkdir("$W/u/a\\"b\\303\\251", 0777) = 0'], 1, r'OTHER mkdir: $W/u/a"bé')
+
+
+# ----------------------------------------------------------------------------------------------
+# A call strace could not read at a dying thread's entry stop ("???(", "????(" in 5.16)
+
+UNREADABLE_LOGS = HERE / "recorded" / "unreadable-stubs.json.xz"
+END = "1234  +++ exited with 0 +++"
+# Each fixture: thread 1235's lines among the log of 1234 (which execs first and ends), and
+# the stub-and-shape that passes ("" when the stub must be UNPARSED).
+UNREADABLE_FIXTURES = {
+    # Pass: the shapes strace 5.16, 6.1 and 6.17 printed in the reproducer, and the CI shape.
+    "A, unfinished then killed": (["1235  ???( <unfinished ...>", "1235  +++ killed by SIGKILL +++", END],
+                                  "???( unfinished, then the end"),
+    "B, resumed with no value then exited": (["1235  ???( <unfinished ...>", "1234  close(3) = 0",
+                                              "1235  <... ??? resumed>) = ?", "1235  +++ exited with 0 +++", END],
+                                             "???( unfinished, resumed with no value, then the end"),
+    "B, strace 5.16's name": (["1235  ????( <unfinished ...>", "1235  <... ???? resumed>) = ?",
+                               "1235  +++ killed by SIGKILL +++", END],
+                              "????( unfinished, resumed with no value, then the end"),
+    "C, one line then killed": (["1235  ???()           = ?", "1235  +++ killed by SIGKILL +++", END],
+                                "???( one line with no value, then the end"),
+    # Fail, each one condition broken.
+    "a resumed line with a value": (["1235  ???( <unfinished ...>", "1235  <... ??? resumed>) = 0",
+                                     "1235  +++ exited with 0 +++", END], ""),
+    "another call, then the end": (["1235  ???( <unfinished ...>", "1235  close(3) = 0", "1235  +++ exited with 0 +++", END], ""),
+    "another call, no end": (["1235  ???( <unfinished ...>", "1235  close(3) = 0", END], ""),
+    "another thread's death": ([END, "1235  ???( <unfinished ...>", "1236  +++ killed by SIGKILL +++"], ""),
+    "the end of the log": ([END, "1235  ???( <unfinished ...>"], ""),
+    "superseded by execve": (["1235  ???( <unfinished ...>", "1235  +++ superseded by execve in pid 1234 +++", END], ""),
+    "a record after the end": (["1235  ???( <unfinished ...>", "1235  +++ killed by SIGKILL +++", "1235  close(3) = 0", END], ""),
+    "arguments in the parentheses": (["1235  ???(0x3, 0x7ffd <unfinished ...>", "1235  +++ killed by SIGKILL +++", END], ""),
+    "arguments, one line": (["1235  ???(0x3)           = ?", "1235  +++ killed by SIGKILL +++", END], ""),
+    "a mixed stub name": (["1235  ???( <unfinished ...>", "1235  <... ???? resumed>) = ?", "1235  +++ killed by SIGKILL +++", END], ""),
+    "a call by number": (["1235  syscall_0x1c4(0xffffff9c, 0x7ffd, 0x1ff, 0, 0, 0 <unfinished ...>",
+                          "1235  +++ killed by SIGKILL +++", END], ""),
+    "a call by number, no arguments": (["1235  syscall_0x1c4( <unfinished ...>", "1235  +++ killed by SIGKILL +++", END], ""),
+    "a resumed line with no start": (["1235  <... ??? resumed>) = ?", "1235  +++ killed by SIGKILL +++", END], ""),
+}
+# One mutant per condition: each drops it, and a failing fixture above must then pass.
+UNREADABLE_MUTANTS = {
+    "the same stub name throughout": lambda: mock.patch.object(tr, "same_stub", lambda a, b: True),
+    "empty parentheses": lambda: mock.patch.multiple(
+        tr, UNREADABLE=re.compile(r"^(\?{3,4})\(.*<unfinished \.\.\.>$"), UNREADABLE_DONE=re.compile(r"^(\?{3,4})\(.*\)\s+= \?$")),
+    "the stub name is ??? or ????": lambda: mock.patch.object(tr, "UNREADABLE", re.compile(r"^(\S+)\( <unfinished \.\.\.>$")),
+    "a resumed line carries no value": lambda: mock.patch.object(tr, "UNREADABLE_END", re.compile(r"^<\.\.\. (\?{3,4}) resumed>\)\s+= .*$")),
+    "the next record is the end": lambda: mock.patch.object(tr, "ends_there", lambda tail: True),
+    "nothing of the thread after its end": lambda: mock.patch.object(tr, "nothing_after", lambda tail: True),
+    "the end is exited or killed": lambda: mock.patch.object(tr, "STUB_ENDS", {"exit", "superseded"}),
+    "the thread's own records": lambda: mock.patch.object(
+        tr.LogState, "rest_of", lambda self, i: [(r[2], r[3]) for r in self.records[i:]]),
+}
+
+
+def unreadable_verdict(lines: list[str]) -> tuple[int, str, int]:
+    """Exit code, output and how many stubs passed, for a log of 1234 holding `lines`."""
+    with Lines.world() as w:
+        code, out = Lines.report(w, lines, end=False)
+    m = re.search(r"(?m)^trace: .* (\d+) unreadable \(objects\)$", out)
+    return code, out, int(m.group(1)) if m else -1
+
+
+def unreadable_mutant_table() -> list[tuple[str, str, int]]:
+    """(mutant, the first failing fixture that passes a stub under it, its exit code then)."""
+    rows = []
+    for mutant, patch in UNREADABLE_MUTANTS.items():
+        caught = ("", -1)
+        with patch():
+            for name, (lines, shape) in UNREADABLE_FIXTURES.items():
+                if shape:
+                    continue
+                code, _, passed = unreadable_verdict(lines)
+                if passed > 0:
+                    caught = (name, code)
+                    break
+        rows.append((mutant, *caught))
+    return rows
+
+
+class Unreadable(unittest.TestCase):
+    """A call strace could not read passes only as a thread's last call before its own end
+    (docs/DESKTOP.md, "A call strace could not read")."""
+
+    def test_each_shape_passes_counted_and_shown(self):
+        for name, (lines, shape) in UNREADABLE_FIXTURES.items():
+            if not shape:
+                continue
+            with self.subTest(fixture=name):
+                code, out, passed = unreadable_verdict(lines)
+                self.assertEqual((code, passed), (0, 1), out)
+                self.assertRegex(out, rf"(?m)^unreadable stub: {re.escape(shape)}: process 1235, \S+:\d+$")
+                self.assertRegex(out, r"(?m)^  at \S+:\d+, process 1235; before it: .*; after it: .*\+\+\+ (exited|killed) .*$")
+                self.assertIn(f"trace: calls strace could not read at a dying thread's entry stop: 1 x {shape}", out)
+                self.assertNotRegex(out, r"(?m)^UNPARSED ")
+
+    def test_every_other_shape_stays_unparsed(self):
+        for name, (lines, shape) in UNREADABLE_FIXTURES.items():
+            if shape:
+                continue
+            with self.subTest(fixture=name):
+                code, out, passed = unreadable_verdict(lines)
+                self.assertEqual(code, 1, out)
+                self.assertEqual(passed, 0, out)
+                if "syscall_0x" not in "".join(lines):
+                    self.assertRegex(out, r"(?m)^UNPARSED line: <?\.?\.?\.? ?\?{3,4}.*$")
+                    self.assertRegex(out, r"(?m)^  at \S+:\d+, process 1235; ")
+                self.assertIn("trace: calls strace could not read at a dying thread's entry stop: none", out)
+
+    def test_each_condition_is_load_bearing(self):
+        table = unreadable_mutant_table()
+        survivors = [m for m, fixture, _ in table if not fixture]
+        self.assertEqual(survivors, [], f"mutants no fixture catches: {table}")
+        for mutant, fixture, code in table:
+            self.assertIn(code, (0, 1), (mutant, fixture))
+
+    def test_the_kernel_check_catches_a_stub_call_that_ran(self):
+        import unreadable_control as uc
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "k.log")
+            Path(log).write_text('1235 1.000000 mkdirat(3</x>, "1235-3", 0700) = 0\n'
+                                 '1235 1.100000 ???( <unfinished ...>\n'
+                                 '1235 1.200000 <... ??? resumed>) = ?\n'
+                                 '1235 1.300000 +++ killed by SIGKILL +++\n')
+            self.assertEqual(uc.stubs(log, d), (1, []))
+            os.mkdir(os.path.join(d, "1235-4"))  # as if the call the stub stands for had run
+            count, ran = uc.stubs(log, d)
+            self.assertEqual(count, 1)
+            self.assertEqual(len(ran), 1, ran)
+
+    def test_ci_runs_the_kernel_check_where_the_stub_appeared(self):
+        jobs = (HERE.parent.parent.parent / ".github" / "workflows" / "desktop.yml").read_text().split("\n  appimage-hosts:", 1)
+        self.assertEqual(len(jobs), 2)
+        job = jobs[1]
+        self.assertIn("gcc -O1 -static -pthread", job)
+        self.assertIn("python3 /e2e/unreadable_control.py /kr/killrace /out/unreadable", job)
+        self.assertIn('"${{ matrix.image }}"', job.split("unreadable_control.py", 1)[0].rsplit("docker run", 1)[1])
+
+    def test_the_reproducer_logs_of_three_strace_versions(self):
+        # e2e/killrace.c under each version's strace with the observer's options (t2-dev,
+        # Linux 6.8): the real lines of shapes B and C pass, nothing about them is UNPARSED.
+        logs = json.loads(lzma.decompress(UNREADABLE_LOGS.read_bytes()))
+        seen = set()
+        for label, entry in sorted(logs.items()):
+            with self.subTest(log=label), tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+                f.write(entry["log"])
+                name = f.name
+            try:
+                code, out = run_main([name, "--subtree", "/tmp"])
+            finally:
+                os.unlink(name)
+            self.assertNotRegex(out, r"(?m)^UNPARSED ", label)
+            got = re.search(r"(?m)^trace: calls strace could not read at a dying thread's entry stop: (.*)$", out).group(1)
+            self.assertEqual(got, entry["expect"], label)
+            seen.add(entry["strace"])
+        self.assertEqual(seen, {"5.16", "6.1", "6.17"})
 
 
 # ----------------------------------------------------------------------------------------------

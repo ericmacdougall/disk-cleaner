@@ -197,7 +197,7 @@ if ! $win; then
     echo "::error::no trace log: the suite launched no traced app"; trace=1
   else
     "$PY" e2e/trace_report.py "${logs[@]}" "${DECLARE[@]}" --links-from "$OUT/before.json" > "$OUT/trace.txt" || trace=$?
-    { grep -E '^(LATE|LOST|UNKNOWN|UNSUPPORTED|UNPARSED|UNRESOLVED|OTHER|trace:)' "$OUT/trace.txt" | head -200; } || true
+    { grep -E '^(LATE|LOST|UNKNOWN|UNSUPPORTED|UNPARSED|UNRESOLVED|OTHER|unreadable|trace:|  at )' "$OUT/trace.txt" | head -200; } || true
   fi
 fi
 

@@ -406,10 +406,66 @@ fails if one the kernel has is not in the log.
 - UNSUPPORTED: a successful call whose effects the trace cannot follow: io_uring, Linux AIO,
   `ptrace`, `process_vm_writev`, `bpf`, a seccomp filter, mounts, a new root or mount, user or
   PID namespace, POSIX message queues, keyrings, an `fcntl` command it does not know.
-- UNPARSED: a line it cannot read; LATE: a log that does not start with the program's
-  `execve`; LOST: a process with no exit record (strace let it go or was killed); an empty log.
+- UNPARSED: a line it cannot read, shown with its log, line and what its process logged just
+  before and after it; LATE: a log that does not start with the program's `execve`; LOST: a
+  process with no exit record (strace let it go or was killed); an empty log.
 - UNRESOLVED: a path or descriptor whose object it cannot establish.
 - OTHER: a change no declaration allows.
+
+A call strace could not read. When a thread is killed while it waits in a syscall entry stop,
+strace can no longer read its registers and prints its stub name with no arguments: `???` in
+strace 6.1 and 6.17, `????` in 5.16. Seen in CI run 44896444434 as `???( <unfinished ...>`
+on both AppImage hosts, at the app's close, where WebKitGTK kills its web process. Such a call
+never runs. On Linux 6.8, `syscall_trace_enter` (`kernel/entry/common.c`, lines 44 to 47)
+returns -1, which runs no call (`arch/x86/entry/common.c`, `do_syscall_64`, lines 79 to 83),
+when `ptrace_report_syscall_entry` returns nonzero. That function returns
+`fatal_signal_pending(current)` once the tracer lets the thread go (`include/linux/ptrace.h`,
+`ptrace_report_syscall`, line 426; `ptrace_report_syscall_entry`, lines 449 to 452). The
+reproducer, `e2e/killrace.c`, ran on t2-dev (Linux 6.8) under the observer's own strace
+options, in ubuntu:22.04, debian:12 and fedora:41. Each of 16 threads loops `mkdirat` on
+`<tid>-<i>`, so a call ran exactly when its folder exists. The process was killed five ways:
+`exit_group`, its own SIGKILL, another process's SIGKILL (once or twice), and a WebKit-like
+parent kill with a parent-death SIGKILL. Results:
+
+- 84 stub lines appeared, and 0 of their 84 calls ran.
+- In 135 runs where nothing was killed (the threads joined), no stub appeared.
+- Every stub was followed by only its thread's end, in one of two shapes:
+  - B: `???( <unfinished ...>`, then `<... ??? resumed>) = ?`, then the end.
+  - C: one line `???() = ?`, then the end.
+
+The observer passes these calls in exactly three shapes; any other is UNPARSED. In each, the
+name is the same `???` or `????` throughout and the parentheses are empty. In each, the end
+that follows is the thread's own `+++ killed by` or `+++ exited with` record, and nothing of
+that thread follows it. The shapes:
+
+- A: `???( <unfinished ...>`, then the end. CI run 44896444434 listed this line alone; that
+  run kept no strace log, so its thread's other records are unknown. The AppImage hosts job now
+  keeps the log (`launch/trace/strace.log` in its artifact).
+- B: `???( <unfinished ...>`, then `<... ??? resumed>) = ?` (no value), then the end.
+- C: `???() = ?`, then the end.
+
+These stay UNPARSED, each with a fixture:
+
+- a resumed line with any value;
+- another call, before or instead of the end;
+- another thread's death;
+- the end of the log;
+- `superseded by execve`;
+- arguments inside the parentheses;
+- a mixed stub name;
+- a call printed by number (`syscall_0x1c4(...)`).
+
+Each passing call is listed as `unreadable`, with its records, and is counted in the summary by
+stub name and shape. One mutant per condition checks the rules (`test_trace_report.py`,
+`Unreadable`). The real logs of the three strace versions are kept in
+`e2e/recorded/unreadable-stubs.json.xz`. The AppImage hosts job runs `e2e/unreadable_control.py`
+on the CI kernel, with that host's strace and the observer's options. It does 20 runs each of an
+external kill and the WebKit-like kill, which takes about 5 s plus the strace install. The check
+fails in any of these cases:
+
+- a stub's call ran;
+- the observer did not pass every stub;
+- no stub appeared, so the check proved nothing.
 
 Descriptors: a write through any descriptor (inherited, `dup`, `dup2`, `dup3`, `F_DUPFD`,
 received over a socket, shared or copied by `fork` and `clone`) is judged by the object strace

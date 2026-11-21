@@ -81,7 +81,7 @@ grep -v ' cache/mesa_shader_cache' "$OUT/sandbox.txt" || true
 echo "== trace"
 trace=0
 python3 "$HERE/trace_report.py" "$LOG" "${DECLARE[@]}" --links-from "$OUT/before.json" > "$OUT/trace.txt" || trace=$?
-{ grep -E '^(LATE|LOST|UNKNOWN|UNSUPPORTED|UNPARSED|UNRESOLVED|OTHER|declared|trace:)' "$OUT/trace.txt" | grep -v mesa_shader_cache | head -200; } || true
+{ grep -E '^(LATE|LOST|UNKNOWN|UNSUPPORTED|UNPARSED|UNRESOLVED|OTHER|declared|unreadable|trace:|  at )' "$OUT/trace.txt" | grep -v mesa_shader_cache | head -200; } || true
 echo "== snapshot compare"
 nowrite=0
 python3 "$HERE/trace_report.py" --snapshot "$OUT/before.json" "$OUT/after.json" "${DECLARE[@]}" > "$OUT/manifest.txt" || nowrite=$?

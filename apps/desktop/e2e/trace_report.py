@@ -8,7 +8,12 @@ Its default is failure. Each of these fails the check:
   - a call whose effects it cannot judge (UNSUPPORTED): io_uring, Linux AIO, ptrace,
     process_vm_writev, a seccomp filter, a new mount namespace or root, mounts, mqueues,
     keyrings and the like;
-  - a line it cannot read (UNPARSED);
+  - a line it cannot read (UNPARSED), each shown with where it is and what its process logged
+    just before and after it. Not a failure: a call strace could not read at its entry stop
+    (its stub name "???" or "????", no arguments, no return value; three exact shapes, see
+    unreadable_shape) that is its thread's last call, followed by nothing but that thread's own
+    end. The thread was killed in that stop, and a call whose thread dies at its entry stop never
+    runs (docs/DESKTOP.md). These are listed and counted as "unreadable";
   - a path or descriptor whose object it cannot establish (UNRESOLVED);
   - a process the trace lost before it ended (LOST), or a log that does not start with the
     program's execve (LATE);
@@ -311,6 +316,54 @@ DETACHED = re.compile(r"^strace: Process (\d+) detached$")
 START = re.compile(r"^([a-z_][a-z0-9_]*)\(")
 UNFINISHED = " <unfinished ...>"
 RESUMED = re.compile(r"^<\.\.\. ([a-z_][a-z0-9_]*) resumed>(.*)$")
+# A call strace could not read at its entry stop: get_scno failed (the thread was gone when
+# strace asked for its registers), so strace printed its stub name ("???" in 6.x, "????" in
+# 5.16) and no arguments. Then, at the thread's exit, either "<... ??? resumed>) = ?" (strace
+# 5.16, 6.1, 6.17 on t2-dev, Linux 6.8) or nothing; or, with no other line between, the one line
+# "???() = ?". "= ?" is no return value: the call never returned. LogState lets these pass only
+# as the thread's last records before its end (docs/DESKTOP.md, "A call strace could not read").
+UNREADABLE = re.compile(r"^(\?{3,4})\( <unfinished \.\.\.>$")
+UNREADABLE_END = re.compile(r"^<\.\.\. (\?{3,4}) resumed>\)\s+= \?$")
+UNREADABLE_DONE = re.compile(r"^(\?{3,4})\(\)\s+= \?$")
+# The records that may end a thread after such a call: "+++ exited with" and "+++ killed by"
+# (never "superseded by execve", where the thread group goes on).
+STUB_ENDS = {"exit"}
+
+
+def same_stub(a: str, b: str) -> bool:
+    return a == b
+
+
+def ends_there(tail: list) -> bool:
+    """The thread's next record after the call is its own end."""
+    return bool(tail) and tail[0][0] in STUB_ENDS
+
+
+def nothing_after(tail: list) -> bool:
+    """Nothing of the thread follows its end."""
+    return len(tail) == 1
+
+
+def unreadable_shape(rest: list) -> str | None:
+    """`rest`: the (kind, text) of a thread's records from a "stub" record on. The shape when
+    they are a call strace could not read at its entry stop and then only the thread's end;
+    None otherwise (the line is then UNPARSED)."""
+    if not rest or rest[0][0] != "stub":
+        return None
+    if m := UNREADABLE.match(rest[0][1]):
+        name, tail, shape = m.group(1), rest[1:], "unfinished, then the end"
+        if tail and tail[0][0] == "stub-end":
+            e = UNREADABLE_END.match(tail[0][1])
+            if not e or not same_stub(name, e.group(1)):
+                return None
+            tail, shape = tail[1:], "unfinished, resumed with no value, then the end"
+    elif d := UNREADABLE_DONE.match(rest[0][1]):
+        name, tail, shape = d.group(1), rest[1:], "one line with no value, then the end"
+    else:
+        return None
+    if not ends_there(tail) or not nothing_after(tail):
+        return None
+    return f"{name}( {shape}"
 RESULT = re.compile(r"^(\?|-?\d+|0x[0-9a-fA-F]+)(?:<((?:[^>\\]|\\.)*)>(\(deleted\))?)?(?:\s+(.*))?$")
 DESCRIPTOR = re.compile(r"^(AT_FDCWD|-?\d+)(?:<((?:[^>\\]|\\.)*)>(\(deleted\))?)?$")
 DELETED = " (deleted)"
@@ -526,6 +579,10 @@ class Report:
     def __init__(self, decls: Declarations):
         self.decls = decls
         self.seen: dict[tuple[str, str], set[str]] = defaultdict(set)
+        # Where each finding is: the log, the line, and its process's records around it.
+        self.where: dict[tuple[str, str], list[str]] = defaultdict(list)
+        # Calls strace could not read at a dying thread's entry stop, by stub name and shape.
+        self.unreadable: dict[str, int] = defaultdict(int)
         self.calls = 0
         self.logs = 0
         self.ops: list[PathOp] = []
@@ -533,8 +590,10 @@ class Report:
         self.links_seed: dict[str, str] = {}
         self.plain_seed: set[str] = set()
 
-    def note(self, kind: str, call: str, what: str) -> None:
+    def note(self, kind: str, call: str, what: str, where: str | None = None) -> None:
         self.seen[(kind, what)].add(call)
+        if where is not None:
+            self.where[(kind, what)].append(where)
 
     # -- one log ---------------------------------------------------------------------------
 
@@ -546,12 +605,14 @@ class Report:
         log.run()
 
     def records(self, path: str, default: str):
-        """(tid, timestamp, kind, payload) for every line: kind is "call" (name, args, result
-        or None for a call the process never returned from), "exit", "superseded", "signal",
-        "detached" or "bad" (the line, the reason)."""
-        pending: dict[tuple[str, str], tuple[float, str]] = {}
+        """(tid, timestamp, kind, payload, line number) for every line: kind is "call" (name,
+        args, result or None for a call the process never returned from), "exit",
+        "superseded", "signal", "detached", "stub" or "stub-end" (a line of a call strace
+        could not read: its text; LogState decides whether it may pass) or "bad" (the line,
+        the reason)."""
+        pending: dict[tuple[str, str], tuple[float, str, int]] = {}
         with open(path, errors="surrogateescape") as f:
-            for raw in f:
+            for n, raw in enumerate(f, 1):
                 line = raw.rstrip("\n")
                 m = PREFIX.match(line)
                 tid = m.group(1) or m.group(2) or default
@@ -561,42 +622,46 @@ class Report:
                     continue
                 try:
                     if EXIT.match(text):
-                        yield tid, ts, "exit", text
+                        yield tid, ts, "exit", text, n
                     elif s := SUPERSEDED.match(text):
-                        yield tid, ts, "superseded", s.group(1)
+                        yield tid, ts, "superseded", s.group(1), n
                     elif SIGNAL.match(text):
-                        yield tid, ts, "signal", text
+                        yield tid, ts, "signal", text, n
                     elif d := DETACHED.match(text):
-                        yield d.group(1), ts, "detached", text
+                        yield d.group(1), ts, "detached", text, n
                     elif PERSONALITY.match(text):
-                        yield tid, ts, "bad", (text, "a 32-bit or x32 process: its calls are not x86_64's")
+                        yield tid, ts, "bad", (text, "a 32-bit or x32 process: its calls are not x86_64's"), n
+                    elif UNREADABLE.match(text) or UNREADABLE_DONE.match(text):
+                        yield tid, ts, "stub", text, n
+                    elif UNREADABLE_END.match(text):
+                        yield tid, ts, "stub-end", text, n
                     elif text.endswith(UNFINISHED):
                         s = START.match(text)
                         if not s:
                             raise Unparsed("not a call")
-                        pending[(tid, s.group(1))] = (ts, text[: -len(UNFINISHED)])
+                        pending[(tid, s.group(1))] = (ts, text[: -len(UNFINISHED)], n)
                     elif r := RESUMED.match(text):
                         head = pending.pop((tid, r.group(1)), None)
                         if head is None:
                             raise Unparsed("resumed without its start")
                         name, args, result = split_call(head[1] + r.group(2))
-                        yield tid, head[0], "call", (name, args, result)
+                        yield tid, head[0], "call", (name, args, result), head[2]
                     else:
                         name, args, result = split_call(text)
-                        yield tid, ts, "call", (name, args, result)
+                        yield tid, ts, "call", (name, args, result), n
                 except Unparsed as e:
-                    yield tid, ts, "bad", (text[:200], str(e))
+                    yield tid, ts, "bad", (text[:200], str(e)), n
                 if len(pending) > 100000:
-                    yield tid, ts, "bad", (text[:200], "too many unfinished calls")
+                    yield tid, ts, "bad", (text[:200], "too many unfinished calls"), n
                     pending.clear()
-        for (tid, name), (ts, head) in pending.items():
+        for (tid, name), (ts, head, n) in pending.items():
             # The process ended inside the call: it may have taken effect.
             try:
                 body = head[len(name) + 1:].rstrip().rstrip(",")
                 split_args(body)
-                yield tid, ts, "call", (name, body, None)
+                yield tid, ts, "call", (name, body, None), n
             except Unparsed as e:
-                yield tid, ts, "bad", (head[:200], str(e))
+                yield tid, ts, "bad", (head[:200], str(e)), n
 
     # -- after every log: the paths -------------------------------------------------------
 
@@ -627,19 +692,25 @@ class Report:
 
     def print(self, label: str = "trace") -> int:
         bad = ["LATE", "LOST", "UNKNOWN", "UNSUPPORTED", "UNPARSED", "UNRESOLVED", "OTHER"]
-        order = bad + ["declared", "anonymous"]
+        order = bad + ["declared", "anonymous", "unreadable"]
         counts = defaultdict(int)
         # One line per verdict, call and object: "OTHER openat: /tmp/x" (e2e/expect_variant.py
-        # looks for that exact line).
+        # looks for that exact line). Under it, "  at ..." for each place the log shows it
+        # (findings that come from one line: UNPARSED and unreadable).
         for kind in order:
             for (k, p), calls in sorted(self.seen.items()):
                 if k == kind:
                     counts[kind] += 1
                     for call in sorted(calls):
                         print(f"{kind} {call}: {p}")
+                    for w in self.where.get((k, p), [])[:5]:
+                        print(f"  {w}")
         nbad = sum(counts[k] for k in bad)
         print(f"{label}: {self.calls} calls in {self.logs} logs; " + ", ".join(f"{counts[k]} {k}" for k in order)
               + " (objects)")
+        # Not a failure, but never silent: each shape and stub name, counted.
+        print(f"{label}: calls strace could not read at a dying thread's entry stop: "
+              + ("; ".join(f"{c} x {s}" for s, c in sorted(self.unreadable.items())) or "none"))
         if self.calls == 0:
             print(f"{label}: FAIL: no call in the logs (an empty or foreign log proves nothing)")
             return 1
@@ -657,21 +728,76 @@ class LogState:
         self.tasks: dict[str, Task] = {}
         self.children: dict[str, tuple[str, set[str]]] = {}  # child tid -> (parent tid, flags)
         self.first = True
+        # Each thread's records, by their index in `records`, and each record's place there.
+        self.mine: dict[str, list[int]] = defaultdict(list)
+        for i, rec in enumerate(records):
+            self.mine[rec[0]].append(i)
+        self.place = {i: k for idx in self.mine.values() for k, i in enumerate(idx)}
+
+    def rest_of(self, i: int) -> list:
+        """(kind, text) of record i's thread's records from i on."""
+        return [(self.records[j][2], self.records[j][3]) for j in self.mine[self.records[i][0]][self.place[i]:]]
+
+    @staticmethod
+    def brief(rec) -> str:
+        tid, ts, kind, payload, n = rec
+        if kind == "call":
+            name, args, result = payload
+            text = f"{name}({args[:80]}{'...' if len(args) > 80 else ''})" + (" <unfinished>" if result is None else f" = {result[:40]}")
+        elif kind == "bad":
+            text = payload[0][:120]
+        else:
+            text = str(payload)[:120]
+        return f"line {n}: {text}"
+
+    def where(self, i: int) -> str:
+        """Where record i is and what its thread logged just before and after it."""
+        tid = self.records[i][0]
+        idx, k = self.mine[tid], self.place[i]
+        before = self.brief(self.records[idx[k - 1]]) if k else "nothing (its first record)"
+        after = "; ".join(self.brief(self.records[j]) for j in idx[k + 1:k + 4]) or "nothing (its last record)"
+        return f"at {self.path}:{self.records[i][4]}, process {tid}; before it: {before}; after it: {after}"
+
+    def unreadable(self) -> set[int]:
+        """The stub records that pass (unreadable_shape) and the resumed lines they own. Every
+        other stub record, and every resumed stub line no passing stub owns, is UNPARSED."""
+        ok: set[int] = set()
+        for i, rec in enumerate(self.records):
+            if rec[2] != "stub":
+                continue
+            shape = unreadable_shape(self.rest_of(i))
+            if shape is None:
+                continue
+            idx, k = self.mine[rec[0]], self.place[i]
+            ok.add(i)
+            if k + 1 < len(idx) and self.records[idx[k + 1]][2] == "stub-end":
+                ok.add(idx[k + 1])
+            self.r.unreadable[shape] += 1
+            self.r.note("unreadable", "stub", f"{shape}: process {rec[0]}, {self.path}:{rec[4]}", self.where(i))
+        return ok
 
     # The clone records first, so a child that runs before its parent's clone returns already
     # knows whose descriptors and folder it has.
     def run(self) -> None:
-        for tid, ts, kind, payload in self.records:
+        for tid, ts, kind, payload, n in self.records:
             if kind == "call" and payload[0] in ("clone", "clone3", "fork", "vfork") and payload[2] is not None:
                 m = RESULT.match(payload[2])
                 if m and m.group(1) not in ("?",) and int(m.group(1), 0) > 0:
                     self.children[str(int(m.group(1), 0))] = (tid, self.clone_flags(payload[0], payload[1]))
-        for tid, ts, kind, payload in self.records:
+        passed = self.unreadable()
+        for i, (tid, ts, kind, payload, n) in enumerate(self.records):
+            if kind in ("stub", "stub-end"):
+                self.task(tid)
+                if i not in passed:
+                    why = ("a call strace could not read, not followed by nothing but its thread's end"
+                           if kind == "stub" else "a resumed call strace could not read, with no passing start")
+                    self.r.note("UNPARSED", "line", f"{payload} ({why})", self.where(i))
+                continue
             try:
-                self.record(tid, ts, kind, payload)
+                self.record(tid, ts, kind, payload, i)
             except (Unparsed, IndexError, ValueError) as e:
                 text = f"{payload[0]}({payload[1][:120]}) = {payload[2]}" if kind == "call" else str(payload)
-                self.r.note("UNPARSED", payload[0] if kind == "call" else "line", f"{text} ({e})")
+                self.r.note("UNPARSED", payload[0] if kind == "call" else "line", f"{text} ({e})", self.where(i))
         for t in self.tasks.values():
             if not t.ended:
                 self.r.note("LOST", "trace", f"process {t.tid} ({t.exe}) has no exit in {self.path}: the trace "
@@ -703,9 +829,9 @@ class LogState:
         self.tasks[tid] = t
         return t
 
-    def record(self, tid: str, ts: float, kind: str, payload) -> None:
+    def record(self, tid: str, ts: float, kind: str, payload, i: int) -> None:
         if kind == "bad":
-            self.r.note("UNPARSED", "line", f"{payload[0]} ({payload[1]})")
+            self.r.note("UNPARSED", "line", f"{payload[0]} ({payload[1]})", self.where(i))
             return
         if kind == "detached":
             self.r.note("LOST", "trace", f"strace detached from process {tid}: what it did after is unseen")
