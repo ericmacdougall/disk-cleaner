@@ -8,7 +8,8 @@ PruneDisk; the repository and the command are still called disk-cleaner.
 > tagged release, installer or download page yet, so you build it from source. (Continuous
 > integration also builds unsigned binaries for each platform and keeps them as workflow artifacts
 > for 14 days; they are test builds, not releases.) No command removes, moves or changes anything:
-> the only file it writes is the one you name with `scan --out`.
+> the only file it writes is the one you name with `scan --out`. The desktop app is read-only
+> too; what it writes outside the folders it scans is listed below.
 
 ## What it does today
 
@@ -35,6 +36,19 @@ proposes one action per item: `keep`, `remove-regenerable`, `backup-then-remove`
 `recover-backup-then-remove` or `ask`, each with a reason in words. The plan is a proposal only;
 nothing applies it yet.
 
+### Desktop app (read-only)
+
+`apps/desktop` is a Tauri window over the same scan and plan: choose drives or folders (or open a
+scan file), then look at the size tree, a treemap, the top files, the developer view (repos,
+worktrees, rebuildable folders and caches with their plan action and reason) and Settings. It has
+no apply step: nothing in it deletes, moves or backs up anything. A sunburst view, planned in
+[docs/DESIGN.md](docs/DESIGN.md), is not built yet. Outside the folders it scans, it writes only
+what Settings lists under "What this app writes" and
+[docs/DESKTOP.md](docs/DESKTOP.md#files-the-desktop-app-writes) repeats. That includes its config
+files on Save, the plan you export, the web view's own data folder, and on Linux the GTK file
+dialog's entry in your recent files. How to build it, its checks and its limits are in
+[docs/DESKTOP.md](docs/DESKTOP.md).
+
 The scan and plan formats, every fact and every rule are described in
 [docs/SCAN-FORMAT.md](docs/SCAN-FORMAT.md). The overall design is in [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -60,7 +74,7 @@ None of this exists yet:
   [rclone](https://rclone.org)), removal with a manifest, and restore;
 - detection and backup of coding-agent sessions and logs, and age and size policies for caches and
   outputs;
-- a desktop app with outline, sunburst, treemap and biggest-files views;
+- a sunburst view in the desktop app, and applying a plan from it;
 - installers and releases;
 - renaming the repository and the command to `prunedisk`.
 
