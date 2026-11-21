@@ -27,6 +27,14 @@ for (const k of ["app", "fixture", "big", "valid", "malformed", "export"]) {
   if (!a[k]) throw new Error(`--${k} is required`);
 }
 const run = new Run("e2e");
+const linux = process.platform === "linux";
+// The untraced switch (an e2e build only, honoured by e2e/check.sh's wrapper; never shipped:
+// e2e/check-shipped.sh). Every timing assertion is taken in a launch with it set, after the
+// session shows from /proc that its app is not traced (main's ruling, relayed by the stream
+// owner; inferred). Variant untraced-ignored renames it here, so every launch is traced and each
+// timing check must fail on that precondition, never on its numbers.
+const UNTRACED_VAR = "PRUNEDISK_E2E_UNTRACED";
+const NOT_UNTRACED = "not shown to be untraced; not measured";
 const env = {
   ...process.env,
   PRUNEDISK_E2E_FOLDERS: [a.fixture, a.big].join(path.delimiter),
@@ -35,6 +43,8 @@ const env = {
   // One export folder; the second export is a cancel. The app names the file in it (N2).
   PRUNEDISK_E2E_EXPORT: a.export,
 };
+// The main session is traced (Linux), whatever the caller's environment holds.
+delete env[UNTRACED_VAR];
 const EXPORT_LABEL = "Export plan to a folder...";
 
 /** `YYYYMMDD-HHMMSS` (UTC), as the app stamps an exported plan. */
@@ -85,6 +95,124 @@ const tab = async (label) => {
   await app.s.click(el);
   await app.s.until("return document.querySelector('[role=tab][aria-selected=true]')?.textContent === arguments[0]", 10_000, label);
 };
+
+// The default fixture's timings (registered in WAL w0ce4fd7355e), as functions of a session, so
+// the same steps run in the traced main session and in the untraced timing session (Linux).
+/** p50/p95/max of samples, nearest rank, against a threshold (information when gate is false). */
+function stats(id, ms, thresholdMs) {
+  return { id, n: ms.length, p50: rank(ms, 0.5), p95: rank(ms, 0.95), max: Math.max(...ms), thresholdMs };
+}
+/** The timings mean something only over the wide folder (probe run 44686507550 measured a short
+ *  tree when the drill failed). */
+function wideShown(total) {
+  if (total < 1000) throw new Error(`the wide folder is not shown (${total} rows); not measured`);
+}
+/** Size tree, into the fixture's wide folder (5,000 rows): the row count shown. */
+async function drillIntoWide(x) {
+  const el = await x.s.findText("[role=tab]", "Size tree");
+  await x.s.click(el);
+  await x.s.until("return document.querySelector('[role=tab][aria-selected=true]')?.textContent === arguments[0]", 10_000, "Size tree");
+  // Rows are re-rendered as pages arrive, so a row found a moment ago can be gone when the
+  // pointer reaches it (run 44688993733: "stale element reference"). The driver refuses such an
+  // action before it clicks, so trying again cannot click twice.
+  const again = async (f) => {
+    const end = Date.now() + 30_000;
+    for (;;) {
+      try {
+        return await f();
+      } catch (e) {
+        if (Date.now() > end || !/stale element|no such element/.test(String(e?.message))) throw e;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
+  };
+  await again(async () => x.s.dblclick(await x.s.find(".tg-scroll [role=row][aria-rowindex='2']")));
+  await x.s.until("return document.querySelectorAll(\"nav[aria-label='Folder path'] button\").length >= 2", 15_000);
+  await again(async () => x.s.dblclick(await x.s.findText(".tg-scroll [role=row] .name", "wide")));
+  return x.s.until(
+    "const n = Number(document.querySelector('.tg-scroll').getAttribute('aria-rowcount')) - 1; return n >= 1000 ? n : 0;",
+    30_000,
+  );
+}
+/** IPC: tree_page of 60 rows at offsets (i * 37) mod total, 10 warm-up calls, 200 timed. */
+async function ipcDefaultSamples(x, total) {
+  const r = await x.invoke("current_state");
+  if (!r.ok) throw new Error(`current_state: ${r.error}`);
+  const ms = await x.s.execAsync(
+    `const [view, total, warm, n, done] = arguments;
+     (async () => {
+       const inv = window.__TAURI_INTERNALS__.invoke;
+       const out = [];
+       for (let i = 0; i < warm + n; i++) {
+         const offset = (i * 37) % Math.max(1, total);
+         const t = performance.now();
+         await inv("tree_page", { view, offset, limit: 60 });
+         if (i >= warm) out.push(performance.now() - t);
+       }
+       return out;
+     })().then(done, (e) => done({ error: String(e) }));`,
+    120_000,
+    r.value.view,
+    total,
+    THRESHOLDS.warmup,
+    THRESHOLDS.samples,
+  );
+  if (!Array.isArray(ms)) throw new Error(JSON.stringify(ms));
+  return ms;
+}
+/** Scroll: 200 steps of 40 rows, each timed until its top row is in the DOM. */
+async function scrollDefaultSamples(x) {
+  const ms = await x.s.execAsync(
+    `const [n, step, rowH, done] = arguments;
+     (async () => {
+       const sc = document.querySelector(".tg-scroll");
+       const frame = () => new Promise((r) => requestAnimationFrame(r));
+       const out = [];
+       for (let i = 0; i < n; i++) {
+         const max = sc.scrollHeight - sc.clientHeight;
+         sc.scrollTop = sc.scrollTop + step * rowH > max ? 0 : sc.scrollTop + step * rowH;
+         const want = Math.floor(sc.scrollTop / rowH);
+         const t = performance.now();
+         while (!document.getElementById("tg-row-" + want)) {
+           await frame();
+           if (performance.now() - t > 5000) throw new Error("row " + want + " never shown");
+         }
+         out.push(performance.now() - t);
+         await frame();
+       }
+       return out;
+     })().then(done, (e) => done({ error: String(e) }));`,
+    180_000,
+    THRESHOLDS.samples,
+    40,
+    ROW_HEIGHT,
+  );
+  if (!Array.isArray(ms)) throw new Error(JSON.stringify(ms));
+  return ms;
+}
+/** The two gated default-fixture timings, in the session `x`. `ready` throws when the session
+ *  may not be timed (not shown to be untraced, or the wide folder not shown). Thresholds, n and
+ *  no retry as registered; each also judges its samples against 0 ms, which must fail. */
+async function defaultTimings(x, total, ready) {
+  await run.check("timing.ipc_tree_page_p95", async () => {
+    ready();
+    const ms = await ipcDefaultSamples(x, total);
+    const m = stats("ipc_tree_page", ms, THRESHOLDS.ipcP95Ms);
+    run.measure(m);
+    if (judge(m.id, ms, 0).pass) throw new Error("control: a 0 ms threshold passed these samples");
+    if (m.p95 > THRESHOLDS.ipcP95Ms) throw new Error(`p95 ${m.p95.toFixed(1)} ms > ${THRESHOLDS.ipcP95Ms} ms`);
+    return m;
+  });
+  await run.check("timing.scroll_p95", async () => {
+    ready();
+    const ms = await scrollDefaultSamples(x);
+    const m = stats("scroll_rows_shown", ms, THRESHOLDS.scrollP95Ms);
+    run.measure(m);
+    if (judge(m.id, ms, 0).pass) throw new Error("control: a 0 ms threshold passed these samples");
+    if (m.p95 > THRESHOLDS.scrollP95Ms) throw new Error(`p95 ${m.p95.toFixed(1)} ms > ${THRESHOLDS.scrollP95Ms} ms`);
+    return m;
+  });
+}
 
 try {
   await run.check("launch", async () => {
@@ -194,101 +322,32 @@ try {
     return got;
   });
 
-  // Size tree: into the wide folder (5,000 rows), then the timings.
+  // Size tree: into the wide folder (5,000 rows), then the timings' steps.
   let total = 0;
   await run.check("view.tree_drill_into_wide", async () => {
-    await tab("Size tree");
-    // Rows are re-rendered as pages arrive, so a row found a moment ago can be gone when the
-    // pointer reaches it (run 44688993733: "stale element reference"). The driver refuses
-    // such an action before it clicks, so trying again cannot click twice.
-    const again = async (f) => {
-      const end = Date.now() + 30_000;
-      for (;;) {
-        try {
-          return await f();
-        } catch (e) {
-          if (Date.now() > end || !/stale element|no such element/.test(String(e?.message))) throw e;
-          await new Promise((r) => setTimeout(r, 200));
-        }
-      }
-    };
-    await again(async () => app.s.dblclick(await app.s.find(".tg-scroll [role=row][aria-rowindex='2']")));
-    await app.s.until("return document.querySelectorAll(\"nav[aria-label='Folder path'] button\").length >= 2", 15_000);
-    await again(async () => app.s.dblclick(await app.s.findText(".tg-scroll [role=row] .name", "wide")));
-    total = await app.s.until(
-      "const n = Number(document.querySelector('.tg-scroll').getAttribute('aria-rowcount')) - 1; return n >= 1000 ? n : 0;",
-      30_000,
-    );
+    total = await drillIntoWide(app);
     return { rows: total };
   });
-
-  // The timings mean something only over the wide folder (probe run 44686507550 measured a
-  // short tree when the drill failed).
-  const wideShown = () => {
-    if (total < 1000) throw new Error(`the wide folder is not shown (${total} rows); not measured`);
-  };
-  await run.check("timing.ipc_tree_page_p95", async () => {
-    wideShown();
-    const view = (await state()).view;
-    const ms = await app.s.execAsync(
-      `const [view, total, warm, n, done] = arguments;
-       (async () => {
-         const inv = window.__TAURI_INTERNALS__.invoke;
-         const out = [];
-         for (let i = 0; i < warm + n; i++) {
-           const offset = (i * 37) % Math.max(1, total);
-           const t = performance.now();
-           await inv("tree_page", { view, offset, limit: 60 });
-           if (i >= warm) out.push(performance.now() - t);
-         }
-         return out;
-       })().then(done, (e) => done({ error: String(e) }));`,
-      120_000,
-      view,
-      total,
-      THRESHOLDS.warmup,
-      THRESHOLDS.samples,
-    );
-    if (!Array.isArray(ms)) throw new Error(JSON.stringify(ms));
-    const m = { id: "ipc_tree_page", n: ms.length, p50: rank(ms, 0.5), p95: rank(ms, 0.95), max: Math.max(...ms), thresholdMs: THRESHOLDS.ipcP95Ms };
-    run.measure(m);
-    if (m.p95 > THRESHOLDS.ipcP95Ms) throw new Error(`p95 ${m.p95.toFixed(1)} ms > ${THRESHOLDS.ipcP95Ms} ms`);
-    return m;
-  });
-
-  await run.check("timing.scroll_p95", async () => {
-    wideShown();
-    const ms = await app.s.execAsync(
-      `const [n, step, rowH, done] = arguments;
-       (async () => {
-         const sc = document.querySelector(".tg-scroll");
-         const frame = () => new Promise((r) => requestAnimationFrame(r));
-         const out = [];
-         for (let i = 0; i < n; i++) {
-           const max = sc.scrollHeight - sc.clientHeight;
-           sc.scrollTop = sc.scrollTop + step * rowH > max ? 0 : sc.scrollTop + step * rowH;
-           const want = Math.floor(sc.scrollTop / rowH);
-           const t = performance.now();
-           while (!document.getElementById("tg-row-" + want)) {
-             await frame();
-             if (performance.now() - t > 5000) throw new Error("row " + want + " never shown");
-           }
-           out.push(performance.now() - t);
-           await frame();
-         }
-         return out;
-       })().then(done, (e) => done({ error: String(e) }));`,
-      180_000,
-      THRESHOLDS.samples,
-      40,
-      ROW_HEIGHT,
-    );
-    if (!Array.isArray(ms)) throw new Error(JSON.stringify(ms));
-    const m = { id: "scroll_rows_shown", n: ms.length, p50: rank(ms, 0.5), p95: rank(ms, 0.95), max: Math.max(...ms), thresholdMs: THRESHOLDS.scrollP95Ms };
-    run.measure(m);
-    if (m.p95 > THRESHOLDS.scrollP95Ms) throw new Error(`p95 ${m.p95.toFixed(1)} ms > ${THRESHOLDS.scrollP95Ms} ms`);
-    return m;
-  });
+  if (linux) {
+    // Linux: this session is traced, so its numbers are not judged; the timings are taken in the
+    // untraced session after it (on the same fixture). The same steps run here, under the write
+    // observer: they must complete, and their numbers are recorded as information only.
+    await run.check("steps.ipc_tree_page_traced", async () => {
+      wideShown(total);
+      const ms = await ipcDefaultSamples(app, total);
+      run.measure({ ...stats("ipc_tree_page_traced", ms, THRESHOLDS.ipcP95Ms), gate: false });
+      return { n: ms.length, timed: false };
+    });
+    await run.check("steps.scroll_traced", async () => {
+      wideShown(total);
+      const ms = await scrollDefaultSamples(app);
+      run.measure({ ...stats("scroll_rows_shown_traced", ms, THRESHOLDS.scrollP95Ms), gate: false });
+      return { n: ms.length, timed: false };
+    });
+  } else {
+    // Windows has no tracer: the timings are taken here, as registered.
+    await defaultTimings(app, total, () => wideShown(total));
+  }
 
   // Developer view: a class with more than one page, Next and Previous, then another class.
   await run.check("view.dev_paging_and_class_switch", async () => {
@@ -591,16 +650,16 @@ try {
 // Linux, as ruled after the no-strace controls (docs/DESKTOP.md; registered in WAL w3bd2a24a6c6
 // and wad2689e80fc before its first run): the running-app scroll (2) is timed in an untraced
 // launch (PRUNEDISK_E2E_UNTRACED=1, which e2e/check.sh's wrapper honours for an e2e build only;
-// this session checks the app is not traced). Threshold, n and no retry are unchanged. A second,
-// traced launch then runs the IPC gate (1) as registered and the same scroll steps, not timed:
-// they must complete within the DOM limit, under the write observer. Windows has no tracer: one
-// session, as registered.
-const linux = process.platform === "linux";
+// this session checks the app is not traced). Threshold, n and no retry are unchanged. Since
+// main's later ruling every timing assertion is taken untraced, the IPC gate (1) included. A
+// second, traced launch then runs the same IPC pages and scroll steps, not timed: they must
+// complete within the DOM limit, under the write observer. Windows has no tracer: one session,
+// as registered.
 const SYNTH_PROCS = ["e2e", "WebKitWebProces", "WebKitNetworkPr"];
 const synthEnv = (untraced) => {
   const e = { ...env, PRUNEDISK_E2E_SYNTH_NODES: String(AC9.nodes) };
-  if (untraced) e.PRUNEDISK_E2E_UNTRACED = "1";
-  else delete e.PRUNEDISK_E2E_UNTRACED;
+  if (untraced) e[UNTRACED_VAR] = "1";
+  else delete e[UNTRACED_VAR];
   return e;
 };
 /** The app processes started since `before` (pids of the e2e binary), with their TracerPid. */
@@ -662,6 +721,76 @@ const runSteps = (app) =>
     600_000,
     scrollOptions(),
   );
+/** Linux: whether this launch's app processes (since `before`) are all untraced (TracerPid 0).
+ *  Throws, so a check fails, when none is found or any is traced: never time a traced app. */
+const shownUntraced = (before) => {
+  const apps = newApps(before);
+  if (!apps.length) throw new Error(`no app process of this launch found in /proc; ${NOT_UNTRACED}`);
+  const traced = apps.filter((p) => p.tracerPid !== 0);
+  if (traced.length) throw new Error(`traced: ${JSON.stringify(traced)}; ${NOT_UNTRACED}`);
+  return apps;
+};
+
+// Linux: the default fixture's timings (timing.ipc_tree_page_p95, timing.scroll_p95), taken in a
+// launch of their own with the untraced switch, after the main session closed: the same fixture
+// scanned, the same wide folder, the same steps, thresholds, n and no retry. The scan here does
+// not collect git facts (the size tree does not use them), so the untraced launch starts no git;
+// the main session's traced scan does. The sandbox snapshot still covers this launch.
+if (linux) {
+  let procU;
+  let appU;
+  let before = new Set();
+  let beforeAll = new Set();
+  let sessionPids = [];
+  let untraced = false;
+  let totalU = 0;
+  try {
+    await new Promise((r) => setTimeout(r, 2000));
+    before = appPids();
+    beforeAll = allPids();
+    // Precondition (recorded): no other app instance alive at the session's start.
+    run.measure({ id: "info.default.precondition.untraced", others: procStates([...before]) });
+    const envU = { ...env, PRUNEDISK_E2E_FOLDERS: a.fixture, [UNTRACED_VAR]: "1" };
+    delete envU.PRUNEDISK_E2E_OPEN;
+    delete envU.PRUNEDISK_E2E_EXPORT;
+    delete envU.PRUNEDISK_E2E_SYNTH_NODES;
+    ({ proc: procU } = await startDriver({ nativeDriver: a["native-driver"], port: 4450, nativePort: 4451, env: envU }));
+    await run.check("launch.default_untraced", async () => {
+      appU = await App.open("http://127.0.0.1:4450", a.app);
+      await appU.s.cmd("POST", "/timeouts", { script: 600_000 });
+      await appU.s.until("return [...document.querySelectorAll('h2')].some((e) => e.textContent === 'Choose what to scan')", 60_000);
+      return { title: await appU.s.cmd("GET", "/title") };
+    });
+    sessionPids = procsSince(LEFT_PROCS, beforeAll);
+    await run.check("trace.default.timed_launch_untraced", async () => {
+      const apps = shownUntraced(before);
+      untraced = true;
+      return { apps };
+    });
+    await run.check("flow.default_untraced_scan", async () => {
+      if (!appU) throw new Error("the untraced launch did not open");
+      await appU.s.clickText("Add folders...");
+      await appU.s.until("return document.querySelectorAll('ul.chosen li').length === 1", 10_000);
+      await appU.s.clickText("Scan");
+      await appU.s.until("return [...document.querySelectorAll('.bar span')].some((e) => e.textContent.startsWith('Scan complete.'))", 120_000);
+      totalU = await drillIntoWide(appU);
+      return { rows: totalU };
+    });
+    await defaultTimings(appU, totalU, () => {
+      // The trace state first: a traced app is never timed, whatever else is wrong.
+      if (!untraced) throw new Error(`the timing launch is ${NOT_UNTRACED}`);
+      wideShown(totalU);
+    });
+  } catch (e) {
+    run.results.push({ id: "suite.default_untraced", ok: false, ms: 0, detail: String(e?.stack ?? e) });
+    console.log(`FAIL suite.default_untraced ${String(e?.message ?? e)}`);
+  } finally {
+    if (appU) await appU.close().catch(() => {});
+    if (procU) stopDriver(procU);
+    await afterClose("default_untraced", sessionPids);
+  }
+}
+
 {
   const rows = AC9.nodes + 1;
   let proc2;
@@ -701,17 +830,15 @@ const runSteps = (app) =>
     let untraced = !linux;
     if (linux) {
       await run.check("trace.synth_1m.timed_launch_untraced", async () => {
-        const apps = newApps(before);
-        if (!apps.length) throw new Error("no app process of this launch found in /proc");
-        const traced = apps.filter((p) => p.tracerPid !== 0);
-        if (traced.length) throw new Error(`traced: ${JSON.stringify(traced)}; not timed`);
+        const apps = shownUntraced(before);
         untraced = true;
         return { apps };
       });
     }
     const ready = () => {
+      // The trace state first: a traced app is never timed, whatever else is wrong.
+      if (!untraced) throw new Error(`the timed launch is ${NOT_UNTRACED}`);
       if (shown !== rows) throw new Error(`the one-million-row tree is not shown (${shown} rows); not measured`);
-      if (!untraced) throw new Error("the timed launch is not shown to be untraced; not measured");
     };
     // Informational, never a pass gate: a probe that fails is recorded, not counted as a failure.
     const info = async (id, f) => {
@@ -724,13 +851,18 @@ const runSteps = (app) =>
     const start = snapshot();
     await info("info.synth_1m.runner", async () => ({ machine: machine(), start }));
 
-    // Linux: (1)'s pages, in the registered order ahead of the steps. Information only here: the
-    // IPC gate is judged in the traced launch below, as registered.
+    // (1) IPC, Linux, in the registered order ahead of the steps: tree_page offset k*200 limit
+    // 200, 10 warm-up pages, then k = 0..99. Timed here, untraced (it was judged in the traced
+    // launch until every timing moved out of it); the traced launch below runs the same pages.
     if (linux) {
-      await info("info.synth_1m.ipc_untraced", async () => {
+      await run.check("timing.synth_1m.ipc_tree_page_p95", async () => {
         ready();
         const out = await ipcPages(app2);
-        return { ...judge("synth_1m_ipc_tree_page_untraced", out, AC9.ipcP95Ms), gate: false };
+        const m = { ...judge("synth_1m_ipc_tree_page", out, AC9.ipcP95Ms), rows, pageLimit: AC9.pageLimit };
+        run.measure(m);
+        if (judge(m.id, out, 0).pass) throw new Error("control: a 0 ms threshold passed these samples");
+        if (!m.pass) throw new Error(`p95 ${m.p95.toFixed(1)} ms, not under ${AC9.ipcP95Ms} ms`);
+        return m;
       });
     }
 
@@ -789,8 +921,8 @@ const runSteps = (app) =>
   }
 }
 
-// Linux: the traced launch. The IPC gate (1) as registered, then the same scroll steps as (2),
-// not timed: they must complete within the DOM limit, and the launch must leave its strace log
+// Linux: the traced launch. The IPC pages of (1), then the same scroll steps as (2), neither
+// timed: they must complete within the DOM limit, and the launch must leave its strace log
 // and pass the write observer (e2e/check.sh).
 if (linux) {
   const rows = AC9.nodes + 1;
@@ -826,15 +958,13 @@ if (linux) {
       if (shown !== rows) throw new Error(`the one-million-row tree is not shown (${shown} rows); not measured`);
     };
 
-    // (1) IPC, as registered: tree_page offset k*200 limit 200, 10 warm-up pages, then k = 0..99.
-    await run.check("timing.synth_1m.ipc_tree_page_p95", async () => {
+    // (1)'s pages under the write observer, not timed: they must all come back, each with 200
+    // rows at its offset; the numbers are information only.
+    await run.check("steps.synth_1m.traced_ipc", async () => {
       ready();
       const out = await ipcPages(app3);
-      const m = { ...judge("synth_1m_ipc_tree_page", out, AC9.ipcP95Ms), rows, pageLimit: AC9.pageLimit };
-      run.measure(m);
-      if (judge(m.id, out, 0).pass) throw new Error("control: a 0 ms threshold passed these samples");
-      if (!m.pass) throw new Error(`p95 ${m.p95.toFixed(1)} ms, not under ${AC9.ipcP95Ms} ms`);
-      return m;
+      run.measure({ ...judge("synth_1m_ipc_tree_page_traced", out, AC9.ipcP95Ms), rows, pageLimit: AC9.pageLimit, gate: false });
+      return { pages: out.length, timed: false };
     });
 
     // (2)'s steps under the write observer, not timed.
@@ -860,7 +990,7 @@ if (linux) {
 // sample in WAL w07983c42191 and wf5f38e99704. Opt-in (AC9_INVESTIGATE=1, Linux only) and never
 // a gate: everything goes to run.measure, nothing to a check. The gated sessions above are not
 // changed. Six more one-million-row sessions, each a fresh launch, with and without the strace
-// wrapper (e2e/check.sh skips it for PRUNEDISK_E2E_UNTRACED=1 with PRUNEDISK_E2E_SYNTH_NODES):
+// wrapper (e2e/check.sh skips it for PRUNEDISK_E2E_UNTRACED=1):
 // - steps: floor windows at the start, middle and end, around the scroll steps;
 // - idle: the app with the tree shown, no steps, the floor loop alone for the same time;
 // - blank: the same launch, navigated to about:blank (no app code), the floor loop likewise.

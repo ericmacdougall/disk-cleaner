@@ -1,0 +1,12 @@
+diff --git a/apps/desktop/e2e/run.mjs b/apps/desktop/e2e/run.mjs
+--- a/apps/desktop/e2e/run.mjs
++++ b/apps/desktop/e2e/run.mjs
+@@ -33,7 +33,7 @@ const linux = process.platform === "linux";
+ // session shows from /proc that its app is not traced (main's ruling, relayed by the stream
+ // owner; inferred). Variant untraced-ignored renames it here, so every launch is traced and each
+ // timing check must fail on that precondition, never on its numbers.
+-const UNTRACED_VAR = "PRUNEDISK_E2E_UNTRACED";
++const UNTRACED_VAR = "PRUNEDISK_VARIANT_IGNORED";
+ const NOT_UNTRACED = "not shown to be untraced; not measured";
+ const env = {
+   ...process.env,

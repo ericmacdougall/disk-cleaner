@@ -27,6 +27,17 @@ EXPECT = {
     "row-cap-removed": (["timing.synth_1m.scroll_p95", "steps.synth_1m.traced_scroll"], None),
     # PR gate F10: a write outside every snapshot root; only the trace can see it.
     "planted-outside": ([], None),
+    # Every timing is taken untraced (main's ruling): with the untraced switch never honoured,
+    # every launch is traced, and each timing check must refuse to time it (see DETAIL).
+    "untraced-ignored": (
+        ["timing.ipc_tree_page_p95", "timing.scroll_p95", "timing.synth_1m.ipc_tree_page_p95", "timing.synth_1m.scroll_p95"],
+        None,
+    ),
+}
+# variant -> text each of its failed checks must report: caught by that check's precondition,
+# not by its numbers
+DETAIL = {
+    "untraced-ignored": "not shown to be untraced; not measured",
 }
 # variant -> the line the trace report (trace.txt) must hold
 TRACE = {
@@ -46,10 +57,15 @@ def main(argv: list[str]) -> int:
         print(f"no suite results: {e}", file=sys.stderr)
         return 2
     failed = set(result["failed"])
+    details = {r.get("id"): str(r.get("detail", "")) for r in result.get("results", []) if not r.get("ok", True)}
     caught = True
     for c in checks:
         print(f"{'caught' if c in failed else 'MISSED'}: {c}")
         caught &= c in failed
+        if variant in DETAIL and c in failed:
+            hit = DETAIL[variant] in details.get(c, "")
+            print(f"{'caught' if hit else 'MISSED'}: {c} reports {DETAIL[variant]!r}: {details.get(c, '')[:200]!r}")
+            caught &= hit
     if manifest_text is not None:
         report = (out / "manifest.txt").read_text() if (out / "manifest.txt").exists() else ""
         hit = [line for line in report.splitlines() if line.startswith(manifest_text) and ".planted-by-variant" in line]
