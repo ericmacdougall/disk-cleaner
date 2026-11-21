@@ -110,6 +110,52 @@ fn real_plan_noise_and_git_act_with_the_core_oracle() {
     );
 }
 
+/// AC-7: rule noise needs its markers now, not only at scan time. With the marker gone the core
+/// oracle still agrees (it re-derives from the scan file), so only apply's live check stands
+/// between the piece and an unrecoverable removal: the piece must be backed up first, and
+/// restore must bring the bytes back rather than say "regenerate".
+#[test]
+fn a_rule_noise_piece_whose_marker_is_gone_is_backed_up() {
+    let w = world();
+    let nm = w.proj.join("node_modules");
+    let before = apply_common::tree_digest(&nm);
+    std::fs::remove_file(w.proj.join("package.json")).unwrap();
+    let fx = Fx::new();
+    let mut o = fx.opts(true);
+    o.oracle = core_oracle();
+    let rep = apply(&w.scan, &w.plan, &o).unwrap();
+    let mine: Vec<_> = rep
+        .pieces
+        .iter()
+        .filter(|p| p.path.starts_with(&nm))
+        .collect();
+    assert!(!mine.is_empty(), "{rep:#?}");
+    for p in &mine {
+        assert!(
+            p.reason.contains("marker"),
+            "{}: {}",
+            p.path.display(),
+            p.reason
+        );
+        assert!(
+            p.reason.contains("backed up"),
+            "{}: {}",
+            p.path.display(),
+            p.reason
+        );
+        assert_eq!(p.outcome, "removed", "{}: {}", p.path.display(), p.reason);
+    }
+    assert!(fx.shard_total() > 0, "the node_modules bytes were archived");
+    assert!(!nm.exists());
+    let rr = restore(&nm, &ropts(&fx)).unwrap();
+    assert!(rr.failed.is_empty() && rr.conflicts.is_empty(), "{rr:?}");
+    assert!(
+        !rr.regenerate.iter().any(|(p, _)| p.starts_with(&nm)),
+        "{rr:?}"
+    );
+    assert_eq!(apply_common::tree_digest(&nm), before);
+}
+
 /// `tree_digest` for a single file or a directory.
 fn tree_digest(p: &Path) -> String {
     if p.is_dir() {
