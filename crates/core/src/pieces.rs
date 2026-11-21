@@ -291,9 +291,15 @@ struct DirRec {
     /// This directory is a scan node's own path.
     is_node: bool,
     in_gitdir: bool,
-    /// Inside a git directory, below `refs`, `logs`, `worktrees` or `modules`: names here are
-    /// branch, worktree and submodule names that git chose from the user's words, never file
-    /// contents, so name-based secret rules do not apply to them.
+    /// The top of a git directory: where a git directory starts, or the admin directory of a
+    /// linked worktree or submodule (below `worktrees` or `modules`, holding a `HEAD` file).
+    git_top: bool,
+    /// Below `worktrees` or `modules` of a git top, outside an admin directory: these directory
+    /// names are worktree names and submodule paths.
+    git_area: bool,
+    /// Below `refs` or `logs` of a git top: names here are ref names (branches, tags, remotes)
+    /// that git chose from the user's words, never file contents, so name-based secret rules do
+    /// not apply to them.
     git_named: bool,
     in_artifact: bool,
     /// The topmost secret directory at or above this one: its kind.
@@ -377,6 +383,8 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
             node: node_at.get(root).copied(),
             is_node: node_at.contains_key(root),
             in_gitdir: false,
+            git_top: false,
+            git_area: false,
             git_named: false,
             in_artifact: false,
             secret_dir: None,
@@ -424,6 +432,8 @@ fn read_tree(roots: &[PathBuf], one_fs: bool, nodes: &[Node]) -> Tree {
                             node: None,
                             is_node: node_at.contains_key(&p),
                             in_gitdir: false,
+                            git_top: false,
+                            git_area: false,
                             git_named: false,
                             in_artifact: false,
                             secret_dir: None,
@@ -521,9 +531,10 @@ fn preorder_ents(t: &Tree) -> Vec<usize> {
     out
 }
 
-/// Directories of a git directory whose entries are named after branches, worktrees and
-/// submodules.
-const GIT_NAMED_DIRS: [&str; 4] = ["refs", "logs", "worktrees", "modules"];
+/// Directories of a git top whose entries are ref names.
+const GIT_REF_DIRS: [&str; 2] = ["refs", "logs"];
+/// Directories of a git top whose subdirectories are named after worktrees and submodules.
+const GIT_ADMIN_DIRS: [&str; 2] = ["worktrees", "modules"];
 
 /// The context a directory hands to its children.
 #[derive(Clone, Debug, Default)]
@@ -535,12 +546,31 @@ struct Inherited {
     secret_dir: Option<String>,
 }
 
+/// Physical evidence that `dir` is a git directory, whether or not the scan holds its repository
+/// as a node: it is named `.git`, or it has the shape of one (a `HEAD` file and `objects` and
+/// `refs` directories, as a bare repository has). Symlinks are not followed. This only ever adds
+/// git-directory context, which keeps entries (the safe side).
+fn looks_like_git_dir(dir: &Path) -> bool {
+    if dir.file_name() == Some(OsStr::new(".git")) {
+        return true;
+    }
+    let is = |name: &str, want_dir: bool| {
+        std::fs::symlink_metadata(dir.join(name))
+            .map(|m| if want_dir { m.is_dir() } else { m.is_file() })
+            .unwrap_or(false)
+    };
+    is("HEAD", false) && is("objects", true) && is("refs", true)
+}
+
 /// The context a scan root inherits from the directories that physically enclose it, as if the
 /// walk had reached it from above: whatever the order of the roots, and whether or not an
 /// enclosing root was scanned too (a root walked on its own because it is another file system
-/// under `--one-file-system`, or a root given alone). Node, git-directory and artifact context
-/// follow the root's real path; secrecy follows any secret-named directory above the root in its
-/// real path or its spelling, so everything inside a secret directory stays local.
+/// under `--one-file-system`, or a root given alone). Node and artifact context follow the
+/// root's real path through the scan's nodes. Git-directory context follows the nodes too, and
+/// also the directories themselves (`looks_like_git_dir`), so a root inside the git directory of
+/// a repository the scan did not cover is still inside a git directory. Secrecy follows any
+/// secret-named directory above the root in its real path or its spelling, so everything inside
+/// a secret directory stays local.
 fn enclosing_context(
     root: &Path,
     real_nodes: &HashMap<PathBuf, usize>,
@@ -563,7 +593,8 @@ fn enclosing_context(
         let name_is_git = a.file_name() == Some(OsStr::new(".git"));
         c.in_gitdir = c.in_gitdir
             || class_of(here) == Some(Class::BareRepo)
-            || (name_is_git && matches!(pclass, Some(Class::Repo) | Some(Class::Worktree)));
+            || (name_is_git && matches!(pclass, Some(Class::Repo) | Some(Class::Worktree)))
+            || looks_like_git_dir(a);
         if here.is_some() {
             c.node = here;
         }
@@ -639,22 +670,36 @@ fn annotate(t: &mut Tree, roots: &[PathBuf], nodes: &[Node], rules: &RuleSet, or
             || class == Some(Class::BareRepo)
             || (name_is_git
                 && pctx.is_node
-                && matches!(pclass, Some(Class::Repo) | Some(Class::Worktree)));
+                && matches!(pclass, Some(Class::Repo) | Some(Class::Worktree)))
+            // A scan root that is itself a git directory the scan holds no node for.
+            || (parent.is_none() && looks_like_git_dir(&t.dirs[d].path));
         let nclass = t.dirs[d].node.and_then(|n| nodes.get(n)).map(|n| n.class);
         t.dirs[d].in_artifact = part || nclass.map(|c| c.is_artifact()).unwrap_or(false);
-        let pnamed = parent.map(|p| t.dirs[p].git_named).unwrap_or(false);
-        t.dirs[d].git_named = t.dirs[d].in_gitdir
-            && (pnamed
-                || (pgit
-                    && t.dirs[d]
-                        .name
-                        .to_str()
-                        .map(|n| GIT_NAMED_DIRS.contains(&n))
-                        .unwrap_or(false)));
+        let (ptop, parea, pnamed) = parent
+            .map(|p| (t.dirs[p].git_top, t.dirs[p].git_area, t.dirs[p].git_named))
+            .unwrap_or((false, false, false));
+        let name_in = |list: &[&str]| {
+            t.dirs[d]
+                .name
+                .to_str()
+                .map(|n| list.contains(&n))
+                .unwrap_or(false)
+        };
+        let has_head = t.dirs[d].children.iter().any(|c| match *c {
+            Child::Ent(e) => t.ents[e].name == OsStr::new("HEAD"),
+            Child::Dir(_) => false,
+        });
+        let in_gitdir = t.dirs[d].in_gitdir;
+        let top = in_gitdir && (!pgit || (parea && has_head));
+        let area = in_gitdir && !top && ((ptop && name_in(&GIT_ADMIN_DIRS)) || parea);
+        let named = in_gitdir && (pnamed || (ptop && name_in(&GIT_REF_DIRS)));
+        t.dirs[d].git_top = top;
+        t.dirs[d].git_area = area;
+        t.dirs[d].git_named = named;
         if psecret.is_some() {
             t.dirs[d].secret_dir = psecret;
-        } else if pnamed {
-            // A branch, worktree or submodule name: never a secret directory by name.
+        } else if pnamed || parea {
+            // A ref, worktree or submodule name: never a secret directory by name.
         } else if let Some(kind) = t.dirs[d].name.to_str().and_then(|n| rules.secret_dir(n)) {
             // A scan root with a secret directory name is a secret directory too. Inside a git
             // directory it is not cut out (the git piece stays whole), but its entries are
@@ -680,7 +725,8 @@ fn annotate(t: &mut Tree, roots: &[PathBuf], nodes: &[Node], rules: &RuleSet, or
             dir.in_gitdir || (parent_is_worktree_node && t.ents[e].name == OsStr::new(".git"));
         let in_artifact = dir.in_artifact;
         // Git's own bookkeeping names (refs, reflogs, packed-refs) are branch names.
-        let git_named = in_gitdir && (dir.git_named || t.ents[e].name == OsStr::new("packed-refs"));
+        let git_named = in_gitdir
+            && (dir.git_named || (dir.git_top && t.ents[e].name == OsStr::new("packed-refs")));
         let secret = if in_gitdir {
             None
         } else if let Some(k) = &dir.secret_dir {
@@ -916,6 +962,21 @@ impl<'a> Cutter<'a> {
         for &e in ents {
             self.t.ents[e].piece = id;
         }
+        // The choke point for every piece kind other than `git-node`: a git directory is handled
+        // only whole, as part of its repository's `git-node` piece under the preserve obligation
+        // (where a secret-named file makes that piece incomplete, in `collect`). So any other
+        // piece that lies in a git directory or holds a file of one (the piece of a scan root
+        // inside a git directory, secret-named or not) is incomplete, and kept.
+        if incomplete.is_none()
+            && kind != PieceKind::GitNode
+            && (self.t.dirs[anchor].in_gitdir || ents.iter().any(|&e| self.t.ents[e].in_gitdir))
+        {
+            incomplete = Some(
+                "it lies inside a git directory, which is handled only whole, as part of its \
+                 repository; kept"
+                    .to_string(),
+            );
+        }
         if incomplete.is_none() && !has_identity() {
             incomplete = Some(NO_IDENTITY.to_string());
         }
@@ -995,6 +1056,18 @@ impl<'a> Cutter<'a> {
                     Child::Dir(c) => {
                         let cd = &self.t.dirs[c];
                         if cd.other_root {
+                            // Another scan root inside the git directory: the git directory is
+                            // not whole in this piece, exactly as when that directory is a
+                            // mount the walk does not enter, whichever roots were given.
+                            if ctx == Ctx::Git && cd.in_gitdir {
+                                r.incomplete.get_or_insert_with(|| {
+                                    format!(
+                                        "{} is another scan root inside its git directory, so \
+                                         the git directory is not whole in this piece",
+                                        self.rel(d, c, None)
+                                    )
+                                });
+                            }
                             r.excludes.push(self.rel(d, c, None));
                             continue;
                         }
