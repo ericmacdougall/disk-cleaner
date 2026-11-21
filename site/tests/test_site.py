@@ -127,11 +127,19 @@ def forbidden_hits(text, words):
 OVERCLAIM = re.compile(
     r"(secret|\.env|credential|key file)[^.;]{0,60}\b(never|not|isn't|is not|are not)\b[^.;]{0,20}\b(read|opened)\b"
     r"|\bnever (reads|opens)\b[^.;]{0,40}(secret|\.env|credential|any file|your files)"
-    r"|\bno file is ever (read|opened)\b", re.I)
+    r"|\bno file is ever (read|opened)\b"
+    # Absolute redaction promises: only some parts of a remote address are removed (redact.rs).
+    r"|\b(any|all|every)\b[^.;]{0,30}\b(passwords?|tokens?|credentials?|secrets?)\b[^.;]{0,30}"
+    r"\b(stripped|removed|redacted|hidden|never stored|never recorded)\b"
+    r"|\b(stripped|removed|redacted|cleaned) of (any|all|every)\b"
+    r"|\bnever (contains?|includes?|stores?|records?|keeps?) (a |an |any )?(passwords?|tokens?|credentials?|secrets?)\b"
+    r"|\b(no|never a) (passwords?|tokens?|credentials?|secrets?) (ever )?(reaches|reach|is stored|are stored|ends up)",
+    re.I)
 
 
 def overclaims(text):
-    """Sentences promising that secret files are never read: the scanner runs git, which reads tracked files."""
+    """Sentences promising more than the scanner does: that secret files are never read (it runs git, which
+    reads tracked files), or that every password or token is removed from what it records."""
     return [m.group(0) for m in OVERCLAIM.finditer(text)]
 
 
@@ -392,7 +400,13 @@ class TestDetectorsAreNotVacuous(unittest.TestCase):
         for bad in ("Secret files are never read.", "PruneDisk never reads your .env file.",
                     "It never opens a secret file.", "No file is ever read.", "it never reads any file"):
             self.assertTrue(overclaims(bad), bad)
+        for bad in ("remote names and addresses with any password or token stripped",
+                    "All credentials are removed from the scan.", "addresses stripped of any secrets",
+                    "The scan file never contains a token.", "No token ever reaches the scan file.",
+                    "every secret is redacted"):
+            self.assertTrue(overclaims(bad), bad)
         self.assertEqual(overclaims("git reads the files it tracks, a tracked .env included"), [])
+        self.assertEqual(overclaims("it removes the user and password part and any query or fragment"), [])
 
     def test_structure_detector_fires(self):
         c = Collector()
@@ -565,8 +579,24 @@ class TestContent(unittest.TestCase):
         # The page must say so, and must not promise that secret files are never read.
         flat = re.sub(r"\s+", " ", self.text)
         self.assertIn("git reads the files it tracks, as it always does, a tracked .env included", flat)
-        self.assertIn("it never copies what a file contains into its output", flat)
         self.assertEqual(overclaims(flat), [])
+
+    def test_remote_redaction_is_described_as_built(self):
+        # crates/core/src/redact.rs: for scheme:// addresses the userinfo up to the last '@' goes
+        # (a plain ssh user name stays) and so do the query and fragment; names, paths and other
+        # address forms are stored as they are. The page must say exactly that, and say to keep
+        # a scan file private.
+        flat = re.sub(r"\s+", " ", self.text)
+        flat = re.sub(r"\(\s+", "(", re.sub(r"\s+([,;)])", r"\1", flat))  # tag gaps around <code>
+        self.assertEqual(overclaims(flat), [])
+        for part in ("it removes the user and password part (everything between :// and the last @",
+                     "a plain user name on an ssh address, such as ssh://git@host/…, is kept",
+                     "and any query (?…) or fragment (#…)",
+                     "Everything else is recorded as it is: the remote's name, the host and path of its address, "
+                     "and addresses in other forms, such as git@host:owner/repo.git or a local path",
+                     "A token put in a remote's name or in the path of its address stays in the scan file",
+                     "treat a scan file as private"):
+            self.assertIn(part, flat)
 
     def test_no_stale_review_claims(self):
         # The scanner and planner were merged into main; copy written while they were on a draft pull
