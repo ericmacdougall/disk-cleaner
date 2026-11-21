@@ -257,6 +257,89 @@ class TestCreateDraft(unittest.TestCase):
                 self.assertEqual(len(gh.releases), n)
                 self.assertEqual([m for m, _ in gh.calls], ["GET"] * 4)
 
+    def test_every_failure_after_the_draft_exists_names_it(self):
+        # Count the API calls a good run makes after the create POST, then fail each one in turn
+        # (an exception from the network layer, not an HTTP status). A call added later is covered
+        # automatically. Every failure must name the retained draft, keep its own reason, write the
+        # job summary, and leave the draft.
+        good = FakeGitHub()
+        self.create(good)
+        create_at = good.calls.index(("POST", "https://api.github.com/repos/%s/releases" % REPO))
+        after = len(good.calls) - create_at - 1
+        self.assertGreaterEqual(after, 4)  # 3 uploads and the re-read
+        for k in range(after):
+            with self.subTest(failing_call=k):
+                gh = FakeGitHub()
+                orig = gh.transport
+
+                def flaky(method, url, data, headers, k=k, gh=gh, orig=orig):
+                    posted = any(m == "POST" and u.endswith("/releases") for m, u in gh.calls)
+                    if posted and len(gh.calls) - gh.calls.index(
+                            ("POST", "https://api.github.com/repos/%s/releases" % REPO)) - 1 == k:
+                        gh.calls.append((method, url))
+                        raise OSError("connection reset (injected at call %d)" % k)
+                    return orig(method, url, data, headers)
+                gh.transport = flaky
+                if os.path.exists(self.summary):
+                    os.remove(self.summary)
+                with self.assertRaises(rm.GuardError) as cm:
+                    self.create(gh)
+                msg = str(cm.exception)
+                (rel,) = gh.releases.values()
+                self.assertIn("OSError: connection reset (injected at call %d)" % k, msg)
+                self.assertIn("release %d (%s) is a draft this run created" % (rel["id"], rel["html_url"]), msg)
+                self.assertIn(msg, read(self.summary))
+                self.assertNotIn("DELETE", gh.verbs())
+
+    def test_local_failures_after_the_draft_exists_name_it(self):
+        class Broken(io.StringIO):
+            def write(self, s):
+                raise OSError("stdout closed")
+        cases = {"identity file": dict(identity_path=os.path.join(self.d, "missing", "identity.json")),
+                 "final report": dict(out=Broken())}
+        for what, kw in cases.items():
+            with self.subTest(what=what):
+                gh = FakeGitHub()
+                args = dict(identity_path=self.ident, out=self.out, summary=self.summary)
+                args.update(kw)
+                with self.assertRaises(rm.GuardError) as cm:
+                    rm.create_draft(gh.api(), REPO, "v0.1.0", self.dist, self.notes, **args)
+                (rel,) = gh.releases.values()
+                self.assertIn("release %d (%s) is a draft this run created" % (rel["id"], rel["html_url"]),
+                              str(cm.exception))
+
+    def test_an_interrupt_after_the_draft_exists_is_reported_and_re_raised(self):
+        gh = FakeGitHub()
+        orig = gh.transport
+
+        def interrupted(method, url, data, headers):
+            if "uploads.github.com" in url:
+                raise KeyboardInterrupt()
+            return orig(method, url, data, headers)
+        gh.transport = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            self.create(gh)
+        (rel,) = gh.releases.values()
+        self.assertIn("KeyboardInterrupt", read(self.summary))
+        self.assertIn("release %d (%s) is a draft this run created" % (rel["id"], rel["html_url"]), read(self.summary))
+
+    def test_a_lost_create_response_says_a_draft_may_exist(self):
+        gh = FakeGitHub()
+        orig = gh.transport
+
+        def lost(method, url, data, headers):
+            status, body = orig(method, url, data, headers)
+            if method == "POST" and url.endswith("/releases"):
+                raise OSError("timed out")  # the release was created; the answer never came back
+            return status, body
+        gh.transport = lost
+        msg = self.refused(gh, "OSError: timed out; a draft for v0.1.0 may exist anyway")
+        self.assertIn(msg, read(self.summary))
+        self.assertEqual(len(gh.releases), 1)
+        # The re-run then refuses instead of making a second draft.
+        gh.transport = orig
+        self.refused(gh, "a release for v0.1.0 already exists")
+
     def test_a_file_changed_after_packaging_is_not_uploaded(self):
         name = [n for n in sorted(os.listdir(self.dist)) if n != "SHA256SUMS"][0]
         with open(os.path.join(self.dist, name), "ab") as f:
@@ -592,6 +675,49 @@ class TestBinding(unittest.TestCase):
                 self.assertIn("left in place and nothing was deleted", msg)
                 self.assertIn("repos/%s/releases/%d --jq .draft" % (REPO, identity["id"]), msg)
                 self.assertIn(msg, read(summary))
+
+    def test_after_create_lookup_failure_names_the_draft(self):
+        # The tag lookup itself fails (here: a real git failure, an unknown remote; then an
+        # unexpected exception and an interrupt). The draft must still be named, with the reason.
+        gh, ident, identity, summary = self.made_draft()
+        named = "release %d (%s) is a draft this run created" % (identity["id"], identity["html_url"])
+        with self.assertRaises(rm.GuardError) as cm:
+            rm.check_binding("v0.1.0", self.r.A, remote="no-such-remote", cwd=self.r.work, after_create=True,
+                             repo=REPO, identity_path=ident, out=self.out, summary=summary)
+        self.assertIn("git ls-remote no-such-remote failed", str(cm.exception))
+        self.assertIn(named, str(cm.exception))
+        self.assertIn(str(cm.exception), read(summary))
+        orig = rm.remote_tag_commit
+        try:
+            for exc, raised in ((RuntimeError("boom"), rm.GuardError), (KeyboardInterrupt(), KeyboardInterrupt)):
+                with self.subTest(exc=type(exc).__name__):
+                    def fail(*a, **k):
+                        raise exc
+                    rm.remote_tag_commit = fail
+                    with self.assertRaises(raised):
+                        rm.check_binding("v0.1.0", self.r.A, cwd=self.r.work, after_create=True, repo=REPO,
+                                         identity_path=ident, out=self.out, summary=summary)
+                    self.assertIn("%s" % type(exc).__name__, read(summary))
+                    self.assertIn(named, read(summary).split("### Release guard")[-1])
+        finally:
+            rm.remote_tag_commit = orig
+
+    def test_after_create_without_an_identity_record_still_says_a_draft_exists(self):
+        gh, ident, identity, summary = self.made_draft()
+        d = os.path.dirname(ident)
+        with self.assertRaises(rm.GuardError) as cm:
+            rm.check_binding("v0.1.0", self.r.B, cwd=self.r.work, after_create=True, repo=REPO,
+                             identity_path=os.path.join(d, "never-written.json"), out=self.out,
+                             summary=os.path.join(d, "no-such-dir", "summary.md"))
+        msg = str(cm.exception)
+        self.assertIn("not at the built commit", msg)  # the original reason
+        self.assertIn("a draft this run created could not be identified here", msg)
+        self.assertIn("List the releases for the tag", msg)  # and an unwritable summary did not mask it
+
+    def test_sigterm_becomes_a_reportable_exit(self):
+        with self.assertRaises(SystemExit) as cm:
+            rm._terminated(15, None)
+        self.assertEqual(cm.exception.code, 143)
 
     def test_after_create_with_the_tag_in_place_passes(self):
         gh, ident, _, summary = self.made_draft()

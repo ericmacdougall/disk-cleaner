@@ -98,8 +98,12 @@ The `crates-dry-run` job in the same run is the crates.io check (below). It does
    at it. The draft job refuses to create a release if any release (draft or published) already
    carries the tag, and checks every file against `SHA256SUMS` before uploading it. Nothing in the
    workflow or its script ever edits, publishes or deletes a release: if anything fails after the
-   draft exists (an upload, or the tag moved), the job fails, leaves the draft, and prints its id and
-   address in the log and on the run's summary page (see "A draft left by a failed run").
+   draft exists (an upload, a network or git error, the tag moved, a cancelled job, a bug), the job
+   fails, leaves the draft, and prints the reason with the draft's id and address in the log and on
+   the run's summary page (see "A draft left by a failed run"). If the answer to the create request
+   itself is lost, the error says a draft may exist anyway. A job killed outright (a runner lost,
+   or the forced kill after a cancel times out) prints nothing: check the releases for the tag
+   after any run that did not succeed.
 4. The workflow creates a **draft** release with the archives, `SHA256SUMS` and the notes, titled
    `PruneDisk vX.Y.Z`. Nothing is public yet. Before publishing, check all of this:
    - the run that made it succeeded, and its summary names no draft left behind;

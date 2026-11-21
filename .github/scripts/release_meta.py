@@ -27,10 +27,12 @@ Python 3.9 compatible, standard library only.
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -405,6 +407,11 @@ def package(dist, template_path, notes_out, tag, version, sha, bin_name, repo):
 def manual_cleanup(repo, identity):
     """What a maintainer does with a draft this run made and left in place. Nothing here removes it."""
     rid = identity.get("id")
+    if not isinstance(rid, int):
+        return ("a draft this run created could not be identified here (its identity record is missing or "
+                "unreadable); it was left in place and nothing was deleted. Do not publish it. List the "
+                "releases for the tag (docs/RELEASING.md, step 4), leave any published release alone, and "
+                "remove the draft by hand (docs/RELEASING.md, \"A draft left by a failed run\")")
     return ("release %s (%s) is a draft this run created; it was left in place and nothing was deleted. "
             "Do not publish it. To remove it by hand: check that `gh api repos/%s/releases/%s --jq .draft` "
             "prints true, then delete that release by its id (docs/RELEASING.md, \"A draft left by a failed "
@@ -414,30 +421,61 @@ def manual_cleanup(repo, identity):
 def report(summary, text):
     """Also write a failure to the job summary page, when the workflow provides one."""
     if summary:
-        with open(summary, "a", encoding="utf-8") as f:
-            f.write("### Release guard\n\n%s\n\n" % text)
+        try:
+            with open(summary, "a", encoding="utf-8") as f:
+                f.write("### Release guard\n\n%s\n\n" % text)
+        except OSError as e:  # never let the summary replace the failure being reported
+            print("could not write the job summary (%s)" % e, file=sys.stderr)
+
+
+@contextlib.contextmanager
+def draft_retained(repo, identity, summary):
+    """Wraps everything that runs once a draft exists. Any failure inside, of any kind (a guard
+    refusal, a git or network error, a bug, an interrupt), is reported the same way: its own reason,
+    then the retained draft's id, URL and the manual steps, in the error and in the job summary."""
+    try:
+        yield
+    except BaseException as e:
+        reason = str(e) if isinstance(e, GuardError) else "%s: %s" % (type(e).__name__, e)
+        why = "%s; %s" % (reason, manual_cleanup(repo, identity))
+        report(summary, why)
+        if isinstance(e, Exception):
+            raise GuardError(why) from e
+        raise  # KeyboardInterrupt, SystemExit (a cancelled job): reported, then re-raised as is
+
+
+def load_identity(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            identity = json.load(f)
+        return identity if isinstance(identity, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def require_binding(tag, sha, remote, cwd, out):
+    at = remote_tag_commit(remote, tag, cwd)
+    if at != sha:
+        raise GuardError("tag %s now points at %s, not at the built commit %s" % (tag, at or "nothing", sha))
+    print("tag %s points at %s, the commit that was built" % (tag, sha), file=out)
 
 
 def check_binding(tag, sha, remote="origin", cwd=None, after_create=False, repo=None,
                   identity_path=IDENTITY_FILE, out=sys.stdout, summary=None):
-    """The tag on the remote still points at the built commit. With after_create, a failure names
-    the draft this run created and how to remove it by hand; the guard never deletes a release."""
+    """The tag on the remote still points at the built commit. With after_create (a draft exists),
+    every failure names the draft this run created and how to remove it by hand; the guard never
+    deletes a release."""
     validate_tag(tag)
     validate_sha(sha)
-    at = remote_tag_commit(remote, tag, cwd)
-    if at == sha:
-        print("tag %s points at %s, the commit that was built" % (tag, sha), file=out)
-        return
-    why = "tag %s now points at %s, not at the built commit %s" % (tag, at or "nothing", sha)
     if after_create:
-        try:
-            with open(identity_path, encoding="utf-8") as f:
-                identity = json.load(f)
-        except (OSError, ValueError):
-            identity = {}
-        why += "; " + manual_cleanup(validate_repo(repo or ""), identity)
-    report(summary, why)
-    raise GuardError(why)
+        with draft_retained(validate_repo(repo or ""), load_identity(identity_path), summary):
+            require_binding(tag, sha, remote, cwd, out)
+        return
+    try:
+        require_binding(tag, sha, remote, cwd, out)
+    except GuardError as e:
+        report(summary, str(e))
+        raise
 
 
 # ---------------------------------------------------------------------------------------------
@@ -509,7 +547,8 @@ class GitHubAPI:
 
 def identity_of(release):
     return {"id": release.get("id"), "node_id": release.get("node_id"), "tag_name": release.get("tag_name"),
-            "created_at": release.get("created_at"), "author": (release.get("author") or {}).get("login"),
+            "created_at": release.get("created_at"),
+            "author": release["author"].get("login") if isinstance(release.get("author"), dict) else None,
             "html_url": release.get("html_url")}
 
 
@@ -579,15 +618,26 @@ def create_draft(api, repo, tag, dist, notes_path, identity_path=IDENTITY_FILE, 
                    "id %s, %s" % (r.get("id"), "draft" if r.get("draft") else "published") for r in existing)))
         report(summary, why)
         raise GuardError(why)
-    status, rel = api.call("POST", "/repos/%s/releases" % repo, {
-        "tag_name": tag, "name": RELEASE_TITLE % tag, "body": notes, "draft": True,
-        "prerelease": is_prerelease(tag)})
-    if status != 201 or not isinstance(rel, dict):
-        raise GuardError("creating the draft failed (HTTP %s): %s" % (status, str(rel)[:300]))
-    identity = identity_of(rel)
-    with open(identity_path, "w", encoding="utf-8") as f:
-        json.dump(identity, f)
     try:
+        status, rel = api.call("POST", "/repos/%s/releases" % repo, {
+            "tag_name": tag, "name": RELEASE_TITLE % tag, "body": notes, "draft": True,
+            "prerelease": is_prerelease(tag)})
+        if status != 201 or not isinstance(rel, dict) or not isinstance(rel.get("id"), int):
+            raise GuardError("creating the draft failed (HTTP %s): %s" % (status, str(rel)[:300]))
+    except BaseException as e:
+        # The request may have reached GitHub even if no answer came back (a lost response).
+        why = ("%s; a draft for %s may exist anyway: list the releases for the tag (docs/RELEASING.md, "
+               "step 4) before re-running; a re-run refuses while one exists"
+               % (e if isinstance(e, GuardError) else "%s: %s" % (type(e).__name__, e), tag))
+        report(summary, why)
+        if isinstance(e, Exception):
+            raise GuardError(why) from e
+        raise
+    identity = identity_of(rel)
+    # From here on a draft exists: every failure, whatever it is, goes through draft_retained.
+    with draft_retained(repo, identity, summary):
+        with open(identity_path, "w", encoding="utf-8") as f:
+            json.dump(identity, f)
         if rel.get("draft") is not True or rel.get("tag_name") != tag:
             raise GuardError("GitHub did not create a draft for %s" % tag)
         upload = str(rel.get("upload_url") or "").split("{", 1)[0]
@@ -604,11 +654,7 @@ def create_draft(api, repo, tag, dist, notes_path, identity_path=IDENTITY_FILE, 
         got = sorted(str(a.get("name")) for a in now.get("assets", []))
         if st != 200 or now.get("draft") is not True or got != names:
             raise GuardError("the draft does not hold exactly the files built (HTTP %s, assets %s)" % (st, got))
-    except Exception as e:
-        why = "%s; %s" % (e, manual_cleanup(repo, identity))
-        report(summary, why)
-        raise GuardError(why)
-    print("draft=true release_id=%d assets=%d (%s)" % (identity["id"], len(names), ", ".join(names)), file=out)
+        print("draft=true release_id=%d assets=%d (%s)" % (identity["id"], len(names), ", ".join(names)), file=out)
     return identity
 
 
@@ -765,6 +811,10 @@ def lint_workflow(text, strict=True):
 # ---------------------------------------------------------------------------------------------
 
 
+def _terminated(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd")
@@ -786,6 +836,9 @@ def main(argv=None):
     lw.add_argument("path", nargs="?", default=RELEASE_WORKFLOW)
     a = p.parse_args(argv)
     env = os.environ
+    # A cancelled job gets SIGINT (KeyboardInterrupt) and then SIGTERM. Turn SIGTERM into SystemExit
+    # so draft_retained can still name the draft before the process ends.
+    signal.signal(signal.SIGTERM, _terminated)
     try:
         if a.cmd == "meta":
             outputs = meta(env)
