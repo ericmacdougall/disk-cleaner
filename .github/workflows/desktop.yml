@@ -236,7 +236,7 @@ jobs:
             echo "## Size tree scroll, 1,000,000 mocked rows (headless Chromium)"
             echo
             echo '```'
-            node -e 'const r = require("./perf-results/ac9-playwright.json"); console.log(JSON.stringify({ browser: r.browser, scroll: r.scroll, control: r.control }, null, 2))' || echo "no results"
+            node -e 'const r = require("./perf-results/ac9-playwright.json"); console.log(JSON.stringify({ browser: r.browser, scroll: r.scroll, control: r.control, floor: r.floor, profile: r.profile }, null, 2))' || echo "no results"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

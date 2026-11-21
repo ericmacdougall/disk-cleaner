@@ -106,6 +106,192 @@ export async function measureScroll(o) {
   return { samples, rowsMax, rowsMin, steps: total, lastTop: sc.scrollTop };
 }
 
+/**
+ * Informational, not a pass gate: the empty-frame floor. With nothing changed, `samples` times
+ * of one requestAnimationFrame and then one MessageChannel message, on the same clock and from
+ * the same starting point as a scroll step (right after the previous one ended), after `warmup`
+ * unrecorded ones. Also the rAF timestamp interval (the frame period the webview runs at).
+ * Self-contained, like measureScroll.
+ */
+export async function measureFloor(o) {
+  const stamps = [];
+  const frame = () =>
+    new Promise((r) =>
+      requestAnimationFrame((ts) => {
+        stamps.push(ts);
+        r();
+      }),
+    );
+  const postPaint = () =>
+    new Promise((r) => {
+      const ch = new MessageChannel();
+      ch.port1.onmessage = () => r();
+      ch.port2.postMessage(0);
+    });
+  const samples = [];
+  for (let i = 0; i < o.warmup + o.samples; i++) {
+    const t0 = performance.now();
+    await frame();
+    await postPaint();
+    if (i >= o.warmup) samples.push(performance.now() - t0);
+  }
+  const intervals = [];
+  for (let i = o.warmup + 1; i < stamps.length; i++) intervals.push(stamps[i] - stamps[i - 1]);
+  return {
+    samples,
+    intervals,
+    screen: { width: screen.width, height: screen.height, colorDepth: screen.colorDepth, dpr: devicePixelRatio, inner: [innerWidth, innerHeight] },
+    scrollerHeight: document.querySelector(".tg-scroll")?.clientHeight ?? null,
+  };
+}
+
+/**
+ * Informational, not a pass gate: the scroll steps of measureScroll again (same steps, target,
+ * clock and stop), each split into slices. Runs after the gated measurement, so its own cost
+ * never reaches the gated samples; its totals show what the instrumentation adds.
+ * - toScroll: scrollTop set to the first scroll event on `.tg-scroll`;
+ * - toIpc: that event to the page's IPC request (tree.ts load() before it fetches; tauri 2 sends
+ *   IPC with fetch, which is wrapped here; `ipcCalls` counts them);
+ * - ipc: the request to its response headers; body: reading the JSON body;
+ * - toDom: the body read to the DOM holding the target row (tauri's callback, tree.ts render;
+ *   seen by a MutationObserver on the grid);
+ * - toStop: that to the stop (the next animation frame and the post-paint task);
+ * - load = toIpc + ipc + body + toDom (the time inside tree.ts load());
+ * - layoutReads: getBoundingClientRect, clientHeight, offsetHeight and scrollTop reads from the
+ *   scroll event to the DOM change (each may force a synchronous layout).
+ * Without fetch-based IPC (the mocked page) the IPC slices are null and toDom starts at the
+ * scroll event.
+ */
+export async function profileScroll(o) {
+  const sc = document.querySelector(".tg-scroll");
+  if (!sc) return { error: "no .tg-scroll in the page", steps: [] };
+  const now = () => performance.now();
+  const frame = () => new Promise((r) => requestAnimationFrame(r));
+  const postPaint = () =>
+    new Promise((r) => {
+      const ch = new MessageChannel();
+      ch.port1.onmessage = () => r();
+      ch.port2.postMessage(0);
+    });
+  // Originals, for this function's own reads and for restoring.
+  const scrollTopD = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+  const clientHD = Object.getOwnPropertyDescriptor(Element.prototype, "clientHeight");
+  const offsetHD = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetHeight");
+  const gbcr = Element.prototype.getBoundingClientRect;
+  const origFetch = window.fetch;
+  const top0 = () => scrollTopD.get.call(sc);
+  let cur = null;
+  let reads = 0;
+  const counting = (d) => ({
+    ...d,
+    get() {
+      if (cur && cur.scroll !== null && cur.dom === null) reads++;
+      return d.get.call(this);
+    },
+  });
+  Object.defineProperty(Element.prototype, "scrollTop", counting(scrollTopD));
+  Object.defineProperty(Element.prototype, "clientHeight", counting(clientHD));
+  Object.defineProperty(HTMLElement.prototype, "offsetHeight", counting(offsetHD));
+  Element.prototype.getBoundingClientRect = function () {
+    if (cur && cur.scroll !== null && cur.dom === null) reads++;
+    return gbcr.call(this);
+  };
+  window.fetch = function (input, init) {
+    const c = cur;
+    const isIpc = /^(ipc:|http:\/\/ipc\.localhost)/.test(String(input?.url ?? input));
+    if (c && isIpc) {
+      c.ipcCalls++;
+      if (c.ipcStart === null) c.ipcStart = now();
+    }
+    const p = origFetch.call(window, input, init);
+    if (!(c && isIpc)) return p;
+    return p.then((res) => {
+      if (c.ipcHeaders === null) c.ipcHeaders = now();
+      const json = res.json.bind(res);
+      res.json = () =>
+        json().then((v) => {
+          if (c.ipcBody === null) c.ipcBody = now();
+          return v;
+        });
+      return res;
+    });
+  };
+  // Capture on the document: it runs before the grid's own scroll handler, so the handler's work
+  // (load() up to its request) falls after this timestamp.
+  const onScroll = (e) => {
+    if (e.target === sc && cur && cur.scroll === null) cur.scroll = now();
+  };
+  document.addEventListener("scroll", onScroll, { capture: true, passive: true });
+  const mo = new MutationObserver(() => {
+    if (cur && cur.dom === null && document.getElementById("tg-row-" + cur.target)) cur.dom = now();
+  });
+  mo.observe(sc, { childList: true, subtree: true });
+  const steps = [];
+  let error = null;
+  try {
+    for (let i = 0; i < o.warmup + o.samples; i++) {
+      const top = top0() + o.stepRows * o.rowHeight;
+      const target = Math.floor((top + clientHD.get.call(sc)) / o.rowHeight) - 2;
+      if (i >= o.warmup && document.getElementById("tg-row-" + target)) {
+        error = `profile step ${i + 1}: row ${target} is in the DOM before the step`;
+        break;
+      }
+      cur = { target, t0: 0, scroll: null, ipcStart: null, ipcHeaders: null, ipcBody: null, dom: null, ipcCalls: 0 };
+      reads = 0;
+      cur.t0 = now();
+      scrollTopD.set.call(sc, top);
+      for (;;) {
+        await frame();
+        if (document.getElementById("tg-row-" + target)) break;
+        if (now() - cur.t0 > o.stepTimeoutMs) {
+          error = `profile step ${i + 1}: row ${target} not shown within ${o.stepTimeoutMs} ms`;
+          break;
+        }
+      }
+      if (error) break;
+      await postPaint();
+      const c = cur;
+      const stop = now();
+      cur = null;
+      if (i < o.warmup) continue;
+      const d = (a, b) => (a === null || b === null ? null : b - a);
+      const ipc = c.ipcStart !== null;
+      steps.push({
+        total: stop - c.t0,
+        toScroll: d(c.t0, c.scroll),
+        toIpc: ipc ? d(c.scroll, c.ipcStart) : null,
+        ipc: ipc ? d(c.ipcStart, c.ipcHeaders) : null,
+        body: ipc ? d(c.ipcHeaders, c.ipcBody) : null,
+        toDom: d(ipc ? c.ipcBody : c.scroll, c.dom),
+        load: d(c.scroll, c.dom),
+        toStop: d(c.dom, stop),
+        ipcCalls: c.ipcCalls,
+        layoutReads: reads,
+      });
+    }
+  } finally {
+    cur = null;
+    mo.disconnect();
+    document.removeEventListener("scroll", onScroll, { capture: true });
+    Object.defineProperty(Element.prototype, "scrollTop", scrollTopD);
+    Object.defineProperty(Element.prototype, "clientHeight", clientHD);
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", offsetHD);
+    Element.prototype.getBoundingClientRect = gbcr;
+    window.fetch = origFetch;
+  }
+  return { error, steps };
+}
+
+/** Per-slice p50, p95 and max of profileScroll's steps (nearest rank; nulls left out). */
+export function summarizeProfile(steps) {
+  const out = {};
+  for (const k of ["total", "toScroll", "toIpc", "ipc", "body", "toDom", "load", "toStop", "layoutReads", "ipcCalls"]) {
+    const xs = steps.map((s) => s[k]).filter((x) => typeof x === "number");
+    out[k] = xs.length ? { n: xs.length, p50: rank(xs, 0.5), p95: rank(xs, 0.95), max: Math.max(...xs) } : null;
+  }
+  return out;
+}
+
 /** The options measureScroll takes, from AC9. */
 export function scrollOptions() {
   return {

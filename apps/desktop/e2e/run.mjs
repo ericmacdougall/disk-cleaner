@@ -15,7 +15,8 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { App, Run, args, startDriver, stopDriver } from "./driver.mjs";
 import { KEY } from "./webdriver.mjs";
-import { AC9, judge, measureScroll, scrollOptions, scrollVerdict } from "./ac9.mjs";
+import { AC9, judge, measureFloor, measureScroll, profileScroll, scrollOptions, scrollVerdict, summarizeProfile } from "./ac9.mjs";
+import { cpuShares, machine, snapshot } from "./runner_info.mjs";
 
 // Registered before the first measurement (WAL w0ce4fd7355e): p95 by nearest rank.
 const THRESHOLDS = { ipcP95Ms: 50, scrollP95Ms: 50, samples: 200, warmup: 10 };
@@ -511,6 +512,16 @@ try {
     const ready = () => {
       if (shown !== rows) throw new Error(`the one-million-row tree is not shown (${shown} rows); not measured`);
     };
+    // Informational, never a pass gate: a probe that fails is recorded, not counted as a failure.
+    const info = async (id, f) => {
+      try {
+        run.measure({ id, ...(await f()) });
+      } catch (e) {
+        run.measure({ id, error: String(e?.message ?? e) });
+      }
+    };
+    const start = snapshot();
+    await info("info.synth_1m.runner", async () => ({ machine: machine(), start }));
 
     // (1) IPC, Linux: tree_page offset k*200 limit 200, 10 warm-up pages, then k = 0..99.
     if (process.platform === "linux") {
@@ -549,6 +560,21 @@ try {
       });
     }
 
+    // The empty-frame floor (informational), just before the scroll steps, same session.
+    await info("info.synth_1m.frame_floor", async () => {
+      ready();
+      const r = await app2.s.execAsync(
+        `const [o, done] = arguments;
+         (${measureFloor.toString()})(o).then(done, (e) => done({ error: String(e) }));`,
+        120_000,
+        { warmup: AC9.scrollWarmup, samples: AC9.scrollSamples },
+      );
+      if (r.error) throw new Error(r.error);
+      const f = judge("frame_floor", r.samples, AC9.scrollP95Ms);
+      const iv = r.intervals.length ? { n: r.intervals.length, p50: rank(r.intervals, 0.5), p95: rank(r.intervals, 0.95), max: Math.max(...r.intervals) } : null;
+      return { n: f.n, p50: f.p50, p95: f.p95, max: f.max, rafInterval: iv, screen: r.screen, scrollerHeight: r.scrollerHeight, gate: false };
+    });
+
     // (2) Running-app scroll, Linux and Windows: 10 warm-up steps, then 200 steps of 10 rows.
     await run.check("timing.synth_1m.scroll_p95", async () => {
       ready();
@@ -563,6 +589,23 @@ try {
       run.measure(m);
       if (!m.pass) throw new Error(`p95 ${m.p95.toFixed(1)} ms, not under ${AC9.scrollP95Ms} ms`);
       return m;
+    });
+
+    // The same steps again, split into slices (informational; after the gated samples, so the
+    // instrumentation never reaches them).
+    await info("info.synth_1m.scroll_profile", async () => {
+      ready();
+      const r = await app2.s.execAsync(
+        `const [o, done] = arguments;
+         (${profileScroll.toString()})(o).then(done, (e) => done({ error: String(e), steps: [] }));`,
+        600_000,
+        scrollOptions(),
+      );
+      return { error: r.error ?? null, slices: summarizeProfile(r.steps), steps: r.steps, gate: false };
+    });
+    await info("info.synth_1m.runner_end", async () => {
+      const end = snapshot();
+      return { end, cpuShares: cpuShares(start, end) };
     });
   } catch (e) {
     run.results.push({ id: "suite.synth_1m", ok: false, ms: 0, detail: String(e?.stack ?? e) });

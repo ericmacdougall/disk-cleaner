@@ -304,12 +304,19 @@ start when `PRUNEDISK_E2E_SYNTH_NODES=1000000` is set (`src-tauri/src/e2e.rs`,
 `open_synthetic`). It goes through the scan path: a job starts as Start starts one,
 `show_walk` installs the tree, and a one-folder `synth::synthetic_scan` finishes the job with
 `show_scan`, so the window opens on the results (Done). No command is added, and the
-release-binary string check covers the name. The pre-registration's wording names
-`synthetic_scan(1_000_000)` as the workload; a scan document has no size tree, so the tree is
-`wide_tree` as briefed (an assumption awaiting the owner's ruling).
+release-binary string check covers the name. The workload is
+`wide_tree(1_000_000, 16452)`. The pre-registration's `synthetic_scan` wording was the owner's
+error, corrected before any result was judged.
 
 Every percentile is nearest rank; pass means p95 strictly under the threshold. A miss is
 reported as measured, with no retry to pass.
+
+What counts as AC-9. The user's AC-9 target, as quoted, is check (3); the owner's and main's
+ruling (no user source for it was shown) is that AC-9 is met by checks (1) and (3) and the DOM
+cap. Check (2) is an additional measurement: its 50 ms threshold is the owner's own
+pre-registration, inferred, not the user's words. Its results are neither an AC-9 miss nor an
+AC-9 pass. It is still a pass gate in `e2e/run.mjs`, as registered, until main rules on its
+form.
 
 1. IPC (Linux; `timing.synth_1m.ipc_tree_page_p95` in `e2e/run.mjs`). A second app session at
    the end of the WebDriver suite, with its own tauri-driver (ports 4446 and 4447), because the
@@ -350,9 +357,8 @@ Controls (none lowers a threshold):
 
 The 0 ms judgement cannot pass for any samples, so it only shows that the verdict is computed,
 not fixed. No run has shown check (1) failing on its threshold. Check (2)'s failure path has
-been seen on real misses (results below). Choosing the last row fully in view as the target is
-an assumption awaiting the owner's ruling. The pre-registration says "the new rows", and the
-brief says "the target row".
+been seen on real misses (results below). The owner accepted the last row fully in view as the target. The
+pre-registration says "the new rows", and the brief says "the target row".
 
 Demonstrations, not committed (t2-dev, docker node:22-bookworm, Playwright 1.64.1, before the
 first commit): a copy of (3) with the threshold set to 0.001 ms failed (p95 17.7 ms); with
@@ -401,12 +407,32 @@ results (p95, then p50, in ms):
 | focus-broken | 3 | 34 | 41 | pass |
 | modal-trap-removed | 3 | 34 | 42 | pass |
 
-Linux running-app scroll at one million rows, all eight runs so far: 3 passed and 5 failed, at
-both commits. The results fall into two groups. In one, scroll p95 is 41 to 42 ms with IPC p50
-of 2 to 3 ms. In the other, scroll p95 is 51 to 70 ms with IPC p50 of 4 to 5 ms. The cause of
-the split is not established. Neither the runners' hardware nor their load was recorded. On
-ubuntu-22.04 under strace, the check does not meet the 50 ms threshold reliably. The threshold
-stays at 50 ms. Windows passed both runs (p95 32.2 ms each).
+Running-app scroll (check 2), all runs through desktop run 44879992370 at cb39cc1:
+
+- Windows passed 3 of 3, with p95 of 32.2 to 32.3 ms.
+- Linux, under Xvfb and strace, passed 4 of 9. The p50 is about 33 ms or about 46 ms.
+  - With scroll p50 about 33 ms: scroll p95 is 41 to 43 ms and IPC p50 is 2 to 3 ms.
+  - With scroll p50 about 46 ms: scroll p95 is 51 to 70 ms and IPC p50 is 4 to 5 ms.
+
+The cause of the split is not established. Run 44879992370 at cb39cc1 measured p50 34, p95 43
+and max 55 ms (pass). This is an additional measurement, not an AC-9 verdict (above). The
+threshold stays at 50 ms.
+
+The suite now also records, in the same one-million-row session and never as a pass gate:
+
+- `info.synth_1m.runner`: CPU model, logical CPUs, `nproc`, memory, load (Linux load average;
+  Windows processor LoadPercentage), and the X screen (`xdpyinfo`, `xrandr`, when installed);
+- `info.synth_1m.frame_floor`: 200 empty frames (requestAnimationFrame, then a MessageChannel
+  message, nothing changed), on the same clock as a step, with the rAF interval;
+- `info.synth_1m.scroll_profile`: the 200 steps again, each split into slices: to the scroll
+  event, load() up to its IPC request, the IPC to its headers, the body, the callback and DOM
+  build, and to the stop. It also counts layout reads (getBoundingClientRect, clientHeight,
+  offsetHeight, scrollTop). It runs after the gated samples, so the instrumentation never
+  reaches them;
+- `info.synth_1m.runner_end`: load at the end, and on Linux the CPU time shares (steal,
+  iowait) over the session.
+
+The Playwright job records the floor and the profile too.
 
 Both builds showed 1,000,001 rows before measuring in both runs. Linux's WebDriver clock ticks in whole
 milliseconds. The variant run is workflow "e2e-variants" run 44877270665 at 86fafdc. In it,
