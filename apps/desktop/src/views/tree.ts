@@ -137,13 +137,20 @@ export class TreeGrid {
     const first = Math.max(0, Math.floor(this.scroller.scrollTop / ROW_HEIGHT) - 5);
     const id = ++this.request;
     try {
-      const page = await this.backend.treePage(this.view, first, this.visibleRows());
+      const limit = this.visibleRows();
+      const wanted = this.selected;
+      // The selected row is scrolled away: fetch it alone (alongside the page), to keep its
+      // node and so focus.
+      const away = wanted < first || wanted >= first + limit;
+      const [page, alone] = await Promise.all([
+        this.backend.treePage(this.view, first, limit),
+        away ? this.backend.treePage(this.view, wanted, 1) : Promise.resolve(null),
+      ]);
       if (id !== this.request) return;
       const sel = Math.min(this.selected, Math.max(0, page.total - 1));
       let pinned: Row | null = null;
       if (page.total > 0 && (sel < page.offset || sel >= page.offset + page.rows.length)) {
-        // The selected row is scrolled away: fetch it alone, to keep its node (and focus).
-        pinned = (await this.backend.treePage(this.view, sel, 1)).rows[0] ?? null;
+        pinned = alone && alone.offset === sel ? (alone.rows[0] ?? null) : (await this.backend.treePage(this.view, sel, 1)).rows[0] ?? null;
         if (id !== this.request) return;
       }
       this.page = page;
