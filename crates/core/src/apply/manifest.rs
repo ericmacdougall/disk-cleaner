@@ -510,6 +510,37 @@ impl Manifest {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Make the in-memory history the whole history (Codex plan review r9b, F1): the committed
+    /// rows in storage, in commit order, then the local rows storage does not hold, in local
+    /// order (rows not mirrored yet, rows of a segment that is not committed history, rows for
+    /// another remote). When the local manifest already holds every stored row it is left as it
+    /// is. The local file is never rewritten (ASSUMPTION A-8). Returns how many stored rows the
+    /// local manifest lacked.
+    pub fn adopt_history(&mut self, stored: &[Envelope]) -> usize {
+        let local: BTreeSet<String> = self.rows.iter().map(line_of).collect();
+        let missing = stored
+            .iter()
+            .filter(|e| !local.contains(&line_of(e)))
+            .count();
+        if missing == 0 {
+            return 0;
+        }
+        let in_storage: BTreeSet<String> = stored.iter().map(line_of).collect();
+        let mut rows: Vec<Envelope> = stored.to_vec();
+        rows.extend(
+            self.rows
+                .drain(..)
+                .filter(|e| !in_storage.contains(&line_of(e))),
+        );
+        self.rows = rows;
+        missing
+    }
+}
+
+/// One row as stored: its JSON line.
+pub fn line_of(e: &Envelope) -> String {
+    serde_json::to_string(e).unwrap_or_default()
 }
 
 /// Parse one mirrored segment strictly: every non-empty line must be a row of this manifest

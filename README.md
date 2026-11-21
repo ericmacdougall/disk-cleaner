@@ -113,7 +113,11 @@ head that lists every stored manifest copy. When a listed copy is missing, chang
 the head itself is missing, restore refuses and names what is missing; `--accept-partial` restores
 what is stored. Such a gap is permanent and never dropped. A copy that storage fails to send
 (an outage) is not a gap: `apply` and `restore` stop with the storage error and change nothing,
-so run them again once storage answers. Because removal relies on the same
+so run them again once storage answers. Every `apply --apply` run reads that history in storage
+before it acts and decides with it too, so a lost or replaced local manifest (or a state
+directory that took the label over) does not forget what earlier runs relied on; the summary says
+how many rows came from storage. The read costs about two storage calls per stored manifest copy
+on every acting run. A dry run does not read storage, and says so. Because removal relies on the same
 storage holding the backups, an `apply --apply` run that finds a gap does nothing and exits 7;
 `--accept-history-gap` lets that one run go ahead, and its report says so. Two hosts or two state
 directories sharing one label are not supported; apply refuses a label another state directory

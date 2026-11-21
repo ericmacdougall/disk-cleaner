@@ -397,6 +397,9 @@ pub struct ApplyReport {
     /// This run took over its label from another state directory (`take_over_label`): the id
     /// of the state directory that wrote the head before.
     pub took_over_label_from: Option<String>,
+    /// Committed rows in storage that the local manifest did not hold (it was lost, replaced
+    /// or another state directory wrote them): this run decided with them too (r9b F1).
+    pub rows_from_storage: usize,
 }
 
 /// The reason given for a piece kept because an earlier run of the same scan changed its

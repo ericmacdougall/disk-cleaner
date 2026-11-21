@@ -358,6 +358,10 @@ pub fn apply_summary(r: &disk_cleaner_core::apply::ApplyReport) -> String {
             "Would upload at most {} bytes (deduplicated; verified at apply).",
             r.uploaded_bytes
         );
+        let _ = writeln!(
+            o,
+            "Stored history was not checked (a dry run reads only the local manifest); an acting run also reads the history in storage and may keep more, or stop on a gap."
+        );
     } else {
         let _ = writeln!(
             o,
@@ -387,6 +391,13 @@ pub fn apply_summary(r: &disk_cleaner_core::apply::ApplyReport) -> String {
         let _ = writeln!(
             o,
             "This run took over the storage label from state directory {from} (--take-over-label)."
+        );
+    }
+    if r.rows_from_storage > 0 {
+        let _ = writeln!(
+            o,
+            "{} manifest row(s) came from the history in storage, not from the local manifest (it was lost or replaced, or another state directory wrote them); this run decided with them.",
+            r.rows_from_storage
         );
     }
     if !r.rescan_needed.is_empty() {

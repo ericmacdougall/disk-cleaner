@@ -9,7 +9,7 @@ mod apply_common;
 
 use apply_common::*;
 use disk_cleaner_core::apply::restore::{restore, RestoreOptions};
-use disk_cleaner_core::apply::{apply, ApplyError, ApplyOptions, ApplyReport};
+use disk_cleaner_core::apply::{apply, ApplyError, ApplyOptions, ApplyReport, CrashPoint};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -410,4 +410,278 @@ fn a_stale_or_cut_head_slot_alone_loses_nothing_and_restores_completely() {
         assert!(rep.history_gaps.is_empty(), "{case}: {rep:?}");
         complete(&fx, &all);
     }
+}
+
+/// Codex plan review r9b, F1: what earlier runs relied on comes from the whole stored history,
+/// not only from the local manifest. A duplicate removed earlier relied on its retained copy;
+/// with the local manifest lost, or with a new state directory taking the label over, a later
+/// plan that removes the retained copy as noise backs it up first, and both files restore from
+/// storage alone.
+#[test]
+fn a_retained_copy_stays_protected_when_local_history_is_lost_or_taken_over() {
+    for case in ["local manifest lost", "label taken over"] {
+        let fx = Fx::new();
+        let content = b"the same bytes in three places\n";
+        let orig = fx.write("keep/orig.txt", content);
+        let dup = fx.write("dups/copy.txt", content);
+        let third = fx.write("other/third.txt", content);
+        let mut piece = P::files(&fx.data.join("dups"), &["copy.txt"], "noise");
+        piece.evidence = Some(serde_json::json!({
+            "kind": "duplicate", "sha256": sha(&orig), "size": content.len(),
+            "retained_copy": orig, "retained_piece": 0
+        }));
+        let (scan, plan) = docs(
+            &[&fx.data],
+            &[P::tree(&fx.data.join("keep"), "keep"), piece],
+        );
+        let mut o = fx.opts(true);
+        o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+        let rep = apply(&scan, &plan, &o).unwrap();
+        assert_eq!(rep.pieces[1].outcome, "removed", "{case}: {rep:?}");
+        let other = fx.state.parent().unwrap().join("state-two");
+        if case == "local manifest lost" {
+            fs::remove_file(fx.manifest()).unwrap();
+        } else {
+            fs::create_dir_all(&other).unwrap();
+        }
+        let mut piece = P::files(&fx.data.join("keep"), &["orig.txt"], "noise");
+        piece.evidence = Some(serde_json::json!({
+            "kind": "duplicate", "sha256": sha(&third), "size": content.len(),
+            "retained_copy": third, "retained_piece": 0
+        }));
+        let (scan, plan) = docs(
+            &[&fx.data],
+            &[P::tree(&fx.data.join("other"), "keep"), piece],
+        );
+        let mut o = fx.opts(true);
+        o.oracle = Box::new(agreeing_oracle(&scan, &plan));
+        if case == "label taken over" {
+            o.state_dir = other.join("lock");
+            o.manifest = other.join("manifest.jsonl");
+            o.take_over_label = true;
+        }
+        let before = fx.shard_total();
+        let rep = apply(&scan, &plan, &o).unwrap();
+        assert!(rep.history_gaps.is_empty(), "{case}: {rep:?}");
+        assert_eq!(rep.pieces[1].outcome, "removed", "{case}: {rep:?}");
+        assert!(
+            rep.pieces[1].reason.contains("retained copy"),
+            "{case}: {rep:?}"
+        );
+        assert!(
+            fx.shard_total() > before,
+            "{case}: the retained copy was archived before removal"
+        );
+        let _ = fs::remove_file(fx.manifest());
+        let _ = fs::remove_file(other.join("manifest.jsonl"));
+        for p in [&dup, &orig] {
+            let r = restore(p, &ropts(&fx)).unwrap();
+            assert!(r.failed.is_empty(), "{case}: {}: {r:?}", p.display());
+            assert_eq!(fs::read(p).unwrap(), content, "{case}");
+        }
+    }
+}
+
+/// Codex plan review r9b, F2: every gap a run sees is durable in the next head. A segment
+/// stored with its sidecar but not yet listed (a crash before the head) and then damaged is a
+/// gap; runs that go ahead with it record it once (accepted runs do not grow the head), and
+/// deleting the damaged objects afterwards does not make it go away.
+#[test]
+fn a_damaged_segment_the_head_does_not_list_yet_stays_a_gap() {
+    let fx = Fx::new();
+    let _ = history(&fx);
+    fx.write("seven/f.txt", b"seven");
+    match try_run(&fx, "seven", false, |o| {
+        o.hooks.crash_at = Some(CrashPoint::AfterSidecarUpload)
+    }) {
+        Err(ApplyError::InjectedCrash(_)) => {}
+        other => panic!("expected the injected crash: {other:?}"),
+    }
+    let seg = committed(&fx).last().unwrap().clone();
+    let name = seg.file_name().unwrap().to_string_lossy().to_string();
+    let heads = || -> Vec<String> {
+        ["head.0", "head.1"]
+            .iter()
+            .filter_map(|s| fs::read_to_string(dir(&fx).join(s)).ok())
+            .collect()
+    };
+    assert!(
+        heads().iter().all(|h| !h.contains(&name)),
+        "the head does not list the segment yet"
+    );
+    let mut b = fs::read(&seg).unwrap();
+    b[0] ^= 1;
+    fs::write(&seg, &b).unwrap();
+    fx.write("eight/f.txt", b"eight");
+    refused_to_act(&fx, "eight", &name);
+    for n in ["eight", "nine"] {
+        fx.write(&format!("{n}/f.txt"), n.as_bytes());
+        let rep = run_with(&fx, n, false, |o| o.accept_history_gap = true);
+        let named = rep
+            .history_gaps
+            .iter()
+            .filter(|g| g.contains(&name))
+            .count();
+        assert_eq!(named, 1, "{n}: reported once: {rep:?}");
+        for h in heads() {
+            let lost = h
+                .lines()
+                .filter(|l| l.starts_with("lost ") && l.contains(&name))
+                .count();
+            assert!(lost <= 1, "{n}: the head grows: {h}");
+        }
+        assert!(
+            heads().iter().any(|h| h
+                .lines()
+                .any(|l| l.starts_with("lost ") && l.contains(&name))),
+            "{n}: the gap is recorded"
+        );
+    }
+    fs::remove_file(&seg).unwrap();
+    fs::remove_file(sum(&seg)).unwrap();
+    fx.write("ten/f.txt", b"ten");
+    refused_to_act(&fx, "ten", &name);
+    refused(&fx, &name);
+}
+
+/// An interrupted upload is skipped only when its rows are stored elsewhere (A-4), and left
+/// for the next run to store again only while the local manifest holds them. With the local
+/// manifest lost, nothing holds them: that is a gap, and an acting run stops (A-6).
+#[test]
+fn an_interrupted_upload_whose_rows_only_the_lost_local_manifest_held_is_a_gap() {
+    let needle = "neither committed history nor the local manifest";
+    let fx = Fx::new();
+    let _ = history(&fx);
+    fx.write("seven/f.txt", b"seven");
+    match try_run(&fx, "seven", false, |o| {
+        o.hooks.crash_at = Some(CrashPoint::AfterSegmentUpload)
+    }) {
+        Err(ApplyError::InjectedCrash(_)) => {}
+        other => panic!("expected the injected crash: {other:?}"),
+    }
+    fs::remove_file(fx.manifest()).unwrap();
+    refused_to_act(&fx, "seven", needle);
+    let rep = run_with(&fx, "seven", false, |o| o.accept_history_gap = true);
+    assert!(
+        rep.history_gaps.iter().any(|g| g.contains(needle)),
+        "{rep:?}"
+    );
+    refused(&fx, needle);
+}
+
+/// The merged history is in commit order (r9b F1): segment names sort in the order they were
+/// committed, also for runs within one second, where run ids (`<seconds>-<random>`) do not.
+#[test]
+fn segment_names_sort_in_commit_order_within_one_second() {
+    let fx = Fx::new();
+    let names = ["s1", "s2", "s3", "s4", "s5", "s6"];
+    for n in names {
+        fx.write(&format!("{n}/f.txt"), n.as_bytes());
+        run_with(&fx, n, false, |o| o.now = 1_800_000_000);
+    }
+    let by_name: Vec<PathBuf> = {
+        let mut v = committed(&fx);
+        v.sort();
+        v
+    };
+    assert_eq!(by_name, committed(&fx), "name order is commit order");
+    // And the runs' own rows come out in run order when the local manifest is gone.
+    let runs: Vec<String> = by_name
+        .iter()
+        .flat_map(|p| {
+            fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .filter_map(|l| {
+                    serde_json::from_str::<serde_json::Value>(l)
+                        .ok()
+                        .and_then(|v| v["run"].as_str().map(str::to_string))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut firsts: Vec<String> = Vec::new();
+    for r in runs {
+        if firsts.last() != Some(&r) {
+            assert!(!firsts.contains(&r), "a run's rows are split: {firsts:?}");
+            firsts.push(r);
+        }
+    }
+    assert_eq!(firsts.len(), names.len(), "{firsts:?}");
+}
+
+/// Measurement, not a gate (main's condition for r10): an acting run reads the whole label
+/// history before it acts. Builds `PD_HIST_SEGMENTS` x `PD_HIST_ROWS` committed rows (default
+/// 100 x 1000) from real rows with fresh run ids, then times one acting run, counts its rclone
+/// calls and prints the peak RSS. Run with `--ignored --nocapture` on Linux.
+#[test]
+#[ignore]
+fn measure_an_acting_run_over_a_large_history() {
+    use sha2::{Digest, Sha256};
+    let env = |k: &str, d: usize| -> usize {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (segs, per) = (env("PD_HIST_SEGMENTS", 100), env("PD_HIST_ROWS", 1000));
+    let fx = Fx::new();
+    let _ = history(&fx);
+    let template: Vec<String> = fs::read_to_string(committed(&fx)[0].clone())
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let run_of = |l: &str| -> String {
+        let v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["run"].as_str().unwrap().to_string()
+    };
+    let mut rows = 0;
+    for s in 0..segs {
+        let mut text = String::new();
+        let mut blk = 0;
+        while text.lines().count() < per {
+            for l in &template {
+                let run = format!("1700000000-{s:08x}{blk:08x}");
+                text.push_str(&l.replace(&run_of(l), &run));
+                text.push('\n');
+            }
+            blk += 1;
+        }
+        rows += text.lines().count();
+        let name = format!("o{:010}-1700000000-{s:016x}-00000001.jsonl", 1000 + s);
+        let bytes = text.into_bytes();
+        let sum = format!(
+            "{} {}\nname {name}\nend\n",
+            hex::encode(Sha256::digest(&bytes)),
+            bytes.len()
+        );
+        fs::write(dir(&fx).join(&name), &bytes).unwrap();
+        fs::write(dir(&fx).join(format!("{name}.sum")), sum).unwrap();
+    }
+    let calls = || {
+        fs::read_to_string(fx.fake_dir.join("log"))
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+    fx.write("big/f.txt", b"big");
+    let before = calls();
+    let t = std::time::Instant::now();
+    let rep = run_one(&fx, "big", false);
+    let secs = t.elapsed().as_secs_f64();
+    let hwm = fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM"))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "VmHWM unknown".into());
+    eprintln!(
+        "PD-HIST segments={segs} rows={rows} run_seconds={secs:.2} rclone_calls={} rows_from_storage={} {hwm}",
+        calls() - before,
+        rep.rows_from_storage
+    );
+    assert!(rep.history_gaps.is_empty(), "{rep:?}");
 }

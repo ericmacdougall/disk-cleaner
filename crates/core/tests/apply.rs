@@ -422,6 +422,43 @@ fn resume_after_crash_at_every_boundary() {
     }
 }
 
+/// Codex plan review r9b, F1 (interrupted removals): a crash after the mirror, or in the middle
+/// of an unlink, and then the local manifest lost. The re-run takes the begun removal from the
+/// stored history, finishes it, and everything restores from storage alone.
+#[test]
+fn resume_with_the_local_manifest_lost_converges_from_storage() {
+    for at in [CrashPoint::AfterMirror, CrashPoint::MidUnlink] {
+        let fx = Fx::new();
+        let (scan, plan) = dedup_fixture(&fx);
+        let digest_a = tree_digest(&fx.data.join("a"));
+        let digest_b = tree_digest(&fx.data.join("b"));
+        let mut o = fx.opts(true);
+        o.hooks.crash_at = Some(at);
+        match apply(&scan, &plan, &o) {
+            Err(ApplyError::InjectedCrash(_)) => {}
+            other => panic!("{at:?}: expected the injected crash, got {other:?}"),
+        }
+        fs::remove_file(fx.manifest()).unwrap();
+        let rep = apply(&scan, &plan, &fx.opts(true)).unwrap();
+        assert!(rep.history_gaps.is_empty(), "{at:?}: {rep:?}");
+        assert!(rep.rescan_needed.is_empty(), "{at:?}: {rep:#?}");
+        assert!(
+            !fx.data.join("a").exists() && !fx.data.join("b").exists(),
+            "{at:?}: {rep:#?}"
+        );
+        fs::remove_file(fx.manifest()).unwrap();
+        let mut ro = ropts(&fx);
+        ro.from_remote = true;
+        let r = restore(&fx.data, &ro).unwrap();
+        assert!(
+            r.failed.is_empty() && r.conflicts.is_empty(),
+            "{at:?}: {r:?}"
+        );
+        assert_eq!(tree_digest(&fx.data.join("a")), digest_a, "{at:?}");
+        assert_eq!(tree_digest(&fx.data.join("b")), digest_b, "{at:?}");
+    }
+}
+
 #[test]
 fn manifest_failure_never_loses_an_entry() {
     // NEG-12: a failing append stops the run at once. Nothing is unlinked unless its `file` row

@@ -245,6 +245,8 @@ pub(crate) struct Ctx<'a> {
     pub head: Option<super::restore::Head>,
     /// This state directory's id (acting runs only), written into every head.
     pub state_id: String,
+    /// The commit order of the next manifest segment written ([`super::restore::seg_order`]).
+    pub next_order: u64,
     pub report: ApplyReport,
 }
 
@@ -329,6 +331,7 @@ pub fn apply(
         unlinked_inodes: Default::default(),
         head: None,
         state_id: String::new(),
+        next_order: 1,
         report: ApplyReport {
             dry_run: !opts.act,
             run: run.clone(),
@@ -348,6 +351,10 @@ pub fn apply(
         if !ctx.manifest.rows.is_empty() {
             seed_unmirrored(&mut ctx, &remote);
         }
+        // One owner of history state (Codex plan review r9b, F1): from here on, every decision
+        // (what was begun or done, what a retained copy protects, which blobs are stored) reads
+        // the stored history too, not only what the local manifest happens to hold.
+        ctx.report.rows_from_storage = ctx.manifest.adopt_history(&remote.rows);
     }
     let begun = ctx.manifest.begun();
     let done = ctx.manifest.done(&inputs.plan_digest);
@@ -1187,8 +1194,15 @@ fn upload_verified(rc: &Rclone, name: &str, bytes: &[u8]) -> Result<(), ApplyErr
 /// Read the label's manifest history in storage once per acting run, before anything else: the
 /// head the next write stores, and the gaps found (A-5, A-6). Returns the reading.
 fn load_head(ctx: &mut Ctx) -> Result<super::restore::RemoteManifest, ApplyError> {
-    let remote = super::restore::remote_manifest(&ctx.rc, &ctx.opts.label)?;
+    let local: BTreeSet<String> = ctx
+        .manifest
+        .rows
+        .iter()
+        .map(super::manifest::line_of)
+        .collect();
+    let remote = super::restore::remote_manifest(&ctx.rc, &ctx.opts.label, Some(&local))?;
     ctx.head = Some(remote.next_head.clone());
+    ctx.next_order = remote.next_order;
     ctx.report.history_gaps = remote
         .gaps
         .iter()
@@ -1237,7 +1251,14 @@ fn mirror(ctx: &mut Ctx) -> Result<(), ApplyError> {
     let mut text = ctx.manifest.unmirrored.join("\n");
     text.push('\n');
     let seq = ctx.manifest.rows.len();
-    let file = format!("{}-{:08}.jsonl", ctx.manifest.run, seq);
+    // The order prefix gives the segment its commit position (`seg_order`). It moves on only
+    // once a segment is committed: a retry in this run of the same rows overwrites the same name
+    // (as before the prefix), and a retry with more rows shares the order but has a higher
+    // `seq`, which orders it after.
+    let file = format!(
+        "o{:010}-{}-{:08}.jsonl",
+        ctx.next_order, ctx.manifest.run, seq
+    );
     let name = format!("manifests/{}/{file}", ctx.opts.label);
     let bytes = text.into_bytes();
     upload_verified(&ctx.rc, &name, &bytes)?;
@@ -1246,6 +1267,7 @@ fn mirror(ctx: &mut Ctx) -> Result<(), ApplyError> {
     // treats a segment without a well-formed one as an interrupted upload, not as history.
     let sum = super::restore::format_sidecar(&file, &bytes);
     upload_verified(&ctx.rc, &format!("{name}.sum"), sum.as_bytes())?;
+    ctx.next_order += 1;
     ctx.manifest.unmirrored.clear();
     ctx.opts.crash(CrashPoint::AfterSidecarUpload)?;
     head.segs.insert(file, hex::encode(Sha256::digest(&bytes)));

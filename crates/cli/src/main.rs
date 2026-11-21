@@ -501,6 +501,7 @@ mod tests {
         let gap = ApplyReport {
             history_gaps: vec!["a-1.jsonl: missing".into()],
             took_over_label_from: Some("0f".repeat(16)),
+            rows_from_storage: 3,
             ..Default::default()
         };
         assert_eq!(apply_exit_code(&Ok(gap.clone())), 0);
@@ -512,7 +513,21 @@ mod tests {
                 && s.contains(&format!(
                     "took over the storage label from state directory {}",
                     "0f".repeat(16)
-                )),
+                ))
+                && s.contains("3 manifest row(s) came from the history in storage"),
+            "{s}"
+        );
+        assert!(!s.contains("Stored history was not checked"), "{s}");
+        // A dry run never reads storage, and says so (main's ruling: never promise silently
+        // more than the acting run does).
+        let dry = ApplyReport {
+            dry_run: true,
+            ..Default::default()
+        };
+        let s = super::report::apply_summary(&dry);
+        assert!(
+            s.contains("Stored history was not checked")
+                && s.contains("an acting run also reads the history in storage"),
             "{s}"
         );
     }

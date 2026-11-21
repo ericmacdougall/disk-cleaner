@@ -260,6 +260,8 @@ pub(crate) struct RemoteManifest {
     /// The head the next write must store (A-5): the stored head's entries, never dropped, plus
     /// every committed segment present, plus each new gap as a `lost` entry.
     pub next_head: Head,
+    /// The commit order the next segment written gets: 1 + the highest present.
+    pub next_order: u64,
 }
 
 const INTERRUPTED: &str = "its upload was interrupted before its checksum file was written, and no committed segment holds its rows; the next acting apply run stores them again from the local manifest";
@@ -290,10 +292,51 @@ fn read_head(
     })
 }
 
-/// Every manifest segment in storage, classified; only committed segments give rows. Two
-/// passes: committed history first, then each interrupted upload judged against it. Then the
-/// head: every segment it lists must be present, committed and byte for byte the one listed.
-pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest, ApplyError> {
+/// The commit order of a segment named `o<10 digits>-<run>-<seq>.jsonl` (the writer gives each
+/// new segment 1 + the highest order present). Run ids start with whole seconds, so they do not
+/// order the runs of one second; names without the prefix (written before it) are order 0.
+pub(crate) fn seg_order(name: &str) -> u64 {
+    name.strip_prefix('o')
+        .and_then(|r| r.split_once('-'))
+        .filter(|(d, _)| d.len() == 10 && d.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|(d, _)| d.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The segment a `lost` line names: `<name>: <why>` where name is a segment file name.
+fn lost_key(line: &str) -> Option<&str> {
+    line.split_once(": ")
+        .map(|(n, _)| n)
+        .filter(|n| n.ends_with(".jsonl") && !n.contains(' ') && !n.contains('/'))
+}
+
+/// Whether every row of an interrupted upload is in `local` (the local manifest, one serialized
+/// row per entry): each whole line is a local row, and a cut last line is the start of one.
+fn held_locally(orphan: &[u8], local: &BTreeSet<String>) -> bool {
+    let text = String::from_utf8_lossy(orphan);
+    let (whole, tail) = match text.rfind('\n') {
+        Some(i) => (&text[..i], &text[i + 1..]),
+        None => ("", &text[..]),
+    };
+    whole
+        .lines()
+        .filter(|l| !l.is_empty())
+        .all(|l| local.contains(l))
+        && (tail.is_empty() || local.iter().any(|l| l.starts_with(tail)))
+}
+
+const ORPHANED: &str = "its upload was interrupted and neither committed history nor the local manifest holds its rows (the local manifest was lost, replaced or taken over), so no run can store them again";
+
+/// Every manifest segment in storage, classified; only committed segments give rows, in commit
+/// order ([`seg_order`], then name). Two passes: committed history first, then each interrupted
+/// upload judged against it, and against `local` when an acting run passes its local manifest.
+/// Then the head: every segment it lists must be present, committed and byte for byte the one
+/// listed. Every gap seen is made durable in `next_head`.
+pub(crate) fn remote_manifest(
+    rc: &Rclone,
+    label: &str,
+    local: Option<&BTreeSet<String>>,
+) -> Result<RemoteManifest, ApplyError> {
     let dir = format!("manifests/{label}");
     let mut names = rc.list(&dir).map_err(ApplyError::Storage)?;
     names.sort();
@@ -329,6 +372,23 @@ pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest
             vec![format!("the storage head was damaged while segments were stored ({why}), so segments missing before then cannot be named")],
         ),
     };
+    // Interrupted uploads. One that committed history holds is skipped (A-4). One the head
+    // lists is a loss already named below. Otherwise its rows are stored nowhere else: the next
+    // acting run stores them again while the local manifest holds them, and when it does not
+    // (lost, replaced or taken over: `local` is what an acting run holds) they are a gap.
+    let mut uncovered = Vec::new();
+    for (n, b) in &interrupted {
+        if head.segs.contains_key(n) {
+            continue;
+        }
+        if covered(b, &texts) {
+            out.abandoned.push(n.clone());
+        } else if local.is_some_and(|l| !held_locally(b, l)) {
+            out.gaps.push((n.clone(), ORPHANED.into()));
+        } else {
+            uncovered.push(n.clone());
+        }
+    }
     let damaged: BTreeSet<String> = out.gaps.iter().map(|(n, _)| n.clone()).collect();
     for (n, sha) in &head.segs {
         let why = match committed.get(n) {
@@ -343,7 +403,13 @@ pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest
         };
         out.gaps.push((n.clone(), why.to_string()));
     }
+    // What is seen now, by name, is reported once with today's reason; an earlier record of the
+    // same segment is not repeated.
+    let seen: BTreeSet<String> = out.gaps.iter().map(|(n, _)| n.clone()).collect();
     for l in &head.lost {
+        if lost_key(l).is_some_and(|k| seen.contains(k)) {
+            continue;
+        }
         out.gaps.push((
             "history".into(),
             format!("an earlier apply run found a gap: {l}"),
@@ -357,19 +423,23 @@ pub(crate) fn remote_manifest(rc: &Rclone, label: &str) -> Result<RemoteManifest
         next.segs.entry(n.clone()).or_insert_with(|| sha.clone());
     }
     next.lost.append(&mut new_lost);
-    out.next_head = next;
-    out.rejected = out.gaps.clone();
-    for (n, b) in interrupted {
-        if head.segs.contains_key(&n) {
-            // Listed as committed: a loss in storage, already a gap, never a crash to skip.
+    // The one place a gap becomes durable (Codex plan review r9b, F2): every gap seen is in the
+    // next head. A segment the head lists stays listed, so its loss is found again at every
+    // read; any other segment gap is recorded as a `lost` line keyed by its name, once.
+    for (n, why) in &out.gaps {
+        if n == "history" || head.segs.contains_key(n) {
             continue;
         }
-        if covered(&b, &texts) {
-            out.abandoned.push(n);
-        } else {
-            out.rejected.push((n, INTERRUPTED.into()));
+        if !next.lost.iter().any(|l| lost_key(l) == Some(n.as_str())) {
+            next.lost.push(format!("{n}: {why}"));
         }
     }
+    out.next_head = next;
+    out.rejected = out.gaps.clone();
+    for n in uncovered {
+        out.rejected.push((n, INTERRUPTED.into()));
+    }
+    out.next_order = segments.iter().map(|n| seg_order(n)).max().unwrap_or(0) + 1;
     out.lines = texts
         .iter()
         .flat_map(|t| {
@@ -401,7 +471,7 @@ pub fn restore(target: &Path, opts: &RestoreOptions) -> Result<RestoreReport, Ap
     let mut rejected_segments = Vec::new();
     let mut abandoned_segments = Vec::new();
     let rows: Vec<Envelope> = if opts.from_remote {
-        let m = remote_manifest(&rc, &opts.label)?;
+        let m = remote_manifest(&rc, &opts.label, None)?;
         abandoned_segments = m.abandoned;
         let (rows, rejected) = (m.rows, m.rejected);
         if !rejected.is_empty() && !opts.accept_partial {
@@ -868,8 +938,41 @@ fn restore_git_blob(
 
 #[cfg(test)]
 mod tests {
-    use super::{covered, format_head, format_sidecar, parse_head, parse_sidecar};
-    use std::collections::BTreeMap;
+    use super::{
+        covered, format_head, format_sidecar, held_locally, lost_key, parse_head, parse_sidecar,
+        seg_order,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Segment names order history (r9b F1): the order prefix, fixed width, and nothing else.
+    #[test]
+    fn segment_order_lost_keys_and_local_holding_parse_strictly() {
+        assert_eq!(seg_order("o0000000012-1700000000-ab-00000003.jsonl"), 12);
+        for n in [
+            "1700000000-ab-00000003.jsonl",
+            "o12-1700000000-ab-00000003.jsonl",
+            "o00000000x2-r-1.jsonl",
+            "x0000000012-r-1.jsonl",
+        ] {
+            assert_eq!(seg_order(n), 0, "{n}");
+        }
+        let a = "o0000000001-r-00000001.jsonl";
+        let b = "o0000000002-r-00000002.jsonl";
+        let mut names = [b, "1700000000-r-00000009.jsonl", a];
+        names.sort();
+        assert_eq!(names[1..], [a, b], "name order is commit order");
+        assert_eq!(lost_key(&format!("{a}: its sha256 differs")), Some(a));
+        assert_eq!(lost_key("the storage head was missing: x"), None);
+        let local: BTreeSet<String> = ["{\"a\":1}", "{\"b\":2}"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(held_locally(b"{\"a\":1}\n{\"b\":2}\n", &local));
+        assert!(held_locally(b"{\"a\":1}\n{\"b\"", &local), "a cut last row");
+        assert!(held_locally(b"", &local));
+        assert!(!held_locally(b"{\"a\":1}\n{\"c\":3}\n", &local));
+        assert!(!held_locally(b"{\"c\"", &local));
+    }
 
     #[test]
     fn heads_and_sidecars_parse_only_whole() {

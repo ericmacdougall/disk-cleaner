@@ -124,7 +124,14 @@ fn an_interrupted_segment_whose_rows_are_not_stored_again_is_still_refused() {
         assert_eq!(orphan.len(), 1, "{case}: {:?}", segments(&fx));
         if case == "local manifest gone" {
             fs::remove_file(fx.manifest()).unwrap();
-            apply(&scan, &plan, &fx.opts(true)).unwrap();
+            // Nothing holds its rows now: a gap, so the acting run does nothing (r9b, A-6).
+            match apply(&scan, &plan, &fx.opts(true)) {
+                Err(ApplyError::HistoryGap(g)) => assert!(
+                    g.iter().any(|x| x.contains("neither committed history")),
+                    "{g:?}"
+                ),
+                other => panic!("{case}: went ahead past lost rows: {other:?}"),
+            }
         } else {
             fx.set_fake(
                 // Segments and their sidecars fail; any other manifest object would be stored.
