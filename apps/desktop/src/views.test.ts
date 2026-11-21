@@ -264,15 +264,15 @@ describe("settings (spec AC-5, NEG-5)", () => {
     await f.load();
     (f.el.querySelector("#set-window") as HTMLInputElement).value = "7";
     await f.save(false);
-    const dialog = f.el.querySelector('[role="alertdialog"]') as HTMLElement;
+    const dialog = document.querySelector('[role="alertdialog"]') as HTMLElement;
     expect(dialog).not.toBeNull();
     expect(document.activeElement?.textContent).toBe("Keep 30 days");
     dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-    expect(f.el.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
     expect(b.calls.filter((c) => c.name === "saveSettings")).toHaveLength(1);
     expect((f.el.querySelector("#set-window") as HTMLInputElement).value).toBe("7");
     await f.save(false);
-    (f.el.querySelector('[role="alertdialog"] button.primary') as HTMLButtonElement).click();
+    (document.querySelector('[role="alertdialog"] button.primary') as HTMLButtonElement).click();
     await flush();
     expect(b.calls.filter((c) => c.name === "saveSettings").map((c) => c.args[2])).toEqual([false, false, true]);
   });
@@ -290,13 +290,13 @@ describe("settings (spec AC-5, NEG-5)", () => {
     const input = f.el.querySelector("#set-window") as HTMLInputElement;
     input.value = "7";
     await f.save(false);
-    expect(f.el.querySelector('[role="alertdialog"]')).not.toBeNull();
+    expect(document.querySelector('[role="alertdialog"]')).not.toBeNull();
     // The draft cannot be edited, nor another save started, while the question is open.
     expect(f.el.querySelector("fieldset")?.disabled).toBe(true);
     input.value = "1";
     await f.save(false);
     expect(b.calls.filter((c) => c.name === "saveSettings")).toHaveLength(1);
-    (f.el.querySelector('[role="alertdialog"] button.primary') as HTMLButtonElement).click();
+    (document.querySelector('[role="alertdialog"] button.primary') as HTMLButtonElement).click();
     await flush();
     const saves = b.calls.filter((c) => c.name === "saveSettings");
     expect(saves).toHaveLength(2);
@@ -333,6 +333,89 @@ describe("settings (spec AC-5, NEG-5)", () => {
     await f.load();
     expect(f.el.querySelector('[role="status"]')?.textContent).toContain("The config file changed; the plan was recomputed.");
     expect(replans).toEqual([true]);
+  });
+});
+
+describe("the shorten question is modal (PR gate F8)", () => {
+  const needsConfirm = () =>
+    mockBackend({
+      saveSettings: async (_core, _app, confirm) => {
+        if (!confirm) throw { kind: "needs_confirmation", message: "shortening the active window from 30 to 7 days", old: 30, new: 7 };
+        return { report: { outcome: "saved", note: null, replanned: false }, settings: structuredClone(SETTINGS) };
+      },
+    });
+  /** The settings form inside a stand-in app: a tab button before it and a New scan button after. */
+  async function opened() {
+    const b = needsConfirm();
+    const f = new SettingsForm(b);
+    const tabButton = document.createElement("button");
+    tabButton.textContent = "Developer view";
+    const newScan = document.createElement("button");
+    newScan.textContent = "New scan";
+    const shell = document.createElement("div");
+    shell.append(tabButton, f.el, newScan);
+    document.body.replaceChildren(shell);
+    await f.load();
+    (f.el.querySelector("#set-window") as HTMLInputElement).value = "7";
+    await f.save(false);
+    const dialog = document.querySelector('[role="alertdialog"]') as HTMLElement;
+    expect(dialog).not.toBeNull();
+    return { b, f, dialog, tabButton, newScan, shell };
+  }
+  const tab = (shift = false) => {
+    const e = new KeyboardEvent("keydown", { key: "Tab", shiftKey: shift, bubbles: true, cancelable: true });
+    (document.activeElement ?? document.body).dispatchEvent(e);
+    return e;
+  };
+
+  it("Tab and Shift+Tab stay on the question's buttons until it is answered", async () => {
+    const { dialog } = await opened();
+    const keep = button(dialog, "Keep 30");
+    const shorten = button(dialog, "Shorten to 7");
+    expect(document.activeElement).toBe(keep);
+    shorten.focus();
+    const forward = tab();
+    expect(forward.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(keep);
+    const back = tab(true);
+    expect(back.defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(shorten);
+  });
+
+  it("everything behind the question is inert while it is open, and only then", async () => {
+    const { dialog, f, tabButton, newScan } = await opened();
+    expect(dialog.closest("[inert]")).toBeNull();
+    for (const el of [tabButton, newScan, f.el.querySelector("form")!]) expect(el.closest("[inert]"), el.textContent ?? "").not.toBeNull();
+    button(dialog, "Keep 30").click();
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(document.querySelector("[inert]")).toBeNull();
+    expect(document.activeElement?.id).toBe("set-window");
+  });
+
+  it("focus moved behind the question by a script comes back to it", async () => {
+    const { dialog, newScan } = await opened();
+    newScan.focus();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
+  it("a re-render of the app while the question is open keeps the question, the draft and focus", async () => {
+    const { f, dialog, shell } = await opened();
+    // As App.renderResults does on a scan event: the panel is rebuilt, the form re-appended and loaded.
+    f.el.remove();
+    shell.append(f.el);
+    await f.load();
+    expect(document.querySelector('[role="alertdialog"]')).toBe(dialog);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    button(dialog, "Keep 30").click();
+    expect((f.el.querySelector("#set-window") as HTMLInputElement).value).toBe("7");
+  });
+
+  it("is the only element in the app that declares aria-modal, and passes axe while open", async () => {
+    const { dialog } = await opened();
+    expect(document.querySelectorAll('[aria-modal="true"]')).toHaveLength(1);
+    expect(dialog.getAttribute("aria-labelledby")).toBeTruthy();
+    const r = await axe.run(document.body, { rules: { region: { enabled: false }, "color-contrast": { enabled: false } } });
+    expect(r.violations.map((v) => v.id)).toEqual([]);
   });
 });
 
