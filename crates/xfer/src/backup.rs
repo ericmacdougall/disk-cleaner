@@ -23,8 +23,8 @@ use crate::pack::{
 use crate::receipt::{Receipt, Writer};
 use crate::repo::{
     enc_bytes, encode, engine, files_key, idx_key, snapshot_key, valid_run, Budget, Cache,
-    ChunkRef, CommitRef, Entry, FilesObj, IdxObj, Meter, ObjRef, Repo, Snapshot, Totals,
-    CHUNK_ENTRY_COST,
+    ChunkMap, ChunkRef, CommitRef, Entry, FilesObj, IdxObj, Loc, Meter, ObjRef, Repo, Snapshot,
+    Totals,
 };
 use crate::transport::{verified_put, RetryPolicy, Transport};
 use crate::walk::{self, Filter, Node, WalkOpts};
@@ -33,7 +33,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 pub struct Options {
@@ -63,6 +63,8 @@ pub struct Options {
     /// Unreferenced packs up to this many bytes are downloaded, checked and adopted.
     pub adopt_limit: u64,
     pub epoch: Duration,
+    /// Where a notice for the person running the backup goes (the CLI prints it to stderr).
+    pub notice: Option<fn(&str)>,
 }
 
 impl Options {
@@ -91,6 +93,7 @@ impl Options {
             run: None,
             adopt_limit: 1 << 30,
             epoch: Duration::from_secs(5),
+            notice: None,
         }
     }
 }
@@ -132,6 +135,12 @@ pub struct Report {
     pub level_histogram: Vec<(i32, u64)>,
     pub throttles: u64,
     pub peak_rss: u64,
+    /// Times a reader waited for a commit to make room in the hot table (pass boundaries).
+    pub index_waits: u64,
+    /// New chunks the hot table holds at once.
+    pub hot_room: u64,
+    /// The index limits, said at start when the tree comes within 2x of them.
+    pub limits: Option<String>,
 }
 
 fn shown(rel: &[u8]) -> String {
@@ -287,12 +296,157 @@ fn schedule(nodes: &[Node], files: &[usize], prev: &HashMap<Vec<u8>, Entry>) -> 
     v.into_iter().map(|(_, _, i)| i).collect()
 }
 
+/// The committed chunk map, shared: readers look chunks up in it, the committer merges each
+/// commit's chunks into it.
+type Cold = RwLock<ChunkMap>;
+
+fn cold_read(c: &Cold) -> std::sync::RwLockReadGuard<'_, ChunkMap> {
+    c.read().unwrap_or_else(|p| p.into_inner())
+}
+
+/// This run's new chunks until they are committed (Revision 6.4): each id with whether its pack
+/// is uploaded and verified. Allocated once from the index share (`hot_table`), so it never
+/// grows; at `room` entries a reader that finds a new chunk waits until a commit moves chunks
+/// into the committed map (a pass boundary), instead of the run exceeding `--mem-budget`.
+///
+/// Every id is in the hot table or the committed map, never neither, while it matters: the
+/// committer merges a commit's chunks into the committed map before it removes them here, and a
+/// reader looks in the committed map again under this table's lock before it claims an id.
+/// Lock order: this table, then the committed map. The committer never holds the committed map
+/// while it takes this lock.
+struct Hot {
+    s: Mutex<HotState>,
+    cv: Condvar,
+}
+
+struct HotState {
+    ids: HashMap<ChunkId, bool>,
+    room: usize,
+    /// Set once nothing more can be claimed: (whether it is the share, why).
+    stop: Option<(bool, String)>,
+    /// Whether the share's refusal was reported as an error of the run.
+    announced: bool,
+    /// Readers waiting for room now.
+    parked: usize,
+    /// Times a reader waited for room.
+    waits: u64,
+}
+
+impl Hot {
+    fn new(i: u64) -> Hot {
+        let (buckets, _) = crate::repo::hot_table(i);
+        let cap = if buckets < 8 {
+            buckets - 1
+        } else {
+            buckets / 8 * 7
+        };
+        Hot {
+            s: Mutex::new(HotState {
+                ids: HashMap::with_capacity(cap as usize),
+                room: crate::repo::hot_room(i),
+                stop: None,
+                announced: false,
+                parked: 0,
+                waits: 0,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, HotState> {
+        self.s.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    /// Claim `id` for this run: Ok(true) when no commit and no other reader holds it (the
+    /// caller then sends its bytes), Ok(false) when it is a duplicate. Waits while the table is
+    /// full; fails once the run stops taking new chunks.
+    fn claim(&self, id: ChunkId, cold: &Cold) -> Result<bool> {
+        if cold_read(cold).contains(&id) {
+            return Ok(false);
+        }
+        let mut s = self.lock();
+        let mut parked = false;
+        let r = loop {
+            // a commit may have moved it from here to the committed map since the look above
+            if s.ids.contains_key(&id) || cold_read(cold).contains(&id) {
+                break Ok(false);
+            }
+            if let Some((share, why)) = &s.stop {
+                break Err(if *share {
+                    Error::Budget(why.clone())
+                } else {
+                    Error::Refused(why.clone())
+                });
+            }
+            if s.ids.len() < s.room {
+                s.ids.insert(id, false);
+                break Ok(true);
+            }
+            if !parked {
+                parked = true;
+                s.parked += 1;
+                s.waits += 1;
+            }
+            s = self.cv.wait(s).unwrap_or_else(|p| p.into_inner());
+        };
+        if parked {
+            s.parked -= 1;
+        }
+        r
+    }
+    /// Whether readers are waiting for room (a commit is then due as soon as one can be made).
+    fn pressed(&self) -> bool {
+        self.lock().parked > 0
+    }
+    /// Mark the chunks of a verified pack.
+    fn verified(&self, cs: &[(ChunkId, u32)]) {
+        let mut s = self.lock();
+        for (id, _) in cs {
+            if let Some(v) = s.ids.get_mut(id) {
+                *v = true;
+            }
+        }
+    }
+    /// Drop chunks whose pack failed (they are sent again if another file holds them), or that
+    /// a commit moved into the committed map, and wake the readers waiting for room.
+    fn remove(&self, ids: impl Iterator<Item = ChunkId>) {
+        let mut s = self.lock();
+        for id in ids {
+            s.ids.remove(&id);
+        }
+        drop(s);
+        // the broken-hot-wake variant forgets the wake-up (failing-first evidence only)
+        if !cfg!(feature = "broken-hot-wake") {
+            self.cv.notify_all();
+        }
+    }
+    /// Stop claims: every waiting and later claim of a new chunk fails with `why`.
+    fn halt(&self, share: bool, why: String) {
+        let mut s = self.lock();
+        if s.stop.is_none() {
+            s.stop = Some((share, why));
+        }
+        drop(s);
+        self.cv.notify_all();
+    }
+    /// Record the chunks of adopted orphan packs, already stored and verified: all of `ids` or,
+    /// if they do not fit, none.
+    fn admit_verified(&self, ids: &[ChunkId]) -> bool {
+        let mut s = self.lock();
+        if s.ids.len() + ids.len() > s.room {
+            return false;
+        }
+        for id in ids {
+            s.ids.insert(*id, true);
+        }
+        true
+    }
+}
+
 struct ReadCtx<'a> {
     root: &'a Path,
     nodes: &'a [Node],
     prev: &'a HashMap<Vec<u8>, Entry>,
-    committed: &'a crate::repo::ChunkMap,
-    seen: &'a Mutex<HashSet<ChunkId>>,
+    committed: &'a Cold,
+    hot: &'a Hot,
     sem: &'a ByteSem,
     chunk_tx: Sender<ChunkMsg>,
     ev_tx: Sender<Event>,
@@ -329,12 +483,10 @@ fn read_one(c: &ReadCtx, i: usize, last_try: bool) -> ReadOutcome {
     e.group = c.groups.get(&i).cloned();
     if !c.rehash {
         if let Some(p) = c.prev.get(&n.rel) {
-            if p.kind == Kind::File
-                && same_identity(&p.id, &n.stat.id)
-                && p.chunks
-                    .iter()
-                    .all(|id| c.committed.chunks.contains_key(id))
-            {
+            if p.kind == Kind::File && same_identity(&p.id, &n.stat.id) && {
+                let cold = cold_read(c.committed);
+                p.chunks.iter().all(|id| cold.contains(id))
+            } {
                 let mut r = p.clone();
                 r.id = n.stat.id;
                 r.mode = n.stat.mode;
@@ -386,7 +538,7 @@ fn read_one(c: &ReadCtx, i: usize, last_try: bool) -> ReadOutcome {
         None => Vec::new(),
     };
     let res = chunk_stream(&mut f, before.id.size, |id, data| {
-        let fresh = c.seen.lock().expect("seen").insert(id);
+        let fresh = c.hot.claim(id, c.committed)?;
         if fresh {
             c.new_chunks.fetch_add(1, Ordering::Relaxed);
             c.new_chunk_bytes
@@ -407,6 +559,18 @@ fn read_one(c: &ReadCtx, i: usize, last_try: bool) -> ReadOutcome {
     });
     let cf = match res {
         Ok(cf) => cf,
+        Err(Error::Budget(m)) => {
+            // the committed map's share is spent: an error of the run (exit 3), said once
+            let first = {
+                let mut s = c.hot.lock();
+                !std::mem::replace(&mut s.announced, true)
+            };
+            if first {
+                let _ = c.ev_tx.send(Event::Failed(m.clone()));
+            }
+            let _ = c.ev_tx.send(Event::Skipped(i, format!("not read: {m}")));
+            return ReadOutcome::Done;
+        }
         Err(err) => {
             let _ = c.ev_tx.send(Event::Skipped(i, format!("read: {err}")));
             return ReadOutcome::Done;
@@ -576,6 +740,7 @@ fn packer(
     shared: &Shared,
     flush_after: Duration,
     ev_tx: Sender<Event>,
+    hot: &Hot,
 ) {
     let mut pb = PackBuilder::new();
     let mut chunks: Vec<(ChunkId, u32)> = Vec::new();
@@ -602,6 +767,7 @@ fn packer(
             }
             Err(e) => {
                 let _ = ev_tx.send(Event::Failed(format!("pack failed its decode check: {e}")));
+                hot.remove(chunks.iter().map(|(id, _)| *id));
                 true
             }
         }
@@ -629,7 +795,10 @@ fn packer(
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                if !pb.is_empty() && first.is_some_and(|t| t.elapsed() >= flush_after) {
+                // readers waiting for room in the hot table need this pack committed now
+                if !pb.is_empty()
+                    && (first.is_some_and(|t| t.elapsed() >= flush_after) || hot.pressed())
+                {
                     let full = std::mem::take(&mut pb);
                     if !seal(full, std::mem::take(&mut chunks)) {
                         return;
@@ -653,6 +822,7 @@ fn uploader(
     shared: &Shared,
     policy: RetryPolicy,
     ev_tx: Sender<Event>,
+    hot: &Hot,
 ) {
     loop {
         shared.acquire();
@@ -683,6 +853,8 @@ fn uploader(
             }
             Err(e) => {
                 let _ = ev_tx.send(Event::Failed(format!("upload {}: {e}", p.key)));
+                // its chunks leave the hot table, so readers waiting for room go on
+                hot.remove(p.chunks.iter().map(|(id, _)| *id));
             }
         }
     }
@@ -695,11 +867,15 @@ fn adopt_orphans(
     packs: &HashMap<String, crate::transport::RemoteObject>,
     referenced: &HashMap<String, ObjRef>,
     limit: u64,
-    meter: &mut Meter,
+    committed: &ChunkMap,
+    hot: &Hot,
 ) -> Vec<(ObjRef, Vec<(ChunkId, u32)>)> {
     let mut orphans: Vec<_> = packs
         .values()
-        .filter(|o| !referenced.contains_key(&o.key) && o.hash.is_some())
+        // referenced: held by the committed map, or named by an index without matching
+        .filter(|o| {
+            !committed.has_pack(&o.key) && !referenced.contains_key(&o.key) && o.hash.is_some()
+        })
         .collect();
     orphans.sort_by(|a, b| a.key.cmp(&b.key));
     let total: u64 = orphans.iter().map(|o| o.size).sum();
@@ -721,10 +897,16 @@ fn adopt_orphans(
         let Ok(tr) = seal_and_check(&b) else {
             continue;
         };
-        if meter
-            .charge(tr.chunks.len() as u64 * CHUNK_ENTRY_COST)
-            .is_err()
-        {
+        // a pack is adopted whole or not at all; its chunks are new chunks of this run
+        let fresh: Vec<ChunkId> = tr
+            .chunks
+            .iter()
+            .map(|c| c.id)
+            .filter(|id| !committed.contains(id) && !hot.lock().ids.contains_key(id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if !hot.admit_verified(&fresh) {
             break;
         }
         out.push((
@@ -810,7 +992,13 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
         Some(d) => Cache::open(d, &run, o.cache_budget, listed_idx_bytes)?,
         None => None,
     };
-    let mut mi = Meter::new("the chunk map", b.i);
+    // The index share holds the hot table (this run's uncommitted new chunks, allocated once)
+    // and the committed chunk map (the rest). Revision 6.4.
+    let hot = Hot::new(b.i);
+    let mut mi = Meter::new(
+        "the chunk map",
+        b.i.saturating_sub(crate::repo::hot_table(b.i).1),
+    );
     // The previous run's file table, for the metadata fast path.
     let mut mw = Meter::new("the walk and the previous file table", b.w);
     let load_prev = |mw: &mut Meter| -> Result<HashMap<Vec<u8>, Entry>> {
@@ -834,12 +1022,12 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
         Ok(prev)
     };
     let (maps, prev) = if serial {
-        let m = repo.load_chunk_map(&idx_list, &packs, &mut mi, cache.as_ref());
+        let m = repo.load_map(&idx_list, &packs, &mut mi, cache.as_ref(), true);
         (m, load_prev(&mut mw))
     } else {
         std::thread::scope(|s| {
             let h = s.spawn(|| load_prev(&mut mw));
-            let m = repo.load_chunk_map(&idx_list, &packs, &mut mi, cache.as_ref());
+            let m = repo.load_map(&idx_list, &packs, &mut mi, cache.as_ref(), true);
             let p = h
                 .join()
                 .unwrap_or_else(|_| Err(Error::Bug("load thread panicked".into())));
@@ -848,7 +1036,8 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
     };
     let (committed, _n_idx, referenced) = maps?;
     let prev = prev?;
-    let adopted = adopt_orphans(&repo, &packs, &referenced, o.adopt_limit, &mut mi);
+    let adopted = adopt_orphans(&repo, &packs, &referenced, o.adopt_limit, &committed, &hot);
+    let committed: Cold = RwLock::new(committed);
     rep.adopted_packs = adopted.len() as u64;
     rep.load_ms = t0.elapsed().as_millis() as u64;
 
@@ -922,6 +1111,30 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
     }
     rep.freeable_bytes = freeable;
     rep.files = (data_files.len() + hard.len()) as u64;
+    // Say the limits up front when this tree comes within 2x of them: at least one chunk per
+    // file, plus one per MiB (the chunker's average) of the larger files.
+    {
+        let est = data_files.len() as u64 + rep.source_bytes / (1 << 20);
+        let have = cold_read(&committed).len() as u64;
+        // the conservative case: packs of 1 MiB chunks of large files, each pack a cost too
+        let cold = b.i.saturating_sub(crate::repo::hot_table(b.i).1);
+        let fit = crate::repo::map_fit(cold, (b.p_max >> 20).max(1)) as u64;
+        if (have + est) * 2 >= fit {
+            let m = format!(
+                "this tree has {} files (about {est} chunks) and the repository holds {have} \
+                 chunks; at --mem-budget {} the chunk map holds at most {fit} chunks in all and \
+                 {} new chunks at a time before a commit makes room. Past {fit} the run stops \
+                 reading with an error; back the tree up in parts or raise --mem-budget",
+                rep.files,
+                crate::util::human(b.total),
+                crate::repo::hot_room(b.i)
+            );
+            if let Some(f) = o.notice {
+                f(&m);
+            }
+            rep.limits = Some(m);
+        }
+    }
     let order = schedule(&nodes, &data_files, &prev);
 
     // Pipeline.
@@ -934,13 +1147,6 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
     );
     let rm = RateMatcher::new(o.level, o.compressors, shared.goodput.clone(), b.z);
     let sem = ByteSem::new(b.c);
-    let seen: Mutex<HashSet<ChunkId>> = Mutex::new(committed.chunks.keys().copied().collect());
-    for (_, cs) in &adopted {
-        let mut s = seen.lock().expect("seen");
-        for (id, _) in cs {
-            s.insert(*id);
-        }
-    }
     let read_bytes = AtomicU64::new(0);
     let new_chunks = AtomicU64::new(0);
     let new_chunk_bytes = AtomicU64::new(0);
@@ -962,8 +1168,9 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
         engine: &eng,
         nodes: &nodes,
         committed: &committed,
+        cold_meter: mi,
+        hot: &hot,
         cache: cache.as_ref(),
-        avail: HashSet::new(),
         waiting: Vec::new(),
         hard_waiting: hard,
         done_data: HashSet::new(),
@@ -980,11 +1187,6 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
         t0,
         rep: &mut rep,
     };
-    for (_, cs) in &commit.new_packs {
-        for (id, _) in cs {
-            commit.avail.insert(*id);
-        }
-    }
 
     std::thread::scope(|sc| -> Result<()> {
         // controller
@@ -999,7 +1201,8 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
             let sh = &*shared;
             let tt = &*t;
             let pol = o.policy;
-            ups.push(sc.spawn(move || uploader(tt, rx, sh, pol, ev)));
+            let hot = &hot;
+            ups.push(sc.spawn(move || uploader(tt, rx, sh, pol, ev, hot)));
         }
         drop(up_rx);
         // packer
@@ -1007,7 +1210,8 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
             let sh = &*shared;
             let ev = ev_tx.clone();
             let flush = o.commit_every / 2;
-            sc.spawn(move || packer(comp_rx, up_tx, sh, flush, ev));
+            let hot = &hot;
+            sc.spawn(move || packer(comp_rx, up_tx, sh, flush, ev, hot));
         }
         // compressors
         for _ in 0..o.compressors.max(1) {
@@ -1028,7 +1232,7 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
                 nodes: &nodes,
                 prev: &prev,
                 committed: &committed,
-                seen: &seen,
+                hot: &hot,
                 sem: &sem,
                 chunk_tx,
                 ev_tx: ev_tx.clone(),
@@ -1075,6 +1279,8 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
         drop(ev_tx);
 
         let res = commit.run(&ev_rx, o.commit_bytes, o.commit_every);
+        // readers waiting for room must not outlive the committer
+        hot.halt(false, "the run stopped committing".into());
         shared.stop.store(true, Ordering::Relaxed);
         for u in ups {
             let _ = u.join();
@@ -1096,6 +1302,11 @@ pub fn backup(t: Arc<dyn Transport>, o: &Options) -> Result<Report> {
     rep.k_trace = shared.k_trace.lock().expect("trace").clone();
     rep.throttles = shared.throttles.load(Ordering::Relaxed);
     rep.level_histogram = rm.histogram();
+    {
+        let h = hot.lock();
+        rep.index_waits = h.waits;
+        rep.hot_room = h.room as u64;
+    }
 
     if !fatal && rep.errors.is_empty() {
         let snap = Snapshot {
@@ -1146,11 +1357,13 @@ struct Committer<'a> {
     repo_label: &'a str,
     engine: &'a str,
     nodes: &'a [Node],
-    committed: &'a crate::repo::ChunkMap,
+    /// the committed chunk map; each commit's chunks are merged in, charged to `cold_meter`
+    committed: &'a Cold,
+    cold_meter: Meter,
+    /// this run's chunks until committed, with whether each is uploaded and verified
+    hot: &'a Hot,
     /// the state dir's cache of commit objects: what this run commits goes in as it verifies
     cache: Option<&'a Cache>,
-    /// chunks uploaded and verified in this run
-    avail: HashSet<ChunkId>,
     waiting: Vec<(Entry, usize)>,
     /// (hard-link member, its group's data file)
     hard_waiting: Vec<(usize, usize)>,
@@ -1176,9 +1389,102 @@ const SERIAL_READ: u64 = 4 << 20;
 /// Entries per `.files` object (keeps each object well under the 64 MiB decode limit).
 const FILES_PER_COMMIT: usize = 100_000;
 
+/// Move committed chunks from the hot table to the committed map: merge first, then remove, so
+/// a reader finds each id in one of the two at every moment. All or nothing: a merge that does
+/// not fit leaves the map as it was and the chunks in the hot table.
+fn migrate(
+    committed: &Cold,
+    meter: &mut Meter,
+    hot: &Hot,
+    packs: &[(ObjRef, Vec<(ChunkId, u32)>)],
+) -> Result<()> {
+    let ids = || {
+        packs
+            .iter()
+            .flat_map(|(_, cs)| cs.iter().map(|(id, _)| *id))
+    };
+    // the broken-migrate-order variant removes before it merges (failing-first evidence only)
+    if cfg!(feature = "broken-migrate-order") {
+        hot.remove(ids());
+        // the window a real scheduler opens here at random, held open
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let mut cold = committed.write().unwrap_or_else(|p| p.into_inner());
+    let before = meter.used;
+    let mut add = Vec::new();
+    for (p, cs) in packs {
+        if !cold.has_pack(&p.key) {
+            if let Err(e) = meter.charge(crate::repo::pack_cost(p)) {
+                meter.used = before;
+                return Err(e);
+            }
+        }
+        let pi = cold.pack_index(p);
+        add.extend(cs.iter().map(|&(id, len)| (id, Loc { pack: pi, len })));
+    }
+    cold.merge(add, meter)?;
+    drop(cold);
+    if !cfg!(feature = "broken-migrate-order") {
+        hot.remove(ids());
+    }
+    Ok(())
+}
+
+/// Whether a chunk is stored and verified: committed before, or uploaded in this run. Holds
+/// both tables for a scan (hot first: the lock order).
+struct Avail<'g> {
+    hot: std::sync::MutexGuard<'g, HotState>,
+    cold: std::sync::RwLockReadGuard<'g, ChunkMap>,
+}
+
+impl Avail<'_> {
+    fn has(&self, id: &ChunkId) -> bool {
+        self.hot.ids.get(id) == Some(&true) || self.cold.contains(id)
+    }
+    fn all(&self, e: &Entry) -> bool {
+        e.chunks.iter().all(|c| self.has(c))
+    }
+}
+
 impl Committer<'_> {
-    fn has_chunk(&self, id: &ChunkId) -> bool {
-        self.avail.contains(id) || self.committed.chunks.contains_key(id)
+    fn avail(&self) -> Avail<'_> {
+        let hot = self.hot.lock();
+        Avail {
+            hot,
+            cold: cold_read(self.committed),
+        }
+    }
+
+    /// Stop the readers too: a committer that can no longer commit must not leave them waiting
+    /// for room.
+    fn set_broken(&mut self) {
+        self.broken = true;
+        self.hot.halt(false, "the run stopped committing".into());
+    }
+
+    /// After a commit is stored: merge its chunks into the committed map, then take them out of
+    /// the hot table (in that order, so a reader always finds each in one of the two). If the
+    /// committed map's share cannot hold them, they stay in the hot table (still verified, so
+    /// files waiting on them commit) and the run takes no more new chunks.
+    fn migrate(&mut self, packs: &[(ObjRef, Vec<(ChunkId, u32)>)]) {
+        if packs.is_empty() {
+            return;
+        }
+        match migrate(self.committed, &mut self.cold_meter, self.hot, packs) {
+            Ok(()) => {}
+            Err(_) => {
+                let have = cold_read(self.committed).len();
+                let m = format!(
+                    "the chunk map is full: its {} share of --mem-budget holds about {} \
+                     chunks and this run committed past it; the files receipted so far are \
+                     backed up, the rest were not read. Back the tree up in parts, or with a \
+                     larger --mem-budget",
+                    crate::util::human(self.cold_meter.limit),
+                    have.max(crate::repo::chunk_map_fit(self.cold_meter.limit))
+                );
+                self.hot.halt(true, m);
+            }
+        }
     }
 
     fn run(&mut self, ev_rx: &Receiver<Event>, commit_bytes: u64, every: Duration) -> Result<()> {
@@ -1217,9 +1523,7 @@ impl Committer<'_> {
                     self.rep.packs += 1;
                     self.rep.pack_bytes += p.size;
                     self.pending_pack_bytes += p.size;
-                    for (id, _) in &cs {
-                        self.avail.insert(*id);
-                    }
+                    self.hot.verified(&cs);
                     self.new_packs.push((p, cs));
                 }
                 Ok(Event::Failed(e)) => {
@@ -1272,6 +1576,8 @@ impl Committer<'_> {
     fn due(&self, last: Instant, commit_bytes: u64, every: Duration) -> bool {
         last.elapsed() >= Duration::from_secs(1)
             && (self.pending_pack_bytes >= commit_bytes
+                // readers wait for room in the hot table: commit what is verified now
+                || (!self.new_packs.is_empty() && self.hot.pressed())
                 || self.waiting.len() + self.ready.len() >= FILES_PER_COMMIT
                 || (last.elapsed() >= every
                     && (!self.waiting.is_empty()
@@ -1282,19 +1588,19 @@ impl Committer<'_> {
 
     /// Allocated bytes of the files a commit now would receipt.
     fn ready_alloc(&self) -> u64 {
+        let a = self.avail();
         let w: u64 = self
             .waiting
             .iter()
-            .filter(|(e, _)| e.chunks.iter().all(|c| self.has_chunk(c)))
+            .filter(|(e, _)| a.all(e))
             .map(|(e, _)| e.alloc)
             .sum();
         w + self.ready.iter().map(|e| e.alloc).sum::<u64>()
     }
 
     fn any_ready(&self) -> bool {
-        self.waiting
-            .iter()
-            .any(|(e, _)| e.chunks.iter().all(|c| self.has_chunk(c)))
+        let a = self.avail();
+        self.waiting.iter().any(|(e, _)| a.all(e))
     }
 
     /// One commit: `.idx` (new packs), then `.files` (entries whose chunks are all verified),
@@ -1312,12 +1618,16 @@ impl Committer<'_> {
         }
         let mut data_now: Vec<usize> = Vec::new();
         let mut keep = Vec::new();
-        for (e, i) in std::mem::take(&mut self.waiting) {
-            if batch.len() < take && e.chunks.iter().all(|c| self.has_chunk(c)) {
-                data_now.push(i);
-                batch.push(e);
-            } else {
-                keep.push((e, i));
+        let waiting = std::mem::take(&mut self.waiting);
+        {
+            let a = self.avail();
+            for (e, i) in waiting {
+                if batch.len() < take && a.all(&e) {
+                    data_now.push(i);
+                    batch.push(e);
+                } else {
+                    keep.push((e, i));
+                }
             }
         }
         self.waiting = keep;
@@ -1425,7 +1735,7 @@ impl Committer<'_> {
             Ok((iref, fref, rs)) => {
                 if let Err(e) = self.writer.write_batch(&rs) {
                     self.rep.errors.push(format!("receipts: {e}"));
-                    self.broken = true;
+                    self.set_broken();
                     return Ok(false);
                 }
                 self.rep.entries += files.entries.len() as u64;
@@ -1459,7 +1769,15 @@ impl Committer<'_> {
                     self.rep.t50_ms = Some(self.t0.elapsed().as_millis() as u64);
                 }
                 self.done_data.extend(data_now);
-                self.new_packs.clear();
+                let packs = std::mem::take(&mut self.new_packs);
+                // test builds only: die between a stored, receipted commit and its merge
+                if cfg!(feature = "crash-hooks")
+                    && !packs.is_empty()
+                    && std::env::var_os("XFER_ABORT_BEFORE_MIGRATE").is_some()
+                {
+                    std::process::abort();
+                }
+                self.migrate(&packs);
                 self.pending_pack_bytes = 0;
                 self.commits.push(CommitRef {
                     seq,
@@ -1476,9 +1794,227 @@ impl Committer<'_> {
                         .unreceipted
                         .push(shown(&e.rel().unwrap_or_default()));
                 }
-                self.broken = true;
+                self.set_broken();
                 Ok(false)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The hot table as shared state (Revision 6.4): readers waiting for room are woken by a
+    //! failed pack and by a stopped committer, and a commit's migration never lets a chunk be
+    //! claimed twice. Seeds are fixed; each wait is bounded, so a missed wake-up fails the test
+    //! instead of hanging it.
+    use super::*;
+    use crate::repo::MIB;
+    use std::sync::mpsc;
+
+    fn ids(seed: u64, n: usize) -> Vec<ChunkId> {
+        let mut x = seed.max(1);
+        (0..n)
+            .map(|_| {
+                let mut id = [0u8; 32];
+                for part in id.chunks_mut(8) {
+                    x ^= x >> 12;
+                    x ^= x << 25;
+                    x ^= x >> 27;
+                    part.copy_from_slice(&x.wrapping_mul(0x2545_f491_4f6c_dd1d).to_le_bytes());
+                }
+                ChunkId(id)
+            })
+            .collect()
+    }
+
+    fn cold(limit: u64) -> (Cold, Meter) {
+        let mut m = Meter::new("test", limit);
+        let map = ChunkMap::new(&mut m).expect("slots fit");
+        (RwLock::new(map), m)
+    }
+
+    fn pack(n: usize, cs: &[ChunkId]) -> (ObjRef, Vec<(ChunkId, u32)>) {
+        (
+            ObjRef {
+                key: format!("v1/packs/00/{n:064x}.pack"),
+                size: 1,
+                hash: String::new(),
+            },
+            cs.iter().map(|id| (*id, 1)).collect(),
+        )
+    }
+
+    const BOUND: Duration = Duration::from_secs(10);
+
+    fn wait_parked(hot: &Hot, n: usize) {
+        let t = Instant::now();
+        while hot.lock().parked < n {
+            assert!(t.elapsed() < BOUND, "readers did not wait for room");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn readers_waiting_for_room_go_on_when_a_pack_fails() {
+        let hot = Arc::new(Hot::new(1024));
+        assert_eq!(hot.lock().room, 3);
+        let (c, _) = cold(MIB);
+        let c = Arc::new(c);
+        let v = ids(5, 7);
+        for id in &v[..3] {
+            assert!(hot.claim(*id, &c).expect("room"));
+        }
+        let (tx, rx) = mpsc::channel();
+        for id in v[3..7].iter().copied() {
+            let (hot, c, tx) = (hot.clone(), c.clone(), tx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(hot.claim(id, &c).map_err(|e| e.to_string()));
+            });
+        }
+        // all four wait: the table is full
+        wait_parked(&hot, 4);
+        assert!(rx.try_recv().is_err());
+        // the pack holding the first three failed: three readers go on within the bound
+        hot.remove(v[..3].iter().copied());
+        for _ in 0..3 {
+            let r = rx
+                .recv_timeout(BOUND)
+                .expect("a reader waiting for room was not woken when its room freed");
+            assert_eq!(r, Ok(true));
+        }
+        // the fourth still waits; a stopped run releases it with an error
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        hot.halt(false, "the run stopped committing".into());
+        let r = rx
+            .recv_timeout(BOUND)
+            .expect("a halted reader was not woken");
+        assert!(r.is_err(), "{r:?}");
+    }
+
+    #[test]
+    fn readers_waiting_for_room_stop_with_the_committer() {
+        for share in [false, true] {
+            let hot = Arc::new(Hot::new(1024));
+            let (c, _) = cold(MIB);
+            let c = Arc::new(c);
+            let v = ids(9, 5);
+            for id in &v[..3] {
+                assert!(hot.claim(*id, &c).expect("room"));
+            }
+            let (tx, rx) = mpsc::channel();
+            for id in v[3..5].iter().copied() {
+                let (hot, c, tx) = (hot.clone(), c.clone(), tx.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(hot.claim(id, &c));
+                });
+            }
+            wait_parked(&hot, 2);
+            // a commit failed (or the committed map is full): the committer halts the readers
+            hot.halt(share, "stop".into());
+            for _ in 0..2 {
+                let r = rx
+                    .recv_timeout(BOUND)
+                    .expect("a waiting reader was not woken");
+                match (share, r) {
+                    (true, Err(Error::Budget(_))) | (false, Err(Error::Refused(_))) => {}
+                    (_, r) => panic!("share {share}: {r:?}"),
+                }
+            }
+            // a chunk already held is still a duplicate after the halt, not an error
+            assert!(!hot.claim(v[0], &c).expect("a held chunk is no error"));
+        }
+    }
+
+    /// Readers claim ids from a pool (every id in every reader's sequence, each reader in its
+    /// own fixed order) while a committer verifies and migrates whatever the hot table holds.
+    /// Each id must be claimed exactly once and the committed map must end holding exactly the
+    /// pool: what a plain set gives.
+    #[test]
+    fn migration_racing_claims_never_claims_a_chunk_twice() {
+        const READERS: usize = 4;
+        let pool = ids(20261121, 4000);
+        let hot = Arc::new(Hot::new(64 << 10));
+        let room = hot.lock().room;
+        assert!(room < pool.len(), "the race needs passes: room {room}");
+        let (c, mut meter) = cold(64 * MIB);
+        let c = Arc::new(c);
+        let claimed = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut hs = Vec::new();
+        for r in 0..READERS {
+            let mut order = pool.clone();
+            let mut x = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(r as u64 + 1);
+            for i in (1..order.len()).rev() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                order.swap(i, (x % (i as u64 + 1)) as usize);
+            }
+            let (hot, c, claimed, done) = (hot.clone(), c.clone(), claimed.clone(), done.clone());
+            hs.push(std::thread::spawn(move || {
+                for id in order {
+                    if hot.claim(id, &c).expect("no halt in this test") {
+                        claimed.lock().expect("claimed").push(id);
+                    }
+                }
+                done.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        let mut n = 0;
+        let t = Instant::now();
+        loop {
+            let finished = done.load(Ordering::SeqCst) == READERS;
+            let batch: Vec<ChunkId> = hot.lock().ids.keys().copied().collect();
+            if !batch.is_empty() {
+                let p = pack(n, &batch);
+                n += 1;
+                hot.verified(&p.1);
+                migrate(&c, &mut meter, &hot, std::slice::from_ref(&p)).expect("fits");
+            }
+            if finished && hot.lock().ids.is_empty() {
+                break;
+            }
+            assert!(
+                t.elapsed() < Duration::from_secs(60),
+                "the race did not finish"
+            );
+        }
+        for h in hs {
+            h.join().expect("reader");
+        }
+        let claimed = claimed.lock().expect("claimed").clone();
+        let distinct: HashSet<ChunkId> = claimed.iter().copied().collect();
+        assert_eq!(
+            claimed.len(),
+            distinct.len(),
+            "{} chunks were claimed twice (sent twice) across {n} migrations",
+            claimed.len() - distinct.len()
+        );
+        let want: HashSet<ChunkId> = pool.iter().copied().collect();
+        assert_eq!(distinct, want);
+        let cold = cold_read(&c);
+        assert_eq!(cold.len(), want.len());
+        assert!(want.iter().all(|id| cold.contains(id)));
+        assert!(n > 1, "one migration is no race");
+    }
+
+    #[test]
+    fn a_full_committed_map_keeps_the_chunks_in_the_hot_table() {
+        let hot = Hot::new(64 << 10);
+        let (c, mut meter) = cold(4096);
+        let v = ids(3, 100);
+        for id in &v {
+            assert!(hot.claim(*id, &c).expect("room"));
+        }
+        let p = pack(0, &v);
+        hot.verified(&p.1);
+        assert!(matches!(
+            migrate(&c, &mut meter, &hot, std::slice::from_ref(&p)),
+            Err(Error::Budget(_))
+        ));
+        // nothing was lost: every chunk is still held, verified, so its files still commit
+        let s = hot.lock();
+        assert!(v.iter().all(|id| s.ids.get(id) == Some(&true)));
+        assert_eq!(cold_read(&c).len(), 0);
     }
 }

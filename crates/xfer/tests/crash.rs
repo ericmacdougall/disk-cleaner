@@ -179,6 +179,57 @@ fn receipted_paths_restore_after_a_crash_and_their_deletion() {
     assert_eq!(a, b);
 }
 
+/// Run a backup whose process aborts right after its first commit is stored and receipted,
+/// before that commit's chunks move from the hot table into the committed map (the
+/// `crash-hooks` test feature; Revision 6.4).
+#[cfg(feature = "crash-hooks")]
+fn backup_abort_before_migrate(env: &Env) -> Vec<Receipt> {
+    let rcp = env.p("receipts.jsonl");
+    let st = Command::new(BIN)
+        .args(["backup", "--repo"])
+        .arg(format!("local:{}", env.p("store").display()))
+        .args([
+            "--mem-budget",
+            "640Mi",
+            "--max-pack",
+            "16Mi",
+            "--max-streams",
+            "2",
+        ])
+        .arg("--source")
+        .arg(env.p("src"))
+        .arg("--state")
+        .arg(env.p("state"))
+        .arg("--receipts")
+        .arg(&rcp)
+        .env("XFER_ABORT_BEFORE_MIGRATE", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run backup");
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        st.signal(),
+        Some(libc::SIGABRT),
+        "the hook did not abort: {st}"
+    );
+    receipts(&rcp)
+}
+
+#[cfg(feature = "crash-hooks")]
+#[test]
+fn a_crash_between_a_commit_and_its_merge_loses_and_resends_nothing() {
+    let env = Env::new();
+    let src = env.p("src");
+    tree(&src);
+    let rs = backup_abort_before_migrate(&env);
+    assert!(
+        !rs.is_empty(),
+        "the first commit was receipted before the abort"
+    );
+    rerun_reuploads_nothing(&env, &src);
+}
+
 #[test]
 fn a_rerun_after_a_crash_reuploads_no_committed_pack() {
     let env = Env::new();
@@ -186,6 +237,12 @@ fn a_rerun_after_a_crash_reuploads_no_committed_pack() {
     tree(&src);
     let rs = backup_then_kill(&env);
     assert!(!rs.is_empty());
+    rerun_reuploads_nothing(&env, &src);
+}
+
+/// After a crash: the rerun finds every committed chunk in the committed index (no stored pack
+/// is uploaded again), and the repository verifies and restores to the source.
+fn rerun_reuploads_nothing(env: &Env, src: &Path) {
     let store = xfer::transport::local::LocalDir::new(env.p("store"), xfer::hash::HashKind::Sha1)
         .expect("store");
     let packs_before: std::collections::HashSet<String> = store
@@ -198,7 +255,7 @@ fn a_rerun_after_a_crash_reuploads_no_committed_pack() {
     assert!(!packs_before.is_empty());
 
     let t = Arc::new(Faulty::new(env.local(), FaultConfig::default()));
-    let mut o = opts(&src, &env.p("rerun.jsonl"));
+    let mut o = opts(src, &env.p("rerun.jsonl"));
     o.state = Some(env.p("state")); // the crashed run's state is not trusted, only checked
     let rep = xfer::backup::backup(t.clone(), &o).expect("rerun");
     assert_eq!(rep.exit_code, 0, "{rep:#?}");
@@ -228,5 +285,5 @@ fn a_rerun_after_a_crash_reuploads_no_committed_pack() {
     let rr = xfer::restore::restore(env.local(), &restore_opts(&target, Some(rep.run.clone())))
         .expect("restore");
     assert_eq!(rr.exit_code, 0, "{rr:#?}");
-    assert_eq!(manifest(&src), manifest(&target));
+    assert_eq!(manifest(src), manifest(&target));
 }

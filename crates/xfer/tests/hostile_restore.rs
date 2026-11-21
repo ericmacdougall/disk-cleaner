@@ -675,8 +675,10 @@ fn a_non_empty_target_is_refused() {
 /// Streamed straight into the store, so this process never holds the JSON.
 fn fill_index(env: &Env, pack: &ObjRef, n: usize) {
     use std::io::Write;
-    let per = n.div_ceil(4);
-    for o in 0..4 {
+    // objects of at most 200k entries, so each compressed body stays inside one fetch batch
+    let objs = n.div_ceil(200_000).max(4);
+    let per = n.div_ceil(objs);
+    for o in 0..objs {
         let p = env.p(&format!("store/v1/index/rfill{o}/000000.idx"));
         std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
         let f = std::io::BufWriter::new(std::fs::File::create(&p).expect("create"));
@@ -698,19 +700,23 @@ fn fill_index(env: &Env, pack: &ObjRef, n: usize) {
     }
 }
 
-fn share_case(extra: usize) -> (Env, Out) {
+/// The index share of the profile `restore` runs with.
+fn index_share() -> u64 {
+    xfer::repo::Budget::compute(640 << 20, 16 << 20, 8)
+        .expect("budget")
+        .i
+}
+
+/// A restore whose index holds `n` chunks besides the run's own.
+fn index_case(n: usize) -> (Env, Out) {
     let a = rand_bytes(11, 3000);
     let env = Env::new();
     let r = Repo::new(&[&a], vec![entry(b"f.bin", Kind::File, 0o644, &a)]);
     r.write(&env);
     let pk = pack_key(&r.pack);
-    let i = xfer::repo::Budget::compute(640 << 20, 16 << 20, 8)
-        .expect("budget")
-        .i as usize;
-    let fit = i / xfer::repo::CHUNK_ENTRY_COST as usize;
-    fill_index(&env, &objref(&pk, &r.pack), fit + extra - 2000);
+    fill_index(&env, &objref(&pk, &r.pack), n);
     let out = restore(&env, &env.p("target"), &[]);
-    eprintln!("[{} MiB] share case +{extra}", out.rss >> 20);
+    eprintln!("[{} MiB] index of {n} chunks", out.rss >> 20);
     assert!(
         out.rss < RSS_MAX,
         "peak RSS {} MiB: {}",
@@ -720,11 +726,134 @@ fn share_case(extra: usize) -> (Env, Out) {
     (env, out)
 }
 
+/// `extra` chunks past what the share holds (40 bytes an entry, the prefix table aside), less
+/// a margin for the packs and the run's own objects.
+fn share_case(extra: usize) -> (Env, Out) {
+    index_case(xfer::repo::chunk_map_fit(index_share()) + extra - 2000)
+}
+
 #[test]
 fn an_index_just_under_its_share_is_accepted() {
     let (env, out) = share_case(0);
     assert_eq!(out.code, 0, "{}", out.text);
     assert!(env.p("target/f.bin").exists());
+}
+
+/// A chunk map filled to its share costs the process at most the share, plus the one fetch
+/// batch of compressed index objects held while it loads (`FETCH_BYTES`). Measured against the
+/// same restore with an empty index, so the binary, the allocator and the run's own objects
+/// cancel out. Before Revision 6.3 each entry was charged 72 bytes, about half its cost while
+/// the hash table grew, and a full share cost about 140 MiB of an 80 MiB share. The sorted
+/// vector of Revision 6.4 holds 2.3 times the entries; the measured bytes per entry are printed
+/// (crates/xfer/README.md publishes them).
+#[test]
+fn a_chunk_map_filled_to_its_share_stays_inside_it() {
+    let (_e0, base) = index_case(0);
+    assert_eq!(base.code, 0, "{}", base.text);
+    let n = xfer::repo::chunk_map_fit(index_share()) - 2000;
+    let (_e1, full) = share_case(0);
+    assert_eq!(full.code, 0, "{}", full.text);
+    let grew = full.rss.saturating_sub(base.rss);
+    let allowed = index_share() + xfer::repo::FETCH_BYTES;
+    eprintln!(
+        "[{} MiB] over the empty index for {n} chunks ({:.1} bytes each, the fetch batch \
+         included); share plus one fetch batch {} MiB",
+        grew >> 20,
+        grew as f64 / n as f64,
+        allowed >> 20
+    );
+    assert!(
+        grew <= allowed,
+        "the full index cost {} MiB over an empty one, more than its {} MiB share plus {} MiB",
+        grew >> 20,
+        index_share() >> 20,
+        xfer::repo::FETCH_BYTES >> 20
+    );
+}
+
+/// As `fill_index`, with the chunks spread over listed packs of `per_pack` chunks each (the
+/// ratio of large files: about 16 chunks of 1 MiB in a 16 MiB pack). Each pack is a one-byte
+/// object in the store, listed with its real size and checksum, so the map keeps it.
+fn fill_index_packs(env: &Env, n: usize, per_pack: usize) {
+    use std::io::Write;
+    let per_obj = 200_000 / per_pack * per_pack;
+    let mut pack_no = 0usize;
+    let mut o = 0usize;
+    let mut lo = 0usize;
+    while lo < n {
+        let hi = (lo + per_obj).min(n);
+        let packs: Vec<ObjRef> = (0..(hi - lo).div_ceil(per_pack))
+            .map(|_| {
+                let hex = blake3::hash(format!("pack {pack_no}").as_bytes()).to_hex();
+                pack_no += 1;
+                let key = format!("v1/packs/{}/{hex}.pack", &hex[..2]);
+                write(&env.p(&format!("store/{key}")), b"p");
+                objref(&key, b"p")
+            })
+            .collect();
+        let p = env.p(&format!("store/v1/index/rpack{o}/000000.idx"));
+        std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+        let f = std::io::BufWriter::new(std::fs::File::create(&p).expect("create"));
+        let mut z = zstd::stream::write::Encoder::new(f, 1).expect("encoder");
+        write!(
+            z,
+            "{{\"v\":1,\"engine\":\"e\",\"run\":\"rpack{o}\",\"seq\":0,\"root\":\"r\",\"hash_kind\":\"sha1\",\"packs\":{},\"chunks\":[",
+            serde_json::to_string(&packs).expect("refs")
+        )
+        .expect("head");
+        for i in lo..hi {
+            let id = blake3::hash(&(i as u64).to_le_bytes()).to_hex();
+            let sep = if i > lo { "," } else { "" };
+            let pi = (i - lo) / per_pack;
+            write!(z, "{sep}{{\"id\":\"{id}\",\"p\":{pi},\"len\":1}}").expect("chunk");
+        }
+        z.write_all(b"]}").expect("tail");
+        z.finish().expect("finish").flush().expect("flush");
+        lo = hi;
+        o += 1;
+    }
+}
+
+/// The filled-share check at the pack ratio of large files: every pack costs the map and the
+/// pack listing (Revision 6.4 charges both), so the share holds fewer chunks, and still the
+/// process grows by at most the share plus one fetch batch.
+#[test]
+fn a_chunk_map_of_large_file_packs_filled_to_its_share_stays_inside_it() {
+    let (_e0, base) = index_case(0);
+    assert_eq!(base.code, 0, "{}", base.text);
+    let per_pack = 16;
+    let n = xfer::repo::map_fit(index_share(), per_pack as u64) - 2000;
+    let a = rand_bytes(11, 3000);
+    let env = Env::new();
+    let r = Repo::new(&[&a], vec![entry(b"f.bin", Kind::File, 0o644, &a)]);
+    r.write(&env);
+    fill_index_packs(&env, n, per_pack);
+    let full = restore(&env, &env.p("target"), &[]);
+    assert_eq!(full.code, 0, "{}", full.text);
+    let grew = full.rss.saturating_sub(base.rss);
+    let allowed = index_share() + xfer::repo::FETCH_BYTES;
+    eprintln!(
+        "[{} MiB] over the empty index for {n} chunks in {} packs ({:.1} bytes a chunk with its \
+         share of a pack, the fetch batch included); share plus one fetch batch {} MiB",
+        grew >> 20,
+        n.div_ceil(per_pack),
+        grew as f64 / n as f64,
+        allowed >> 20
+    );
+    assert!(
+        grew <= allowed,
+        "the full index cost {} MiB over an empty one, more than its {} MiB share plus {} MiB",
+        grew >> 20,
+        index_share() >> 20,
+        xfer::repo::FETCH_BYTES >> 20
+    );
+    // one more pack's worth past the share is refused
+    let env2 = Env::new();
+    Repo::new(&[&a], vec![entry(b"f.bin", Kind::File, 0o644, &a)]).write(&env2);
+    fill_index_packs(&env2, n + 2000 + 4 * per_pack * 100, per_pack);
+    let over = restore(&env2, &env2.p("target"), &[]);
+    assert_eq!(over.code, 3, "{}", over.text);
+    assert!(over.text.contains("share"), "{}", over.text);
 }
 
 #[test]

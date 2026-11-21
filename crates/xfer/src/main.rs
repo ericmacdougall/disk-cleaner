@@ -192,6 +192,11 @@ fn read_files_from(p: &PathBuf) -> Result<Vec<Vec<u8>>, String> {
         .collect())
 }
 
+/// A notice for the person running the command, on stderr.
+fn notice(m: &str) {
+    eprintln!("prunedisk-xfer: {m}");
+}
+
 fn run(cli: Cli) -> Result<i32, String> {
     match cli.cmd {
         Cmd::Backup {
@@ -231,6 +236,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             o.rehash = rehash;
             o.max_objects = r.max_objects;
             o.commit_every = Duration::from_secs(commit_secs.max(1));
+            o.notice = Some(notice as fn(&str));
             if let Some(l) = label {
                 o.root_label = l;
             }

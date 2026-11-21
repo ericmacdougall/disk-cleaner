@@ -56,6 +56,12 @@ jobs:
       - name: Show whether the wrong-case guard ran
         if: ${{ !cancelled() }}
         run: cargo test -p disk-cleaner-core --locked --test worktree_config a_bare_repo_under_a_wrong_case_scan_root -- --nocapture
+      - name: xfer crash between a commit and its merge (test hook build)
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: cargo test -p disk-cleaner-xfer --locked --features crash-hooks --test crash a_crash_between_a_commit_and_its_merge -- --nocapture
+      - name: xfer chunk-map memory at its share (measured bytes per chunk)
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: cargo test -p disk-cleaner-xfer --locked --test hostile_restore filled_to_its_share -- --nocapture --test-threads 1
 
   mount-test:
     name: one-file-system on a real mount (linux)

@@ -263,7 +263,7 @@ pub fn restore(t: Arc<dyn Transport>, o: &RestoreOpts) -> Result<RestoreReport> 
         }
         let mut off = 0u64;
         for c in &it.e.chunks {
-            let l = ld.map.chunks[c];
+            let l = ld.map.loc(c).expect("every chunk was checked to be mapped");
             plan.entry(l.pack).or_default().push((fi, off, *c, l.len));
             off += l.len as u64;
         }
@@ -492,7 +492,7 @@ pub fn verify(
     let entries: Vec<&Entry> = files.iter().flat_map(|(_, f)| f.entries.iter()).collect();
     for e in &entries {
         for c in &e.chunks {
-            match map.chunks.get(c) {
+            match map.loc(c) {
                 Some(l) => {
                     if need_set.insert(l.pack) {
                         needed.push(l.pack);
@@ -530,7 +530,7 @@ pub fn verify(
                 let mut h = blake3::Hasher::new();
                 let mut ok = true;
                 for c in &e.chunks {
-                    let l = map.chunks[c];
+                    let l = map.loc(c).expect("every chunk was checked to be mapped");
                     if !cache.iter().any(|x| x.0 == l.pack) {
                         let pr = &map.packs[l.pack as usize];
                         let b = repo.t.get(&pr.key, pr.size.min(PACK_READ_MAX))?;
