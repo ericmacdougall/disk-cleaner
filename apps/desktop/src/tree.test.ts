@@ -342,6 +342,50 @@ describe("one focus owner under virtualisation (CT-F4, gate F6)", () => {
     expect(document.activeElement).toBe(cell);
   });
 
+  // Each replaced row node is a burst of accessibility events that a screen reader works through
+  // before it speaks the next focus: Orca 46 fell silent after a wheel over a 5,000-row folder.
+  const rowNodes = (grid: HTMLElement) =>
+    new Map([...grid.querySelectorAll<HTMLElement>('.tg-body [role="row"]')].map((r) => [r.getAttribute("aria-rowindex"), r]));
+
+  it("a key press keeps every rendered row node; only the selection's attributes change", async () => {
+    const { grid } = await setup([6]);
+    const before = rowNodes(grid);
+    const removed: unknown[] = [];
+    const watch = new MutationObserver((ms) => ms.forEach((m) => removed.push(...m.removedNodes)));
+    watch.observe(grid.querySelector(".tg-body")!, { childList: true });
+    await press("ArrowDown");
+    await press("ArrowDown");
+    watch.disconnect();
+    expect(focusAt().rowindex).toBe(ri(2));
+    expect(removed).toEqual([]);
+    for (const [k, el] of rowNodes(grid)) expect(el, `row ${k}`).toBe(before.get(k));
+    expect(grid.querySelectorAll('.tg-body [role="row"][aria-selected="true"]').length).toBe(1);
+    expect(grid.querySelectorAll('.tg-body [role="row"][tabindex="0"]').length).toBe(1);
+  });
+
+  it("a scroll of a few rows keeps the nodes still in the window, in order", async () => {
+    const { grid } = await setup([6]);
+    grid.scrollTop = 20 * 28;
+    grid.dispatchEvent(new Event("scroll"));
+    await flush(10);
+    const before = rowNodes(grid);
+    grid.scrollTop = 23 * 28;
+    grid.dispatchEvent(new Event("scroll"));
+    await flush(10);
+    const after = rowNodes(grid);
+    // The window moved by three rows: every row in both windows is the same node.
+    const both = [...after.keys()].filter((k) => before.has(k) && k !== ri(0));
+    expect(both.length).toBeGreaterThan(30);
+    for (const k of both) expect(after.get(k), `row ${k}`).toBe(before.get(k));
+    const order = [...grid.querySelectorAll('.tg-body [role="row"]')].map((r) => Number(r.getAttribute("aria-rowindex")));
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    // A kept node shows the row now at its index.
+    const r30 = after.get(ri(30))!;
+    expect(r30.getAttribute("aria-label")).toMatch(/^b28,/);
+    await press("ArrowDown");
+    expect(focusAt().rowindex).toBe(ri(1));
+  });
+
   it("keeps the DOM under the row cap with the focused row pinned", async () => {
     const { grid } = await setup([6]);
     Object.defineProperty(grid, "clientHeight", { value: 1_000_000 });

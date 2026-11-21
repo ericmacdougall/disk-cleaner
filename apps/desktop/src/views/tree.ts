@@ -237,18 +237,41 @@ export class TreeGrid {
       if (hadFocus && target && document.activeElement !== target) target.focus({ preventScroll: true });
     }
     this.focusRow = selEl;
-    for (const c of [...this.body.children]) if (c !== selEl) c.remove();
+    // Keyed by row index: a row node still in the window is kept and updated in place, so a key
+    // press or a scroll of a few rows adds and removes only the rows that enter or leave. Every
+    // node replaced is a burst of accessibility events a screen reader works through before it
+    // speaks the next focus (gate F6: Orca fell silent after a wheel over a 5,000-row folder).
+    const kept = new Map<number, HTMLElement>();
+    for (const c of [...this.body.children] as HTMLElement[]) {
+      if (c === selEl) continue;
+      const i = Number(c.dataset.index);
+      if (i >= p.offset && i < p.offset + p.rows.length && i !== sel && !kept.has(i)) kept.set(i, c);
+      else c.remove();
+    }
     const before: HTMLElement[] = [];
     const after: HTMLElement[] = [];
     p.rows.forEach((r, i) => {
       const index = p.offset + i;
-      if (index !== sel || !selEl) (index < sel ? before : after).push(this.row(r, index));
+      if (index === sel && selEl) return;
+      const old = kept.get(index);
+      // A row pinned while it was selected and scrolled away rejoins the flow.
+      if (old && old.style.cssText) old.style.cssText = "";
+      (index < sel || !selEl ? before : after).push(old ? this.patch(old, r, index) : this.row(r, index));
     });
+    // Place in index order around the selected row, which never moves (moving it would drop
+    // focus); a kept node already in its place is not touched.
+    const place = (list: HTMLElement[], start: Element | null, stop: Element | null) => {
+      let at = start;
+      for (const n of list) {
+        if (n === at) at = at.nextElementSibling;
+        else this.body.insertBefore(n, at ?? stop);
+      }
+    };
     if (selEl) {
-      selEl.before(...before);
-      selEl.after(...after);
+      place(before, this.body.firstElementChild, selEl);
+      place(after, selEl.nextElementSibling, null);
     } else {
-      this.body.append(...before, ...after);
+      place(before, this.body.firstElementChild, null);
     }
     if (p.total === 0) this.status("Nothing to show: the scanned folders are empty.");
   }
