@@ -617,7 +617,8 @@ impl Place {
             // A ref, worktree or submodule name: never a secret directory by name.
             None
         } else {
-            name_str
+            // On the raw name, never on a conversion that can fail (CT-A1).
+            f.name
                 .and_then(|n| rules.secret_dir(n))
                 .map(|k| k.to_string())
         };
@@ -817,20 +818,14 @@ fn annotate(t: &mut Tree, roots: &[PathBuf], nodes: &[Node], rules: &RuleSet, or
         } else if let Some(k) = &dir.secret_dir {
             Some(k.clone())
         } else {
-            t.ents[e]
-                .name
-                .to_str()
-                .and_then(|n| rules.secret_file(n, in_artifact))
+            // On the raw name, never on a conversion that can fail (CT-A1).
+            rules
+                .secret_file(&t.ents[e].name, in_artifact)
                 .map(|k| k.to_string())
         };
         t.ents[e].gitdir_secret = in_gitdir
             && (dir.secret_dir.is_some()
-                || (!git_named
-                    && t.ents[e]
-                        .name
-                        .to_str()
-                        .and_then(|n| rules.secret_file(n, false))
-                        .is_some()));
+                || (!git_named && rules.secret_file(&t.ents[e].name, false).is_some()));
         t.ents[e].in_gitdir = in_gitdir;
         t.ents[e].secret = secret;
     }
@@ -1456,6 +1451,20 @@ fn blobs(
     opts: &PieceOptions,
     totals: &mut PieceTotals,
 ) -> Vec<Blob> {
+    // A name whose path is valid UTF-8 throughout, as spelled and as real. A file reachable by
+    // any other name is never read: its name may be a secret the rules cannot fully see, and its
+    // path cannot be written into the scan file and read back (CT-A1).
+    let exact_name = |e: usize| t.ents[e].utf8 && t.dirs[t.ents[e].dir].exact;
+    let every_name_exact = |e: usize| {
+        let m = t.ents[e].m;
+        exact_name(e)
+            && (!has_identity()
+                || m.nlink <= 1
+                || names
+                    .get(&(m.dev, m.ino))
+                    .map(|l| l.iter().all(|&o| exact_name(o)))
+                    .unwrap_or(true))
+    };
     // One candidate per inode: its owner name.
     let eligible = |e: usize| -> bool {
         let er = &t.ents[e];
@@ -1463,6 +1472,7 @@ fn blobs(
             && er.m.kind == b'f'
             && er.secret.is_none()
             && !er.gitdir_secret
+            && every_name_exact(e)
             && er.counted_logical > 0
             && !er.linked_outside
             && !(has_identity() && er.m.alloc.saturating_mul(2) < er.m.len)
@@ -1475,8 +1485,9 @@ fn blobs(
             || er.m.kind != b'f'
             || er.secret.is_some()
             || er.gitdir_secret
+            || !every_name_exact(e)
         {
-            continue; // not an owner name, or not a regular non-secret file
+            continue; // not an owner name, or not a regular non-secret file with exact names
         }
         if er.m.len >= opts.min_dup_bytes {
             by_len.entry(er.m.len).or_default().push(e);

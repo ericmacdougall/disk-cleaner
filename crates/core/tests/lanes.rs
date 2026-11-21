@@ -2204,6 +2204,89 @@ fn fill(dir: &Path) {
     write_bytes(&dir.join("sub").join("c.bin"), 100 * KIB);
     write(&dir.join("notes.txt"), "n");
     fs::create_dir_all(dir.join("hollow").join("deeper")).unwrap();
+    // CT-A1: names that are not valid UTF-8, one per secret rule kind and an ordinary one, each
+    // with the same contents as a.bin, so that reading one shows as a blob copy.
+    if cfg!(target_os = "linux") {
+        use std::os::unix::ffi::OsStrExt;
+        for n in INVALID_NAMES {
+            write_bytes(&dir.join(std::ffi::OsStr::from_bytes(n)), 100 * KIB);
+        }
+    }
+}
+
+/// The invalid-byte names `fill` writes: a prefix, a suffix, the `.env.*` pattern with
+/// exceptions, two secret words, and an ordinary name (never hashed either).
+#[cfg(unix)]
+const INVALID_NAMES: [&[u8]; 6] = [
+    b"id_rsa\xff",
+    b"\xff.pem",
+    b".env.\xff",
+    b"api\xfftoken",
+    b"\xff_secret.txt",
+    b"plain\xff.bin",
+];
+
+/// The secret ones among [`INVALID_NAMES`].
+#[cfg(unix)]
+fn invalid_name_is_secret(n: &[u8]) -> bool {
+    n != b"plain\xff.bin"
+}
+
+/// CT-A1 over one scanned root: every file below it (as spelled) named in [`INVALID_NAMES`] lies
+/// in a survey piece; a secret one outside a git directory is in a piece marked secret, and in a
+/// git directory in a piece that is never removed. (That none is hashed is checked over the
+/// blobs in [`location_violations`].)
+#[cfg(unix)]
+fn invalid_name_violations(label: &str, res: &ScanResult, p: &Plan, root: &Path) -> Vec<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let ft = e.file_type().unwrap();
+            if ft.is_dir() {
+                stack.push(e.path());
+            } else if ft.is_file() && INVALID_NAMES.contains(&e.file_name().as_bytes()) {
+                found.push(e.path());
+            }
+        }
+    }
+    let survey = res.pieces.as_ref().unwrap();
+    let l = lanes_of(p);
+    let mut v = Vec::new();
+    for f in &found {
+        let lossy = f.to_string_lossy();
+        let holder = survey.pieces.iter().enumerate().find(|(_, sp)| {
+            sp.path == lossy
+                || sp
+                    .members
+                    .iter()
+                    .any(|m| Path::new(&sp.path).join(m.path()).to_string_lossy() == lossy)
+        });
+        let secret = invalid_name_is_secret(f.file_name().unwrap().as_bytes());
+        let in_git = oracle_in_gitdir(f.parent().unwrap());
+        match holder {
+            None if in_git => {}
+            None => v.push(format!("{label}: {lossy} is in no survey piece")),
+            Some((i, sp)) => {
+                let lane = l
+                    .pieces
+                    .iter()
+                    .find(|lp| lp.scan_piece == i)
+                    .map(|lp| lp.lane);
+                if lane.map(|x| x.removes()).unwrap_or(false) {
+                    v.push(format!(
+                        "{label}: {lossy} is in removing piece {i} ({lane:?})"
+                    ));
+                }
+                if secret && !in_git && sp.secret.is_none() {
+                    v.push(format!("{label}: {lossy} is not marked secret (piece {i})"));
+                }
+            }
+        }
+    }
+    v
 }
 
 /// Is any directory at or above `p` (as spelled, and as real) a secret directory by name?
@@ -2326,6 +2409,13 @@ fn location_violations(label: &str, res: &ScanResult, p: &Plan) -> Vec<String> {
     }
     for b in &survey.blobs {
         for c in &b.copies {
+            // CT-A1: a file reachable by a name that is not valid UTF-8 is never read.
+            if c.path.contains('\u{FFFD}') {
+                v.push(format!(
+                    "{label}: {} has a name that is not valid UTF-8 and was hashed",
+                    c.path
+                ));
+            }
             if oracle_secret(Path::new(&c.path)) {
                 v.push(format!(
                     "{label}: {} is in a secret directory and was hashed",
@@ -2443,6 +2533,13 @@ fn guard_context_follows_location_over_composed_layouts() {
         let res = scan_now(std::slice::from_ref(root));
         let p = plan(&res, &idle_opts());
         violations.extend(location_violations(label, &res, &p));
+        violations.extend(invalid_name_violations(label, &res, &p, root));
+        // Not vacuous: the ordinary files beside the invalid names are still hashed, wherever
+        // their path is exact.
+        if *kind == Kind::Plain {
+            let hashed = res.pieces.as_ref().unwrap().blobs.len();
+            assert!(hashed > 0, "{label}: nothing was hashed");
+        }
         // Not vacuous: without context the same layout gives removing pieces.
         if *kind == Kind::Plain {
             let removing = lanes_of(&p)
@@ -2466,11 +2563,9 @@ fn guard_context_follows_location_over_composed_layouts() {
                 } else {
                     "inner first"
                 };
-                violations.extend(location_violations(
-                    &format!("{label}, nested root, {order}"),
-                    &nested,
-                    &np,
-                ));
+                let nlabel = format!("{label}, nested root, {order}");
+                violations.extend(location_violations(&nlabel, &nested, &np));
+                violations.extend(invalid_name_violations(&nlabel, &nested, &np, root));
             }
         }
     }

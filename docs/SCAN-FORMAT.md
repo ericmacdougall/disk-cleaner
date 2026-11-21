@@ -1103,7 +1103,12 @@ result does not depend on which name owns a hard-linked inode) and count members
 matches `[[secret_name]]`, or a directory whose name matches `[[secret_dir]]`, in
 `rules/artifacts.toml` is always its own piece with `secret` set (a `files` piece of one entry, or
 a `tree` piece for the directory), anywhere, including inside git nodes. The enclosing piece
-lists it in `excludes`. Names are compared ignoring ASCII case; nothing is opened, and a secret
+lists it in `excludes`. Names are compared ignoring ASCII case, on the raw bytes of the name,
+never on a conversion to text that can fail: every pattern is ASCII (a rules file with a
+non-ASCII secret pattern, exception or directory name is refused), so a name that is not valid
+UTF-8 is a secret exactly when its valid parts make it one (`id_rsa` followed by an invalid byte
+matches `id_rsa*`; `api`, an invalid byte and `token` holds the word `token`). The same holds for
+`[[secret_word]]` segments, where an invalid byte ends a segment. Nothing is opened, and a secret
 entry is **never hashed** and never appears in `blobs`. The list:
 
 - exact names: `.env`, `.netrc`, `_netrc`, `.pgpass`, `.git-credentials`, `.npmrc`, `.pypirc`,
@@ -1193,8 +1198,10 @@ SHA-256. Not hashed (counted in `totals.unhashed_candidates`, and never part of 
 file (allocated below half its length), a file whose length, mtime or inode changed while it was
 read, one that could not be opened as a regular file, and every candidate once `max_hash_bytes`
 have been read. An inode that has more hard links than names the survey saw is also left
-unhashed: a name outside the scan roots could be a secret name. A blob is a sha256 with more than
-one copy:
+unhashed: a name outside the scan roots could be a secret name. A file reachable by any name
+whose path is not exact (a component, as spelled or as real, that is not valid UTF-8) is never a
+candidate and is never opened: the rules may not see all of such a name, and its path could not
+be written back exactly. A blob is a sha256 with more than one copy:
 
 | Field | Meaning |
 |---|---|

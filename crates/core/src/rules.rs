@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::model::Class;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Component, Path};
 
 /// The rules shipped with the tool, embedded at build time.
@@ -72,14 +73,23 @@ pub struct StateFile {
 impl StateFile {
     /// Does `name` match this pattern (and none of its exceptions)?
     pub fn matches(&self, name: &str) -> bool {
-        name_matches(&self.pattern, name)
+        name_matches(&self.pattern, name.as_bytes())
             && !self.except.iter().any(|e| e.eq_ignore_ascii_case(name))
     }
 }
 
+/// The raw bytes of a name, as the platform holds them (on Unix exactly; on Windows WTF-8).
+/// Secret matching works on these, never on a conversion to `str` that can fail: every rule
+/// pattern is ASCII (checked when rules load), an ASCII byte in these bytes is always that
+/// character, and a byte that is not ASCII never matches a pattern byte, so a name that is not
+/// valid UTF-8 matches exactly where its valid parts say it does.
+fn name_bytes(name: &OsStr) -> &[u8] {
+    name.as_encoded_bytes()
+}
+
 /// `name`, `*suffix` or `prefix*`, ignoring ASCII case.
-fn name_matches(spec: &str, name: &str) -> bool {
-    let (s, n) = (spec.as_bytes(), name.as_bytes());
+fn name_matches(spec: &str, n: &[u8]) -> bool {
+    let s = spec.as_bytes();
     if let Some(suffix) = spec.strip_prefix('*') {
         n.len() >= suffix.len()
             && n[n.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
@@ -126,16 +136,21 @@ impl SecretName {
     }
 
     /// Does `name` match, inside (`in_artifact`) or outside an artifact directory?
-    pub fn matches(&self, name: &str, in_artifact: bool) -> bool {
-        if self.except.iter().any(|e| e.eq_ignore_ascii_case(name)) {
+    pub fn matches(&self, name: impl AsRef<OsStr>, in_artifact: bool) -> bool {
+        let name = name_bytes(name.as_ref());
+        if self
+            .except
+            .iter()
+            .any(|e| e.as_bytes().eq_ignore_ascii_case(name))
+        {
             return false;
         }
         if self.is_substring() {
             if in_artifact {
                 return false;
             }
-            let sub = self.pattern[1..self.pattern.len() - 1].to_ascii_lowercase();
-            return name.to_ascii_lowercase().contains(&sub);
+            let sub = &self.pattern.as_bytes()[1..self.pattern.len() - 1];
+            return name.windows(sub.len()).any(|w| w.eq_ignore_ascii_case(sub));
         }
         name_matches(&self.pattern, name)
     }
@@ -172,11 +187,14 @@ pub struct SecretWord {
 }
 
 /// The lower-case segments of `stem` (see [`SecretWord`]).
-fn name_segments(stem: &str) -> Vec<String> {
+fn name_segments(stem: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut prev_lower = false;
-    for ch in stem.chars() {
+    // Byte by byte: a byte that is not an ASCII letter or digit (any byte of a non-ASCII
+    // character, or of an invalid sequence) ends a segment, as the character would.
+    for &b in stem {
+        let ch = b as char;
         if !ch.is_ascii_alphanumeric() {
             if !cur.is_empty() {
                 out.push(std::mem::take(&mut cur));
@@ -198,8 +216,8 @@ fn name_segments(stem: &str) -> Vec<String> {
 
 /// `name` split into stem and lower-case last extension; a leading dot is part of the stem
 /// (`.token` has no extension).
-fn stem_and_ext(name: &str) -> (&str, Option<String>) {
-    match name.rfind('.') {
+fn stem_and_ext(name: &[u8]) -> (&[u8], Option<Vec<u8>>) {
+    match name.iter().rposition(|&b| b == b'.') {
         Some(i) if i > 0 && i + 1 < name.len() => {
             (&name[..i], Some(name[i + 1..].to_ascii_lowercase()))
         }
@@ -209,16 +227,24 @@ fn stem_and_ext(name: &str) -> (&str, Option<String>) {
 
 impl SecretWord {
     /// Does the file name `name` hold this word? `plain` are the code and document extensions.
-    pub fn matches(&self, name: &str, plain: &HashSet<String>) -> bool {
-        let (stem, ext) = stem_and_ext(name);
+    pub fn matches(&self, name: impl AsRef<OsStr>, plain: &HashSet<String>) -> bool {
+        let (stem, ext) = stem_and_ext(name_bytes(name.as_ref()));
         if let Some(e) = &ext {
-            if self.extensions.iter().any(|x| x.eq_ignore_ascii_case(e)) {
+            if self
+                .extensions
+                .iter()
+                .any(|x| x.as_bytes().eq_ignore_ascii_case(e))
+            {
                 return true;
             }
         }
         let segs = name_segments(stem);
         let is_word = |s: &str| self.words.iter().any(|w| w.eq_ignore_ascii_case(s));
-        if ext.as_ref().map(|e| plain.contains(e)).unwrap_or(false) {
+        let plain_ext = ext
+            .as_deref()
+            .and_then(|e| std::str::from_utf8(e).ok())
+            .is_some_and(|e| plain.contains(e));
+        if plain_ext {
             return self.whole_stem_in_code && segs.len() == 1 && is_word(&segs[0]);
         }
         segs.iter().enumerate().any(|(i, s)| {
@@ -363,10 +389,16 @@ impl RuleSet {
                 2 => p.len() > 2 && p.starts_with('*') && p.ends_with('*'),
                 _ => false,
             };
-            if p.is_empty() || p.contains('/') || !ok_shape || sn.kind.trim().is_empty() {
+            if p.is_empty()
+                || p.contains('/')
+                || !ok_shape
+                || sn.kind.trim().is_empty()
+                || !p.is_ascii()
+                || sn.except.iter().any(|e| !e.is_ascii())
+            {
                 return Err(Error::Rules(format!(
-                    "secret_name {p:?}: needs a name, `*suffix`, `prefix*` or `*substring*` \
-                     pattern and a kind"
+                    "secret_name {p:?}: needs an ASCII name, `*suffix`, `prefix*` or \
+                     `*substring*` pattern, ASCII exceptions and a kind"
                 )));
             }
         }
@@ -389,10 +421,11 @@ impl RuleSet {
             if sd.name.is_empty()
                 || sd.name.contains('/')
                 || sd.name.contains('*')
+                || !sd.name.is_ascii()
                 || sd.kind.trim().is_empty()
             {
                 return Err(Error::Rules(format!(
-                    "secret_dir {:?}: needs a plain directory name and a kind",
+                    "secret_dir {:?}: needs a plain ASCII directory name and a kind",
                     sd.name
                 )));
             }
@@ -490,7 +523,11 @@ impl RuleSet {
 
     /// The kind of secret file name `name` is, if any (`in_artifact`: the entry is inside a
     /// regenerable or cache directory, where substring patterns and secret words do not apply).
-    pub fn secret_file(&self, name: &str, in_artifact: bool) -> Option<&str> {
+    ///
+    /// The name is matched on its raw bytes, so a name that is not valid UTF-8 is a secret
+    /// exactly when its valid parts make it one (`id_rsa` followed by an invalid byte is).
+    pub fn secret_file(&self, name: impl AsRef<OsStr>, in_artifact: bool) -> Option<&str> {
+        let name = name.as_ref();
         if let Some(s) = self
             .secret_names
             .iter()
@@ -513,10 +550,12 @@ impl RuleSet {
     }
 
     /// The kind of secret directory name `name` is, if any.
-    pub fn secret_dir(&self, name: &str) -> Option<&str> {
+    /// Matched on the raw bytes of the name, as [`RuleSet::secret_file`].
+    pub fn secret_dir(&self, name: impl AsRef<OsStr>) -> Option<&str> {
+        let name = name_bytes(name.as_ref());
         self.secret_dirs
             .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .find(|s| s.name.as_bytes().eq_ignore_ascii_case(name))
             .map(|s| s.kind.as_str())
     }
 
@@ -711,5 +750,47 @@ mod tests {
         assert!(rs.is_output_file("clip.MP4"));
         assert!(!rs.is_output_file("mp4"));
         assert!(rs.is_source_file("main.rs"));
+    }
+
+    /// CT-A1: every secret rule kind matches on the raw bytes of a name, so a name that is not
+    /// valid UTF-8 is a secret exactly when its valid parts make it one.
+    #[cfg(unix)]
+    #[test]
+    fn secret_rules_match_names_that_are_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let rs = RuleSet::builtin();
+        let b = |x: &[u8]| OsStr::from_bytes(x).to_os_string();
+        for (name, want) in [
+            (&b"id_rsa\xff"[..], true),      // prefix pattern `id_rsa*`
+            (&b"\xff.pem"[..], true),        // suffix pattern `*.pem`
+            (&b".env.\xff"[..], true),       // `.env.*` with exceptions
+            (&b".env"[..], true),            // exact name
+            (&b"api\xfftoken"[..], true),    // secret word, last segment
+            (&b"\xff_secret.txt"[..], true), // secret word
+            (&b"\xffsecret.txt"[..], true),  // an invalid byte ends a segment
+            (&b"notes\xff.txt"[..], false),
+            (&b"tokenizer\xff.rs"[..], false),
+            (&b".env.example"[..], false),
+        ] {
+            let n = b(name);
+            assert_eq!(rs.secret_file(&n, false).is_some(), want, "{n:?}");
+        }
+        // Inside an artifact only names and fixed patterns count, not words.
+        assert!(rs.secret_file(b(b"id_rsa\xff"), true).is_some());
+        assert!(rs.secret_file(b(b"api\xfftoken"), true).is_none());
+        assert!(rs.secret_dir(b(b".SSH")).is_some());
+        assert!(rs.secret_dir(b(b".ssh\xff")).is_none());
+    }
+
+    #[test]
+    fn secret_patterns_must_be_ascii() {
+        let name = "[[secret_name]]\npattern = \"cl\u{e9}*\"\nkind = \"k\"\n";
+        assert!(RuleSet::from_toml(name).is_err());
+        let except = "[[secret_name]]\npattern = \"x*\"\nkind = \"k\"\nexcept = [\"x\u{e9}\"]\n";
+        assert!(RuleSet::from_toml(except).is_err());
+        let dir = "[[secret_dir]]\nname = \"s\u{e9}\"\nkind = \"k\"\n";
+        assert!(RuleSet::from_toml(dir).is_err());
+        let ok = "[[secret_dir]]\nname = \"se\"\nkind = \"k\"\n";
+        assert!(RuleSet::from_toml(ok).is_ok());
     }
 }
