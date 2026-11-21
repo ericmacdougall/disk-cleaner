@@ -1,11 +1,14 @@
-//! disk-cleaner core: scan, classify, repo safety facts and dry-run planning.
+//! disk-cleaner core: scan, classify, repo safety facts and dry-run planning, plus the apply
+//! module that executes an approved lane plan.
 //!
-//! This crate is read-only. It has no UI and no network code, and it contains no code path
-//! that deletes, moves or writes files (the only write is [`write_json`], used by the CLI for
-//! its own output file) or runs a mutating git command.
+//! Scan and plan are read-only: outside [`apply`], no code path deletes, moves or writes files
+//! (the only other write is [`write_json`], used by the CLI for its own output file) or runs a
+//! mutating git command. Removal, uploads, recovery pushes and restore live only in [`apply`]
+//! (DESIGN 10), which acts only when its caller passes `act` and re-verifies every piece first.
 
 #![forbid(unsafe_code)]
 
+pub mod apply;
 pub mod config;
 pub mod error;
 pub mod facts;

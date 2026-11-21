@@ -324,6 +324,73 @@ pub fn plan_summary(p: &Plan) -> String {
     o
 }
 
+/// Human summary of an apply run.
+pub fn apply_summary(r: &disk_cleaner_core::apply::ApplyReport) -> String {
+    let mut o = String::new();
+    if r.dry_run {
+        let _ = writeln!(
+            o,
+            "Dry run (nothing is changed; pass --apply to act). Run {}.",
+            r.run
+        );
+    } else {
+        let _ = writeln!(o, "Apply run {}.", r.run);
+    }
+    for p in &r.pieces {
+        let _ = writeln!(
+            o,
+            "  [{}] {} {}: {}",
+            p.lane.as_str(),
+            p.outcome,
+            p.path.display(),
+            p.reason
+        );
+        if !p.restore.is_empty() && p.outcome != "kept" {
+            let _ = writeln!(o, "      restore: {}", p.restore);
+        }
+    }
+    if r.dry_run {
+        let _ = writeln!(
+            o,
+            "Would upload at most {} bytes (deduplicated; verified at apply).",
+            r.uploaded_bytes
+        );
+    } else {
+        let _ = writeln!(
+            o,
+            "Uploaded {} bytes in {} shards; {} failed; removed {} entries.",
+            r.uploaded_bytes,
+            r.shards_uploaded,
+            r.shards_failed.len(),
+            r.removed_entries
+        );
+    }
+    o
+}
+
+/// Human summary of a restore.
+pub fn restore_summary(r: &disk_cleaner_core::apply::restore::RestoreReport) -> String {
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "Restored {}, already identical {}, conflicts {}, failed {}.",
+        r.restored.len(),
+        r.identical.len(),
+        r.conflicts.len(),
+        r.failed.len()
+    );
+    for p in &r.conflicts {
+        let _ = writeln!(o, "  conflict (left as is): {}", p.display());
+    }
+    for (p, e) in &r.failed {
+        let _ = writeln!(o, "  failed: {}: {e}", p.display());
+    }
+    for (p, rule) in &r.regenerate {
+        let _ = writeln!(o, "  regenerate: {} ({rule})", p.display());
+    }
+    o
+}
+
 #[cfg(test)]
 mod tests {
     use super::{esc, human_bytes};

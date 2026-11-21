@@ -1,5 +1,6 @@
-//! `disk-cleaner` command line. Phase 1 is read-only: `scan` and `plan` never change anything
-//! except the output file named with `--out`.
+//! `disk-cleaner` command line. `scan` and `plan` are read-only: they never change anything
+//! except the output file named with `--out`. `apply` is a dry run unless `--apply` is given;
+//! `restore` puts removed paths back without overwriting anything.
 
 mod report;
 
@@ -16,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[command(
     name = "disk-cleaner",
     version,
-    about = "Understand what fills a disk. Read-only: scans and dry-run plans only."
+    about = "Understand what fills a disk, plan what to do, and apply the plan safely."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,6 +30,88 @@ enum Command {
     Scan(ScanArgs),
     /// Turn a scan into a dry-run plan. Nothing is changed.
     Plan(PlanArgs),
+    /// Execute a lane plan: back up, recover and remove, re-checking every piece first.
+    /// A dry run unless --apply is given.
+    Apply(ApplyArgs),
+    /// Put a removed path back, byte for byte, from storage. Never overwrites.
+    Restore(RestoreArgs),
+}
+
+#[derive(Args)]
+struct ApplyArgs {
+    /// Scan JSON written by `scan --lanes --out`.
+    #[arg(long, value_name = "FILE")]
+    scan: PathBuf,
+    /// Plan JSON written by `plan --json` from that scan.
+    #[arg(long, value_name = "FILE")]
+    plan: PathBuf,
+    /// rclone remote root for backups, e.g. b2-archive2:prunebackup/disk-cleaner-archive.
+    /// rclone owns the credentials.
+    #[arg(long, value_name = "REMOTE")]
+    remote: String,
+    /// Act. Without it nothing is written, uploaded, pushed or removed.
+    #[arg(long)]
+    apply: bool,
+    /// Concurrent upload pipelines.
+    #[arg(long, default_value_t = 4)]
+    jobs: usize,
+    /// Shard size bound in MiB (rclone buffers one shard per pipeline in memory).
+    #[arg(long, default_value_t = 64)]
+    shard_mib: u64,
+    /// Deadline in seconds for each rclone command; a hung upload is killed and nothing of it
+    /// is removed.
+    #[arg(long, default_value_t = 1800)]
+    shard_timeout_secs: u64,
+    /// Manifest file (default ~/.disk-cleaner/prunedisk/<label>.jsonl).
+    #[arg(long, value_name = "FILE")]
+    manifest: Option<PathBuf>,
+    /// Label used in storage paths and recovery refs (default: the short host name).
+    #[arg(long, value_name = "LABEL")]
+    host_label: Option<String>,
+    /// `upload`: also upload pieces holding secret-named files (default `keep`: they stay local).
+    #[arg(long, value_name = "MODE")]
+    secrets: Option<String>,
+    /// A remote URL (without credentials) you declare private; recovery refs may be pushed to
+    /// it. Repeatable.
+    #[arg(long = "private-remote", value_name = "URL")]
+    private_remotes: Vec<String>,
+    /// The rclone binary.
+    #[arg(long, default_value = "rclone")]
+    rclone: PathBuf,
+    /// Print the report as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Override the current time (unix seconds), for tests.
+    #[arg(long, hide = true)]
+    now: Option<i64>,
+}
+
+#[derive(Args)]
+struct RestoreArgs {
+    /// The removed path (a file, or a directory that held removed entries).
+    #[arg(long, value_name = "PATH")]
+    path: PathBuf,
+    /// The rclone remote root the backup was written to.
+    #[arg(long, value_name = "REMOTE")]
+    remote: String,
+    /// Manifest file (default ~/.disk-cleaner/prunedisk/<label>.jsonl).
+    #[arg(long, value_name = "FILE")]
+    manifest: Option<PathBuf>,
+    /// Rebuild the manifest from its copies in storage (when the local one is lost).
+    #[arg(long)]
+    from_remote: bool,
+    /// Label the backup was written with (default: the short host name).
+    #[arg(long, value_name = "LABEL")]
+    host_label: Option<String>,
+    /// Restore this run's generation instead of the newest.
+    #[arg(long, value_name = "RUN")]
+    run: Option<String>,
+    /// The rclone binary.
+    #[arg(long, default_value = "rclone")]
+    rclone: PathBuf,
+    /// Print the report as JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -107,6 +190,8 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Scan(a) => run_scan(a),
         Command::Plan(a) => run_plan(a),
+        Command::Apply(a) => run_apply(a),
+        Command::Restore(a) => run_restore(a),
     }
 }
 
@@ -177,6 +262,89 @@ fn run_plan(a: PlanArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&p)?);
     } else {
         print!("{}", report::plan_summary(&p));
+    }
+    Ok(())
+}
+
+fn state_base() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".disk-cleaner").join("prunedisk"))
+}
+
+fn run_apply(a: ApplyArgs) -> Result<()> {
+    use disk_cleaner_core::apply::{apply, short_hostname, ApplyOptions};
+    let label = a.host_label.unwrap_or_else(short_hostname);
+    let secrets_upload = match a.secrets.as_deref() {
+        None | Some("keep") => false,
+        Some("upload") => true,
+        Some(other) => anyhow::bail!("--secrets takes `keep` or `upload`, not {other:?}"),
+    };
+    let base = state_base()?;
+    let manifest = a
+        .manifest
+        .unwrap_or_else(|| base.join(format!("{label}.jsonl")));
+    let now = a.now.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    });
+    let scan_text = std::fs::read_to_string(&a.scan)
+        .with_context(|| format!("cannot read {}", a.scan.display()))?;
+    let plan_text = std::fs::read_to_string(&a.plan)
+        .with_context(|| format!("cannot read {}", a.plan.display()))?;
+    let mut opts = ApplyOptions::new(a.remote.clone(), manifest, base.join("state"), now);
+    opts.label = label;
+    opts.act = a.apply;
+    opts.jobs = a.jobs.max(1);
+    opts.shard_bytes = a.shard_mib.max(1) << 20;
+    opts.shard_timeout = Duration::from_secs(a.shard_timeout_secs.max(10));
+    opts.secrets_upload = secrets_upload;
+    opts.private_remotes = a.private_remotes;
+    opts.rclone = a.rclone;
+    opts.process = running_cwds();
+    let local = PathBuf::from(&a.remote);
+    if local.is_absolute() {
+        opts.remote_local = Some(local);
+    }
+    let rep = apply(&scan_text, &plan_text, &opts)?;
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&rep)?);
+    } else {
+        print!("{}", report::apply_summary(&rep));
+    }
+    if !rep.shards_failed.is_empty() {
+        std::process::exit(4);
+    }
+    Ok(())
+}
+
+fn run_restore(a: RestoreArgs) -> Result<()> {
+    use disk_cleaner_core::apply::restore::{restore, RestoreOptions};
+    use disk_cleaner_core::apply::short_hostname;
+    let label = a.host_label.unwrap_or_else(short_hostname);
+    let manifest = match a.manifest {
+        Some(m) => m,
+        None => state_base()?.join(format!("{label}.jsonl")),
+    };
+    let opts = RestoreOptions {
+        remote: a.remote,
+        rclone: a.rclone,
+        git: PathBuf::from("git"),
+        manifest,
+        from_remote: a.from_remote,
+        label,
+        run: a.run,
+        timeout: Duration::from_secs(1800),
+    };
+    let rep = restore(&a.path, &opts)?;
+    if a.json {
+        println!("{}", serde_json::to_string_pretty(&rep)?);
+    } else {
+        print!("{}", report::restore_summary(&rep));
+    }
+    if !rep.failed.is_empty() || !rep.conflicts.is_empty() {
+        std::process::exit(4);
     }
     Ok(())
 }
