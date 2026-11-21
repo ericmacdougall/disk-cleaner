@@ -344,7 +344,9 @@ pub fn walk(root: &Path, o: &WalkOpts) -> Result<Walked> {
     }
 
     // Hard-link groups with an excluded member are excluded entirely.
-    if !excl_inodes.is_empty() {
+    // (the broken-exclusion variant skips this and the symlink rule: failing-first evidence only)
+    let rules = !cfg!(feature = "broken-exclusion");
+    if rules && !excl_inodes.is_empty() {
         let before = w.nodes.len();
         w.nodes.retain(|n| {
             !(n.stat.kind == Ok(Kind::File)
@@ -354,7 +356,7 @@ pub fn walk(root: &Path, o: &WalkOpts) -> Result<Walked> {
         w.excluded += (before - w.nodes.len()) as u64;
     }
     // Symlinks pointing at an excluded path are excluded.
-    if !o.filter.pats.is_empty() {
+    if rules && !o.filter.pats.is_empty() {
         let before = w.nodes.len();
         w.nodes.retain(|n| match (&n.stat.kind, &n.target) {
             (Ok(Kind::Symlink), Some(t)) => match resolve_lexical(&n.rel, t, &root_abs) {
@@ -385,6 +387,10 @@ pub fn link_groups(nodes: &[Node]) -> HashMap<(u64, u64), Vec<usize>> {
 #[cfg(unix)]
 pub fn open_beneath(root: &Path, rel: &[u8]) -> std::io::Result<fs::File> {
     use std::os::fd::{FromRawFd, OwnedFd};
+    if cfg!(feature = "broken-read-guard") {
+        // the broken variant follows symlinks on the way (failing-first evidence only)
+        return fs::File::open(root.join(rel_path(rel)));
+    }
     use std::os::unix::ffi::OsStrExt;
     let croot = std::ffi::CString::new(root.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::other("root contains NUL"))?;

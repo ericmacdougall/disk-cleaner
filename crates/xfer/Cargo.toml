@@ -22,6 +22,8 @@ broken-pack-offset = []   # the pack writer records an off-by-one segment offset
 broken-retry = []         # a retried put skips the stat that finds an already-stored object
 broken-fixed-chunks = []  # fixed 1 MiB blocks instead of content-defined chunks
 broken-identity = []      # Receipt::still_matches accepts any existing path
+broken-exclusion = []     # hard-link groups and symlinks reaching an excluded path are kept
+broken-read-guard = []    # reads follow symlinks and skip the before/after identity checks
 
 [dependencies]
 blake3 = "1.8"

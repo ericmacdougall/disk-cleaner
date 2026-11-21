@@ -368,7 +368,9 @@ fn read_one(c: &ReadCtx, i: usize, last_try: bool) -> ReadOutcome {
             return ReadOutcome::Done;
         }
     };
-    if before.id.dev != n.stat.id.dev || before.id.ino != n.stat.id.ino {
+    // the broken-read-guard variant skips both identity checks (failing-first evidence only)
+    let guard = !cfg!(feature = "broken-read-guard");
+    if guard && (before.id.dev != n.stat.id.dev || before.id.ino != n.stat.id.ino) {
         if last_try {
             let _ = c.ev_tx.send(Event::Changed(i));
             return ReadOutcome::Done;
@@ -418,7 +420,7 @@ fn read_one(c: &ReadCtx, i: usize, last_try: bool) -> ReadOutcome {
             return ReadOutcome::Done;
         }
     };
-    if !same_identity(&before.id, &after.id) || cf.bytes != before.id.size {
+    if guard && (!same_identity(&before.id, &after.id) || cf.bytes != before.id.size) {
         if last_try {
             let _ = c.ev_tx.send(Event::Changed(i));
             return ReadOutcome::Done;
