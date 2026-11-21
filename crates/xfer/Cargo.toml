@@ -40,6 +40,9 @@ broken-migrate-order = [] # a commit's chunks leave the hot table before the com
 # Test hooks, never shipped: XFER_ABORT_BEFORE_MIGRATE aborts after a commit with packs is
 # receipted, before its chunks move into the committed map (tests/crash.rs).
 crash-hooks = []
+# Diagnostics, never shipped: the index load and restore print peak RSS and allocator counts
+# by phase on stderr (tests/hostile_restore.rs mem_trace_*, run on CI).
+mem-trace = []
 
 [dependencies]
 blake3 = "1.8"

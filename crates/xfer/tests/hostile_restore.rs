@@ -674,9 +674,13 @@ fn a_non_empty_target_is_refused() {
 /// run's listed pack), `n` entries in all, spread over several objects of other runs.
 /// Streamed straight into the store, so this process never holds the JSON.
 fn fill_index(env: &Env, pack: &ObjRef, n: usize) {
-    use std::io::Write;
     // objects of at most 200k entries, so each compressed body stays inside one fetch batch
-    let objs = n.div_ceil(200_000).max(4);
+    fill_index_objects(env, pack, n, 200_000)
+}
+
+fn fill_index_objects(env: &Env, pack: &ObjRef, n: usize, per_object: usize) {
+    use std::io::Write;
+    let objs = n.div_ceil(per_object).max(4);
     let per = n.div_ceil(objs);
     for o in 0..objs {
         let p = env.p(&format!("store/v1/index/rfill{o}/000000.idx"));
@@ -724,6 +728,46 @@ fn index_case(n: usize) -> (Env, Out) {
         out.text
     );
     (env, out)
+}
+
+/// Diagnostics for the filled-share check (feature `mem-trace`; no assertion on memory): the
+/// growth over an empty index, and the child's phase trace, for the full share in 200k-entry
+/// objects, the full share in 20k-entry objects, and half the share in 200k-entry objects.
+/// Growth that follows object size points at fetch and decode; growth that follows the entry
+/// count points at the map.
+#[cfg(feature = "mem-trace")]
+#[test]
+fn mem_trace_chunk_map_cases() {
+    let run = |n: usize, per_object: usize| {
+        let a = rand_bytes(11, 3000);
+        let env = Env::new();
+        let r = Repo::new(&[&a], vec![entry(b"f.bin", Kind::File, 0o644, &a)]);
+        r.write(&env);
+        let pk = pack_key(&r.pack);
+        fill_index_objects(&env, &objref(&pk, &r.pack), n, per_object);
+        let out = restore(&env, &env.p("target"), &[]);
+        assert_eq!(out.code, 0, "{}", out.text);
+        (env, out)
+    };
+    let full = xfer::repo::chunk_map_fit(index_share()) - 2000;
+    let (_e0, base) = run(0, 200_000);
+    eprintln!("== empty index: peak {} KiB", base.rss >> 10);
+    for l in base.text.lines().filter(|l| l.starts_with("mem-trace")) {
+        eprintln!("   {l}");
+    }
+    for (n, per) in [(full, 200_000), (full, 20_000), (full / 2, 200_000)] {
+        let (_e, out) = run(n, per);
+        let grew = out.rss.saturating_sub(base.rss);
+        eprintln!(
+            "== {n} entries in objects of {per}: peak {} KiB, grew {} KiB ({:.1} bytes an entry)",
+            out.rss >> 10,
+            grew >> 10,
+            grew as f64 / n as f64
+        );
+        for l in out.text.lines().filter(|l| l.starts_with("mem-trace")) {
+            eprintln!("   {l}");
+        }
+    }
 }
 
 /// `extra` chunks past what the share holds (40 bytes an entry, the prefix table aside), less

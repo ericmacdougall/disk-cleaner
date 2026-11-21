@@ -803,6 +803,10 @@ impl ChunkMap {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+    /// Entries the map has room for without reallocating.
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
     pub fn pack_index(&mut self, p: &ObjRef) -> u32 {
         if let Some(&i) = self.pack_ix.get(&p.key) {
             return i;
@@ -1269,18 +1273,26 @@ impl Repo {
             )));
         }
         meter.charge(listing)?;
+        crate::util::mem_trace("index listing charged");
         let mut map = ChunkMap::new(meter)?;
         // A backup reserves room for every entry its share can pay for, so merging a commit's
         // chunks never reallocates. A restore only loads: a chunk entry takes at least ~32
         // compressed bytes (its id is random), so z/8 bounds an honest index; past it the map
         // grows (see `ChunkMap::room_for`).
         map.reserve_share(meter, (!backup).then_some((z_total / 8) as usize + 1024));
+        crate::util::mem_trace(&format!(
+            "map reserved for {} entries, {} index objects of {} compressed",
+            map.capacity(),
+            idx.len(),
+            z_total
+        ));
         // fetched in parallel batches, decoded and charged one at a time in listing order; a
         // batch is decoded before the next is fetched, so at most one batch of bodies is held
         let mut z_done = 0u64;
         for r in fetch_batches(idx) {
             let group = &idx[r];
             let bodies = self.fetch_many(group, cache)?;
+            crate::util::mem_trace(&format!("batch of {} fetched", group.len()));
             for (o, b) in group.iter().zip(bodies) {
                 z_done += o.size;
                 if let Err(e) = self.add_index(o, &b, packs, meter, &mut map, &mut referenced) {
@@ -1294,9 +1306,11 @@ impl Repo {
                 drop(b);
                 crate::util::release_free_memory();
             }
+            crate::util::mem_trace(&format!("batch decoded, {} entries", map.len()));
         }
         // duplicates were charged as they were read; finish returns their charge
         map.finish(meter);
+        crate::util::mem_trace(&format!("map sorted, capacity {}", map.capacity()));
         Ok((map, idx.len(), referenced))
     }
 

@@ -205,6 +205,7 @@ pub fn restore(t: Arc<dyn Transport>, o: &RestoreOpts) -> Result<RestoreReport> 
     let t0 = Instant::now();
     let repo = Repo::new(t, o.max_objects, o.policy)?;
     let ld = load(&repo, o.run.as_deref(), &o.budget)?;
+    crate::util::mem_trace("restore loaded");
     let mut rep = RestoreReport {
         run: ld.run.clone(),
         entries: ld.items.len() as u64,
@@ -431,6 +432,7 @@ pub fn restore(t: Arc<dyn Transport>, o: &RestoreOpts) -> Result<RestoreReport> 
     }
     rep.wall_ms = t0.elapsed().as_millis() as u64;
     rep.peak_rss = crate::util::peak_rss_bytes();
+    crate::util::mem_trace("restore done");
     rep.exit_code = if rep.errors.is_empty() { 0 } else { 3 };
     Ok(rep)
 }

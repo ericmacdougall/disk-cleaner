@@ -62,6 +62,9 @@ jobs:
       - name: xfer chunk-map memory at its share (measured bytes per chunk)
         if: ${{ !cancelled() && runner.os != 'Windows' }}
         run: cargo test -p disk-cleaner-xfer --locked --test hostile_restore filled_to_its_share -- --nocapture --test-threads 1
+      - name: xfer chunk-map memory by phase (diagnostic trace build)
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: cargo test -p disk-cleaner-xfer --locked --features mem-trace --test hostile_restore mem_trace -- --nocapture --test-threads 1
 
   mount-test:
     name: one-file-system on a real mount (linux)

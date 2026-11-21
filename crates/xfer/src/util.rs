@@ -205,6 +205,60 @@ pub fn peak_rss_bytes() -> u64 {
     0
 }
 
+/// Test-only diagnostics (feature `mem-trace`): print, tagged with `phase`, this process's peak
+/// RSS and the allocator's own counts (bytes live now, the most ever live, and bytes it holds
+/// from the system), so a measured peak can be split into live data and allocator retention.
+/// Does nothing in a normal build.
+pub fn mem_trace(phase: &str) {
+    #[cfg(feature = "mem-trace")]
+    {
+        let (live, live_max, held) = malloc_counts();
+        eprintln!(
+            "mem-trace {phase}: peak {} KiB, malloc live {} KiB, live max {} KiB, held {} KiB",
+            peak_rss_bytes() >> 10,
+            live >> 10,
+            live_max >> 10,
+            held >> 10
+        );
+    }
+    #[cfg(not(feature = "mem-trace"))]
+    let _ = phase;
+}
+
+/// (live, most ever live, held from the system) in bytes; zeros where unknown.
+#[cfg(feature = "mem-trace")]
+fn malloc_counts() -> (usize, usize, usize) {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct MallocStatistics {
+            blocks_in_use: u32,
+            size_in_use: usize,
+            max_size_in_use: usize,
+            size_allocated: usize,
+        }
+        extern "C" {
+            fn malloc_zone_statistics(zone: *mut libc::c_void, stats: *mut MallocStatistics);
+        }
+        let mut s = MallocStatistics {
+            blocks_in_use: 0,
+            size_in_use: 0,
+            max_size_in_use: 0,
+            size_allocated: 0,
+        };
+        // SAFETY: a null zone sums every zone; the call fills the struct we own.
+        unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut s) };
+        let _ = s.blocks_in_use;
+        (s.size_in_use, s.max_size_in_use, s.size_allocated)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux: VmRSS now in place of live bytes (glibc has no cheap equivalent here)
+        let rss = rss_of(std::process::id()).unwrap_or(0) as usize;
+        (rss, 0, 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
