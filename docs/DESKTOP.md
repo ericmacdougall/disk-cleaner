@@ -277,6 +277,7 @@ All in CI; nothing is built on a developer machine by default.
 | frontend unit tests (vitest, jsdom, mocked backend) | job "frontend unit tests" (`npm test` in `apps/desktop`) |
 | desktop backend, worker and containment (Cancel; the parent's input closing; the parent dying with every pipe; a real parent process killed; a stuck ending cut short by the deadline; a worker that dies on its own) | jobs "desktop backend (linux)", "worker containment" (`cargo build --examples`, then `cargo test` in `apps/desktop/src-tauri`, then `scripts/repeat-containment.sh 10`) |
 | one million nodes | job "performance at one million nodes" (results in the job summary and the `perf-results` artifact) |
+| size tree scroll at one million rows, mocked backend, headless Chromium (spec AC-9) | job "size tree scroll at one million rows" (`npm run perf:tree` in `apps/desktop`; results in the job summary and the `tree-scroll-1m` artifact) |
 | a wide install: 20,000 sibling folders with pages and Cancel asked meanwhile | `tests/state_flow.rs` in the desktop backend and containment jobs (the `PERF install_wide` and `PERF cancel_wide` lines) |
 | the packaged app through WebDriver, Linux and Windows (below) | job "end-to-end" (`apps/desktop/e2e/check.sh`; results in the `e2e-<os>` artifact) |
 | each end-to-end check caught by a broken variant | workflow "e2e-variants" (`apps/desktop/e2e/variants/*.patch`, `e2e/expect_variant.py`) |
@@ -331,7 +332,25 @@ The shipped bundles are not built from either automation config:
   name those strings: the title and the hooks on both OSes, and the DevTools switch on
   Windows. The release binary built in the e2e job must pass it.
 
-One session (`e2e/run.mjs`) covers these flows, in order:
+On Linux, two launches of the fixture alone come first, on the same pristine sandbox (the
+order is the stream owner's ruling; inferred):
+
+- First run, traced (ports 4452 and 4453): the suite's first launch, so the first scan,
+  render, git run and scroll go through strace and the write observer. It must show it is
+  traced (`trace.default.first_run_traced`), scans on the defaults (git facts on: the box must
+  already be checked, it is never clicked), waits for the analysis (the export button
+  enabled), opens the wide folder, then runs the timing checks' steps, not timed
+  (`steps.ipc_tree_page_traced`, `steps.scroll_traced`; their numbers are information).
+- Untraced (ports 4450 and 4451): the same scan and steps, timed: `timing.ipc_tree_page_p95`
+  and `timing.scroll_p95` (below).
+
+Both come before the main session because its Settings checks save the active window to the
+sandbox's settings file. `flow.default_scan_settings_match` (after the main session's rescan)
+requires the three scans to read the same conditions: the chosen folders, the git-facts box
+and the settings the app reports (`get_settings`), read just before each Scan and compared as
+JSON.
+
+The main session (`e2e/run.mjs`) covers these flows, in order:
 
 1. Choose folders (a seeded fixture tree from `e2e/fixture.py`, seed 16452, and a large
    system folder).
@@ -347,6 +366,10 @@ One session (`e2e/run.mjs`) covers these flows, in order:
    cancelled and writes and says nothing, then New scan and Add folders (no status from the
    import), a malformed file (focus returns to Open) and a cancelled one.
 9. Check that the CSP blocks inline script.
+
+On Linux the main session times nothing; on Windows, which has no tracer, it takes the two
+timings itself (after step 4). Sessions on a one-million-row size tree then follow for the AC-9
+timings (below).
 
 axe-core 4.14 runs on the chooser, each view and the imported developer view; any violation
 fails.
@@ -579,8 +602,460 @@ rendering add to every frame. A slow runner can turn it red. The response is to 
 run's samples (the `e2e-<os>` artifact) for a real regression against a slow runner. The
 limit stays at 50 ms.
 
+Where every timing is taken (main's ruling, relayed by the stream owner; inferred). The
+rebuilt write observer traces every call, which pushed the default fixture's
+`timing.scroll_p95` to 43/50 ms (run 44895185802) and 55/62 ms (run 44896444434, a fail)
+under strace, against 33/35 ms untraced (a83db44). So
+every timing assertion, here and at one million rows, is taken in a launch with the untraced
+switch (below), with its threshold, n and no-retry rule unchanged, and the same steps also run
+in a traced launch, not timed, under the write observer. The probe-run numbers in the table
+above were traced. Windows has no tracer, so its timings stay in the main session.
+
+Preconditions of every timed session (Linux), judged in this order before each timing check;
+a failure fails that check with a reason ending "not measured", and nothing is retried:
+
+1. The trace state: every app process of the launch (`TracerPid` in `/proc`) is untraced,
+   else "not shown to be untraced; not measured" (`trace.default.timed_launch_untraced`,
+   `trace.synth_1m.timed_launch_untraced`).
+2. No other app instance alive at the session's start: any `/proc` entry named `e2e` or
+   `prunedisk-deskt`, zombies counted, read once at the start, else "another app instance is
+   alive at the session start (...); not measured". Pre-registered before any result (WAL
+   w4b6f0f8e4fa); recorded as `info.<group>.precondition.<launch>`. Windows has no `/proc`: it
+   is recorded there as not checkable.
+3. The workload shown: the wide folder (at least 1,000 rows), or 1,000,001 rows.
+
+Each timing check also judges its samples against a 0 ms threshold, which must fail (a pass
+cannot be vacuous). What each launch leaves after it closes is recorded at 2 s and 10 s
+(`info.<group>.after_close.<launch>`).
+
+#### Timings at one million rows (spec AC-9, PR gate F9)
+
+Built to a quoted excerpt of spec v6 AC-9; the spec text was not re-read. Registered before any
+sample (WAL w8d2cd55d39e). The steps, boundary, samples, thresholds and verdict are in one
+file, `e2e/ac9.mjs`, shared by checks (2) and (3).
+
+Workload: `synth::wide_tree(1_000_000, 16452)` (crates/view), one root folder holding
+1,000,000 files, root expanded, so the size tree has 1,000,001 rows. The e2e build loads it at
+start when `PRUNEDISK_E2E_SYNTH_NODES=1000000` is set (`src-tauri/src/e2e.rs`,
+`open_synthetic`). It goes through the scan path: a job starts as Start starts one,
+`show_walk` installs the tree, and a one-folder `synth::synthetic_scan` finishes the job with
+`show_scan`, so the window opens on the results (Done). No command is added, and the
+release-binary string check covers the name. The workload is
+`wide_tree(1_000_000, 16452)`. The pre-registration's `synthetic_scan` wording was the owner's
+error, corrected before any result was judged.
+
+Every percentile is nearest rank; pass means p95 strictly under the threshold. A miss is
+reported as measured, with no retry to pass.
+
+What counts as AC-9. The user's AC-9 target, as quoted, is check (3); the owner's and main's
+ruling (no user source for it was shown) is that AC-9 is met by checks (1) and (3) and the DOM
+cap. Check (2) is an additional measurement: its 50 ms threshold is the owner's own
+pre-registration, inferred, not the user's words. Its results are neither an AC-9 miss nor an
+AC-9 pass. It is a pass gate in `e2e/run.mjs`. Since main's ruling after the no-strace controls
+(below), on Linux it is timed in an untraced launch; its threshold, n and no-retry rule are
+unchanged.
+
+Every check here runs on the one-million-row synthetic tree above (`PRUNEDISK_E2E_SYNTH_NODES`,
+1,000,001 rows), never the 5,000-row fixture of the first session's scroll check.
+
+The sessions, at the end of the WebDriver suite, each with its own tauri-driver because the app
+takes its environment from the driver:
+
+- Linux, the timed launch (ports 4446 and 4447): untraced (below), with the preconditions
+  above (`trace.synth_1m.timed_launch_untraced`: the app process's `TracerPid` is 0). It runs
+  (1), then (2), then the floor and profile probes.
+- Linux, the traced launch (ports 4448 and 4449): under the strace wrapper like every other
+  launch. It runs (1)'s pages and (2)'s steps again, not timed (`steps.synth_1m.traced_ipc`:
+  every page must come back with its rows; `steps.synth_1m.traced_scroll`: the steps must
+  complete within the DOM limit). `e2e/check.sh` requires its strace log, and the write
+  observer and the snapshot cover it.
+- Windows: one session (ports 4446 and 4447) running (2). Windows has no tracer, and (1) is
+  Linux only, as registered.
+
+The untraced switch. `e2e/run.mjs` sets `PRUNEDISK_E2E_UNTRACED=1` for the timed launches only
+(the default fixture's and the one-million-row one) and the investigation's untraced arms; the
+main session's environment never holds it. `e2e/check.sh`'s app wrapper (CI only; it never
+ships) then starts that launch without strace, but only when the e2e binary holds the switch's
+name, which only a `--features e2e` build does (`src-tauri/src/e2e.rs`). The app checks the
+claim for the synthetic tree: with the switch set and a tracer attached, it shows none. An
+untraced launch is still a session of the survivor check: its processes carry
+`PRUNEDISK_TRACE_SESSION` and `e2e/traced.py settle` records it in `close.<pid>.txt` like a
+traced launch, so nothing it started may outlive it. Each untraced launch leaves a marker in
+`$OUT/untraced/`, each traced one-million-row launch one in `$OUT/traced-synth/`, and the trace
+step fails when a traced one-million-row launch left no strace log or none ran. A release
+binary holds no `PRUNEDISK_E2E_` name (check.sh's string
+check); `e2e/check-shipped.sh` names `PRUNEDISK_E2E_UNTRACED` on its own, check.sh's control
+requires it to report that name on the e2e binary, and the variant `untraced-switch-shipped`
+(below) plants the switch in a release build, which check-shipped.sh must fail.
+
+1. IPC (Linux; `timing.synth_1m.ipc_tree_page_p95` in `e2e/run.mjs`, in the timed launch). In
+   the page, `__TAURI_INTERNALS__.invoke`
+   `tree_page` with offset k * 200 and limit 200: 10 warm-up pages, then k = 0..99 timed with
+   `performance.now()`. Each page must hold 200 rows at its offset. Pass: p95 < 50 ms over
+   100 samples.
+2. Running-app scroll (Linux and Windows; `timing.synth_1m.scroll_p95`, in the timed launch). Size
+   tree, 10 warm-up steps, then 200 steps of 10 rows (280 px). The boundary:
+   - the clock starts just before `.tg-scroll`'s `scrollTop` is set;
+   - it stops after the first animation frame in which the step's target row
+     (`#tg-row-<index>`) is in the DOM, plus one post-paint task (`requestAnimationFrame`, then
+     a `MessageChannel` message);
+   - the target is the last row fully in view after the step. The grid fetches 5 rows above
+     the top and 10 past the bottom, so the new top row is already in the DOM before a 10-row
+     step and would time one frame whatever the backend does. Before each measured step the
+     target must be absent, or the check fails.
+   - Hard limit on every step, warm-up included, and on the first render:
+     `document.querySelectorAll('.tg-row').length <= 200` (the header row is one). The first
+     step over it fails the check and is named. The highest and lowest counts are recorded.
+
+   Pass: p95 < 50 ms over 200 samples.
+3. Mocked backend (`perf/tree.spec.ts`, job "size tree scroll at one million rows"). Playwright
+   @playwright/test 1.64.1, headless Chromium, window 1200 x 800 (the app's). The real
+   `TreeGrid` (`src/views/tree.ts`) is mounted over `mockBackend` with
+   `syntheticPage(view, 1_000_000, offset, limit)` (`src/testing.ts`) in a test page that vite
+   builds into `dist-perf/` (`perf/vite.config.ts`), never into the app's `dist/`. Same steps,
+   boundary, samples, threshold and DOM limit as (2). Results are in the `tree-scroll-1m`
+   artifact and the job summary.
+
+Controls (none lowers a threshold):
+
+- every timing check also judges its own samples against 0 ms, and that verdict must fail;
+- (3) runs a second time over a backend that answers each page 100 ms late, and that run must
+  miss the 50 ms threshold (p50 at least 100 ms). A timing that stopped on a row already shown,
+  or before the page answered, would pass there;
+- variant `row-cap-removed.patch` (below) must fail (2).
+
+The 0 ms judgement cannot pass for any samples, so it only shows that the verdict is computed,
+not fixed. No run has shown check (1) failing on its threshold. Check (2)'s failure path has
+been seen on real misses (results below). The owner accepted the last row fully in view as the target. The
+pre-registration says "the new rows", and the brief says "the target row".
+
+Demonstrations, not committed (t2-dev, docker node:22-bookworm, Playwright 1.64.1, before the
+first commit): a copy of (3) with the threshold set to 0.001 ms failed (p95 17.7 ms); with
+`row-cap-removed.patch` applied, (3) failed on the first render ("1001 .tg-row elements in the
+DOM, more than 200").
+
+Results, as measured. Every run is listed, and none was retried to pass. Milliseconds; Rows is
+the highest `.tg-row` count on any step, the header row included.
+
+Workflow "desktop" run 44877232202 at commit 86fafdc (the controls and the variant behaved as
+required):
+
+| Check | Where | n | p50 | p95 | max | Rows | Verdict |
+|---|---|---|---|---|---|---|---|
+| (1) IPC `tree_page`, limit 200 | Linux, ubuntu-22.04, under strace and Xvfb | 100 | 2 | 3 | 10 | | pass |
+| (2) running-app scroll | Linux, ubuntu-22.04, under strace and Xvfb | 200 | 33 | 41 | 46 | 29 | pass |
+| (2) running-app scroll | Windows, windows-latest | 200 | 31.2 | 32.2 | 32.9 | 28 | pass |
+| (3) mocked scroll | headless Chromium 156.0.8078.4, ubuntu-latest | 200 | 16.7 | 17.2 | 19.4 | 29 | pass |
+| (3) control: backend 100 ms late | same | 200 | 133.3 | 133.5 | 136.6 | 29 | misses 50 ms, as required |
+
+Workflow "desktop" run 44879146053 at commit 0291587. The checks are the same as at 86fafdc;
+since then only the session's script timeout was raised and the docs were changed. Linux's
+running-app scroll missed:
+
+| Check | Where | n | p50 | p95 | max | Rows | Verdict |
+|---|---|---|---|---|---|---|---|
+| (1) IPC `tree_page`, limit 200 | Linux, ubuntu-22.04, under strace and Xvfb | 100 | 5 | 9 | 11 | | pass |
+| (2) running-app scroll | Linux, ubuntu-22.04, under strace and Xvfb | 200 | 46 | 69 | 80 | 29 | **fail** (p95 69 ms, not under 50 ms) |
+| (2) running-app scroll | Windows, windows-latest | 200 | 31.3 | 32.2 | 44.4 | 28 | pass |
+| (3) mocked scroll | headless Chromium 156.0.8078.4, ubuntu-latest | 200 | 16.7 | 17.0 | 17.8 | 29 | pass |
+| (3) control: backend 100 ms late | same | 200 | 133.3 | 133.6 | 134.4 | 29 | misses 50 ms, as required |
+
+In the same run, the first session's 5,000-row scroll check measured p50 33, p95 36 ms.
+
+The e2e-variants run 44877270665 at 86fafdc ran the same one-million-row session on six more
+ubuntu-22.04 runners. Six of its variants leave the size tree untouched: they change backend
+writes, the root check, the capability list or the Settings question. Their Linux scroll
+results (p95, then p50, in ms):
+
+| Variant job | IPC p50 | Scroll p50 | Scroll p95 | Verdict |
+|---|---|---|---|---|
+| planted-write | 4 | 39 | 51 | fail |
+| planted-outside | 5 | 47 | 69 | fail |
+| offered-check-removed | 5 | 46 | 70 | fail |
+| capability-broadened | 5 | 47 | 66 | fail |
+| focus-broken | 3 | 34 | 41 | pass |
+| modal-trap-removed | 3 | 34 | 42 | pass |
+
+Running-app scroll (check 2), all runs through desktop run 44879992370 at cb39cc1:
+
+- Windows passed 3 of 3, with p95 of 32.2 to 32.3 ms.
+- Linux, under Xvfb and strace, passed 4 of 9. The p50 is about 33 ms or about 46 ms.
+  - With scroll p50 about 33 ms: scroll p95 is 41 to 43 ms and IPC p50 is 2 to 3 ms.
+  - With scroll p50 about 46 ms: scroll p95 is 51 to 70 ms and IPC p50 is 4 to 5 ms.
+
+The cause of the split is not established. Run 44879992370 at cb39cc1 measured p50 34, p95 43
+and max 55 ms (pass). This is an additional measurement, not an AC-9 verdict (above). The
+threshold stays at 50 ms.
+
+The suite now also records, in the same one-million-row session and never as a pass gate:
+
+- `info.synth_1m.runner`: CPU model, logical CPUs, `nproc`, memory, load (Linux load average;
+  Windows processor LoadPercentage), and the X screen (`xdpyinfo`, `xrandr`, when installed);
+- `info.synth_1m.frame_floor`: 200 empty frames (requestAnimationFrame, then a MessageChannel
+  message, nothing changed), on the same clock as a step, with the rAF interval;
+- `info.synth_1m.scroll_profile`: the 200 steps again, each split into slices: to the scroll
+  event, load() up to its IPC request, the IPC to its headers, the body, the callback and DOM
+  build, and to the stop. It also counts layout reads (getBoundingClientRect, clientHeight,
+  offsetHeight, scrollTop). It runs after the gated samples, so the instrumentation never
+  reaches them;
+- `info.synth_1m.runner_end`: load at the end, and on Linux the CPU time shares (steal,
+  iowait) over the session.
+
+The Playwright job records the floor and the profile too.
+
+First results with these probes (commit 0588a6e): workflow "desktop" run 44881694359 and the
+seven jobs of "e2e-variants" run 44881704164. At that commit the floor ran just before the
+gated steps, and the gated Linux scroll moved on both runner classes against earlier runs: p50
+about 33 rose to 39 to 41 ms, and p50 about 46 rose to 85 to 88 ms. Windows and the 5,000-row
+check did not move. These gated samples may be affected by the probe. Commit 030f494 restores
+the registered order: IPC, the gated steps, then the floor, then the profile (results below).
+Every runner had 4 logical CPUs. Milliseconds,
+p50/p95. Floor is the empty frame. Load runs from the scroll event to the DOM holding the
+target row (IPC included). Stop runs from that point to the stop (the next frame and the
+post-paint task). The profile runs after the gated steps, further down the tree.
+
+| Job | CPU | Floor | Gated scroll | Profile load | Profile stop | Verdict |
+|---|---|---|---|---|---|---|
+| desktop, Linux | AMD EPYC 7763 | 22/57 | 85/128 | 8/15 | 121/183 | fail |
+| planted-write, Linux | AMD EPYC 7763 | 23/60 | 88/120 | 11/16 | 116/176 | fail |
+| focus-broken, Linux | AMD EPYC 7763 | 23/59 | 87/126 | 10/16 | 118/175 | fail |
+| planted-outside, Linux | AMD EPYC 9V74 | 22/48 | 66/100 | 9/14 | 84/133 | fail |
+| capability-broadened, Linux | Intel Xeon Platinum 8370C | 18/29 | 51/86 | 7/15 | 77/122 | fail |
+| offered-check-removed, Linux | AMD EPYC 9V45 | 16/25 | 39/59 | 5/11 | 44/69 | fail |
+| modal-trap-removed, Linux | AMD EPYC 9V45 | 17/30 | 41/62 | 5/10 | 47/73 | fail |
+| desktop, Windows | AMD EPYC 7763 | 15.2/16.7 | 31.2/32.7 | 4.2/4.9 | 14.1/15.3 | pass |
+| Playwright, Chromium | (ubuntu-latest) | 16.7/16.9 | 16.6/17.7 | 2.0/2.5 | 3.8/4.9 | pass |
+
+Other measurements:
+
+- Linux: IPC within load was 1 to 2 ms p50, and every step made 2 layout reads and 1 IPC call.
+  The runners' CPU steal and iowait were 0%, and idle was 41 to 52%.
+- Linux: `xdpyinfo` and `xrandr` are not installed on the runner. The page reports a 1280 x 1024
+  screen at depth 24, and the rAF interval p50 was 16 to 20 ms.
+- Windows: Hyper-V video at 1024 x 768, refresh 1 (as reported).
+- The first session's 5,000-row scroll in the same jobs stayed at p95 35 to 43 ms.
+
+What the numbers show:
+
+- On Linux the step's time is almost all in the frame after the DOM change. That frame takes
+  44 to 121 ms (p50), while an unchanged frame takes 16 to 23 ms and the page's own work, IPC
+  included, takes 5 to 11 ms.
+- On Windows, on the same CPU model (EPYC 7763), that frame takes one frame period, 14 ms.
+- The Linux time follows the CPU model: EPYC 9V45 was fastest and EPYC 7763 slowest.
+- Within a session the cost grows. On the desktop Linux job the profile's stop slice rose from
+  107 to 149 ms (median per 40 steps) over its 200 steps.
+- The profile pass is not a decomposition of the gated samples. On Linux it took about 1.5
+  times the gated p50 (137 against 85 ms, 58 against 39 ms); on Windows the two were equal.
+  The slices describe the profile pass.
+- Unchanged frames are already irregular on the EPYC 7763 runners (floor p95 57 to 60 ms).
+- The profile does not separate the grid's DOM work from software rendering or strace. A run of
+  the one-million-row session without the strace wrapper does (cc3e711, below).
+- At this commit the cause of the slow Linux frame was not established. One candidate is WebKitGTK compositing
+  and painting through Mesa's software renderer under Xvfb (the shader cache shows Mesa). That
+  would fit the CPU dependence. Another is the strace wrapper, which also traces the
+  `ftruncate` of WebKit's shared-memory buffers (`/memfd:WebKitSharedMemory`).
+
+Results in the registered order with the probes (commit 030f494): workflow "desktop" run
+44883021601 and the seven jobs of "e2e-variants" run 44883021841. Here the floor runs after
+the gated steps, so it measures frames late in the session, not a fresh frame. The row-cap
+variant fails on its first render and runs no steps, so its floor is a fresh one. Milliseconds;
+floor and gated scroll are p50/p95/max, with the floor's rAF interval p50; profile slices are
+p50/p95.
+
+| Job | CPU | Floor after the steps | rAF | Gated scroll | Profile load | Profile stop | Verdict |
+|---|---|---|---|---|---|---|---|
+| desktop, Linux | AMD EPYC 9V74 | 64/100/122 | 65 | 38/60/68 | 7/11 | 89/130 | fail |
+| focus-broken, Linux | AMD EPYC 9V74 | 62/104/121 | 65 | 40/56/63 | 6/13 | 88/133 | fail |
+| capability-broadened, Linux | Intel Xeon Platinum 8573C | 68/161/206 | 65 | 38/53/67 | 6/11 | 79/126 | fail |
+| modal-trap-removed, Linux | AMD EPYC 7763 | 78/135/157 | 81 | 46/68/84 | 8/14 | 118/176 | fail |
+| offered-check-removed, Linux | AMD EPYC 7763 | 79/124/154 | 81 | 47/66/81 | 7/13 | 118/179 | fail |
+| planted-outside, Linux | AMD EPYC 7763 | 84/130/146 | 81 | 47/65/82 | 7/13 | 121/173 | fail |
+| planted-write, Linux | AMD EPYC 7763 | 82/130/146 | 81 | 45/68/77 | 8/14 | 116/172 | fail |
+| row-cap-removed, Linux (no steps) | AMD EPYC 9V74 | 20/46/56 | 17 | not run | | | fails by design |
+| desktop, Windows | AMD EPYC 9V74 | 15.5/16.7/18.1 | 15.6 | 31.3/32.6/34.9 | 3.5/5.0 | 14.4/15.5 | pass |
+| Playwright, Chromium | (ubuntu-latest) | 16.7/16.8/19.3 | 16.7 | 16.7/17.0/17.7 | 1.3/1.6 | 2.5/3.2 | pass |
+
+What these add:
+
+- No Linux job passed. On the EPYC 7763 the gated scroll was 45 to 47 ms p50 and 65 to 68 ms
+  p95, against 85 to 88 and 120 to 128 ms at 0588a6e on the same CPU model. The floor ahead of
+  the gated steps made them slower; in the registered order they are faster but still over
+  50 ms p95 on these runners.
+- After the gated steps the Linux frame rate has fallen: rAF interval p50 65 to 81 ms, against
+  16 to 20 ms in a fresh session (the 0588a6e floors, and 17 ms for the row-cap variant here).
+  At 0588a6e the 200 unchanged frames also slowed the steps after them. The cost so grows with
+  the frames the session has shown, or with its time; the two are not separated.
+- The gated step medians per 50 steps rise through the run: 41, 46, 49, 59 ms on one EPYC 7763
+  job and 34, 36, 39, 47 ms on the desktop job.
+- Windows does not slow down: medians per 50 steps stay at 31.3 ms and the floor after the
+  steps is one frame period.
+- The page's own work, IPC included, stays at 6 to 8 ms p50 in the profile pass.
+- The cause was not established at this commit. The run without the strace wrapper, later at
+  cc3e711, separates strace from rendering (below).
+
+The investigation sessions (registered in the WAL before any sample, informational, never a
+gate). They are opt-in: the e2e-variants workflow's `ac9_investigate` input sets
+`AC9_INVESTIGATE=1`, and `e2e/run.mjs` then runs them on Linux after the gated sessions, which
+they do not change. Each one is a fresh one-million-row launch, once with the strace wrapper and
+once without:
+
+- steps: floor windows of 60 frames at the start, the middle and the end, around the 200 steps;
+- app idle: the tree shown, no steps, only the floor loop, for as long as the steps session took;
+- blank page: the same launch navigated to `about:blank`, so no app code runs in the page, then
+  the floor loop for the same time.
+
+They use the untraced switch described above (at cc3e711 it was named `PRUNEDISK_AC9_UNTRACED`
+and honoured for any binary). The write observer (PR gate F10) does not see the untraced
+launches; the sandbox snapshot still covers them. Each session
+reads the app process's `TracerPid` from `/proc` and counts as invalid when it does not match
+its arm. Page functions: `e2e/ac9x.mjs`, which reuses `e2e/ac9.mjs`'s step and floor code.
+
+Running-app scroll tally, Linux under the strace wrapper. Through 030f494 the count was 4 of 16
+passed in the registered order. By procedure and head, through cc3e711:
+
+| Procedure | Head | Linux jobs passed | Note |
+|---|---|---|---|
+| registered order | 86fafdc, 0291587, cb39cc1 | 4 of 9 | three desktop runs and six tree-neutral variant jobs; CPU not recorded |
+| registered order | 030f494 | 0 of 7 | desktop run 44883021601, e2e-variants run 44883021841 |
+| registered order | cc3e711 | 1 of 7 | six tree-neutral jobs of e2e-variants run 44884912971 (the gated session each opens with) and desktop push run 44884907082 |
+| registered order, total | | 5 of 23 | the earlier count of 5 of 22 left out desktop run 44884907082 |
+| floor ahead of the gated steps | 0588a6e | 0 of 7 | kept apart: the procedure differed |
+
+- Windows: 5 of 5 passed (86fafdc, 0291587, cb39cc1, 0588a6e, 030f494). Windows has no tracer.
+- The row-cap variant is left out of every count, as it fails by design.
+- At cc3e711 the gated session measured, p50/p95/max: EPYC 7763 46/64/86 and 46/69/79, Xeon
+  Platinum 8573C 35/51/67 and 34/49/60 (the pass), EPYC 9V74 41/55/68 and 39/57/66, and in the
+  desktop push run EPYC 7763 46/66/84.
+
+The blank-page and app-idle controls (e2e-variants run 44884912971 at cc3e711, WAL entries
+w07983c42191 and wf5f38e99704 registered them before any sample). Each arm is a fresh launch of
+the one-million-row session, with the strace wrapper and without it, in the order steps, app
+idle, blank page. The app-idle and blank-page arms run the floor loop for as long as the steps
+arm of the same condition took (17 to 23 s traced, 10 s untraced). The blank page is
+`about:blank` (3 elements, no grid, no app code). All 36 sessions of the six tree-neutral jobs
+were valid: the app process was traced (`TracerPid` above 0) in every traced arm and untraced
+in every untraced arm. Floor p95 in ms at the start, middle and end of each arm:
+
+| CPU (jobs) | Arm | With strace | Without strace |
+|---|---|---|---|
+| AMD EPYC 7763 (2) | steps | 22-23 / 71 / 125-126 | 17 / 17 / 17 |
+| AMD EPYC 7763 (2) | app idle | 21-22 / 77-82 / 141-145 | 17 / 18-19 / 18 |
+| AMD EPYC 7763 (2) | blank page | 20-22 / 80-81 / 136-144 | 17 / 17 / 18 |
+| Intel Xeon Platinum 8573C (2) | steps | 26-29 / 85-97 / 121-135 | 17 / 17 / 17 |
+| Intel Xeon Platinum 8573C (2) | app idle | 27 / 40-41 / 153-157 | 17 / 17-19 / 17 |
+| Intel Xeon Platinum 8573C (2) | blank page | 24-29 / 80-83 / 136-137 | 17 / 17 / 17-18 |
+| AMD EPYC 9V74 (2) | steps | 20 / 57-61 / 103-106 | 17 / 17 / 17 |
+| AMD EPYC 9V74 (2) | app idle | 19-20 / 63-66 / 106-111 | 17 / 18 / 17-19 |
+| AMD EPYC 9V74 (2) | blank page | 20 / 59-66 / 109-118 | 17 / 17-18 / 17-18 |
+
+- With strace the rAF interval p50 goes from 16 ms at the start to 65 to 113 ms at the end, in
+  every arm. Without strace it stays at 16 ms.
+- The blank page, with no app code, slows down exactly as the app does. What slows the frames
+  is in the engine or the harness, not in what the app holds.
+- Time is matched too. At their middle window (about 9 to 11 s in) the traced arms were already
+  at floor p50 27 to 57 ms; the untraced arms were still at 16 ms at their end (10 s). The
+  row-cap variant's app-idle and blank-page arms ran 20 s in both conditions: traced went from
+  floor p50 16 to 62-64 ms, untraced stayed at 16 ms.
+
+The untraced numbers. Without strace, on every CPU class seen (EPYC 7763, Xeon Platinum 8573C,
+EPYC 9V74; two jobs each):
+
+- the scroll steps measured p50/p95/max 33/35-37/36-55 ms (n=200, the same steps and clock as
+  the gate, with floor windows between the halves), and the medians per 50 steps were 33, 33,
+  33, 33;
+- the floor stayed at p50 16 ms and p95 17 to 19 ms in every window, the rAF interval at 16 ms.
+
+With strace, the same steps arm measured 59-60/100-104/118 ms on the EPYC 7763, 39-41/65-69/83-91
+on the Xeon Platinum 8573C and 49/80-82/91-98 on the EPYC 9V74, with medians per 50 steps rising
+from 33-45 to 54-90 ms.
+
+The measurement condition was changed after these results were seen. The running-app scroll
+gate was registered to be timed under the strace wrapper, and the results above were known
+when the change was decided. The reason is the control data: the blank page slows down under
+strace like the app, and nothing slows down without it, so under strace the gate times the
+harness, not the app. Main's ruling (relayed by the stream owner; its WAL entry is in main's
+WAL, inferred) keeps the threshold (50 ms nearest-rank p95), n (200 after 10 warm-up steps) and
+the no-retry rule, and times the scroll in an untraced launch. Floor-relative thresholds and a
+measure-only gate were rejected. The gate as changed is described at the top of this section
+(the sessions and the untraced switch) and was registered
+before its first run (WAL w3bd2a24a6c6, amended in wad2689e80fc before any run).
+
+Both builds showed 1,000,001 rows before measuring in both runs. Linux's WebDriver clock ticks in whole
+milliseconds. The variant run is workflow "e2e-variants" run 44877270665 at 86fafdc. In it,
+`row-cap-removed` failed `timing.synth_1m.scroll_p95` on the first render ("1001 .tg-row
+elements in the DOM, more than 200"), and the other six variants were still caught.
+
+First run of the gate as changed, at 8a44bd8 (declared before launch in WAL wae5ee3be10d; one
+desktop push run and one e2e-variants dispatch, nothing retried or added). Untraced timed scroll,
+n=200 after 10 warm-up steps, p50/p95/max in ms:
+
+| Run, job | CPU (4 logical) | Scroll | Medians per 50 | Result |
+|---|---|---|---|---|
+| desktop 44888130804, end-to-end Linux | Intel Xeon Platinum 8573C | 33/36/40 | 33, 33, 33, 33 | pass |
+| desktop 44888130804, end-to-end Windows | AMD EPYC 9V74 | 31.2/32.2/32.7 | 31.2 x 4 | pass |
+| e2e-variants 44888136341, capability-broadened | Intel Xeon Platinum 8573C | 33/36/37 | 33 x 4 | pass |
+| e2e-variants 44888136341, planted-write | AMD EPYC 9V74 | 33/36/44 | 33 x 4 | pass |
+| e2e-variants 44888136341, focus-broken | AMD EPYC 7763 | 33/36/37 | 33, 33, 33, 34 | pass |
+| e2e-variants 44888136341, offered-check-removed | AMD EPYC 7763 | 33/36/38 | 33 x 4 | pass |
+| e2e-variants 44888136341, modal-trap-removed | AMD EPYC 7763 | 33/36/71 | 33 x 4 | pass |
+| e2e-variants 44888136341, planted-outside | AMD EPYC 7763 | 33/36/39 | 33 x 4 | pass |
+
+- In every Linux job the traced launch showed 1,000,001 rows with the app traced, passed
+  `timing.synth_1m.ipc_tree_page_p95` (p95 5 to 9 ms, n=100) and `steps.synth_1m.traced_scroll`
+  (210 steps, 29 to 30 `.tg-row`, untimed). The desktop run's trace step reported "trace logs: 2
+  (one per traced launch)", "untraced launches ...: 1", "traced one-million-row launches: 1" and
+  "every write is declared or ignored".
+- `row-cap-removed` failed exactly `timing.synth_1m.scroll_p95` and
+  `steps.synth_1m.traced_scroll`, both "before the first step (initial render): 1000 .tg-row
+  elements in the DOM, more than 200".
+- `untraced-switch-shipped` (job 136797825678): `check-shipped.sh` failed on the release build
+  with the planted switch, reporting `::error::/home/runner/work/_temp/shipped/prunedisk-desktop
+  holds "PRUNEDISK_E2E_UNTRACED"`.
+
+Caveat on these numbers and on every earlier Linux result in this section: all were taken while
+an orphaned app instance could still be running. In run 44888130804 and in all eight Linux
+variant jobs of 44888136341, the app of an earlier traced session (`/home/runner/work/_temp/bin/e2e`,
+parent pid 1) was still alive through both one-million-row sessions, with the app of the traced
+one-million-row session alive after it closed. Only one app instance at a time was expected.
+The results stand as measured (main's ruling, relayed by the stream owner; inferred). The
+comparison with and without strace is to be repeated once after the wrapper fix, as registered
+before any sample in the helper's WAL (w731ed354b12).
+
+What a traced session leaves, at 8a44bd8 (the wrapper as it was: `strace` exec'd in place of
+the app, without `-D`; `info.synth_1m.after_close.*`, 2 s and 10 s after the session closed,
+identical):
+
+- Traced: the strace process (the pid the driver started) was gone. The app was alive, its
+  `/proc/<pid>/stat` reading `14477 (e2e) S 1 1804 1804 0 -1 ...`: state S, parent pid 1
+  (systemd), `TracerPid` 0, 28 open files. Its WebKitNetworkProcess (`14493 (WebKitNetworkPr) S
+  14477 ...`, 18 open files) was alive too; the web process was gone.
+- Untraced: the app and both WebKit processes were gone at 2 s.
+- The same in all eight Linux variant jobs.
+- Workflow "desktop-close" run 44888130843 at the same head, never under strace: on the 22 close
+  routes that end the app, the app, its worker and every child were gone in 0.04 to 2.4 s. On
+  the leader-destroy route the app keeps running, as that route expects. The no-action control
+  failed as required.
+
+Main ruled the leftover a test-tooling defect. Likely, not proven: the driver ends the process it
+started, which was strace; strace's exit detaches the app, which is then orphaned and runs on
+untraced. The wrapper fix (`strace -DD`) is to show it: after it, the traced session must leave
+nothing. Writes after the detach were not traced.
+
+The DOM limit counts every `.tg-row`, selected or not, the header row included. Since 5530ecf
+the grid holds to it in every state (main's ruling, relayed by the stream owner; inferred): at
+most 199 data rows beside the header, and 198 while the focused row is scrolled away and
+pinned, so a slot is kept for the pin only while one is shown. Rows past that room are dropped
+from whatever page the backend returns. Before 5530ecf the grid could hold 201 `.tg-row`
+elements at the cap with the focused row in view, and 202 with it pinned. `src/tree.test.ts`
+requires exactly 200 in both states (a 1,003-row tree in a very tall window) and was red on
+87221db's `tree.ts` (202 and 201). At the app's window height the grid holds a few dozen rows,
+far under the limit.
+
 Broken variants (workflow "e2e-variants", Linux): each patch in `e2e/variants/` breaks one
-guarantee, and `e2e/expect_variant.py` passes only when the check written for it fails:
+guarantee, and `e2e/expect_variant.py` passes only when the check written for it fails, for
+that reason. Where the table names a text, each listed check must report it. A listed check
+that failed on a precondition ("not measured") was never measured, so for a variant without
+such a text it is no catch.
 
 | Patch | What it breaks | Check that must fail |
 |---|---|---|
@@ -590,6 +1065,11 @@ guarantee, and `e2e/expect_variant.py` passes only when the check written for it
 | `focus-broken.patch` | the shorten question gives first focus to Shorten | `settings.save_confirm_keep_escape` |
 | `modal-trap-removed.patch` | the question opens non-modally: no inert background, no Tab trap | `settings.confirm_focus_contained` |
 | `planted-outside.patch` | writes `/tmp/prunedisk-planted-outside`, outside every snapshot root | trace: `OTHER openat: /tmp/prunedisk-planted-outside` (and the manifest must not see it) |
+| `row-cap-removed.patch` | the size tree's row cap is raised to 1000 and the grid renders up to the cap (a 1000-row buffer). Raising or deleting `MAX_DOM_ROWS` alone changes nothing at the app's window height, where the visible height (about 28 rows) is the binding limit, so the patch also renders the cap | `timing.synth_1m.scroll_p95` and `steps.synth_1m.traced_scroll` |
+| `untraced-switch-shipped.patch` | reads `PRUNEDISK_E2E_UNTRACED` outside the e2e feature, so a release build holds the untraced switch (its own job: a release build, no suite) | `e2e/check-shipped.sh`: `holds "PRUNEDISK_E2E_UNTRACED"` |
+| `untraced-ignored.patch` | `e2e/run.mjs` sets the untraced switch under another name, so every launch is traced | `timing.ipc_tree_page_p95`, `timing.scroll_p95`, `timing.synth_1m.ipc_tree_page_p95`, `timing.synth_1m.scroll_p95`, each reporting "not shown to be untraced; not measured" |
+| `scan-settings-differ.patch` | the default scan unticks the git-facts box instead of requiring it on, so the first-run and untraced scans differ from the main one | `flow.default_scan_settings_match`, reporting "scanned under other settings than the main session" |
+| `other-instance-alive.patch` | a second app instance (a copy of the e2e binary named `prunedisk-desktop`, in a home of its own) runs from before the untraced timing session to the end | `timing.synth_1m.ipc_tree_page_p95`, `timing.synth_1m.scroll_p95`, each reporting "another app instance is alive at the session start" and naming `prunedisk-deskt` (an orphan of the e2e build alone is no catch) |
 
 macOS: no WebDriver exists for an app's WKWebView. Apple's safaridriver drives Safari only,
 and tauri-driver supports Linux and Windows only. On macOS the app is covered by:
