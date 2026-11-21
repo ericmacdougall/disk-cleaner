@@ -8,7 +8,9 @@ use super::manifest::{Manifest, Row, Segment};
 use super::recheck::{self, Member};
 use super::shard::{self, BlobSrc, UploadHooks};
 use super::storage::Rclone;
-use super::{canonical, names, ApplyError, ApplyOptions, ApplyReport, CrashPoint, PieceReport};
+use super::{
+    canonical, names, ApplyError, ApplyOptions, ApplyReport, CrashPoint, PieceReport, RESCAN_HINT,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -340,6 +342,7 @@ pub fn apply(
             }
         }
         ctx.report.uploaded_bytes = bytes;
+        mark_rescan(&mut ctx.report);
         return Ok(ctx.report);
     }
 
@@ -400,6 +403,7 @@ pub fn apply(
     // Closing mirror, whatever happened (revision 2c, finding 4).
     let _ = mirror(&mut ctx);
     result?;
+    mark_rescan(&mut ctx.report);
     Ok(ctx.report)
 }
 
@@ -480,6 +484,27 @@ fn dry_word(l: Lane) -> &'static str {
     }
 }
 
+/// The reason for a piece whose scan piece drifted. When entries of that scan piece were
+/// already removed under this scan (an earlier run or batch), the scan itself is stale: the
+/// reason leads with [`RESCAN_HINT`] and the piece is listed in `rescan_needed`.
+fn drift_reason(what: &str, d: &recheck::Drift, earlier: &BTreeMap<String, Ident>) -> String {
+    if earlier.is_empty() {
+        format!("{what}: {}", d.0)
+    } else {
+        format!("{RESCAN_HINT} ({what}: {})", d.0)
+    }
+}
+
+/// The one place `rescan_needed` is computed: every kept piece whose reason is the rescan hint.
+fn mark_rescan(rep: &mut ApplyReport) {
+    rep.rescan_needed = rep
+        .pieces
+        .iter()
+        .filter(|r| r.outcome == "kept" && r.reason.starts_with(RESCAN_HINT))
+        .map(|r| r.id)
+        .collect();
+}
+
 fn set_outcome(rep: &mut ApplyReport, piece: usize, outcome: &str, reason: &str) {
     if let Some(r) = rep.pieces.iter_mut().find(|r| r.id == piece) {
         r.outcome = outcome.to_string();
@@ -532,7 +557,8 @@ fn prepare(
     let removed = ctx
         .manifest
         .removed_under(p.scan_piece, &sp.path, &ctx.inputs.scan_digest);
-    recheck::recheck(sp, &removed).map_err(|d| format!("changed since the scan: {}", d.0))?;
+    recheck::recheck(sp, &removed)
+        .map_err(|d| drift_reason("changed since the scan", &d, &removed))?;
     let en = recheck::enumerate(p.kind, &p.path, &p.files, &p.excludes).map_err(|d| d.0)?;
     if let Some(m) = en.members.iter().find(|m| m.id.kind == 'o') {
         return Err(format!("{} is a FIFO, socket or device file", m.rel));
@@ -1067,7 +1093,7 @@ fn remove_phase(ctx: &mut Ctx, mut ready: Vec<Prepared>) -> Result<(), ApplyErro
                         &mut ctx.report,
                         pr.piece,
                         "kept",
-                        &format!("changed during the backup: {}", d.0),
+                        &drift_reason("changed during the backup", &d, &removed),
                     );
                     continue;
                 }

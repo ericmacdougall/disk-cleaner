@@ -77,6 +77,21 @@ else is put back. A crash between those steps can leave such a name behind, and 
 finishes it. One that is reported as "left at" a `.pd-rm-` path is a different file that took the
 name and was not removed.
 
+Removing part of a folder changes that folder, so a later `apply` with the same scan file keeps
+the rest of it with the reason "an earlier apply run changed this folder; scan again to continue".
+Run `scan` again and make a new plan.
+
+`apply` exits with:
+
+| Status | Meaning |
+|---|---|
+| 0 | Done (or the dry run was printed). |
+| 1 | Another error; read the message. |
+| 2 | The scan or plan was refused before anything was done. |
+| 3 | Another `apply` is running. |
+| 4 | A shard failed; the pieces that depend on it were kept. |
+| 5 | Some pieces were kept because an earlier apply run changed their folder; scan again. |
+
 ### Getting files back
 
 `disk-cleaner restore --path <removed file or folder> --remote <the same remote>` puts removed files

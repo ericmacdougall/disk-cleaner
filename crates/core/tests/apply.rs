@@ -892,6 +892,55 @@ fn sibling_removed_in_an_earlier_run_passes_recheck() {
     assert!(!s.exists());
 }
 
+/// Main's ruling on stream A's directory re-check: when a scan piece drifts after an earlier
+/// run of the same scan removed entries from it, the scan is stale. Its pieces are kept, the
+/// reason says to scan again, and the report lists them in `rescan_needed` (the CLI exits 5).
+/// The same drift with no earlier run is an ordinary change: no hint, nothing listed.
+#[test]
+fn a_piece_kept_after_an_earlier_run_of_the_same_scan_says_scan_again() {
+    use disk_cleaner_core::apply::RESCAN_HINT;
+    for earlier_run in [true, false] {
+        let fx = Fx::new();
+        let s = fx.data.join("s");
+        fx.write("s/d1.bin", b"one");
+        fx.write("s/d2.bin", b"two");
+        fx.write("s/rest/r.txt", b"rest");
+        let scan = scan_doc(&[&fx.data], &[P::tree(&s, "backup")]);
+        if earlier_run {
+            let plan_a = plan_doc(&scan, &[P::derived(&s, "d1.bin", 0, "backup")]);
+            let rep = apply(&scan, &plan_a, &fx.opts(true)).unwrap();
+            assert_eq!(rep.pieces[0].outcome, "removed", "{rep:?}");
+            assert!(rep.rescan_needed.is_empty(), "{rep:?}");
+        }
+        // The folder changes after the scan, without making the group active (a status
+        // change only, like the directory ctime that stream A's re-check reads).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let r = s.join("rest/r.txt");
+        fs::set_permissions(&r, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut residual = P::tree(&s, "backup");
+        residual.moved_out = vec!["d1.bin".into(), "d2.bin".into()];
+        let plan_b = plan_doc(&scan, &[residual, P::derived(&s, "d2.bin", 0, "backup")]);
+        let rep = apply(&scan, &plan_b, &fx.opts(true)).unwrap();
+        for p in &rep.pieces {
+            assert_eq!(p.outcome, "kept", "{earlier_run}: {rep:#?}");
+            assert_eq!(
+                p.reason.starts_with(RESCAN_HINT),
+                earlier_run,
+                "{earlier_run}: {}",
+                p.reason
+            );
+        }
+        let want: Vec<usize> = if earlier_run {
+            rep.pieces.iter().map(|p| p.id).collect()
+        } else {
+            vec![]
+        };
+        assert_eq!(rep.rescan_needed, want, "{earlier_run}: {rep:#?}");
+        assert_eq!(fs::read(s.join("d2.bin")).unwrap(), b"two");
+        assert_eq!(fs::read(s.join("rest/r.txt")).unwrap(), b"rest");
+    }
+}
+
 #[test]
 fn many_derived_pieces_cross_the_batch_boundary() {
     let fx = Fx::new();

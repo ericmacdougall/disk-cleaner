@@ -368,6 +368,17 @@ pub fn apply_summary(r: &disk_cleaner_core::apply::ApplyReport) -> String {
             r.removed_entries
         );
     }
+    if !r.rescan_needed.is_empty() {
+        let _ = writeln!(
+            o,
+            "Scan again: {} piece(s) were kept because {}.",
+            r.rescan_needed.len(),
+            disk_cleaner_core::apply::RESCAN_HINT
+                .split(';')
+                .next()
+                .unwrap_or_default()
+        );
+    }
     o
 }
 

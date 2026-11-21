@@ -367,16 +367,34 @@ fn run_apply(a: ApplyArgs) -> Result<()> {
     if local.is_absolute() {
         opts.remote_local = Some(local);
     }
-    let rep = apply(&scan_text, &plan_text, &opts)?;
-    if a.json {
-        println!("{}", serde_json::to_string_pretty(&rep)?);
-    } else {
-        print!("{}", report::apply_summary(&rep));
+    let res = apply(&scan_text, &plan_text, &opts);
+    match &res {
+        Ok(rep) if a.json => println!("{}", serde_json::to_string_pretty(rep)?),
+        Ok(rep) => print!("{}", report::apply_summary(rep)),
+        Err(e) => eprintln!("disk-cleaner apply: {e}"),
     }
-    if !rep.shards_failed.is_empty() {
-        std::process::exit(4);
+    match apply_exit_code(&res) {
+        0 => Ok(()),
+        code => std::process::exit(code),
     }
-    Ok(())
+}
+
+/// Exit status of `apply`, documented in the README: 0 done; 1 another error; 2 the scan or
+/// plan was refused before anything was done; 3 another apply holds the lock; 4 a shard failed,
+/// so the pieces depending on it were kept; 5 pieces were kept because an earlier apply run
+/// changed their folder, so scan again to continue. A failed shard outranks a stale scan.
+fn apply_exit_code(
+    res: &Result<disk_cleaner_core::apply::ApplyReport, disk_cleaner_core::apply::ApplyError>,
+) -> i32 {
+    use disk_cleaner_core::apply::ApplyError;
+    match res {
+        Err(ApplyError::Plan(_)) => 2,
+        Err(ApplyError::Locked(_)) => 3,
+        Err(_) => 1,
+        Ok(rep) if !rep.shards_failed.is_empty() => 4,
+        Ok(rep) if !rep.rescan_needed.is_empty() => 5,
+        Ok(_) => 0,
+    }
 }
 
 #[cfg(not(unix))]
@@ -414,4 +432,47 @@ fn run_restore(a: RestoreArgs) -> Result<()> {
         std::process::exit(4);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_exit_code;
+    use disk_cleaner_core::apply::{ApplyError, ApplyReport};
+    use std::path::PathBuf;
+
+    #[test]
+    fn apply_exit_codes_are_distinct_and_a_failed_shard_outranks_a_stale_scan() {
+        assert_eq!(apply_exit_code(&Ok(ApplyReport::default())), 0);
+        assert_eq!(apply_exit_code(&Err(ApplyError::Io("x".into()))), 1);
+        assert_eq!(apply_exit_code(&Err(ApplyError::Plan("x".into()))), 2);
+        assert_eq!(
+            apply_exit_code(&Err(ApplyError::Locked(PathBuf::from("/l")))),
+            3
+        );
+        let stale = ApplyReport {
+            rescan_needed: vec![1],
+            ..Default::default()
+        };
+        assert_eq!(apply_exit_code(&Ok(stale.clone())), 5);
+        let both = ApplyReport {
+            shards_failed: vec!["s".into()],
+            ..stale
+        };
+        assert_eq!(apply_exit_code(&Ok(both)), 4);
+    }
+
+    #[test]
+    fn the_summary_says_to_scan_again() {
+        let rep = ApplyReport {
+            rescan_needed: vec![0, 2],
+            ..Default::default()
+        };
+        let s = super::report::apply_summary(&rep);
+        assert!(
+            s.contains(
+                "Scan again: 2 piece(s) were kept because an earlier apply run changed this folder."
+            ),
+            "{s}"
+        );
+    }
 }

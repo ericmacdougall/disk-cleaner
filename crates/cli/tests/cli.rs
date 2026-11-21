@@ -225,6 +225,29 @@ fn scan_json_on_stdout_and_unicode_paths_round_trip_into_the_plan() {
     assert_eq!(loose["action"], "ask");
 }
 
+/// `apply` refuses a scan or plan it cannot use with exit 2 (NEG-9), before anything is done,
+/// and says why on stderr. The status table is in `apply_exit_code` and the README.
+#[cfg(unix)]
+#[test]
+fn apply_refuses_an_unusable_plan_with_exit_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scan = tmp.path().join("scan.json");
+    let plan = tmp.path().join("plan.json");
+    fs::write(&scan, "{\"schema_version\": 1}").unwrap();
+    fs::write(&plan, "not json").unwrap();
+    let o = run(bin()
+        .env("HOME", tmp.path())
+        .args(["apply", "--scan", scan.to_str().unwrap()])
+        .args(["--plan", plan.to_str().unwrap()])
+        .args(["--remote", tmp.path().join("remote").to_str().unwrap()]));
+    assert_eq!(o.status.code(), Some(2), "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("refusing the plan"),
+        "{o:?}"
+    );
+    assert!(!tmp.path().join("remote").exists());
+}
+
 #[test]
 fn active_flag_keeps_everything_under_it() {
     let tmp = tempfile::tempdir().unwrap();

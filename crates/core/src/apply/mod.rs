@@ -353,7 +353,15 @@ pub struct ApplyReport {
     pub shards_uploaded: usize,
     pub shards_failed: Vec<String>,
     pub removed_entries: u64,
+    /// Pieces kept because their scan piece no longer matches the scan after an earlier apply
+    /// run (or batch) of the same scan removed entries from it. The scan is stale; only a new
+    /// scan lets apply continue there. The CLI exits with its own status when this is not empty.
+    pub rescan_needed: Vec<usize>,
 }
+
+/// The reason given for a piece kept because an earlier run of the same scan changed its
+/// folder (main's ruling on stream A's directory re-check, goodqa#16529).
+pub const RESCAN_HINT: &str = "an earlier apply run changed this folder; scan again to continue";
 
 /// Validate inputs without acting (exposed for the CLI and tests).
 pub fn parse_inputs(
