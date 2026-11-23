@@ -2420,3 +2420,508 @@ fn locus_choke_point_session() {
         }
     }
 }
+
+// ------------------------------------------------------------- F1: the one agent walker
+//
+// goodqa#16711 gate F1 (class U, main triage wddbaa118ddc). These tests use only plan output,
+// JSON and string literals, so they compile against 71c21a1's evidence.rs too, where they fail
+// (failing-first record in the repair packet).
+
+/// The 71c21a1 body of `files_below`: listing, entry and type errors dropped. The lint must
+/// find it.
+const PLANTED_BYPASS: &str = r#"
+    while let Some((d, lvl)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(ft) = e.file_type() else {
+                continue;
+            };
+            if ft.is_file() && want(&e.file_name().to_string_lossy()) {
+                out.push((e.path(), e.metadata().ok().as_ref().and_then(mtime_of)));
+            }
+        }
+    }
+"#;
+
+/// The source lint: every filesystem call of `evidence.rs` other than the bounded reads named
+/// here belongs in `evidence/walk.rs`, so no walk can drop an error out of sight. Returns each
+/// offending line.
+fn walk_lint(src: &str) -> Vec<String> {
+    const FORBIDDEN: [&str; 14] = [
+        "read_dir(",
+        ".flatten()",
+        "filter_map(Result::ok)",
+        "Err(_) => continue",
+        "metadata(",
+        ".file_type()",
+        ".is_dir()",
+        ".is_file()",
+        ".exists()",
+        ".is_symlink()",
+        "read_link(",
+        "use std::fs",
+        "walkdir",
+        "jwalk",
+    ];
+    // Reads whose errors are classified where they happen (a transcript head, a `.git` file,
+    // a registry entry) and path canonicalisation.
+    const FS_ALLOWED: [&str; 3] = [
+        "std::fs::File::open(",
+        "std::fs::read(",
+        "std::fs::canonicalize(",
+    ];
+    let mut bad = Vec::new();
+    for (k, line) in src.lines().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        let mut hit = FORBIDDEN.iter().any(|f| code.contains(f));
+        let mut at = 0;
+        while let Some(i) = code[at..].find("fs::") {
+            let i = at + i;
+            let start = i.saturating_sub(5);
+            if !FS_ALLOWED.iter().any(|a| code[start..].starts_with(a)) {
+                hit = true;
+            }
+            at = i + 4;
+        }
+        if hit {
+            bad.push(format!("{}: {}", k + 1, line.trim()));
+        }
+    }
+    bad
+}
+
+/// F1 guard: `evidence.rs` walks agent data only through the walker; the lint fails on the
+/// 71c21a1 `files_below` body and on a one-line bypass planted into the real source, so it can
+/// fail. (Fails at 71c21a1: its evidence.rs has nine such lines.)
+#[test]
+fn walk_choke_point_lint() {
+    let src = include_str!("../evidence.rs");
+    let bad = walk_lint(src);
+    assert!(
+        bad.is_empty(),
+        "filesystem calls outside the walker:\n{}",
+        bad.join("\n")
+    );
+    let planted = walk_lint(PLANTED_BYPASS);
+    assert!(planted.len() >= 4, "the planted bypass was not caught: {planted:?}");
+    for bypass in [
+        "    for e in std::fs::read_dir(d).unwrap().flatten() {}",
+        "    let names: Vec<_> = rd.filter_map(Result::ok).collect();",
+        "        Err(_) => continue,",
+        "    if cand.is_dir() { out.push(cand); }",
+        "    let m = e.metadata().ok();",
+        "    let m = fs::symlink_metadata(&p);",
+    ] {
+        let doctored = format!("{src}\n{bypass}\n");
+        assert_eq!(
+            walk_lint(&doctored).len(),
+            1,
+            "a planted bypass was not caught: {bypass}"
+        );
+    }
+}
+
+/// A directory made unreadable (mode 000) for the life of the value; restored on drop, before
+/// the fixture's temp dir is removed. `None` (with a loud note) when the test runs as a user
+/// who can read it anyway.
+#[cfg(unix)]
+struct Locked(PathBuf);
+
+#[cfg(unix)]
+impl Locked {
+    fn new(p: PathBuf, mode: u32) -> Option<Locked> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+        let l = Locked(p);
+        let probe = fs::read_dir(&l.0).and_then(|mut rd| {
+            rd.try_for_each(|e| e.and_then(|e| fs::metadata(e.path())).map(|_| ()))
+        });
+        if probe.is_ok() {
+            eprintln!(
+                "SKIPPED: running as a user who can read a mode-{mode:o} folder ({}); the \
+                 unreadable-directory case is not checked",
+                l.0.display()
+            );
+            return None;
+        }
+        Some(l)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Locked {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+fn plan_value(p: &Plan) -> serde_json::Value {
+    serde_json::to_value(p).unwrap()
+}
+
+/// Mark `path`'s item `backup-then-remove` in a plan's JSON (what a fail-open tool would say),
+/// for the oracle.
+fn offer_in(pv: &serde_json::Value, path: &Path) -> String {
+    let mut pv = pv.clone();
+    let want = path.to_string_lossy().into_owned();
+    for it in pv["items"].as_array_mut().unwrap() {
+        if it["path"].as_str() == Some(&want) {
+            it["action"] = serde_json::Value::String("backup-then-remove".into());
+        }
+    }
+    serde_json::to_string(&pv).unwrap()
+}
+
+/// One unreadable-directory case: the directory to lock and the transcript inside it that
+/// records `cwd`.
+struct DirCase {
+    what: &'static str,
+    dir: &'static str,
+    transcript: Option<&'static str>,
+}
+
+const DIR_CASES: [DirCase; 4] = [
+    DirCase {
+        what: "Claude projects/<slug>/",
+        dir: ".claude/projects/-hidden",
+        transcript: Some(".claude/projects/-hidden/0001.jsonl"),
+    },
+    DirCase {
+        what: "Claude <id>/subagents/",
+        dir: ".claude/projects/-proj/0002/subagents",
+        transcript: Some(".claude/projects/-proj/0002/subagents/agent-1.jsonl"),
+    },
+    DirCase {
+        what: "Codex sessions/YYYY/MM/DD",
+        dir: ".codex/sessions/2026/01/02",
+        transcript: Some(".codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-0009.jsonl"),
+    },
+    DirCase {
+        what: "Claude registry dir",
+        dir: ".claude/sessions",
+        transcript: None,
+    },
+];
+
+/// Write the case's transcript (an hour old) recording `cwd`.
+fn dir_case_transcript(l: &Live, c: &DirCase, cwd: &Path) {
+    let Some(rel) = c.transcript else {
+        l.fx.dir(c.dir);
+        return;
+    };
+    let text = if rel.contains("rollout-") {
+        codex_rollout(&cwd.to_string_lossy(), "synthetic")
+    } else {
+        format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display())
+    };
+    l.fx.write(rel, &text);
+    l.fx.date(rel, 3600);
+}
+
+/// F1 contract (AC-14): a directory of agent data that cannot be listed (mode 000) — a Claude
+/// project dir, a subagents dir, a Codex day folder, the registry dir — hides whatever is in it,
+/// so every removing item under the agent dirs asks ("agent data unreadable",
+/// `agent-dir-unreadable` recent) while an item elsewhere is offered. Mirrors with the
+/// directory readable: a transcript recording a cwd elsewhere leaves the checkout offered, and
+/// one recording the checkout keeps it (what the locked directory hid). The oracle agrees: it
+/// passes the tool's plan and flags the same plan with the checkout offered. (Fails at
+/// 71c21a1: the locked directory was skipped and the checkout offered.)
+#[cfg(unix)]
+#[test]
+fn unreadable_agent_dir_fails_closed() {
+    for c in &DIR_CASES {
+        // Mirror 1: readable, the transcript works elsewhere: offered.
+        let l = live_fixture();
+        dir_case_transcript(&l, c, &l.fx.p("projects/foo"));
+        let p = l.fx.plan(ProcessSnapshot::none_running());
+        assert_eq!(
+            action(&p, &l.wt),
+            Action::BackupThenRemove,
+            "{} readable mirror: {}",
+            c.what,
+            why(&p, &l.wt)
+        );
+        assert!(
+            plan_value(&p)["coverage_gaps"]["agent_data_recent"]
+                .get("agent-dir-unreadable")
+                .is_none(),
+            "{}",
+            c.what
+        );
+        // Mirror 2: readable, the transcript records the checkout: kept.
+        if c.transcript.is_some() {
+            let l = live_fixture();
+            dir_case_transcript(&l, c, &l.wt);
+            let p = l.fx.plan(ProcessSnapshot::none_running());
+            assert_eq!(
+                action(&p, &l.wt),
+                Action::Keep,
+                "{} readable, recording the checkout: {}",
+                c.what,
+                why(&p, &l.wt)
+            );
+        }
+        // Locked: the transcript (recording the checkout) cannot be seen; fail closed.
+        let l = live_fixture();
+        dir_case_transcript(&l, c, &l.wt);
+        let Some(_lock) = Locked::new(l.fx.p(c.dir), 0o000) else {
+            return;
+        };
+        let p = l.fx.plan(ProcessSnapshot::none_running());
+        let it = item(&p, &l.wt);
+        assert_eq!(it.action, Action::Ask, "{} locked: {}", c.what, why(&p, &l.wt));
+        assert!(
+            it.reason.contains("agent data unreadable"),
+            "{}: {}",
+            c.what,
+            it.reason
+        );
+        let pv = plan_value(&p);
+        assert!(
+            pv["coverage_gaps"]["agent_data_recent"]["agent-dir-unreadable"]
+                .as_u64()
+                .is_some_and(|n| n >= 1),
+            "{}: {}",
+            c.what,
+            pv["coverage_gaps"]
+        );
+        assert!(
+            pv["evidence_notes"]
+                .as_array()
+                .is_some_and(|n| n.iter().any(|n| n
+                    .as_str()
+                    .is_some_and(|n| n.contains("agent-dir-unreadable")
+                        && n.contains(c.dir)))),
+            "{}: {}",
+            c.what,
+            pv["evidence_notes"]
+        );
+        assert_eq!(
+            action(&p, &l.out),
+            Action::BackupThenRemove,
+            "{} elsewhere: {}",
+            c.what,
+            why(&p, &l.out)
+        );
+        // Oracle parity: the tool's plan passes; the same plan offering the checkout is
+        // flagged because the oracle cannot list the directory either.
+        let (ok, out) = oracle_on(&l.fx, &serde_json::to_string(&pv).unwrap());
+        assert!(ok, "{}: oracle rejected the tool's plan:\n{out}", c.what);
+        let (ok, out) = oracle_on(&l.fx, &offer_in(&pv, &l.wt));
+        assert!(
+            !ok && out.contains("recent agent data is unreadable"),
+            "{}: oracle did not flag an offered checkout beside an unlistable dir:\n{out}",
+            c.what
+        );
+    }
+}
+
+/// F1: a transcript whose metadata cannot be read (its directory listable but not searchable,
+/// mode 0444) is of unknown age, so recent: an `agent-dir-unreadable` gap, and removals under
+/// the agent dirs ask.
+#[cfg(unix)]
+#[test]
+fn unreadable_transcript_time_is_recent() {
+    let l = live_fixture();
+    let rel = ".claude/projects/-noexec/t.jsonl";
+    l.fx.write(rel, &format!("{{\"cwd\":\"{}\"}}\n", l.fx.s("projects/foo")));
+    l.fx.date(rel, 400 * DAY);
+    let Some(_lock) = Locked::new(l.fx.p(".claude/projects/-noexec"), 0o444) else {
+        return;
+    };
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    let it = item(&p, &l.wt);
+    assert_eq!(it.action, Action::Ask, "{}", why(&p, &l.wt));
+    assert!(it.reason.contains("agent data unreadable"), "{}", it.reason);
+    assert!(
+        plan_value(&p)["coverage_gaps"]["agent_data_recent"]["agent-dir-unreadable"]
+            .as_u64()
+            .is_some_and(|n| n >= 1),
+        "{}",
+        plan_value(&p)["coverage_gaps"]
+    );
+}
+
+/// F1: a checkout's git admin files that cannot be read make its activity unknown, so active
+/// (never old): a linked worktree whose gitdir cannot be searched is not offered. Mirror: the
+/// same worktree, readable and untouched for 400 days, is offered. (Fails at 71c21a1: the
+/// unreadable admin files were skipped and only the old `.git` file's ctime counted.)
+#[cfg(unix)]
+#[test]
+fn unreadable_git_admin_is_active() {
+    let setup = || {
+        let fx = Fx::new();
+        let main = fx.repo("code/main");
+        let wt = fx.dir(".agent-harness/work/s9/w9");
+        fx.write(".agent-harness/work/s9/w9/src/lib.rs", "fn x() {}\n");
+        fx.write(
+            ".agent-harness/work/s9/w9/.git",
+            &format!("gitdir: {}/.git/worktrees/w9\n", main.display()),
+        );
+        fx.write("code/main/.git/worktrees/w9/HEAD", "ref: refs/heads/w9\n");
+        fx.write("code/main/.git/worktrees/w9/index", "x");
+        fx.write(
+            "code/main/.git/worktrees/w9/gitdir",
+            &format!("{}/.git\n", wt.display()),
+        );
+        fx.age_all();
+        (fx, wt)
+    };
+    // The `.git` file's ctime is the real time of writing, 400 days before the fixture's now.
+    let (fx, wt) = setup();
+    let p = fx.plan(ProcessSnapshot::none_running());
+    assert!(
+        item(&p, &wt).action.removes(),
+        "readable mirror: {}",
+        why(&p, &wt)
+    );
+    let (fx, wt) = setup();
+    let Some(_lock) = Locked::new(fx.p("code/main/.git/worktrees/w9"), 0o000) else {
+        return;
+    };
+    let p = fx.plan(ProcessSnapshot::none_running());
+    let it = item(&p, &wt);
+    assert!(!it.action.removes(), "unreadable admin files: {}", why(&p, &wt));
+    assert_eq!(it.days_since_activity, Some(0), "{}", why(&p, &wt));
+}
+
+// --------------------------------------------------- F5: boundaries on exact durations
+
+/// F5 (goodqa#16804 item 5): `recent` is age <= 7 days, inclusive; a checkout of a live session
+/// or an agent worktree with no locus asks while 7 days < age < 14 days, to the second; at 14
+/// days or more the normal rules apply. Each boundary is checked at exactly 7 and 14 days and
+/// one second either side, and the oracle agrees at each point (it flags an offered checkout
+/// inside 14 days and passes one at exactly 14). (At 71c21a1 the Rust side already held these
+/// points through whole-day truncation; the oracle failed at exactly 14 days.)
+#[test]
+fn idle_ask_boundaries_exact() {
+    let cases = [
+        (7 * DAY - 1, Action::Keep),
+        (7 * DAY, Action::Keep),
+        (7 * DAY + 1, Action::Ask),
+        (14 * DAY - 1, Action::Ask),
+        (14 * DAY, Action::BackupThenRemove),
+        (14 * DAY + 1, Action::BackupThenRemove),
+    ];
+    for (ago, want) in cases {
+        // A live session (a WAL written an hour ago) and its checkout aged `ago`.
+        let l = live_fixture();
+        l.fx.write(".agent-harness/work/s1/wal/main.jsonl", "{}\n");
+        l.fx.date(".agent-harness/work/s1/wal/main.jsonl", 3600);
+        l.fx.date(".agent-harness/work/s1/wt/src/lib.rs", ago);
+        let p = l.fx.plan(ProcessSnapshot::none_running());
+        let it = item(&p, &l.wt);
+        assert_eq!(it.action, want, "session, age {ago}s: {}", why(&p, &l.wt));
+        if want == Action::Ask {
+            let days = ago / DAY;
+            assert!(
+                it.reason
+                    .starts_with(&format!("session live; idle {days} days")),
+                "{}",
+                it.reason
+            );
+        }
+        let pv = plan_value(&p);
+        let (ok, out) = oracle_on(&l.fx, &serde_json::to_string(&pv).unwrap());
+        assert!(ok, "age {ago}s: oracle rejected the tool's plan:\n{out}");
+        let (ok, out) = oracle_on(&l.fx, &offer_in(&pv, &l.wt));
+        assert_eq!(
+            ok,
+            want == Action::BackupThenRemove,
+            "age {ago}s: the oracle's verdict on an offered checkout:\n{out}"
+        );
+
+        // An agent worktree, no session, aged `ago` by its own files.
+        let fx = Fx::new();
+        let x = fx.repo(".claude/worktrees/x");
+        fx.age_all();
+        fx.date(".claude/worktrees/x/src/lib.rs", ago);
+        let p = fx.plan(ProcessSnapshot::none_running());
+        let it = item(&p, &x);
+        assert_eq!(it.action, want, "worktree, age {ago}s: {}", why(&p, &x));
+        if want == Action::Ask {
+            assert!(
+                it.reason
+                    .starts_with(&format!("agent worktree; idle {} days", ago / DAY)),
+                "{}",
+                it.reason
+            );
+        }
+    }
+}
+
+// ------------------------------------------------------------- F4: transcript budgets
+
+/// Agents with a locus elsewhere (`projects/foo`), each holding open one transcript outside the
+/// bulk pass's directories.
+fn agents_with_open_transcripts(l: &Live, k: u32) -> Vec<Proc> {
+    (0..k)
+        .map(|i| {
+            let t = l.fx.write(
+                &format!("live/projects/a/t{i}.jsonl"),
+                &format!("{{\"cwd\":\"{}\"}}\n", l.fx.s("projects/foo")),
+            );
+            let mut a = agent(700 + i, "claude", &l.fx.s("projects/foo"));
+            a.open_files = Some(vec![t.to_string_lossy().into_owned()]);
+            a
+        })
+        .collect()
+}
+
+fn bulk_transcripts(l: &Live, k: usize) {
+    for i in 0..k {
+        let rel = format!(".claude/projects/-proj/b{i}.jsonl");
+        l.fx.write(&rel, &format!("{{\"cwd\":\"{}\"}}\n", l.fx.s("projects/foo")));
+        l.fx.date(&rel, 3600);
+    }
+}
+
+/// F4: live-agent reads (open transcripts, registry session transcripts) have their own
+/// budget, so they never use up the bulk pass's: with the bulk pass exactly at its cap (8 in
+/// tests) and four agents' open transcripts read, nothing is left unread and the checkout is
+/// offered. At the cap exactly: no gap; one past it: `transcripts-not-read`, removals under the
+/// agent dirs ask, and the header numbers say so. A fifth live read (live cap 4 in tests) is a
+/// gap too. (Fails at 71c21a1: one shared budget, so the live reads pushed the bulk pass past
+/// it.)
+#[test]
+fn transcript_budgets() {
+    let cap = MAX_TRANSCRIPTS;
+    // At the cap, with four live reads.
+    let l = live_fixture();
+    bulk_transcripts(&l, cap);
+    let p = l.fx.plan(snap(agents_with_open_transcripts(&l, 4)));
+    let pv = plan_value(&p);
+    assert_eq!(action(&p, &l.wt), Action::BackupThenRemove, "{}", why(&p, &l.wt));
+    assert!(pv["coverage_gaps"]["agent_data"].get("transcripts-not-read").is_none(), "{}", pv["coverage_gaps"]);
+    let t = &pv["transcript_reads"];
+    assert_eq!(t["read"], cap as u64, "{t}");
+    assert_eq!(t["found"], cap as u64, "{t}");
+    assert_eq!(t["cap"], cap as u64, "{t}");
+    assert_eq!(t["live_read"], 4, "{t}");
+    assert_eq!(t["live_cap"], 4, "{t}");
+    assert_eq!(t["window_days"], 14, "{t}");
+
+    // One past the bulk cap.
+    let l = live_fixture();
+    bulk_transcripts(&l, cap + 1);
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    let pv = plan_value(&p);
+    assert_eq!(action(&p, &l.wt), Action::Ask, "{}", why(&p, &l.wt));
+    assert_eq!(pv["coverage_gaps"]["agent_data_recent"]["transcripts-not-read"], 1);
+    assert_eq!(pv["transcript_reads"]["found"], cap as u64 + 1);
+    assert_eq!(pv["transcript_reads"]["read"], cap as u64);
+
+    // One past the live cap.
+    let l = live_fixture();
+    let p = l.fx.plan(snap(agents_with_open_transcripts(&l, 5)));
+    let pv = plan_value(&p);
+    assert_eq!(action(&p, &l.wt), Action::Ask, "{}", why(&p, &l.wt));
+    assert_eq!(pv["coverage_gaps"]["agent_data_recent"]["transcripts-not-read"], 1);
+    assert_eq!(pv["transcript_reads"]["live_read"], 4);
+}

@@ -281,6 +281,9 @@ pub struct Plan {
     /// Where the scan could not look, by errno class.
     #[serde(default)]
     pub coverage_gaps: GapSummary,
+    /// Transcripts read against their caps (live-agent reads and the bulk pass).
+    #[serde(default)]
+    pub transcript_reads: crate::evidence::TranscriptReads,
     /// Notes from gathering the evidence (an unreadable transcript, by path only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_notes: Vec<String>,
@@ -706,11 +709,14 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 action = Action::Keep;
                 reclaim = 0;
             } else if let Some(label) = ne.idle_ask {
-                let idle = ne
-                    .activity
-                    .map(|t| (opts.now.saturating_sub(t).max(0) / 86_400) as u64);
-                if idle.is_none_or(|d| d < crate::evidence::IDLE_ASK_DAYS) {
-                    let n = idle.map_or("unknown".to_string(), |d| count(d, "day", "days"));
+                // Exact durations (goodqa#16804 item 5): the ask applies while the age is under
+                // 14 days to the second; at exactly 14 days the normal rules apply. (An age
+                // within the active window, 7 days inclusive, was already judged active.)
+                let age = ne.activity.map(|t| opts.now.saturating_sub(t));
+                if age.is_none_or(|a| a < crate::evidence::IDLE_ASK_SECS) {
+                    let n = age.map_or("unknown".to_string(), |a| {
+                        count((a.max(0) / 86_400) as u64, "day", "days")
+                    });
                     reason = format!("{label}; idle {n}; on its own: {reason}");
                     action = Action::Ask;
                     reclaim = 0;
@@ -1125,6 +1131,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         process_check_note: opts.process.error.clone(),
         process_counts: ctx.ev.counts.clone(),
         coverage_gaps: ctx.ev.gaps.clone(),
+        transcript_reads: ctx.ev.transcripts.clone(),
         evidence_notes: ctx.ev.notes.clone(),
         trusted_partial_process_check: opts.trust_partial_process_check,
         remote_facts_verified: false,

@@ -132,14 +132,19 @@ harness session. An item is in use when a readable process works in it or holds 
 when any process's command line names a path in it, when a running container binds it, or when a
 locus of its live harness session or a recent agent transcript's working directory equals, contains
 or lies inside it (applied at one choke point in the plan); a checkout in a live session or an
-agent worktree asks while its activity is under 14 days old. A live session alone holds nothing. A process working in an ancestor (a shell at the home) or in a sibling
+agent worktree asks while its age is more than 7 days (the inclusive active window) and less
+than 14 days, both exact durations (goodqa#16804 item 5). A live session alone holds nothing. A process working in an ancestor (a shell at the home) or in a sibling
 holds nothing. A live session is recognised from several independent sources (the Claude Code
 registry, agent processes, process working directories, recent transcripts, recent files and
 same-named entries), and an agent process that maps to no place makes removals under the harness
 work directories ask rather than guess. Transcripts are read for their recorded working directory
 only, from a bounded head of the file; a Claude Code transcript with none there is placed by its
 project directory name, holding every existing directory that encodes to it (the encoding is
-lossy), and one that places nowhere is a disclosed gap.
+lossy), and one that places nowhere is a disclosed gap. Every directory walk over agent data
+goes through one walker that returns each listing, entry, type or metadata error (and a bound
+reached) instead of dropping it; each is an `agent-dir-unreadable` gap of unknown age, so recent,
+and removals under the agent directories ask. Data that could not be seen is never treated as
+absent.
 
 Disclosed limits of the process evidence:
 

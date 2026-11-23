@@ -1724,6 +1724,19 @@ fn plan_evidence_report() {
         "{text}"
     );
     assert!(text.contains("0 fully unknown"), "{text}");
+    // F4: the transcript reads against their caps (the release caps: 5000 bulk, 1000 live).
+    assert!(
+        text.contains(
+            "Transcripts read in window: 1 of cap 5000 (1 found modified within the last 14 \
+             days; live-agent reads: 0 of cap 1000)"
+        ),
+        "{text}"
+    );
+    let tr = &pv["transcript_reads"];
+    assert_eq!(tr["read"], 1, "{tr}");
+    assert_eq!(tr["found"], 1, "{tr}");
+    assert_eq!(tr["cap"], 5000, "{tr}");
+    assert_eq!(tr["window_days"], 14, "{tr}");
     assert!(text.contains("Agent-harness sessions:"), "{text}");
     assert!(
         text.lines().any(|l| l.contains("live") && l.contains("s2")),

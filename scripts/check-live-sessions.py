@@ -37,6 +37,12 @@ to `-`) equals it, found by a walk from / that reads names only; no match, or an
 paths only.
 `--transcript-cwd FILE...` prints each file's result under that contract (the tool's tests compare).
 
+A directory of agent data that cannot be listed (the registry directory, a directory of the
+transcript trees, one of the same-named walk), or an entry whose time cannot be read, is the gap
+`agent-dir-unreadable`, of unknown age and so recent, like the tool's (goodqa#16711 F1); a path that
+does not exist is not a gap. Times are compared in whole seconds; `recent` is age <= the window,
+and a checkout of a live session asks while 7 days < age < 14 days (goodqa#16804 item 5).
+
 Exit 1, naming each one, when an oracle-live session has an item the plan removes, or when the
 plan lists an oracle-live session (one owning plan items) as idle. Exit 0 otherwise.
 Python 3 standard library only.
@@ -60,6 +66,8 @@ WALK_BUDGET = 200_000
 SLUG_MAX_DIRS = 2048  # directories listed while decoding one project directory name
 SLUG_MAX_ENTRIES = 4_000_000  # entries looked at in all by one such walk (names only)
 SLUG_INCOMPLETE = "transcript-slug-incomplete"
+DIR_GAP = "agent-dir-unreadable"
+IDLE_ASK_SECS = 14 * 86400
 TEMP_ROOTS = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"]
 
 
@@ -122,6 +130,8 @@ def slug_candidates(slug, max_dirs=SLUG_MAX_DIRS):
         listed += 1
         try:
             it = os.scandir(d)
+        except FileNotFoundError:
+            continue  # gone since it was seen: nothing hides there
         except OSError:
             incomplete = True
             continue
@@ -139,8 +149,11 @@ def slug_candidates(slug, max_dirs=SLUG_MAX_DIRS):
                     continue
                 try:
                     isdir = e.is_dir()
-                except OSError:
+                except FileNotFoundError:
                     isdir = False
+                except OSError:
+                    incomplete = True  # its type is unknown: it may be the directory
+                    continue
                 if isdir:
                     stack.append((os.path.join(d, e.name), end))
     return sorted(cands), incomplete
@@ -190,6 +203,22 @@ class Oracle:
             fresh = True
         if fresh:
             self.recent_gaps[cls] = self.recent_gaps.get(cls, 0) + 1
+
+    def dir_gap(self):
+        """A directory of agent data not fully seen: of unknown age, so recent."""
+        self.gap(DIR_GAP)
+
+    def onerror(self, top, max_depth):
+        """An os.walk error handler: a listing error at a depth the tool lists too is a gap;
+        a directory that does not exist (any more) is not."""
+        def handler(e):
+            if isinstance(e, FileNotFoundError):
+                return
+            rel = os.path.relpath(e.filename or top, top)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            if depth <= max_depth:
+                self.dir_gap()
+        return handler
 
     def holds_nothing_below(self, path):
         """The one ancestor-exception list: /, the home and every ancestor of it, the harness
@@ -245,7 +274,7 @@ class Oracle:
                 if seen > WALK_BUDGET:
                     return self.now  # too big to judge: active (fail safe)
                 try:
-                    m = os.lstat(os.path.join(root, n)).st_mtime
+                    m = int(os.lstat(os.path.join(root, n)).st_mtime)
                 except OSError:
                     continue
                 newest = m if newest is None else max(newest, m)
@@ -256,7 +285,8 @@ class Oracle:
         elif os.path.isfile(dot):
             try:
                 st = os.lstat(dot)
-                newest = st.st_ctime if newest is None else max(newest, st.st_ctime)
+                c = int(st.st_ctime)
+                newest = c if newest is None else max(newest, c)
                 with open(dot, "rb") as f:
                     line = f.read(4096).decode("utf-8", "replace").splitlines()[0]
                 gd = line.split("gitdir:", 1)[1].strip()
@@ -266,9 +296,11 @@ class Oracle:
                 return self.now  # unknown admin files: active (fail safe)
         for a in admin:
             try:
-                m = os.stat(a).st_mtime
-            except OSError:
+                m = int(os.stat(a).st_mtime)
+            except FileNotFoundError:
                 continue
+            except OSError:
+                return self.now  # an admin file that cannot be read: active (fail safe)
             newest = m if newest is None else max(newest, m)
         return newest
 
@@ -299,7 +331,7 @@ class Oracle:
         return cands
 
     def recent(self, mtime):
-        return mtime >= self.now - self.window
+        return int(mtime) >= self.now - self.window
 
     def mark(self, session, source):
         if session in self.sessions:
@@ -319,7 +351,10 @@ class Oracle:
         d = os.path.join(self.home, ".claude", "sessions")
         try:
             names = os.listdir(d)
+        except FileNotFoundError:
+            return
         except OSError:
+            self.dir_gap()
             return
         for n in names:
             if not re.fullmatch(r"[0-9]+\.json", n):
@@ -329,6 +364,8 @@ class Oracle:
                 mtime = os.stat(path).st_mtime
                 with open(path, "rb") as f:
                     raw = json.loads(f.read(HEAD_BYTES))
+            except FileNotFoundError:
+                continue  # gone since the listing
             except (OSError, ValueError):
                 self.gap("registry-entry-unknown", path)
                 continue
@@ -393,7 +430,8 @@ class Oracle:
         names = set(self.sessions)
         for base in (".claude", ".codex", ".agent-harness"):
             top = os.path.join(self.home, base)
-            for root, dirs, files in os.walk(top):
+            for root, dirs, files in os.walk(top, onerror=self.onerror(top, 2),
+                                             followlinks=True):
                 depth = root[len(top):].count(os.sep)
                 if base == ".agent-harness" and depth == 0 and "work" in dirs:
                     dirs.remove("work")
@@ -407,26 +445,32 @@ class Oracle:
                     if not hit:
                         continue
                     try:
-                        if self.recent(os.lstat(os.path.join(root, n)).st_mtime):
+                        if self.recent(os.stat(os.path.join(root, n)).st_mtime):
                             self.mark(hit, "recent same-named entry")
-                    except OSError:
+                    except FileNotFoundError:
                         pass
+                    except OSError:
+                        self.dir_gap()
 
     # -- recent transcripts
     def transcripts(self):
+        # (top, name filter, deepest directory below top that the tool lists)
         roots = [
-            (os.path.join(self.home, ".claude", "projects"), lambda n: n.endswith(".jsonl")),
+            (os.path.join(self.home, ".claude", "projects"), lambda n: n.endswith(".jsonl"), 3),
             (
                 os.path.join(self.home, ".codex", "sessions"),
                 lambda n: n.startswith("rollout-") and n.endswith(".jsonl"),
+                4,
             ),
             (
                 os.path.join(self.home, ".codex", "archived_sessions"),
                 lambda n: n.startswith("rollout-") and n.endswith(".jsonl"),
+                4,
             ),
         ]
-        for top, want in roots:
-            for root, dirs, files in os.walk(top):
+        for top, want, lists in roots:
+            for root, dirs, files in os.walk(top, onerror=self.onerror(top, lists),
+                                             followlinks=True):
                 if root[len(top):].count(os.sep) >= 4:
                     dirs[:] = []
                 for n in files:
@@ -436,7 +480,10 @@ class Oracle:
                     try:
                         if not self.recent(os.stat(p).st_mtime):
                             continue
+                    except FileNotFoundError:
+                        continue
                     except OSError:
+                        self.dir_gap()  # its time cannot be read: unknown, so recent
                         continue
                     for c in self.cwds_of(p):
                         s = self.session_of(c)
@@ -618,7 +665,7 @@ def check(plan, oracle):
             elif act is not None and act >= oracle.now - oracle.window:
                 offered.append((s, path))
             elif os.path.exists(os.path.join(path, ".git")) and act is not None and \
-                    act >= oracle.now - 14 * 86400:
+                    act > oracle.now - IDLE_ASK_SECS:
                 offered.append((s, path))
     tool_live = {
         s.get("session") for s in plan.get("totals", {}).get("sessions", []) if s.get("live")
@@ -895,11 +942,57 @@ def self_test():
             if main(["--plan", pf, "--home", home, "--now", str(now),
                      "--ground-truth", "false"], processes=False) != 2:
                 problems.append("a failing ground-truth command did not stop the check")
+    unlistable_dir_case(problems)
     for p in problems:
         print("self-test FAILED: " + p)
     if not problems:
         print("self-test ok")
     return 1 if problems else 0
+
+
+def unlistable_dir_case(problems):
+    """goodqa#16711 F1: a Codex day folder that cannot be listed (mode 000) hides a recent
+    rollout recording a checkout, so it is a recent `agent-dir-unreadable` gap and an offered
+    checkout under the work dir is flagged; readable, the rollout is read instead and nothing is
+    a gap. Modes are restored before the temp dir is removed."""
+    now = int(time.time()) + 400 * 86400
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(os.path.realpath(tmp), "home")
+        work = os.path.join(home, ".agent-harness", "work")
+        wt = os.path.join(work, "lk", "wt")
+        os.makedirs(os.path.join(wt, "src"))
+        day = os.path.join(home, ".codex", "sessions", "2026", "01", "03")
+        os.makedirs(day)
+        roll = os.path.join(day, "rollout-9.jsonl")
+        with open(roll, "w") as f:
+            f.write(json.dumps({"type": "session_meta", "payload": {"cwd": wt}}) + "\n")
+        os.utime(roll, (now - 3600, now - 3600))
+        plan = {"items": [{"path": wt, "action": "backup-then-remove"}],
+                "totals": {"sessions": []}}
+        o = Oracle(home, now, 7, processes=False)
+        o.run()
+        if o.recent_gaps or "lk" not in o.live:
+            problems.append("readable day folder: gaps %s, live %s" % (o.recent_gaps, o.live))
+        os.chmod(day, 0)
+        try:
+            try:
+                os.listdir(day)
+                print("self-test SKIPPED the unlistable-directory case: running as a user who "
+                      "can list a mode-000 folder")
+                return
+            except OSError:
+                pass
+            o = Oracle(home, now, 7, processes=False)
+            o.run()
+            if o.recent_gaps.get(DIR_GAP) != 1:
+                problems.append("an unlistable day folder is not a recent %s gap: %s"
+                                % (DIR_GAP, o.recent_gaps))
+            offered, _ = check(plan, o)
+            if ("(recent agent-data gaps)", wt) not in offered:
+                problems.append("an offered checkout beside an unlistable day folder was not "
+                                "flagged: %s" % offered)
+        finally:
+            os.chmod(day, 0o755)
 
 
 def stat_fifo(p):

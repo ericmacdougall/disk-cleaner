@@ -858,9 +858,13 @@ information could not be read at all), `process_check_note`, `process_counts` (`
 `idle_agents`, `unmapped_agents` (pids), `fully_unknown`), `coverage_gaps` (`privacy`,
 `permission`, `mount`, `other`, `overflowed`, `top_folders`, and `agent_data`: agent data the
 live-session rule could not use, by class: `transcript-cwd-unknown`, `transcript-unreadable`,
-`registry-entry-unknown`, `transcripts-not-read`, `transcript-slug-incomplete`), `evidence_notes`
-(for example `transcript-cwd-unknown: <path>` or
-`transcript-cwd-from-project-name (2 candidates): <path>`), `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
+`registry-entry-unknown`, `transcripts-not-read`, `transcript-slug-incomplete`,
+`agent-dir-unreadable`), `transcript_reads` (`window_days`, the bulk pass's window: the larger of
+the active window and 14 days; `found`, transcripts modified within it; `read`, of those read;
+`cap`; `live_read` and `live_cap`, the live-agent reads and their own cap), `evidence_notes`
+(for example `transcript-cwd-unknown: <path>`,
+`transcript-cwd-from-project-name (2 candidates): <path>` or
+`agent-dir-unreadable: <path>: could not be listed`), `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
 `remote_facts_note`, `enclosing_repos`, `scope`, `coverage_complete`, `coverage_note` (only when
 coverage is incomplete), `accepted_incomplete_coverage` (see "Incomplete coverage" and
 "Accepting incomplete coverage"), `active`, `totals` and `items`.
@@ -1005,12 +1009,15 @@ rule in `evidence.rule`) when:
 
 Rules 4 and 5 are applied at one point in the plan, after every other decision about the item:
 any removing action (`remove-regenerable`, `backup-then-remove`, `recover-backup-then-remove`)
-becomes `keep`. Then a checkout with no locus asks while its activity is under 14 days old: in a
+becomes `keep`. Then a checkout with no locus asks while its age (now minus its activity, in
+seconds) is more than 7 days and less than 14 days: in a
 live session `session live; idle N days` (ask code `session-idle`), and in an agent home's
 `worktrees/` directory, live or not, `agent worktree; idle N days` (ask code `worktree-idle`),
 where its activity also counts the mtime of every transcript (read up to 14 days back) that
-records a working directory or candidate inside it. A future mtime counts as active. At 14 days
-or more the normal rules apply.
+records a working directory or candidate inside it. A future mtime counts as active. At exactly
+14 days (to the second) or more the normal rules apply. An age of exactly 7 days is still inside
+the active window, which is inclusive (`recent` means age <= the window), so the item is active
+and kept; both boundaries are exact durations, not whole days (goodqa#16804 item 5).
 
 A checkout's own activity includes its git admin files, metadata only: `.git/index`, `.git/HEAD`
 and `.git/FETCH_HEAD`, or for a linked worktree the `.git` file's ctime and its gitdir's `HEAD`,
@@ -1044,8 +1051,21 @@ the working-directory field only: the top-level `cwd` (Claude Code), or `payload
 whose `type` is `session_meta` (Codex). Nothing else is kept or printed. Any other shape within the
 bound (another line kind, a first line longer than 64 KiB, text that is not JSON) is the coverage
 gap `transcript-cwd-unknown`, a file that cannot be read is `transcript-unreadable`, a registry file
-without an integer `pid` is `registry-entry-unknown`, and transcripts past the listing or read
-limit, or without a modification time, are `transcripts-not-read`.
+without an integer `pid` is `registry-entry-unknown`, and transcripts past a read cap are
+`transcripts-not-read`. The live-agent reads (the transcript a live registry entry's `sessionId`
+names, a transcript an agent holds open) have their own cap (1000) and run first; the bulk pass over
+every transcript modified within the larger of the active window and 14 days has another (5000).
+The header prints `Transcripts read in window: N of cap M (K found modified within the last D days;
+live-agent reads: a of cap b)`, and says so when the cap was reached.
+
+Every directory walk that feeds this evidence (the registry directory, the `projects` and Codex
+`sessions` / `archived_sessions` trees, the session-id lookup, the same-named entries of the
+protected roots) goes through one walker. A directory that cannot be listed, an entry that cannot
+be read, an entry whose type or modification time cannot be read, and a walk that reaches its
+bound are each the gap `agent-dir-unreadable`, of unknown age and so counted as recent (noted by
+path only); a path that does not exist is not a gap. Symbolic links are followed; every walk is
+bounded, so a link loop ends at the bound, recorded. A git admin file that exists but cannot be
+read makes the checkout's activity unknown, so active, never old.
 
 A Claude Code transcript (`projects/<name>/...jsonl`) with no cwd within the bound, in any shape
 (empty included), falls back to its project directory name: Claude Code encodes a working directory

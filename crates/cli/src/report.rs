@@ -284,6 +284,25 @@ pub fn plan_summary(p: &Plan) -> String {
             esc(&parts.join(", "))
         );
     }
+    let t = &p.transcript_reads;
+    if t.cap > 0 {
+        let _ = writeln!(
+            o,
+            "Transcripts read in window: {} of cap {} ({} found modified within the last {}; \
+             live-agent reads: {} of cap {}){}",
+            t.read,
+            t.cap,
+            t.found,
+            count(t.window_days, "day", "days"),
+            t.live_read,
+            t.live_cap,
+            if t.found > t.cap {
+                "; the cap was reached, so removals under the agent directories ask"
+            } else {
+                ""
+            }
+        );
+    }
     for n in &p.evidence_notes {
         let _ = writeln!(o, "note: {}", esc(n));
     }

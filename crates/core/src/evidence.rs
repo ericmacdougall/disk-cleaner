@@ -21,6 +21,14 @@
 //! `pid`, `sessionId` and `cwd` fields; never a `.key` file), and the first 64 KiB or 20 lines of
 //! recent transcripts, from which only the top-level `cwd` string is kept. Transcript text is
 //! never kept, logged or printed.
+//!
+//! Every directory walk that feeds agent evidence goes through the one walker in
+//! `evidence/walk.rs` (goodqa#16711 gate F1): a listing, entry, type or metadata error, or a walk
+//! bound reached, is never dropped; each becomes an `agent-dir-unreadable` gap of unknown age,
+//! counted as recent, so removals under the agent directories ask. A source lint in the tests
+//! keeps every other filesystem call out of this file.
+
+mod walk;
 
 use crate::model::*;
 use crate::procs::{Proc, ProcKind, ProcessSnapshot};
@@ -30,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use walk::{Kind, Walker};
 
 // ------------------------------------------------------------------------------------ inputs
 
@@ -234,6 +243,31 @@ impl GapSummary {
     }
 }
 
+/// The class of a directory an agent-evidence walk could not see all of (goodqa#16711 F1): a
+/// listing, entry, type or metadata read failed, or the walk reached its bound. Of unknown age,
+/// so always counted as recent.
+pub const AGENT_DIR_UNREADABLE: &str = "agent-dir-unreadable";
+
+/// How many transcripts the plan read, against its caps (goodqa#16711 F4). The live-agent
+/// reads (a registry entry's session transcript, a transcript an agent holds open) have their
+/// own budget and run first; the bulk pass over every transcript modified within
+/// `window_days` has another. Past either cap the rest is `transcripts-not-read`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptReads {
+    /// The bulk pass's window: transcripts modified this many days back are read (the larger
+    /// of the active window and the 14-day idle ask).
+    pub window_days: u64,
+    /// Transcripts found modified within that window.
+    pub found: u64,
+    /// Of those, read.
+    pub read: u64,
+    /// The bulk pass's cap.
+    pub cap: u64,
+    /// Live-agent reads made, and their cap.
+    pub live_read: u64,
+    pub live_cap: u64,
+}
+
 /// What made an item in use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Hit {
@@ -268,6 +302,9 @@ pub(crate) struct NodeEvidence {
 /// A checkout in a live session or an agent worktree with no locus asks until its own
 /// activity is this many days old (E1b, G1).
 pub(crate) const IDLE_ASK_DAYS: u64 = 14;
+/// The same, in seconds: the ask applies while `age < IDLE_ASK_SECS`, on exact durations
+/// (goodqa#16804 item 5); at exactly 14 days the normal rules apply.
+pub(crate) const IDLE_ASK_SECS: i64 = IDLE_ASK_DAYS as i64 * 86_400;
 
 /// One session's liveness.
 #[derive(Debug, Clone, Default)]
@@ -284,6 +321,7 @@ pub(crate) struct Evidence {
     pub sessions: Vec<Session>,
     pub counts: ProcessCounts,
     pub gaps: GapSummary,
+    pub transcripts: TranscriptReads,
     /// Reasons every removing item asks (process information unreadable, fully unknown
     /// processes, container runtime).
     pub global_asks: Vec<String>,
@@ -394,12 +432,15 @@ fn arg_tokens(args: &[String]) -> Vec<&str> {
 /// The paths an agent's arguments name, as loci: `argv[0]` is the program, not a place it
 /// works; absolute paths count as given, and a relative argument counts only when it names
 /// something that exists below the working directory (a bare word such as a prompt or a
-/// subcommand is not a place).
+/// subcommand is not a place). A relative argument that cannot be looked at (a prompt word
+/// longer than a file name may be, a path through a file) is not counted as a place: the safe
+/// direction, since an agent left with no place fails closed. This is not a walk of agent data,
+/// so it records no gap.
 fn agent_arg_paths(args: &[String], cwd: Option<&Path>) -> Vec<PathBuf> {
     let rest = args.get(1..).unwrap_or(&[]);
     let mut out = arg_paths(rest, None);
     for p in arg_paths(rest, cwd) {
-        if !out.contains(&p) && p.exists() {
+        if !out.contains(&p) && matches!(walk::stat(&p), Ok(Some(_))) {
             out.push(p);
         }
     }
@@ -524,22 +565,24 @@ pub fn slug_candidates(slug: &str, max_dirs: usize) -> SlugMatch {
             break;
         }
         listed += 1;
-        let Ok(rd) = std::fs::read_dir(&dir) else {
+        let left = MAX_SLUG_ENTRIES.saturating_sub(seen);
+        if left == 0 {
             out.incomplete = true;
-            continue;
-        };
-        for e in rd {
+            break;
+        }
+        // Every listing, entry or type error (and the entry bound) leaves the walk incomplete:
+        // the true directory may be one it did not see. The caller counts that as a gap aged
+        // by its transcript.
+        for r in walk::list(&dir, left) {
             seen += 1;
-            if seen > MAX_SLUG_ENTRIES {
-                out.incomplete = true;
-                break;
-            }
-            let Ok(e) = e else {
-                out.incomplete = true;
-                continue;
+            let e = match r {
+                Ok(e) => e,
+                Err(_unseen) => {
+                    out.incomplete = true;
+                    continue;
+                }
             };
-            let name = e.file_name();
-            let enc = claude_slug(&name.to_string_lossy());
+            let enc = claude_slug(&e.name_lossy());
             let rest = &s[at..];
             if rest.len() < 1 + enc.len()
                 || rest[0] != b'-'
@@ -551,14 +594,8 @@ pub fn slug_candidates(slug: &str, max_dirs: usize) -> SlugMatch {
             if end < s.len() && s[end] != b'-' {
                 continue;
             }
-            let p = dir.join(&name);
-            let is_dir = match e.file_type() {
-                Ok(t) if t.is_symlink() => p.is_dir(),
-                Ok(t) => t.is_dir(),
-                Err(_) => false,
-            };
-            if is_dir {
-                stack.push((p, end));
+            if e.kind == Kind::Dir {
+                stack.push((e.path, end));
             }
         }
     }
@@ -593,29 +630,31 @@ fn claude_project_slug(path: &Path) -> Option<String> {
 fn git_admin_activity(path: &Path) -> Result<Option<i64>, ()> {
     use std::io::Read;
     let dot = path.join(".git");
-    let Ok(md) = std::fs::symlink_metadata(&dot) else {
-        return Ok(None);
+    // An admin file that does not exist says nothing; one that cannot be read makes the whole
+    // answer unknown, so the caller counts the checkout as active (never old).
+    let md = match walk::lstat(&dot) {
+        Ok(Some(md)) => md,
+        Ok(None) => return Ok(None),
+        Err(_unknown) => return Err(()),
     };
-    let newest = |dir: &Path, names: &[&str]| {
-        names
-            .iter()
-            .filter_map(|n| std::fs::metadata(dir.join(n)).ok())
-            .filter_map(|m| mtime_of(&m))
-            .max()
+    let newest = |dir: &Path, names: &[&str]| -> Result<Option<i64>, ()> {
+        let mut t: Option<i64> = None;
+        for n in names {
+            match walk::stat(&dir.join(n)) {
+                Ok(Some(m)) => t = t.max(Some(m.mtime)),
+                Ok(None) => {}
+                Err(_unknown) => return Err(()),
+            }
+        }
+        Ok(t)
     };
-    if md.is_dir() {
-        return Ok(newest(&dot, &["index", "HEAD", "FETCH_HEAD"]));
+    if md.kind == Kind::Dir {
+        return newest(&dot, &["index", "HEAD", "FETCH_HEAD"]);
     }
-    if !md.is_file() {
+    if md.kind != Kind::File {
         return Err(());
     }
-    #[cfg(unix)]
-    let ctime = {
-        use std::os::unix::fs::MetadataExt;
-        Some(md.ctime())
-    };
-    #[cfg(not(unix))]
-    let ctime = mtime_of(&md);
+    let ctime = Some(md.ctime);
     let mut buf = Vec::new();
     std::fs::File::open(&dot)
         .and_then(|f| f.take(4096).read_to_end(&mut buf))
@@ -632,7 +671,7 @@ fn git_admin_activity(path: &Path) -> Result<Option<i64>, ()> {
     } else {
         path.join(gitdir)
     };
-    Ok(ctime.max(newest(&gd, &["HEAD", "index", "logs/HEAD"])))
+    Ok(ctime.max(newest(&gd, &["HEAD", "index", "logs/HEAD"])?))
 }
 
 /// The three fields of a Claude Code session registry entry this module reads.
@@ -650,76 +689,6 @@ struct RegistryEntry {
 fn is_registry_file(name: &str) -> bool {
     name.strip_suffix(".json")
         .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()))
-}
-
-fn mtime_of(md: &std::fs::Metadata) -> Option<i64> {
-    md.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-}
-
-/// Directories named `name` at `base` or up to `depth` levels below it (bounded listings).
-fn named_dirs(base: &Path, name: &str, depth: usize) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut level = vec![base.to_path_buf()];
-    for d in 0..=depth {
-        let mut next = Vec::new();
-        for dir in &level {
-            let cand = dir.join(name);
-            if cand.is_dir() {
-                out.push(cand);
-            }
-            if d < depth {
-                if let Ok(rd) = std::fs::read_dir(dir) {
-                    for e in rd.flatten().take(5000) {
-                        if e.file_type().is_ok_and(|t| t.is_dir()) && e.file_name() != name {
-                            next.push(e.path());
-                        }
-                    }
-                }
-            }
-        }
-        level = next;
-    }
-    out
-}
-
-/// Files below `dir` up to `depth` levels (1 = direct children) for which `want` says yes,
-/// with their mtimes; at most `cap` entries are looked at.
-fn files_below(
-    dir: &Path,
-    depth: usize,
-    cap: usize,
-    want: &dyn Fn(&str) -> bool,
-    truncated: &mut bool,
-) -> Vec<(PathBuf, Option<i64>)> {
-    let mut out = Vec::new();
-    let mut seen = 0usize;
-    let mut stack = vec![(dir.to_path_buf(), 1usize)];
-    while let Some((d, lvl)) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            seen += 1;
-            if seen > cap {
-                *truncated = true;
-                return out;
-            }
-            let Ok(ft) = e.file_type() else {
-                continue;
-            };
-            if ft.is_dir() {
-                if lvl < depth {
-                    stack.push((e.path(), lvl + 1));
-                }
-            } else if ft.is_file() && want(&e.file_name().to_string_lossy()) {
-                out.push((e.path(), e.metadata().ok().as_ref().and_then(mtime_of)));
-            }
-        }
-    }
-    out
 }
 
 // --------------------------------------------------------------------------------- the host
@@ -746,7 +715,7 @@ struct Host {
 const TEMP_ROOTS: [&str; 4] = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
 
 impl Host {
-    fn new(scan: &ScanResult) -> Host {
+    fn new(scan: &ScanResult, walker: &mut Walker) -> Host {
         let pc = &scan.protect;
         let mut homes: Vec<PathBuf> = Vec::new();
         let push = |v: &mut Vec<PathBuf>, p: &Path| {
@@ -784,10 +753,10 @@ impl Host {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_lowercase())
                     .unwrap_or_default();
-                if name.starts_with(".claude") && id.is_dir() {
+                if name.starts_with(".claude") && walker.is_dir(&id) {
                     push(&mut claude_bases, &id);
                 }
-                if name.starts_with(".codex") && id.is_dir() {
+                if name.starts_with(".codex") && walker.is_dir(&id) {
                     push(&mut codex_bases, &id);
                 }
             }
@@ -1005,17 +974,35 @@ enum Via {
     Owner,
 }
 
-/// Most transcripts read per plan.
+/// Most transcripts the bulk pass reads per plan.
 #[cfg(not(test))]
 const MAX_TRANSCRIPTS: usize = 5000;
 /// Small in tests, so the limit can be reached.
 #[cfg(test)]
 const MAX_TRANSCRIPTS: usize = 8;
+/// Most live-agent transcript reads per plan (their own budget, spent first).
+#[cfg(not(test))]
+const MAX_LIVE_TRANSCRIPTS: usize = 1000;
+#[cfg(test)]
+const MAX_LIVE_TRANSCRIPTS: usize = 4;
+/// Most entries one agent-evidence listing looks at.
+const MAX_LIST: usize = 10_000;
+/// Most entries one transcript or same-named walk looks at in all.
+const MAX_WALK: usize = 1_000_000;
+
+/// Which budget a transcript read spends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Budget {
+    Live,
+    Bulk,
+}
 
 /// Decide the per-item evidence for every node of `scan`. `parent` is the cleaned parent links.
 pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> Evidence {
     let n = scan.nodes.len();
-    let host = Host::new(scan);
+    // The one walker every agent-evidence walk below goes through (F1).
+    let mut walker = Walker::default();
+    let host = Host::new(scan, &mut walker);
     let window = i64::try_from(o.window_days)
         .unwrap_or(i64::MAX)
         .saturating_mul(86_400);
@@ -1196,26 +1183,32 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
     let mut registry: Vec<(u32, RegistryEntry)> = Vec::new();
     let mut projects_dirs: Vec<PathBuf> = Vec::new();
     for base in host.claude_bases.iter().filter(|_| any_item) {
-        projects_dirs.extend(named_dirs(base, "projects", 2));
+        projects_dirs.extend(walker.named_dirs(base, "projects", 2, MAX_LIST));
         if !need {
             continue;
         }
-        for sessions in named_dirs(base, "sessions", 2) {
-            let Ok(rd) = std::fs::read_dir(&sessions) else {
-                continue;
-            };
-            for e in rd.flatten().take(10_000) {
-                let name = e.file_name().to_string_lossy().into_owned();
+        for sessions in walker.named_dirs(base, "sessions", 2, MAX_LIST) {
+            for e in walker.list(&sessions, MAX_LIST) {
+                let name = e.name_lossy();
                 if !is_registry_file(&name) {
                     continue;
                 }
-                let Ok(md) = e.metadata() else { continue };
-                let fresh_md = mtime_of(&md).is_none_or(|m| recent(Some(m)));
-                if !md.is_file() || md.len() > 64 * 1024 {
+                // An entry whose metadata cannot be read is a walk error (a gap of unknown
+                // age); one gone since the listing was a session that ended.
+                let md = match walk::stat(&e.path) {
+                    Ok(Some(md)) => md,
+                    Ok(None) => continue,
+                    Err(unseen) => {
+                        walker.errors.push(unseen);
+                        continue;
+                    }
+                };
+                let fresh_md = recent(Some(md.mtime));
+                if md.kind != Kind::File || md.len > 64 * 1024 {
                     gap(&mut ev, "registry-entry-unknown", fresh_md);
                     continue;
                 }
-                let Ok(text) = std::fs::read(e.path()) else {
+                let Ok(text) = std::fs::read(&e.path) else {
                     gap(&mut ev, "registry-entry-unknown", fresh_md);
                     continue;
                 };
@@ -1230,10 +1223,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                 };
                 let Some(p) = by_pid.get(&pid) else { continue };
                 // Pid reuse: the process must have started no later than the entry was written.
-                let ok = match (p.start_time, mtime_of(&md)) {
-                    (Some(start), Some(m)) => start <= m + 1,
-                    _ => false,
-                };
+                let ok = p.start_time.is_some_and(|start| start <= md.mtime + 1);
                 if ok {
                     registry.push((pid, entry));
                 }
@@ -1241,23 +1231,32 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         }
     }
     let mut read_count = 0usize;
+    let mut live_count = 0usize;
     let mut slug_cache: HashMap<String, SlugMatch> = HashMap::new();
     // The working directories a transcript records. A Claude Code transcript with no cwd
     // within the bound falls back to its project directory name: every existing directory
     // whose encoding equals it is a candidate, and all are held (rule 5 and liveness). No
     // match, or an incomplete walk, is a gap, recent when the transcript is.
-    let mut read_cwd = |ev: &mut Evidence, path: &Path| -> Vec<String> {
-        if read_count >= MAX_TRANSCRIPTS {
+    // Live-agent reads and the bulk pass spend separate budgets (F4).
+    let mut read_cwd = |ev: &mut Evidence, path: &Path, budget: Budget| -> Vec<String> {
+        let (used, cap) = match budget {
+            Budget::Live => (&mut live_count, MAX_LIVE_TRANSCRIPTS),
+            Budget::Bulk => (&mut read_count, MAX_TRANSCRIPTS),
+        };
+        if *used >= cap {
             gap(ev, "transcripts-not-read", true);
             return Vec::new();
         }
-        read_count += 1;
+        *used += 1;
         let class = match transcript_cwd(path) {
             Ok(c) => return vec![c],
             Err(class) => class,
         };
-        let m = std::fs::metadata(path).ok().as_ref().and_then(mtime_of);
-        let fresh = m.is_none_or(|m| recent(Some(m)));
+        // A time that cannot be read is unknown: recent (never old).
+        let fresh = match walk::stat(path) {
+            Ok(Some(m)) => recent(Some(m.mtime)),
+            Ok(None) | Err(_) => true,
+        };
         let Some(slug) = claude_project_slug(path) else {
             gap(ev, class, fresh);
             note(ev, format!("{class}: {}", path.display()));
@@ -1365,13 +1364,13 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             }
             if let Some(id) = &entry.session_id {
                 for pd in &projects_dirs {
-                    let Ok(rd) = std::fs::read_dir(pd) else {
-                        continue;
-                    };
-                    for e in rd.flatten().take(10_000) {
-                        let t = e.path().join(format!("{id}.jsonl"));
-                        if t.is_file() {
-                            for c in read_cwd(&mut ev, &t) {
+                    for e in walker.list(pd, MAX_LIST) {
+                        if e.kind != Kind::Dir {
+                            continue;
+                        }
+                        let t = e.path.join(format!("{id}.jsonl"));
+                        if walker.stat(&t).is_some_and(|m| m.kind == Kind::File) {
+                            for c in read_cwd(&mut ev, &t, Budget::Live) {
                                 loci.push((PathBuf::from(c), true));
                             }
                         }
@@ -1382,11 +1381,11 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         if let Some(c) = cwd {
             loci.push((c.to_path_buf(), true));
         }
-        for f in p.open_files.iter().flatten() {
+        for f in p.open_files.as_deref().unwrap_or_default() {
             let fp = Path::new(f);
             if is_transcript_path(fp) {
                 open_transcript = true;
-                for c in read_cwd(&mut ev, fp) {
+                for c in read_cwd(&mut ev, fp, Budget::Live) {
                     loci.push((PathBuf::from(c), true));
                 }
                 continue;
@@ -1488,45 +1487,36 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
     // Every transcript read: (recorded cwd or candidate, mtime), for agent-worktree activity.
     let mut seen_cwds: Vec<(PathBuf, i64)> = Vec::new();
     let idle_secs = (IDLE_ASK_DAYS as i64).saturating_mul(86_400).max(window);
+    ev.transcripts = TranscriptReads {
+        window_days: u64::try_from(idle_secs / 86_400).unwrap_or(0),
+        cap: MAX_TRANSCRIPTS as u64,
+        live_cap: MAX_LIVE_TRANSCRIPTS as u64,
+        ..TranscriptReads::default()
+    };
     if any_item {
         let mut transcripts: Vec<(PathBuf, Option<i64>)> = Vec::new();
-        let mut truncated = false;
         // Claude Code: projects/<project>/<id>.jsonl and, for subagents,
         // projects/<project>/<id>/subagents/<agent>.jsonl.
         for pd in &projects_dirs {
-            transcripts.extend(files_below(
-                pd,
-                4,
-                1_000_000,
-                &|n| n.ends_with(".jsonl"),
-                &mut truncated,
-            ));
+            transcripts.extend(walker.files_below(pd, 4, MAX_WALK, &|n| n.ends_with(".jsonl")));
         }
         // Codex: sessions/YYYY/MM/DD/rollout-*.jsonl and archived_sessions/rollout-*.jsonl.
         for base in &host.codex_bases {
             for name in ["sessions", "archived_sessions"] {
-                for sd in named_dirs(base, name, 1) {
-                    transcripts.extend(files_below(
-                        &sd,
-                        5,
-                        1_000_000,
-                        &|n| n.starts_with("rollout-") && n.ends_with(".jsonl"),
-                        &mut truncated,
-                    ));
+                for sd in walker.named_dirs(base, name, 1, MAX_LIST) {
+                    transcripts.extend(walker.files_below(&sd, 5, MAX_WALK, &|n| {
+                        n.starts_with("rollout-") && n.ends_with(".jsonl")
+                    }));
                 }
             }
         }
-        if truncated {
-            gap(&mut ev, "transcripts-not-read", true);
-        }
-        for _ in transcripts.iter().filter(|(_, m)| m.is_none()) {
-            gap(&mut ev, "transcripts-not-read", true);
-        }
+        // A transcript whose time could not be read is already a recorded walk error.
         transcripts.retain(|(_, m)| m.is_some_and(|m| o.now.saturating_sub(m) <= idle_secs));
         transcripts.sort_by_key(|t| std::cmp::Reverse(t.1));
+        ev.transcripts.found = transcripts.len() as u64;
         for (t, m) in transcripts {
             let m = m.unwrap_or(o.now);
-            for c in read_cwd(&mut ev, &t) {
+            for c in read_cwd(&mut ev, &t, Budget::Bulk) {
                 seen_cwds.push((PathBuf::from(&c), m));
                 if !recent(Some(m)) {
                     continue;
@@ -1543,6 +1533,8 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             }
         }
     }
+    ev.transcripts.read = read_count as u64;
+    ev.transcripts.live_read = live_count as u64;
 
     // ---- files below the session directory, newest within the window.
     for s in ev.sessions.clone() {
@@ -1566,25 +1558,25 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             let mut stack = vec![(r.clone(), 1usize)];
             let mut seen = 0usize;
             while let Some((d, lvl)) = stack.pop() {
-                let Ok(rd) = std::fs::read_dir(&d) else {
-                    continue;
-                };
-                for e in rd.flatten() {
-                    seen += 1;
-                    if seen > 1_000_000 {
-                        break;
-                    }
-                    let name = e.file_name().to_string_lossy().into_owned();
+                let left = MAX_WALK.saturating_sub(seen);
+                if left == 0 {
+                    walker.limit(&d);
+                    break;
+                }
+                let entries = walker.list(&d, left);
+                seen += entries.len();
+                for e in entries {
+                    let name = e.name_lossy();
                     let stem = name.strip_suffix(".jsonl").unwrap_or(&name).to_string();
-                    let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
                     if sidx.contains_key(&stem) {
-                        if let Some(m) = e.metadata().ok().as_ref().and_then(mtime_of) {
-                            let slot = named.entry(stem).or_insert(m);
-                            *slot = (*slot).max(m);
+                        // An unreadable time is a recorded walk error (unknown, so recent).
+                        if let Some(m) = walker.stat(&e.path) {
+                            let slot = named.entry(stem).or_insert(m.mtime);
+                            *slot = (*slot).max(m.mtime);
                         }
                     }
-                    if is_dir && lvl < 3 {
-                        stack.push((e.path(), lvl + 1));
+                    if e.kind == Kind::Dir && lvl < 3 {
+                        stack.push((e.path, lvl + 1));
                     }
                 }
             }
@@ -1603,6 +1595,13 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                 );
             }
         }
+    }
+    // ---- every error the walker met: a directory of agent data not fully seen. Of unknown
+    // age, so counted as recent (removals under the agent directories ask), each noted by
+    // path only. The walker is consumed here, so no walk can run after its errors are counted.
+    for e in walker.errors {
+        gap(&mut ev, AGENT_DIR_UNREADABLE, true);
+        note(&mut ev, format!("{AGENT_DIR_UNREADABLE}: {}", e.describe()));
     }
     if notes_more > 0 {
         ev.notes.push(format!("and {notes_more} more"));
@@ -1727,7 +1726,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         mark(&mut ev, Path::new(c), 1, true, &|| {
             format!("working directory of process {}", p.pid)
         });
-        for f in p.open_files.iter().flatten() {
+        for f in p.open_files.as_deref().unwrap_or_default() {
             mark(&mut ev, Path::new(f), 1, true, &|| {
                 format!("a file open in process {}", p.pid)
             });
@@ -1783,7 +1782,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                 format!("inside the working directory of process {}", p.pid),
             ));
         }
-        for f in p.open_files.iter().flatten() {
+        for f in p.open_files.as_deref().unwrap_or_default() {
             proc_loci.push((
                 PathBuf::from(f),
                 format!("a file open in process {}", p.pid),
@@ -1817,7 +1816,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             by_key.entry(key_of(&id)).or_default().push(k);
             // Equal or containing: the locus's ancestors through the index (owners included).
             for anc in id.ancestors() {
-                for &(i, _) in index.get(&key_of(anc)).into_iter().flatten() {
+                for &(i, _) in index.get(&key_of(anc)).map(Vec::as_slice).unwrap_or_default() {
                     hold(&mut ev, i, c);
                 }
             }
