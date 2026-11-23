@@ -8,6 +8,7 @@
 
 use crate::model::*;
 use crate::procs::ProcessCheck;
+use crate::protect::{self, Hold, Verdict};
 use crate::words::{agree, count, kib, size, some_of};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -172,6 +173,12 @@ pub struct PlanItem {
     /// What must be saved before this item is removed (removing git items only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preserve: Option<Preserve>,
+    /// Set when the item is held (kept because it is protected, synced or inside a package).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<Hold>,
+    /// For an `ask` item: a short code for why a person must decide (see [`ask_code`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_code: Option<String>,
 }
 
 /// Count and bytes for one action.
@@ -189,6 +196,39 @@ pub struct PlanTotals {
     /// Bytes freed by `remove-regenerable` (needs no recovery or remote verification step).
     pub ready_bytes: u64,
     pub by_action: BTreeMap<String, ActionTotal>,
+    /// Removing items by class; an item nested in another removing item is counted by the outer
+    /// one only.
+    #[serde(default)]
+    pub by_class: BTreeMap<String, ActionTotal>,
+    /// Held items by hold code and root (every existing protected or cloud-sync root is listed,
+    /// with 0 items when nothing was held by it).
+    #[serde(default)]
+    pub held: Vec<HeldTotal>,
+    /// `ask` items by reason code; nested items are counted once (an ask nested in another ask
+    /// item is not counted again).
+    #[serde(default)]
+    pub ask_by_reason: BTreeMap<String, AskTotal>,
+}
+
+/// Held items under one root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldTotal {
+    pub code: HoldCode,
+    pub root: String,
+    /// Plan items held by this root.
+    pub items: u64,
+    /// The allocated bytes the scan's walk attributed to the root (`protected_roots[].bytes`),
+    /// not a sum of the items; absent for package directories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+}
+
+/// `ask` items with one reason code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskTotal {
+    pub items: u64,
+    /// Bytes of the directories asked about (`bytes_total`).
+    pub bytes: u64,
 }
 
 /// A dry-run plan.
@@ -504,6 +544,8 @@ fn orphan_submodule_gitdir(scan: &ScanResult, idx: usize) -> Option<String> {
 /// Build a dry-run plan from a scan.
 pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     let ctx = build_ctx(scan, opts);
+    // Holds are decided per node from the scan alone and applied before the nested-veto pass.
+    let verdicts = protect::judge(scan);
     let complete = scan.coverage.complete;
     // Strict coverage, the default: what was not read, unless the user accepted that it does not
     // block removal.
@@ -577,6 +619,28 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 (action, reason, reclaim) = decide(scan, idx, state, &state_reason, Some(gap));
             }
         }
+        // Protection comes last among the node's own decisions and first before everything that
+        // depends on it: a held node is `keep` whatever its facts, so the nested-veto pass below
+        // sees it.
+        let mut hold: Option<Hold> = None;
+        match &verdicts[idx] {
+            Verdict::Hold(h) => {
+                reason = format!("{}: {}; on its own: {reason}", h.code.as_str(), hold_why(h));
+                action = Action::Keep;
+                reclaim = 0;
+                hold = Some(h.clone());
+            }
+            Verdict::CarveOut(root) if action == Action::RecoverBackupThenRemove => {
+                reason = format!("protected: unsaved work inside agent dir; on its own: {reason}");
+                action = Action::Keep;
+                reclaim = 0;
+                hold = Some(Hold {
+                    code: HoldCode::Protected,
+                    root: root.clone(),
+                });
+            }
+            _ => {}
+        }
         own_action.push(action);
         if action.removes() {
             match &opts.process {
@@ -618,6 +682,8 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 .as_ref()
                 .map(|r| effective_facts(r.facts, strict.is_some())),
             preserve: None,
+            hold,
+            ask_code: None,
         });
     }
 
@@ -772,6 +838,72 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         }
     }
 
+    for it in items.iter_mut() {
+        if it.action == Action::Ask {
+            it.ask_code = Some(ask_code(&it.reason).to_string());
+        }
+    }
+    // By class: removing items, nested ones counted by the outer item only.
+    for it in &items {
+        if it.action.removes() && !nested_in_removing[it.node] {
+            let slot = totals
+                .by_class
+                .entry(it.class.as_str().to_string())
+                .or_default();
+            slot.items += 1;
+            slot.reclaimable_bytes = slot.reclaimable_bytes.saturating_add(it.reclaimable_bytes);
+        }
+    }
+    // Ask items by reason code, an ask inside another ask item counted once.
+    let mut asking = vec![false; scan.nodes.len()];
+    for it in &items {
+        if it.action == Action::Ask {
+            asking[it.node] = true;
+        }
+    }
+    let mut nested_in_ask = vec![false; scan.nodes.len()];
+    for &i in &ctx.order {
+        nested_in_ask[i] = ctx.parent[i]
+            .map(|p| asking[p] || nested_in_ask[p])
+            .unwrap_or(false);
+    }
+    for it in &items {
+        if it.action == Action::Ask && !nested_in_ask[it.node] {
+            let slot = totals
+                .ask_by_reason
+                .entry(it.ask_code.clone().unwrap_or_else(|| "other".into()))
+                .or_default();
+            slot.items += 1;
+            slot.bytes = slot.bytes.saturating_add(it.bytes_total);
+        }
+    }
+    // Held items by code and root.
+    let mut held: BTreeMap<(HoldCode, String), HeldTotal> = BTreeMap::new();
+    for r in scan.protect.roots.iter().filter(|r| r.exists) {
+        held.insert(
+            (r.code, r.spelled.clone()),
+            HeldTotal {
+                code: r.code,
+                root: r.spelled.clone(),
+                items: 0,
+                bytes: Some(r.bytes),
+            },
+        );
+    }
+    for it in &items {
+        if let Some(h) = &it.hold {
+            held.entry((h.code, h.root.clone()))
+                .or_insert_with(|| HeldTotal {
+                    code: h.code,
+                    root: h.root.clone(),
+                    items: 0,
+                    bytes: None,
+                })
+                .items += 1;
+        }
+    }
+    totals.held = held.into_values().collect();
+
     Plan {
         schema_version: SCHEMA_VERSION,
         dry_run: true,
@@ -800,6 +932,54 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         totals,
         items,
     }
+}
+
+/// Why a held node is held, for the item's reason.
+fn hold_why(h: &Hold) -> String {
+    match h.code {
+        HoldCode::Protected if h.root == "(unreadable)" => {
+            "its real path could not be resolved (permission denied), so it cannot be shown \
+             to be outside agent data [unreadable]"
+                .to_string()
+        }
+        HoldCode::Protected => format!(
+            "it is inside or contains {}, a protected root (agent transcripts, WALs or state)",
+            h.root
+        ),
+        HoldCode::Synced => format!(
+            "it is inside or contains {}, a cloud-sync folder: removing it would propagate",
+            h.root
+        ),
+        HoldCode::Package => format!(
+            "it is inside {}, an application or library package, which is not taken apart",
+            h.root
+        ),
+    }
+}
+
+/// A short code for the reason an item asks, from its final reason text.
+pub fn ask_code(reason: &str) -> &'static str {
+    const TABLE: [(&str, &str); 14] = [
+        ("the nested ", "nested-veto"),
+        ("running processes could not be inspected", "process-check"),
+        ("could not be inspected, so", "process-check"),
+        ("bare repos are never removed", "bare-repo"),
+        ("source outside any repo", "loose-code"),
+        ("source inside a repository", "loose-code"),
+        ("output file", "outputs"),
+        ("unusual repository layout", "layout"),
+        ("skip-worktree", "hidden-index"),
+        ("cannot judge", "cannot-judge"),
+        ("cannot prove", "unproven-facts"),
+        ("depend", "dependents"),
+        ("git directory", "git-admin"),
+        ("could not be read", "unreadable"),
+    ];
+    TABLE
+        .iter()
+        .find(|(needle, _)| reason.contains(needle))
+        .map(|(_, code)| *code)
+        .unwrap_or("other")
 }
 
 /// The places the scan could not look, each as (`"1 folder"` or `"2 folders"`, verb phrase), and
@@ -1507,6 +1687,232 @@ mod tests {
                 );
                 assert!(!words.contains(name), "{name}: {words}");
                 assert_eq!(fact_words(name, t), format!("{words} [{name}]"));
+            }
+        }
+    }
+
+    fn all_yes_facts() -> Facts {
+        Facts {
+            has_network_remote: Tri::Yes,
+            head_on_remote: Tri::Yes,
+            all_branches_on_remote: Tri::Yes,
+            stash_empty: Tri::Yes,
+            tree_clean: Tri::Yes,
+            no_unique_ignored: Tri::Yes,
+            no_dependents: Tri::Yes,
+            reflog_saved: Tri::Yes,
+            no_pending_state: Tri::Yes,
+            plain_layout: Tri::Yes,
+            no_local_admin_content: Tri::Yes,
+        }
+    }
+
+    fn synthetic(nodes: Vec<Node>, roots: Vec<ProtectedRoot>) -> ScanResult {
+        ScanResult {
+            schema_version: SCHEMA_VERSION,
+            tool_version: "test".into(),
+            generated_at: 0,
+            roots: vec![],
+            options: ScanOptionsRecord::default(),
+            totals: Totals::default(),
+            nodes,
+            outputs: vec![],
+            big_files: vec![],
+            issues: vec![],
+            warnings: vec![],
+            enclosing_repos: vec![],
+            scope: "subtree".to_string(),
+            coverage: Coverage {
+                complete: true,
+                ..Default::default()
+            },
+            protect: ProtectContext {
+                home: "/home/user".into(),
+                roots,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn root(path: &str) -> ProtectedRoot {
+        ProtectedRoot {
+            spelled: path.into(),
+            canonical: Some(path.into()),
+            exists: true,
+            unreadable: false,
+            code: HoldCode::Protected,
+            carve: CarveLayout::None,
+            source: "built-in".into(),
+            bytes: 0,
+        }
+    }
+
+    fn repo(path: &str) -> Node {
+        let mut n = Node::new(path, Class::Repo);
+        n.bytes_self = 5_000;
+        n.bytes_total = 5_000;
+        n.newest_mtime = Some(0);
+        n.repo = Some(RepoInfo {
+            facts: all_yes_facts(),
+            git_admin: Some(GitAdminSurvey {
+                files: 1,
+                bytes: 4096,
+                ..Default::default()
+            }),
+            object_store: Some(ObjectStoreSurvey {
+                files: 1,
+                bytes: 4096,
+            }),
+            ..RepoInfo::default()
+        });
+        n
+    }
+
+    #[test]
+    fn held_child_vetoes_parent() {
+        let mut child = Node::new("/work/p/target", Class::Regenerable);
+        child.parent = Some(0);
+        child.bytes_self = 1_000;
+        child.bytes_total = 1_000;
+        child.newest_mtime = Some(0);
+        child.rule = Some("cargo-target".into());
+        // Control: with no hold the parent is removable and so is the child.
+        let free = synthetic(vec![repo("/work/p"), child.clone()], vec![]);
+        let p = plan(&free, &PlanOptions::new(7, 300 * 86_400));
+        assert_eq!(p.items[0].action, Action::BackupThenRemove);
+        // The child resolves into a protected root: hold applied before the nested veto, so the
+        // parent asks, naming the held child.
+        child.real_path = Some("/home/user/.claude/projects/p/target".into());
+        let held = synthetic(
+            vec![repo("/work/p"), child],
+            vec![root("/home/user/.claude")],
+        );
+        let p = plan(&held, &PlanOptions::new(7, 300 * 86_400));
+        assert_eq!(p.items[1].action, Action::Keep);
+        assert_eq!(p.items[1].hold.as_ref().unwrap().code, HoldCode::Protected);
+        assert_eq!(p.items[0].action, Action::Ask, "{}", p.items[0].reason);
+        assert_eq!(p.items[0].reclaimable_bytes, 0);
+        assert!(
+            p.items[0]
+                .reason
+                .contains("the nested /work/p/target is kept"),
+            "{}",
+            p.items[0].reason
+        );
+        assert_eq!(p.items[0].ask_code.as_deref(), Some("nested-veto"));
+        // The totals do not count the vetoed parent as reclaimable.
+        assert_eq!(p.totals.reclaimable_bytes, 0);
+    }
+
+    fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = e.path();
+            if e.file_type().unwrap().is_dir() {
+                walk_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    fn write_file(path: &Path, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![b'z'; bytes]).unwrap();
+    }
+
+    #[test]
+    fn no_removal_touches_agent_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap().join("user");
+        let roots = [
+            ".claude",
+            ".codex",
+            ".agent-harness",
+            ".prunedisk",
+            ".kimi",
+            ".kimi-code",
+            ".gemini",
+            ".cursor",
+            ".config/claude",
+            ".local/share/claude",
+            "Library/Application Support/Claude",
+        ];
+        for r in roots {
+            let base = home.join(r);
+            write_file(&base.join("rollout-2026-01-01.jsonl"), 3_000);
+            write_file(&base.join("projects/p/x.jsonl"), 3_000);
+            write_file(&base.join("wal/session.jsonl"), 3_000);
+            write_file(&base.join("receipts/receipt-1.json"), 3_000);
+            // Regenerable directories inside the agent homes are candidates for the planner:
+            // protection must hold them back.
+            write_file(&base.join("projects/p/package.json"), 2);
+            write_file(&base.join("projects/p/node_modules/a.js"), 5_000);
+            write_file(&base.join("cache/q/package.json"), 2);
+            write_file(&base.join("cache/q/node_modules/b.js"), 5_000);
+            // Transcripts and receipts that sit inside the regenerable directories themselves:
+            // removing such a directory would remove them.
+            write_file(&base.join("projects/p/node_modules/rollout-9.jsonl"), 3_000);
+            write_file(
+                &base.join("cache/q/node_modules/session-receipt.json"),
+                3_000,
+            );
+        }
+        // A carve-out session dir: transcripts beside a plain project that is not a checkout.
+        let s1 = home.join(".agent-harness/work/s1");
+        write_file(&s1.join("transcript.jsonl"), 3_000);
+        write_file(&s1.join("proj/package.json"), 2);
+        write_file(&s1.join("proj/node_modules/c.js"), 5_000);
+        // Control outside every root: removable, so the check below is not vacuous.
+        write_file(&home.join("work/proj/package.json"), 2);
+        write_file(&home.join("work/proj/node_modules/d.js"), 5_000);
+
+        let mut so = crate::scan::ScanOptions::new(vec![home.clone()]);
+        so.collect_facts = false;
+        so.context = crate::protect::ScanContext {
+            passwd_home: Some(home.clone()),
+            euid: Some(1000),
+            home_env: Some(home.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let scan = crate::scan::scan(&so).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 400 * 86_400;
+        let p = plan(&scan, &PlanOptions::new(7, now));
+
+        // Independent of the module's root list: a plain walk for agent data files.
+        let mut files = Vec::new();
+        walk_files(&home, &mut files);
+        let agent: Vec<&PathBuf> = files
+            .iter()
+            .filter(|f| {
+                let n = f.file_name().unwrap().to_string_lossy();
+                n.ends_with(".jsonl") || n.starts_with("rollout-") || n.contains("receipt")
+            })
+            .collect();
+        assert!(agent.len() >= roots.len() * 4, "fixture has agent files");
+        let removing: Vec<&PlanItem> = p.items.iter().filter(|i| i.action.removes()).collect();
+        assert!(
+            removing
+                .iter()
+                .any(|i| i.path.ends_with("work/proj/node_modules")),
+            "control: the unprotected node_modules is removable: {:?}",
+            p.items
+                .iter()
+                .map(|i| (&i.path, i.action))
+                .collect::<Vec<_>>()
+        );
+        for it in &removing {
+            let ip = Path::new(&it.path);
+            for f in &agent {
+                assert!(
+                    !(ip == f.as_path() || f.starts_with(ip) || ip.starts_with(f)),
+                    "removing item {} touches agent file {}",
+                    it.path,
+                    f.display()
+                );
             }
         }
     }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -351,6 +351,14 @@ pub struct Node {
     pub ask_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<RepoInfo>,
+    /// The node's canonical path (symlinks resolved, macOS `/System/Volumes/Data` stripped),
+    /// recorded at scan time; the lexical path is `path`. `None` when it could not be resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub real_path: Option<String>,
+    /// The canonical path could not be resolved because of a permission error: the plan holds
+    /// the node (`protected: unreadable`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub real_unreadable: bool,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -376,6 +384,8 @@ impl Node {
             skipped_mounts: 0,
             ask_reason: None,
             repo: None,
+            real_path: None,
+            real_unreadable: false,
         }
     }
 }
@@ -482,6 +492,92 @@ pub struct ScanResult {
     pub scope: String,
     /// Where the walk could not look (required: a scan without it is not trusted as complete).
     pub coverage: Coverage,
+    /// The home, user and environment the protected roots were resolved from, and the roots
+    /// (required: the plan refuses a scan without it).
+    pub protect: ProtectContext,
+}
+
+/// Why a node is held (kept whatever its facts): see `docs/DESIGN.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HoldCode {
+    /// Inside, or containing, an agent home or other protected root.
+    Protected,
+    /// Inside, or containing, a cloud-sync folder.
+    Synced,
+    /// Inside an application or library package directory.
+    Package,
+}
+
+impl HoldCode {
+    /// JSON and display name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HoldCode::Protected => "protected",
+            HoldCode::Synced => "synced",
+            HoldCode::Package => "package",
+        }
+    }
+}
+
+/// Where a checkout inside a protected root may be removed after a backup (see `protect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CarveLayout {
+    /// No carve-out: everything inside is held.
+    #[default]
+    None,
+    /// `.agent-harness`: `work/<session>/X` and `work/<session>/<task>/X`.
+    AgentHarness,
+    /// An agent home with a `worktrees/X` directory (`.claude`, `.codex`).
+    Worktrees,
+}
+
+/// One protected or cloud-sync root, as resolved at scan time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectedRoot {
+    /// The path as spelled (absolute, `..` removed).
+    pub spelled: String,
+    /// Its canonical path, when it exists and could be resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical: Option<String>,
+    /// The root exists on this host (an absent root is ignored).
+    pub exists: bool,
+    /// It exists but its canonical path could not be resolved (permission): only the lexical
+    /// path is compared.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreadable: bool,
+    /// `protected` or `synced`.
+    pub code: HoldCode,
+    #[serde(default)]
+    pub carve: CarveLayout,
+    /// Where the root came from (`built-in`, `CLAUDE_CONFIG_DIR`, `config`...).
+    pub source: String,
+    /// Allocated bytes the walk attributed to the root (0 when it lies outside every scan root).
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+/// What the protected roots were resolved from, and the roots.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectContext {
+    /// The home the roots were resolved under.
+    pub home: String,
+    /// The scanning user's home from the passwd entry, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passwd_home: Option<String>,
+    /// Effective user id of the scan process, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xdg_config_home: Option<String>,
+    pub roots: Vec<ProtectedRoot>,
 }
 
 pub fn default_scope() -> String {

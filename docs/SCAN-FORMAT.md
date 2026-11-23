@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **15** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **16** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -60,7 +60,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 15 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification, 13 `checked` and the files git never reads, 14 no object verification and outputs in every artifact, 15 small outputs anywhere in an artifact outside installed packages; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 16 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification, 13 `checked` and the files git never reads, 14 no object verification and outputs in every artifact, 15 small outputs anywhere in an artifact outside installed packages, 16 protected roots and per-node real paths; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots that were walked, as spelled (a kept inner root under the spelling of the root that encloses it); overlapping roots are normalised first (see "Overlapping scan roots") |
@@ -73,6 +73,7 @@ you name.
 | `warnings` | notes about limits that applied to this run |
 | `scope` | `volume` when every scan root is a mount point (its device differs from its parent's) or a file system root, otherwise `subtree`. A subtree scan cannot see clones that live elsewhere, so `no_dependents` means "no dependents were found within the scanned roots"; the plan header repeats the scope and, for `subtree`, every `backup-then-remove` reason says other clones outside the scanned folders were not checked (disclosure only: the apply phase re-verifies, and the plan is not downgraded to `ask` on scope alone) |
 | `coverage` | where the walk could not look, so links, clones and alternates files there were not seen: `complete` (no entry was unreadable and no mount point was skipped), `unreadable_dirs` (directories whose contents could not be listed, each counted once) with up to 20 `unreadable_dir_examples`, `other_unreadable_entries` (entries whose metadata could not be read, and walk errors), and `mount_points_skipped` with up to 20 `mount_point_examples`. See "Incomplete coverage" below |
+| `protect` | what protection was resolved from and the roots (see "Protected roots" below); required: `plan` refuses a scan without it |
 | `enclosing_repos` | scan roots that lie inside a git repository the scan did not cover: `root`, `repo`, `note`. Before the walk each root is looked at upward for a `.git` directory or file in any ancestor (the real path first, then the spelled one; symlinks are not followed). That repository is not a node and never gets a plan item, but the regenerable and cache directories below the root that no scanned repo encloses are decided by its git exactly as in a full scan: the config allowlist and work-tree checks run on it, and a directory is removable only if git lists it as wholly ignored and untracked. A refused config, a git failure or timeout, `--no-git`, or an ancestor `.git` that is not a plain directory or file makes them ask. The plan header and the human outputs say the repository was not assessed |
 
 A `.git` entry that is neither a regular directory nor a regular file (a symlink, socket, fifo or
@@ -107,6 +108,30 @@ must not overflow 64 bits. Negative counts are rejected by the parser. A violati
 naming the field and index (`invalid scan file: nodes[3].parent: index 999999 is out of range`),
 exit code 1, no partial plan. The planner itself has no recursion, so a deep valid tree cannot
 overflow the stack; for a scan built by hand, bad parent links are ignored.
+
+### Protected roots (`protect`)
+
+`scan` records the context protection was resolved from and the roots, so `plan` needs no file
+system or git call to protect anything:
+
+| Field | Meaning |
+|---|---|
+| `home` | the home the roots were resolved under: the passwd home, or `--home DIR` (disposable fixture homes; `HOME` must equal it, and the passwd home stays protected too) |
+| `passwd_home`, `uid` | the scanning user's passwd home and effective user id (omitted where the platform has none) |
+| `home_env`, `claude_config_dir`, `codex_home`, `xdg_config_home` | `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_CONFIG_HOME` as the scan saw them |
+| `roots` | one entry per root: `spelled` path, `canonical` path (when it exists and resolved), `exists`, `unreadable` (it exists but its canonical path failed with a permission error: only the spelled path is compared), `code` (`protected` or `synced`), `carve` (`none`, `agent-harness` or `worktrees`), `source` (`built-in`, an override variable, `config`) and `bytes` (allocated bytes the walk attributed to it, 0 when it lies outside every scan root) |
+
+Protected roots: home-relative `.claude`, `.codex`, `.agent-harness`, `.prunedisk`, `.kimi`,
+`.kimi-code`, `.gemini`, `.cursor`, `.config/claude`, `.local/share/claude` and
+`Library/Application Support/Claude`; `$XDG_CONFIG_HOME/claude`; `CLAUDE_CONFIG_DIR`; `CODEX_HOME`;
+and the config's `protected_paths` (add-only). Cloud-sync roots (`synced`): `Library/Mobile
+Documents`, `Library/CloudStorage` and the home-level `Dropbox*`, `Google Drive*`, `OneDrive*` and
+`iCloud Drive*` entries. A root absent on the host is recorded with `exists = false` and ignored.
+
+`scan` stops with an error, naming the cause, when it runs as euid 0, when `HOME` is not the passwd
+home (or `--home`), or when `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME` or a configured
+path is empty, relative, a literal `~`, `/` or the home itself. `plan` refuses a scan without
+roots and a scan whose `uid` is not the planning process's.
 
 ### `totals`
 
@@ -183,6 +208,8 @@ One entry per classified directory. A directory belongs to its innermost classif
 | `skipped_mounts` | directories inside this node on another file system that `--one-file-system` did not enter (omitted when 0) |
 | `ask_reason` | why this node is never offered for removal (a regenerable or cache node for the reasons below; any node whose path is not valid UTF-8) |
 | `repo` | present for `repo`, `worktree` and `bare-repo` |
+| `real_path` | the node's canonical path (symlinks resolved; on macOS the `/System/Volumes/Data` prefix removed), resolved by the scan; `path` is the lexical one. Omitted when it could not be resolved |
+| `real_unreadable` | the canonical path could not be resolved because of a permission error: the plan holds the node (`protected: unreadable`) (omitted when false) |
 
 Classification rules (design section 3): a directory with a `.git` directory is a `repo`; with a
 `.git` file a `worktree`; a directory with `HEAD`, `objects` and `refs` and no `.git` is a `bare-repo`.
@@ -798,7 +825,34 @@ coverage is incomplete), `accepted_incomplete_coverage` (see "Incomplete coverag
 Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `state` (`active`,
 `idle` or `unknown`), `state_reason` (why it was judged so), `reason` (plain language),
 `reclaimable_bytes`, `bytes_total`, `days_since_activity` (if there is any evidence), `facts`
-and, on every item whose action removes a git node, `preserve` (see "The preserve obligation").
+`hold` (`code`: `protected`, `synced` or `package`, and the `root` responsible; present on a held
+item, see "Holds" below), `ask_code` (a short code for why an `ask` item asks) and, on every item
+whose action removes a git node, `preserve` (see "The preserve obligation").
+
+`totals` holds `reclaimable_bytes`, `ready_bytes`, `by_action`, and since schema 16 `by_class`
+(removing items by class: `items` and `reclaimable_bytes`, an item nested in another removing item
+counted once), `held` (per `code` and `root`: `items` held and, for a protected or synced root, the
+`bytes` the scan attributed to the root, not a sum of the items) and `ask_by_reason` (`ask` items by
+`ask_code`, with their `bytes_total`; an ask nested in another ask item is counted once).
+
+### Holds
+
+A node is held, that is its own action is `keep` whatever its age or facts, when it is, contains or
+lies inside a protected root or a cloud-sync root (either its lexical path or its canonical path is
+equal to or below either path of the root, or a root is below either of its paths; on macOS the
+comparison ignores case), when its canonical path could not be resolved (`protected: unreadable`),
+or when it lies inside a directory whose name ends `.app`, `.photoslibrary`, `.fcpbundle`,
+`.logicx`, `.band`, `.lrlibrary`, `.lrcat-data`, `.musiclibrary`, `.tvlibrary`, `.framework`,
+`.vmwarevm`, `.pvm` or `.utm` (`package`). Holds are decided before the nested-veto pass, so any
+removing node that contains a held node becomes `ask`, naming it.
+
+Carve-outs inside a protected root: a repo or worktree that is a direct child of
+`.agent-harness/work/<session>/`, a direct child of `.agent-harness/work/<session>/<task>/` where
+`<task>` is not itself a checkout, or a direct child of `.claude/worktrees/` or `.codex/worktrees/`
+may get `backup-then-remove` (all its facts are yes); any other action that removes it becomes
+`keep` with `protected: unsaved work inside agent dir`. Regenerable and cache directories inside
+such a checkout keep their normal action. Every other node inside a protected root is held, session
+directories included.
 
 ### The active window
 
@@ -812,6 +866,7 @@ active_window_days = 7
 # trust_partial_process_check = true   # optional, see below; default false
 # accept_incomplete_coverage = true    # optional, see "Accepting incomplete coverage"; default false
 # max_git_admin_bytes = 67108864       # optional, see "The preserve obligation"; default 64 MiB
+# protected_paths = ["~/agents"]      # optional extra protected roots (add-only), see "Protected roots"
 ```
 
 The key `verify_objects` of schemas 12 and 13 is refused with a message: there is no object

@@ -105,6 +105,16 @@ pub fn scan_summary(s: &ScanResult) -> String {
         );
     }
 
+    let _ = writeln!(o, "\nProtected roots (never offered for removal):");
+    for r in s.protect.roots.iter().filter(|r| r.exists) {
+        let _ = writeln!(
+            o,
+            "  {:<9} {:>10}  {}",
+            r.code.as_str(),
+            human_bytes(r.bytes),
+            esc(&r.spelled)
+        );
+    }
     let _ = writeln!(o, "\nSpace by class (innermost classified ancestor):");
     let mut classes: Vec<(&String, &u64)> = t.bytes_by_class.iter().collect();
     classes.sort_by(|a, b| b.1.cmp(a.1));
@@ -281,6 +291,79 @@ pub fn plan_summary(p: &Plan) -> String {
             count(t.items, "item", "items"),
             human_bytes(t.reclaimable_bytes)
         );
+    }
+    let _ = writeln!(
+        o,
+        "\nReclaimable by class (removing items; nested ones counted once):"
+    );
+    if p.totals.by_class.is_empty() {
+        let _ = writeln!(o, "  (nothing is proposed for removal)");
+    }
+    for (c, t) in &p.totals.by_class {
+        let _ = writeln!(
+            o,
+            "  {:<12} {:>10}  {:>10}",
+            c,
+            count(t.items, "item", "items"),
+            human_bytes(t.reclaimable_bytes)
+        );
+    }
+    let _ = writeln!(
+        o,
+        "\nProtected and held back (kept whatever their age or facts; bytes are what the scan \
+         walked under each root):"
+    );
+    let mut any_held = false;
+    for h in &p.totals.held {
+        use disk_cleaner_core::HoldCode;
+        if h.code != HoldCode::Package && h.bytes.is_none() {
+            continue;
+        }
+        any_held = true;
+        let size = h.bytes.map(human_bytes).unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            o,
+            "  {:<10} {:>10}  {:>10} held  {}",
+            h.code.as_str(),
+            size,
+            h.items,
+            esc(&h.root)
+        );
+    }
+    if !any_held {
+        let _ = writeln!(o, "  (no protected root exists in this scan)");
+    }
+    let _ = writeln!(o, "\nNeeds a person (ask), by reason:");
+    if p.totals.ask_by_reason.is_empty() {
+        let _ = writeln!(o, "  (nothing asks)");
+    }
+    for (code, t) in &p.totals.ask_by_reason {
+        let _ = writeln!(
+            o,
+            "  {:<16} {:>10}  {:>10}",
+            code,
+            count(t.items, "item", "items"),
+            human_bytes(t.bytes)
+        );
+    }
+    let mut biggest: Vec<&disk_cleaner_core::PlanItem> = p.items.iter().collect();
+    biggest.sort_by(|a, b| {
+        b.bytes_total
+            .cmp(&a.bytes_total)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    let _ = writeln!(o, "\nBiggest items (top 20):");
+    for it in biggest.iter().take(20) {
+        let reason: String = it.reason.chars().take(110).collect();
+        let _ = writeln!(
+            o,
+            "  {:>10}  {:<26} [{}] {}",
+            human_bytes(it.bytes_total),
+            it.action.as_str(),
+            it.class.as_str(),
+            esc(&it.path)
+        );
+        let _ = writeln!(o, "      {}", esc(&reason));
     }
     let mut items: Vec<&disk_cleaner_core::PlanItem> = p.items.iter().collect();
     items.sort_by(|a, b| {

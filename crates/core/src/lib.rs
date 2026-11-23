@@ -15,6 +15,7 @@ pub mod model;
 pub mod plan;
 pub mod preserve;
 pub mod procs;
+pub mod protect;
 pub mod redact;
 mod regular;
 pub mod rules;
@@ -29,11 +30,12 @@ pub use facts::{is_network_url, FactsConfig};
 pub use git::{Git, GitError};
 pub use model::*;
 pub use plan::{
-    plan, resolve_active, Action, Plan, PlanItem, PlanOptions, Preserve, PreserveGitAdmin,
-    PreserveObjectStore, ProjectState,
+    plan, resolve_active, Action, AskTotal, HeldTotal, Plan, PlanItem, PlanOptions, Preserve,
+    PreserveGitAdmin, PreserveObjectStore, ProjectState,
 };
 pub use preserve::{git_admin_files, object_store_files};
 pub use procs::{running_cwds, ProcessCheck};
+pub use protect::{Hold, ScanContext, Verdict};
 pub use rules::RuleSet;
 pub use scan::{scan, ScanOptions};
 

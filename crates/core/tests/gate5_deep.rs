@@ -34,6 +34,7 @@ fn chain(len: usize) -> ScanResult {
             complete: true,
             ..Default::default()
         },
+        protect: Default::default(),
     }
 }
 

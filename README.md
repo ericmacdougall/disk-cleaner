@@ -32,8 +32,11 @@ yes. It prints a summary, or JSON with `--json`, and writes the JSON to a file w
 window (`active_window_days`, default 7, set in the config file or with `--active-window-days`), a
 path you mark with `--active`, or a folder a running process works in is kept. For the rest it
 proposes one action per item: `keep`, `remove-regenerable`, `backup-then-remove`,
-`recover-backup-then-remove` or `ask`, each with a reason in words. The plan is a proposal only;
-nothing applies it yet.
+`recover-backup-then-remove` or `ask`, each with a reason in words. Agent homes (`~/.claude`,
+`~/.codex`, `~/.agent-harness` and similar, plus `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the config's
+`protected_paths`), cloud-sync folders and application packages are never proposed for removal:
+they are held, and the summary shows what is held and why, how many bytes each class and action
+would free, and the biggest items. The plan is a proposal only; nothing applies it yet.
 
 The scan and plan formats, every fact and every rule are described in
 [docs/SCAN-FORMAT.md](docs/SCAN-FORMAT.md). The overall design is in [docs/DESIGN.md](docs/DESIGN.md).
@@ -75,7 +78,7 @@ None of this exists yet:
 
 ## Safety model in one paragraph
 
-Scanning and planning are read-only. The planned apply step will remove nothing unless the tool has
+Scanning and planning are read-only; scan refuses to run as root or with a `HOME` that is not your own, and plan never proposes removing agent transcripts, WALs or cloud-synced files. The planned apply step will remove nothing unless the tool has
 shown that it is regenerable or exists elsewhere, and has re-checked that at the moment of removal.
 A check that fails or times out leaves its fact unknown, and an unknown fact never leads the plan to
 propose removal: an idle repo with one is marked `ask`. Every removal will be written to a manifest with a restore command.

@@ -185,6 +185,7 @@ dependencies = [
  "anyhow",
  "clap",
  "disk-cleaner-core",
+ "libc",
  "serde_json",
  "tempfile",
 ]

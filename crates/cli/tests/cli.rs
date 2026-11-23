@@ -898,6 +898,14 @@ fn g1_inherited_git_config_never_runs_a_filter_and_is_not_applied() {
         }
         c.env("APPDATA", t.join("appdata"));
         setup(&mut c);
+        // The scan refuses a HOME that is not the passwd home unless `--home` names it too.
+        let fixture_home = c
+            .get_envs()
+            .find(|(k, _)| *k == "HOME")
+            .and_then(|(_, v)| v.map(|v| v.to_owned()));
+        if let Some(h) = fixture_home {
+            c.arg("--home").arg(h);
+        }
         let o = run(&mut c);
         if !o.status.success() {
             failures.push(format!(

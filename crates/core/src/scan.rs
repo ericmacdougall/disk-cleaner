@@ -43,6 +43,9 @@ pub struct ScanOptions {
     pub git_jobs: usize,
     /// Artifact and cache rules.
     pub rules: Arc<RuleSet>,
+    /// The user, home and environment the protected roots are resolved from (see
+    /// [`crate::protect`]). The CLI fills it from the real process.
+    pub context: crate::protect::ScanContext,
 }
 
 impl ScanOptions {
@@ -57,6 +60,7 @@ impl ScanOptions {
             facts: FactsConfig::default(),
             git_jobs: 4,
             rules: Arc::new(RuleSet::builtin()),
+            context: crate::protect::ScanContext::from_env(Vec::new()),
         }
     }
 }
@@ -967,6 +971,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     if opts.roots.is_empty() {
         return Err(Error::NoRoots);
     }
+    // Protection first: a scan that cannot say what it protects is not made.
+    let mut protect_ctx = crate::protect::resolve(&opts.context)?;
     let mut spelled: Vec<PathBuf> = Vec::new();
     for r in &opts.roots {
         let abs = std::path::absolute(r).map_err(|e| Error::Root {
@@ -1093,6 +1099,11 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     // Phase 2: classification.
     let mut dirs: Vec<(PathBuf, DirAgg)> = aggs.into_iter().collect();
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    crate::protect::attribute_bytes(
+        &mut protect_ctx.roots,
+        dirs.iter().map(|(p, a)| (p.as_path(), a.bytes)),
+        &|p| real_under(&roots, &plan_r.canon, p),
+    );
     let root_set: HashSet<PathBuf> = roots.iter().cloned().collect();
     let mut odd_dirs: Vec<PathBuf> = Vec::new();
     let mut builds = classify(&mut dirs, &opts.rules, &root_set, &mut odd_dirs);
@@ -1439,7 +1450,15 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             git_facts: opts.collect_facts,
         },
         totals,
-        nodes: builds.into_iter().map(|b| b.node).collect(),
+        nodes: builds
+            .into_iter()
+            .map(|mut b| {
+                let (real, unreadable) = crate::protect::node_real_path(&b.path);
+                b.node.real_path = real;
+                b.node.real_unreadable = unreadable;
+                b.node
+            })
+            .collect(),
         outputs,
         big_files,
         issues,
@@ -1447,6 +1466,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         enclosing_repos,
         scope: roots_scope(&roots).to_string(),
         coverage,
+        protect: protect_ctx,
     })
 }
 
