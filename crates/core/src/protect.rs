@@ -287,6 +287,7 @@ fn make_root(spelled: PathBuf, code: HoldCode, carve: CarveLayout, source: &str)
         carve,
         source: source.to_string(),
         bytes: 0,
+        file_bytes: Some(0),
     }
 }
 
@@ -462,16 +463,18 @@ pub fn node_real_path(path: &Path) -> (Option<String>, bool) {
     }
 }
 
-/// Add the walk's bytes to each root: `dirs` pairs a directory's spelled path and its own
-/// allocated bytes; `real_of` gives the directory's real path (root-prefix swap). A directory
-/// counts toward a root when either of its paths is at or below either of the root's.
+/// Add the walk's bytes to each root: `dirs` gives a directory's spelled path, its own
+/// allocated bytes (its entry and its direct non-directory entries) and, of those, the bytes of
+/// its direct non-directory entries; `real_of` gives the directory's real path (root-prefix
+/// swap). A directory counts toward a root when either of its paths is at or below either of the
+/// root's.
 pub fn attribute_bytes<'a>(
     roots: &mut [ProtectedRoot],
-    dirs: impl Iterator<Item = (&'a Path, u64)>,
+    dirs: impl Iterator<Item = (&'a Path, u64, u64)>,
     real_of: &dyn Fn(&Path) -> PathBuf,
 ) {
     let ids: Vec<Vec<PathBuf>> = roots.iter().map(root_ids).collect();
-    for (dir, bytes) in dirs {
+    for (dir, bytes, file_bytes) in dirs {
         if bytes == 0 {
             continue;
         }
@@ -482,6 +485,9 @@ pub fn attribute_bytes<'a>(
                 .any(|rp| rel_below(&lex, rp).is_some() || rel_below(&real, rp).is_some())
             {
                 roots[i].bytes = roots[i].bytes.saturating_add(bytes);
+                if let Some(f) = roots[i].file_bytes.as_mut() {
+                    *f = f.saturating_add(file_bytes);
+                }
             }
         }
     }

@@ -226,6 +226,10 @@ pub struct HeldTotal {
     /// not a sum of the items; absent for package directories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    /// Of `bytes`, those of files (not directory entries); folding empty roots in the summary
+    /// uses it. Absent for package directories and for scans that do not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_bytes: Option<u64>,
     /// Package directories only (the scan attributes no bytes to them): the `bytes_total` of
     /// the items held by this package, an item inside another item it holds counted once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -919,6 +923,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 root: r.spelled.clone(),
                 items: 0,
                 bytes: Some(r.bytes),
+                file_bytes: r.file_bytes,
                 item_bytes: None,
             },
         );
@@ -936,6 +941,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                     root: h.root.clone(),
                     items: 0,
                     bytes: None,
+                    file_bytes: None,
                     item_bytes: None,
                 });
             slot.items += 1;
@@ -1822,6 +1828,7 @@ mod tests {
             carve: CarveLayout::None,
             source: "built-in".into(),
             bytes: 0,
+            file_bytes: Some(0),
         }
     }
 

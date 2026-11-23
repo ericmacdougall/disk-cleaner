@@ -119,7 +119,7 @@ system or git call to protect anything:
 | `home` | the home the roots were resolved under: the passwd home, or `--home DIR` (disposable fixture homes; `HOME` must equal it, and the passwd home stays protected too) |
 | `passwd_home`, `uid` | the scanning user's passwd home and effective user id (omitted where the platform has none) |
 | `home_env`, `claude_config_dir`, `codex_home`, `xdg_config_home` | `HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_CONFIG_HOME` as the scan saw them |
-| `roots` | one entry per root: `spelled` path, `canonical` path (when it exists and resolved), `exists`, `unreadable` (it exists but its canonical path failed with a permission error: only the spelled path is compared), `code` (`protected` or `synced`), `carve` (`none`, `agent-harness` or `worktrees`), `source` (`built-in`, an override variable, `config`) and `bytes` (allocated bytes the walk attributed to it, 0 when it lies outside every scan root) |
+| `roots` | one entry per root: `spelled` path, `canonical` path (when it exists and resolved), `exists`, `unreadable` (it exists but its canonical path failed with a permission error: only the spelled path is compared), `code` (`protected` or `synced`), `carve` (`none`, `agent-harness` or `worktrees`), `source` (`built-in`, an override variable, `config`) `bytes` (allocated bytes the walk attributed to it, 0 when it lies outside every scan root) and `file_bytes` (of those, the bytes of files and other non-directory entries; directory entries are left out because their size depends on the file system) |
 
 Protected roots: home-relative `.claude`, `.codex`, `.agent-harness`, `.prunedisk`, `.kimi`,
 `.kimi-code`, `.gemini`, `.cursor`, `.config/claude`, `.local/share/claude` and
@@ -837,11 +837,13 @@ whose action removes a git node, `preserve` (see "The preserve obligation").
 `totals` holds `reclaimable_bytes`, `ready_bytes`, `by_action`, and since schema 16 `by_class`
 (removing items by class: `items` and `reclaimable_bytes`, an item nested in another removing item
 counted once), `held` (per `code` and `root`: `items` held and, for a protected or synced root, the
-`bytes` the scan attributed to the root, not a sum of the items; for a package directory
+`bytes` the scan attributed to the root, not a sum of the items, and its `file_bytes`; for a package directory
 `item_bytes`, the `bytes_total` of its held items, an item inside another it holds counted once)
 and `ask_by_reason` (`ask` items by
 `ask_code`, with their `bytes_total`; an ask nested in another ask item is counted once). The text
-summary lists held roots largest first and folds the roots with 0 B and nothing held into one line.
+summary lists held roots largest first and folds into one line the roots with no file bytes
+(`file_bytes` 0) and nothing held; a root with files in it, or without a recorded `file_bytes`, is
+always listed.
 
 ### Holds
 

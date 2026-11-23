@@ -569,6 +569,11 @@ pub struct ProtectedRoot {
     /// Allocated bytes the walk attributed to the root (0 when it lies outside every scan root).
     #[serde(default)]
     pub bytes: u64,
+    /// Of `bytes`, those of non-directory entries (files, links): what the root holds apart from
+    /// directory entries, whose own size differs by file system (an empty directory takes a
+    /// block on ext4, none on APFS). Missing in older scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_bytes: Option<u64>,
 }
 
 /// What the protected roots were resolved from, and the roots.

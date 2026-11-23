@@ -313,13 +313,14 @@ pub fn plan_summary(p: &Plan) -> String {
         "\nProtected and held back (kept whatever their age or facts; bytes are what the scan \
          walked under each root):"
     );
-    // Largest first (a package directory by its held items' bytes); roots with nothing walked
-    // under them and nothing held are folded into one line.
+    // Largest first (a package directory by its held items' bytes); roots that hold no file
+    // bytes (directory entries alone, whose size depends on the file system, do not count) and
+    // nothing held are folded into one line. A root without a file count is always listed.
     let size_of = |h: &disk_cleaner_core::HeldTotal| h.bytes.or(h.item_bytes);
     let mut listed: Vec<&disk_cleaner_core::HeldTotal> = Vec::new();
     let mut folded = 0u64;
     for h in &p.totals.held {
-        if h.bytes == Some(0) && h.items == 0 {
+        if h.file_bytes == Some(0) && h.items == 0 {
             folded += 1;
         } else {
             listed.push(h);
@@ -348,7 +349,7 @@ pub fn plan_summary(p: &Plan) -> String {
     if folded > 0 {
         let _ = writeln!(
             o,
-            "  {} more {}, empty or outside the scanned folders (0 B, nothing held)",
+            "  {} more {}, empty or outside the scanned folders (no files, nothing held)",
             folded,
             if folded == 1 { "root" } else { "roots" }
         );

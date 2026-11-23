@@ -83,6 +83,8 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     // Two protected roots that exist but hold nothing: folded into one summary line.
     fs::create_dir_all(home.join(".codex")).unwrap();
     fs::create_dir_all(home.join(".gemini")).unwrap();
+    // A root with real data but no plan item inside: it must stay listed.
+    write(&home.join(".cursor/state.bin"), &"c".repeat(9_000));
     write(
         &home.join(".claude/projects/p/rollout-1.jsonl"),
         &"y".repeat(50_000),
@@ -142,6 +144,18 @@ fn plan_cmd(scan_file: &Path, home: &Path, json: bool) -> Output {
 #[test]
 fn plan_summary_classes() {
     let (_tmp, home, scan_file) = fixture();
+    // Linux semantics on every platform: an empty directory's own entry takes a block there,
+    // so the walk attributes 4 KiB to an empty root. Folding must not depend on that.
+    let mut sv: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
+    for r in sv["protect"]["roots"].as_array_mut().unwrap() {
+        let sp = r["spelled"].as_str().unwrap().to_string();
+        if sp.ends_with("/.codex") || sp.ends_with("/.gemini") {
+            let b = r["bytes"].as_u64().unwrap();
+            r["bytes"] = serde_json::json!(b + 4096);
+        }
+    }
+    fs::write(&scan_file, sv.to_string()).unwrap();
 
     // JSON plan.
     let o = plan_cmd(&scan_file, &home, true);
@@ -281,7 +295,15 @@ fn plan_summary_classes() {
         .find(|l| l.contains("/Applications/Foo.app"))
         .unwrap();
     assert!(!pkg_line.contains(" - "), "{pkg_line}");
-    // Roots with 0 B and nothing held are folded into one line, not listed one by one.
+    // Roots holding no file bytes and nothing held are folded into one line, not listed one by
+    // one, even when their directory entries take space; a root with file data stays listed.
+    let cursor = home.join(".cursor");
+    assert!(
+        held_lines
+            .iter()
+            .any(|l| l.ends_with(cursor.to_str().unwrap()) && l.contains(" 0 held")),
+        "{held_lines:?}"
+    );
     for empty in [".codex", ".gemini"] {
         let r = home.join(empty);
         assert!(
@@ -295,7 +317,7 @@ fn plan_summary_classes() {
         .unwrap_or_else(|| panic!("no folded line: {held_lines:?}"));
     let folded = held
         .iter()
-        .filter(|h| h["bytes"] == 0 && h["items"] == 0)
+        .filter(|h| h["file_bytes"] == 0 && h["items"] == 0)
         .count();
     assert!(folded >= 2, "{held:?}");
     assert!(

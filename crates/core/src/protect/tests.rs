@@ -644,6 +644,17 @@ fn scan_records_context_and_attributes_root_bytes() {
         .unwrap();
     assert!(claude.exists && claude.canonical.is_some());
     assert!(claude.bytes >= 70_000, "bytes attributed: {}", claude.bytes);
+    // File bytes count the files only: the log and the package file are in, and a root that
+    // holds only empty directories has none, whatever its directory entries take.
+    let files = claude.file_bytes.unwrap();
+    assert!(files >= 70_000 && files <= claude.bytes, "{claude:?}");
+    let empty = s
+        .protect
+        .roots
+        .iter()
+        .find(|r| r.spelled.ends_with("/.gemini"))
+        .unwrap();
+    assert!(empty.exists && empty.file_bytes == Some(0), "{empty:?}");
     let nm = s
         .nodes
         .iter()

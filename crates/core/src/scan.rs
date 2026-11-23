@@ -140,6 +140,8 @@ fn meta_from(md: &Metadata) -> EntryMeta {
 struct DirAgg {
     /// Allocated bytes of the directory entry itself plus its direct non-directory entries.
     bytes: u64,
+    /// Of `bytes`, those of the direct non-directory entries only.
+    file_bytes: u64,
     files: u64,
     output_bytes: u64,
     newest: Option<i64>,
@@ -483,6 +485,7 @@ impl Walk {
             agg.first_symlink = Some(name.clone());
         }
         agg.bytes += alloc;
+        agg.file_bytes += alloc;
         agg.files += 1;
         if is_file && crate::protect::is_agent_file_name(&name) {
             agg.agent_files += 1;
@@ -1107,7 +1110,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
     crate::protect::attribute_bytes(
         &mut protect_ctx.roots,
-        dirs.iter().map(|(p, a)| (p.as_path(), a.bytes)),
+        dirs.iter()
+            .map(|(p, a)| (p.as_path(), a.bytes, a.file_bytes)),
         &|p| real_under(&roots, &plan_r.canon, p),
     );
     let root_set: HashSet<PathBuf> = roots.iter().cloned().collect();
