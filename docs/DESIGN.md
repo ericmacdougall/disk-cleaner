@@ -129,8 +129,10 @@ it) or mark one inactive.
 Evidence is judged per item by one module (`evidence`, see docs/SCAN-FORMAT.md "Per-item
 evidence"); nothing is inherited from a parent node except through the owning project or the owning
 harness session. An item is in use when a readable process works in it or holds a file open in it,
-when any process's command line names a path in it, when a running container binds it, or when its
-harness session is live. A process working in an ancestor (a shell at the home) or in a sibling
+when any process's command line names a path in it, when a running container binds it, or when a
+locus of its live harness session or a recent agent transcript's working directory equals, contains
+or lies inside it (applied at one choke point in the plan); a checkout in a live session or an
+agent worktree asks while its activity is under 14 days old. A live session alone holds nothing. A process working in an ancestor (a shell at the home) or in a sibling
 holds nothing. A live session is recognised from several independent sources (the Claude Code
 registry, agent processes, process working directories, recent transcripts, recent files and
 same-named entries), and an agent process that maps to no place makes removals under the harness

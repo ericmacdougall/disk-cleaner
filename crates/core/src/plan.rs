@@ -489,15 +489,8 @@ fn judge(ctx: &Ctx, idx: usize, opts: &PlanOptions) -> (ProjectState, String, Op
             days,
         );
     }
-    if let Some(s) = e.session.map(|k| &ctx.ev.sessions[k]) {
-        if let Some(why) = &s.live {
-            return (
-                ProjectState::Active,
-                format!("session {} is live: {why} [rule 4]", s.name),
-                days,
-            );
-        }
-    }
+    // A live session alone holds nothing (r6): its nodes are held by a locus at the plan's one
+    // choke point, by their own activity, or not at all.
     let window = opts.active_window_days;
     match (last, days) {
         (Some(t), Some(d)) => {
@@ -686,16 +679,42 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             }
             _ => {}
         }
-        // Rule 5, the one choke point for a recent agent session's working directory: every
-        // removing action becomes keep (wal:w34c987e0ea8).
+        // The one choke point for locus holds (rules 4 and 5, wal:w34c987e0ea8): every removing
+        // action becomes keep. Then a checkout in a live session or an agent worktree with no
+        // locus asks while its activity is under 14 days old (E1b wal:w3016875c8d9, G1).
         if action.removes() {
-            if let Some(h) = &ctx.ev.nodes[idx].recent_hold {
+            let ne = &ctx.ev.nodes[idx];
+            if let Some(h) = &ne.locus_hold {
+                let what = if h.rule == 5 {
+                    "recent agent session"
+                } else {
+                    "live session locus"
+                };
+                let live = ne
+                    .session
+                    .map(|k| &ctx.ev.sessions[k])
+                    .and_then(|s| {
+                        s.live
+                            .as_ref()
+                            .map(|w| format!("; session {} is live: {w}", s.name))
+                    })
+                    .unwrap_or_default();
                 reason = format!(
-                    "recent agent session: {} ({}) [rule 5]; on its own: {reason}",
-                    h.path, h.detail
+                    "{what}: {} ({}) [rule {}]{live}; on its own: {reason}",
+                    h.path, h.detail, h.rule
                 );
                 action = Action::Keep;
                 reclaim = 0;
+            } else if let Some(label) = ne.idle_ask {
+                let idle = ne
+                    .activity
+                    .map(|t| (opts.now.saturating_sub(t).max(0) / 86_400) as u64);
+                if idle.is_none_or(|d| d < crate::evidence::IDLE_ASK_DAYS) {
+                    let n = idle.map_or("unknown".to_string(), |d| count(d, "day", "days"));
+                    reason = format!("{label}; idle {n}; on its own: {reason}");
+                    action = Action::Ask;
+                    reclaim = 0;
+                }
             }
         }
         own_action.push(action);
@@ -723,31 +742,23 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             rule: ne
                 .in_use
                 .as_ref()
-                .map(|h| h.rule)
-                .or_else(|| {
-                    ne.session
-                        .filter(|k| ctx.ev.sessions[*k].live.is_some())
-                        .map(|_| 4)
-                })
-                .or_else(|| ne.recent_hold.as_ref().map(|h| h.rule)),
+                .or(ne.locus_hold.as_ref())
+                .map(|h| h.rule),
             path: ne
                 .in_use
                 .as_ref()
-                .or(ne.recent_hold.as_ref())
+                .or(ne.locus_hold.as_ref())
                 .map(|h| h.path.clone()),
-            detail: ne
-                .in_use
-                .as_ref()
-                .map(|h| h.detail.clone())
-                .or_else(|| {
-                    ne.session.and_then(|k| {
-                        let s = &ctx.ev.sessions[k];
-                        s.live
-                            .as_ref()
-                            .map(|w| format!("session {} is live: {w}", s.name))
-                    })
-                })
-                .or_else(|| ne.recent_hold.as_ref().map(|h| h.detail.clone())),
+            detail: ne.in_use.as_ref().map(|h| h.detail.clone()).or_else(|| {
+                let h = ne.locus_hold.as_ref()?;
+                let live = ne.session.and_then(|k| {
+                    let s = &ctx.ev.sessions[k];
+                    s.live
+                        .as_ref()
+                        .map(|w| format!("session {} is live: {w}; ", s.name))
+                });
+                Some(format!("{}{}", live.unwrap_or_default(), h.detail))
+            }),
             session: ne.session.map(|k| ctx.ev.sessions[k].name.clone()),
             project: ne.project.clone(),
             gaps_inside: ne.gaps_inside,
@@ -1178,9 +1189,11 @@ pub fn keep_code(it: &PlanItem) -> &'static str {
 
 /// A short code for the reason an item asks, from its final reason text.
 pub fn ask_code(reason: &str) -> &'static str {
-    const TABLE: [(&str, &str); 17] = [
+    const TABLE: [(&str, &str); 19] = [
         ("the nested ", "nested-veto"),
         ("agent data unreadable", "agent-data"),
+        ("session live; idle", "session-idle"),
+        ("agent worktree; idle", "worktree-idle"),
         ("running processes could not be inspected", "process-check"),
         ("could not be inspected (neither", "process-check"),
         ("(fail closed)", "agent-check"),
