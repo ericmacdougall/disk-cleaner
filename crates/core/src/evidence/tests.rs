@@ -270,17 +270,23 @@ fn sibling_process_does_not_hold() {
     assert_eq!(action(&p, &wt), Action::Keep, "{}", why(&p, &wt));
     assert_eq!(item(&p, &wt).evidence.rule, Some(1));
 
-    // NEG-6: the protected checkout is never offered, whatever the evidence says.
-    let p = fx.plan(ProcessSnapshot::none_running());
-    if let Some(h) = p.items.iter().find(|i| i.path == held.to_string_lossy()) {
+    // NEG-6: the protected checkout is never offered, whatever the evidence says: idle, and
+    // with a process working inside it.
+    let cwd = fx.s(".claude/plugins/marketplaces/m/src");
+    for snapshot in [
+        ProcessSnapshot::none_running(),
+        snap(vec![proc(103, &cwd, &["bash"])]),
+    ] {
+        let p = fx.plan(snapshot);
+        let h = item(&p, &held);
         assert_eq!(h.action, Action::Keep, "{}", why(&p, &held));
-        assert!(h.hold.is_some(), "{}", why(&p, &held));
+        assert_eq!(
+            h.hold.as_ref().map(|h| h.code),
+            Some(HoldCode::Protected),
+            "{}",
+            why(&p, &held)
+        );
     }
-    assert!(p
-        .items
-        .iter()
-        .filter(|i| Path::new(&i.path).starts_with(&held))
-        .all(|i| i.action == Action::Keep));
 }
 
 // ------------------------------------------------------------------------------------- AC-2
@@ -604,6 +610,13 @@ fn live_session() {
         &l.fx.plan(snap(vec![a])),
         "session id on a command line",
     );
+    // ...also as a `--flag=value` and inside a `:` list, where no such path exists on disk.
+    for arg in ["--resume=s1", "--sessions=zz:s1"] {
+        let l = live_fixture();
+        let mut a = agent(501, "claude", &l.fx.s("projects/foo"));
+        a.cmdline = Some(vec!["claude".into(), arg.into()]);
+        kept(&l, &l.fx.plan(snap(vec![a])), arg);
+    }
 
     // Recent files below the session directory.
     let l = live_fixture();

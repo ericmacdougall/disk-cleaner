@@ -134,7 +134,9 @@ class Oracle:
     def agents(self):
         for pid, args, cwd, files in agent_processes():
             for a in args[1:]:
-                self.mark(a, "agent pid %d names it" % pid)
+                value = a.split("=", 1)[1] if a.startswith("-") and "=" in a else a
+                for tok in {a, value, *value.split(":")}:
+                    self.mark(tok, "agent pid %d names it" % pid)
             for p in [cwd] + files:
                 s = self.session_of(p)
                 if s:
@@ -314,20 +316,29 @@ def agent_processes():
                 pass
             out.append((int(e), args, cwd, files))
         return out
-    try:
-        ps = subprocess.run(
-            ["ps", "-axo", "pid=,uid=,args="], capture_output=True, text=True, timeout=30
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return out
+    def ps(fields):
+        try:
+            text = subprocess.run(
+                ["ps", "-axo", "pid=,uid=," + fields + "="],
+                capture_output=True, text=True, timeout=30,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        rows = {}
+        for line in text.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].isdigit() and parts[1] == str(me):
+                rows[int(parts[0])] = parts[2]
+        return rows
+
+    # The executable name (`comm`; Claude Code's binary is a versioned file whose argv[0] is
+    # not `claude`) and the arguments.
+    comms, argvs = ps("comm"), ps("args")
     found = {}
-    for line in ps.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3 or not parts[0].isdigit() or parts[1] != str(me):
-            continue
-        args = parts[2].split()
-        if is_agent(args, ""):
-            found[int(parts[0])] = args
+    for pid, comm in comms.items():
+        args = argvs.get(pid, "").split()
+        if is_agent(args, os.path.basename(comm.strip())):
+            found[pid] = args
     if not found:
         return out
     try:
@@ -399,6 +410,8 @@ def main(argv, processes=True):
     for s in sorted(live):
         print("  live  %s  (%s)" % (s, live[s]))
     offered, missed = check(plan, oracle)
+    mapped = [i for i in plan.get("items", []) if oracle.session_of(i.get("path"))]
+    print("plan: %d of %d items lie in a session directory" % (len(mapped), len(plan.get("items", []))))
     for s, p in offered:
         print("OFFERED: live session %s has a removing item: %s" % (s, p))
     for s in missed:

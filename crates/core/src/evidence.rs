@@ -343,6 +343,26 @@ pub(crate) fn arg_paths(args: &[String], cwd: Option<&Path>) -> Vec<PathBuf> {
     out
 }
 
+/// The words of a command line a session id may be: each whole argument, the value of a
+/// `--flag=value`, and each piece of a `:`-separated value (`--resume=s1`, `--dirs=a:s1`).
+fn arg_tokens(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for a in args.iter().take(512) {
+        out.push(a.as_str());
+        let value = match a.split_once('=') {
+            Some((_, v)) if a.starts_with('-') => v,
+            _ => a.as_str(),
+        };
+        if value != a.as_str() {
+            out.push(value);
+        }
+        if value.contains(':') {
+            out.extend(value.split(':').filter(|v| !v.is_empty()));
+        }
+    }
+    out
+}
+
 /// The paths an agent's arguments name, as loci: `argv[0]` is the program, not a place it
 /// works; absolute paths count as given, and a relative argument counts only when it names
 /// something that exists below the working directory (a bare word such as a prompt or a
@@ -1067,8 +1087,8 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                 }
             }
         }
-        for a in &args {
-            if sidx.contains_key(a.as_str()) {
+        for a in arg_tokens(&args) {
+            if sidx.contains_key(a) {
                 live(
                     &mut ev,
                     a,
