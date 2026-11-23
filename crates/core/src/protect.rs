@@ -80,17 +80,6 @@ pub fn is_agent_file_name(name: &str) -> bool {
     n.ends_with(".jsonl") || n.contains("receipt") || has_wal_word(&n)
 }
 
-/// Is `p` a direct child of `.agent-harness/work/<session>/` (by spelling)? The scan calls it for
-/// a directory that holds an agent file at its top level, which makes it a task directory.
-pub fn is_task_dir_path(p: &Path) -> bool {
-    let comps: Vec<String> = normalize(p)
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
-        .collect();
-    let n = comps.len();
-    n >= 5 && comps[n - 3] == "work" && comps[n - 4] == ".agent-harness"
-}
-
 /// The process context a scan resolves its protected roots from. Everything is an input; the CLI
 /// fills it from the real process, tests pass values explicitly.
 #[derive(Debug, Clone, Default)]
@@ -452,7 +441,6 @@ pub fn resolve(ctx: &ScanContext) -> Result<ProtectContext> {
         codex_home: ctx.codex_home.clone(),
         xdg_config_home: ctx.xdg_config_home.clone(),
         roots,
-        task_dirs: Vec::new(),
     })
 }
 
@@ -602,12 +590,22 @@ fn package_above(p: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Is a node at `rel` below an agent-harness root on `work/<session>/` (a direct child of a
+/// session directory or deeper)?
+fn on_work_session(rel: &[OsString]) -> bool {
+    rel.len() >= 3 && comp_eq(&rel[0], OsStr::new("work"))
+}
+
+/// Is `rel` (a node's position below one path of a protected root) a carve-out position?
+/// `top_clean` is the node's own fact that no agent file sits at its top level (a missing count
+/// is not clean). It is judged here, by position under the root, so the same node gets the same
+/// answer whichever spelling of the root or the node the walk used.
 fn carve_position(
     layout: CarveLayout,
     rel: &[OsString],
     root: &Path,
     git_paths: &dyn Fn(&Path) -> bool,
-    task_paths: &dyn Fn(&Path) -> bool,
+    top_clean: bool,
 ) -> bool {
     let first = |name: &str| rel.first().is_some_and(|c| comp_eq(c, OsStr::new(name)));
     match layout {
@@ -615,12 +613,9 @@ fn carve_position(
         CarveLayout::Worktrees => rel.len() == 2 && first("worktrees"),
         CarveLayout::AgentHarness => {
             // A checkout that is a direct child of a session directory and not an agent-data
-            // checkout (one with agent files at its top level, recorded by the scan), or a
-            // direct child of a task directory (any child of the session that is not itself a
-            // checkout).
-            (rel.len() == 3
-                && first("work")
-                && !task_paths(&root.join(&rel[0]).join(&rel[1]).join(&rel[2])))
+            // checkout (one with agent files at its own top level), or a direct child of a task
+            // directory (any child of the session that is not itself a checkout).
+            (rel.len() == 3 && first("work") && top_clean)
                 || (rel.len() == 4
                     && first("work")
                     && !git_paths(&root.join(&rel[0]).join(&rel[1]).join(&rel[2])))
@@ -647,38 +642,35 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
         .flat_map(|(_, v)| v.iter())
         .collect();
     let is_git_path = |p: &Path| git_ids.iter().any(|g| same_path(g, p));
-    let task_ids: Vec<PathBuf> = scan
-        .protect
-        .task_dirs
-        .iter()
-        .map(|t| normalize(Path::new(t)))
-        .collect();
-    let is_task_path = |p: &Path| task_ids.iter().any(|t| same_path(t, p));
-    // Is the node below `work/<session>/` of an agent-harness root (by any identity)?
+    // Is the node below `work/<session>/` of an agent-harness root by some identity? (Only
+    // decides whether the work-dir allowlist is looked at; the exemption itself needs every
+    // identity, see `exempt_roots`.)
     let under_work_session = |my: &[PathBuf]| {
         roots.iter().any(|(r, rids)| {
             r.carve == CarveLayout::AgentHarness
                 && my.iter().any(|np| {
-                    rids.iter().any(|rp| {
-                        rel_below(np, rp).is_some_and(|rel| {
-                            rel.len() >= 3 && comp_eq(&rel[0], OsStr::new("work"))
-                        })
-                    })
+                    rids.iter()
+                        .any(|rp| rel_below(np, rp).is_some_and(|rel| on_work_session(&rel)))
                 })
         })
     };
 
-    let raw = |i: usize, exempt_protected_inside: bool| -> Verdict {
+    // `exempt(k)`: the hold of protected root `k` on this node, by the node being inside it, is
+    // lifted (the work-dir allowlist below). Holds from every other root, from containing a
+    // root, from sync folders and from packages stay.
+    let raw = |i: usize, exempt: &dyn Fn(usize) -> bool| -> Verdict {
         let node = &scan.nodes[i];
         if node.real_unreadable {
             return Verdict::Hold(Hold::new(HoldCode::Protected, "(unreadable)".into()));
         }
         let my = &ids[i];
+        let top_clean = node.top_agent_files == Some(0);
         let mut inside_protected: Vec<&ProtectedRoot> = Vec::new();
         let mut all_carve = true;
         let mut contained_protected: Option<&ProtectedRoot> = None;
         let mut synced: Option<&ProtectedRoot> = None;
-        for (r, rids) in &roots {
+        for (k, (r, rids)) in roots.iter().enumerate() {
+            let lifted = r.code == HoldCode::Protected && exempt(k);
             let mut inside = false;
             let mut contains = false;
             let mut inside_pairs = 0usize;
@@ -686,11 +678,14 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
             for np in my {
                 for rp in rids {
                     if let Some(rel) = rel_below(np, rp) {
+                        if lifted {
+                            continue;
+                        }
                         inside = true;
                         inside_pairs += 1;
                         if r.code == HoldCode::Protected
                             && !rel.is_empty()
-                            && carve_position(r.carve, &rel, rp, &is_git_path, &is_task_path)
+                            && carve_position(r.carve, &rel, rp, &is_git_path, top_clean)
                         {
                             carve_pairs += 1;
                         }
@@ -722,14 +717,9 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
             }
         }
         let mut carve_root: Option<String> = None;
-        if !inside_protected.is_empty() && !exempt_protected_inside {
-            // A task directory is never a candidate, even when it is a checkout.
-            if my.iter().any(|p| is_task_path(p)) {
-                return Verdict::Hold(Hold::new(
-                    HoldCode::Protected,
-                    inside_protected[0].spelled.clone(),
-                ));
-            }
+        if !inside_protected.is_empty() {
+            // A task directory or an agent-data checkout is never a carve-out position
+            // (`carve_position`), so it is held here like every other node inside.
             if all_carve && is_git_checkout(node.class) {
                 carve_root = Some(inside_protected[0].spelled.clone());
             } else {
@@ -756,7 +746,49 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
         }
     };
 
-    let mut verdicts: Vec<Verdict> = (0..n).map(|i| raw(i, false)).collect();
+    let none = |_: usize| false;
+    let mut verdicts: Vec<Verdict> = (0..n).map(|i| raw(i, &none)).collect();
+    // The protected roots whose hold an allowlisted directory `i` (with carve-out checkout `anc`
+    // above it, if any) is exempt from. Only the hold whose cause the allowlist exempts is lifted:
+    // an agent-harness root's hold when the node is on `work/<session>/` by every identity that
+    // puts it inside that root, or the hold of a root that puts the enclosing carve-out checkout
+    // in its carve-out position when the node lies inside that checkout by every identity that
+    // puts it inside the root. Config `protected_paths`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
+    // roots, other built-in roots reached by another identity, and roots that cover only the
+    // directory itself keep their hold.
+    let exempt_roots = |i: usize, anc: Option<usize>| -> Vec<bool> {
+        roots
+            .iter()
+            .map(|(r, rids)| {
+                if r.code != HoldCode::Protected {
+                    return false;
+                }
+                let pairs: Vec<Vec<OsString>> = ids[i]
+                    .iter()
+                    .flat_map(|np| rids.iter().filter_map(move |rp| rel_below(np, rp)))
+                    .collect();
+                if pairs.is_empty() {
+                    return false;
+                }
+                let harness = r.carve == CarveLayout::AgentHarness
+                    && pairs.iter().all(|rel| on_work_session(rel));
+                let carve_anc = anc.is_some_and(|a| {
+                    // The checkout is inside this root, and every identity of the node inside
+                    // the root is inside the checkout.
+                    let a_in = ids[a]
+                        .iter()
+                        .any(|ap| rids.iter().any(|rp| rel_below(ap, rp).is_some()));
+                    a_in && ids[i].iter().all(|np| {
+                        !rids.iter().any(|rp| rel_below(np, rp).is_some())
+                            || ids[a]
+                                .iter()
+                                .any(|ap| rel_below(np, ap).is_some_and(|rel| !rel.is_empty()))
+                    })
+                });
+                harness || carve_anc
+            })
+            .collect()
+    };
     // Regenerable and cache directories inside a checkout that is in a carve-out position keep
     // their normal action: removing them takes nothing but what the project's tooling rebuilds.
     for i in 0..n {
@@ -783,8 +815,8 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
             cur = scan.nodes[c].parent;
             steps += 1;
         }
-        let in_carve = anc.is_some_and(|a| matches!(verdicts[a], Verdict::CarveOut(_)));
-        if !in_carve && !under_work_session(&ids[i]) {
+        let carve_anc = anc.filter(|&a| matches!(verdicts[a], Verdict::CarveOut(_)));
+        if carve_anc.is_none() && !under_work_session(&ids[i]) {
             continue;
         }
         // Inside a carve-out checkout or anywhere else under `work/<session>/`, only dependency
@@ -800,7 +832,8 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
                 h.detail = Some(BUILD_OUTPUT_DETAIL.to_string());
             }
         } else if node.agent_files == Some(0) {
-            verdicts[i] = raw(i, true);
+            let lifted = exempt_roots(i, carve_anc);
+            verdicts[i] = raw(i, &|k| lifted[k]);
         }
     }
     verdicts

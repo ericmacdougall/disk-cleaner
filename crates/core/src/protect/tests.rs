@@ -29,6 +29,8 @@ fn node(path: impl AsRef<Path>, class: Class, facts: Facts) -> Node {
     n.bytes_self = 5_000;
     n.bytes_total = 5_000;
     n.newest_mtime = Some(0);
+    // The scan always records it; no agent file at the node's own top level.
+    n.top_agent_files = Some(0);
     if class.is_git() {
         n.repo = Some(RepoInfo {
             facts,
@@ -174,16 +176,7 @@ fn dirty(mutate: fn(&mut Facts)) -> Facts {
 #[test]
 fn carve_outs() {
     let (_t, home) = fixture_home();
-    let mut pc = resolve(&ctx_for(&home)).unwrap();
-    // The scan records the task directories: ones holding agent files at their top level.
-    pc.task_dirs = vec![
-        home.join(".agent-harness/work/s1/task")
-            .to_string_lossy()
-            .into_owned(),
-        home.join(".agent-harness/work/s2/task")
-            .to_string_lossy()
-            .into_owned(),
-    ];
+    let pc = resolve(&ctx_for(&home)).unwrap();
     let positions = [
         ".agent-harness/work/s1/clone",
         ".agent-harness/work/s1/task/clone",
@@ -233,13 +226,14 @@ fn carve_outs() {
             assert_eq!(it.hold.as_ref().unwrap().code, HoldCode::Protected);
         }
     }
-    // Not carve-out positions: a checkout inside a task dir that is itself a checkout, two
-    // levels below a task dir, and the session dir.
-    let task_checkout = node(
+    // Not carve-out positions: a checkout inside a task dir that is itself a checkout (with agent
+    // files at its top level), two levels below a task dir, and the session dir.
+    let mut task_checkout = node(
         home.join(".agent-harness/work/s2/task"),
         Class::Repo,
         all_yes(),
     );
+    task_checkout.top_agent_files = Some(2);
     let mut inside_task_checkout = node(
         home.join(".agent-harness/work/s2/task/clone"),
         Class::Repo,
@@ -291,21 +285,33 @@ fn carve_outs() {
     );
     assert_eq!(p.items[0].action, Action::BackupThenRemove);
 
-    // A checkout directly below a session with no agent files at its top level (the scan records
-    // none) is a carve-out; with agent files at its top level (recorded) it is an agent-data
-    // checkout: held, never a candidate.
-    let mut recorded = resolve(&ctx_for(&home)).unwrap();
-    recorded.task_dirs = vec![home
-        .join(".agent-harness/work/s2/task")
-        .to_string_lossy()
-        .into_owned()];
-    let agent_data = node(
-        home.join(".agent-harness/work/s2/task"),
-        Class::Repo,
-        all_yes(),
-    );
-    let p = plan(&scan_of(recorded, vec![agent_data]), &opts(300 * DAY));
-    assert!(held_protected(&p, 0), "{:?}", p.items[0]);
+    // A checkout directly below a session with no agent files at its top level is a carve-out;
+    // with agent files at its top level it is an agent-data checkout: held, never a candidate.
+    // A missing count is treated as nonzero.
+    for top in [Some(1), None] {
+        let mut agent_data = node(
+            home.join(".agent-harness/work/s2/task"),
+            Class::Repo,
+            all_yes(),
+        );
+        agent_data.top_agent_files = top;
+        let p = plan(
+            &scan_of(resolve(&ctx_for(&home)).unwrap(), vec![agent_data]),
+            &opts(300 * DAY),
+        );
+        assert!(held_protected(&p, 0), "{top:?}: {:?}", p.items[0]);
+    }
+    // The count matters only in that position: a checkout under a task dir, or in a worktrees
+    // dir, with agent files at its own top level is judged by its facts as before.
+    for pos in [".agent-harness/work/s7/t/clone", ".claude/worktrees/wt"] {
+        let mut x = node(home.join(pos), Class::Repo, all_yes());
+        x.top_agent_files = Some(3);
+        let p = plan(
+            &scan_of(resolve(&ctx_for(&home)).unwrap(), vec![x]),
+            &opts(300 * DAY),
+        );
+        assert_eq!(p.items[0].action, Action::BackupThenRemove, "{pos}");
+    }
 
     // A task dir holding only notes.md and results.tsv (so not a checkout, and no node of its
     // own) with a clean, pushed `wt/`: `wt/` is removable after a backup, nothing else is.
@@ -418,6 +424,11 @@ fn spellings() {
     // A root whose canonical path fails with a permission error.
     #[cfg(unix)]
     permission_denied_root_case();
+
+    // `.agent-harness` a symlink, scanned at its real target: an agent-data checkout is held
+    // although the walk never spells `.agent-harness` (class P).
+    #[cfg(unix)]
+    symlinked_harness_scanned_at_real_target();
 
     // A symlink loop (ELOOP): a root behind it is present and unresolved, so it is compared by
     // its spelled path, and a node behind it cannot be shown to be outside protected data.
@@ -850,16 +861,13 @@ fn task_dirs_and_prefixes() {
             .unwrap_or_else(|| panic!("{want} is not a protected root"));
         assert!(r.exists && r.code == HoldCode::Protected, "{r:?}");
     }
-    for t in ["tg", "u", "v", "w", "y"] {
-        assert!(
-            s.protect
-                .task_dirs
-                .iter()
-                .any(|d| d.ends_with(&format!("/s/{t}"))),
-            "{t} is not recorded as a task dir: {:?}",
-            s.protect.task_dirs
-        );
-    }
+    // The checkout `tg` records its top-level log and receipt (2); its `src` has none.
+    let tg_node = s
+        .nodes
+        .iter()
+        .find(|n| n.path.ends_with("/s/tg"))
+        .expect("tg is a node");
+    assert_eq!(tg_node.top_agent_files, Some(2), "{tg_node:?}");
     let nm = |d: &str| {
         s.nodes
             .iter()
@@ -1004,5 +1012,409 @@ fn config_paths_are_validated() {
     assert!(validate_config_path("~/agents").is_ok());
     for bad in ["", "rel/x", "~", "~/", "/", "~user/x"] {
         assert!(validate_config_path(bad).is_err(), "{bad:?}");
+    }
+}
+
+// ---------------------------------------------------------------- class P: identity
+
+/// A checkout made by hand (no git process): enough for the scan to classify it as a repo.
+fn fake_checkout(dir: &Path) {
+    fs::create_dir_all(dir.join(".git/objects")).unwrap();
+    fs::create_dir_all(dir.join(".git/refs")).unwrap();
+    fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    put(&dir.join("src/main.rs"), 300);
+}
+
+/// The scan ran without git: give every checkout the facts of a clean, fully pushed one, so a
+/// carve-out position really reaches `backup-then-remove` and "not removed" means something.
+fn patch_clean(s: &mut ScanResult) {
+    for n in s.nodes.iter_mut() {
+        if let Some(info) = n.repo.as_mut() {
+            info.facts = all_yes();
+            info.git_admin = Some(GitAdminSurvey {
+                files: 1,
+                bytes: 4096,
+                ..Default::default()
+            });
+            info.object_store = Some(ObjectStoreSurvey {
+                files: 1,
+                bytes: 4096,
+            });
+        }
+    }
+}
+
+/// Every agent-named file below `dir`, found by a plain walk (symlinks not followed).
+fn agent_named_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            let ft = e.file_type().unwrap();
+            if ft.is_dir() && e.file_name() != ".git" {
+                stack.push(e.path());
+            } else if ft.is_file() && is_agent_file_name(&e.file_name().to_string_lossy()) {
+                out.push(e.path());
+            }
+        }
+    }
+    out
+}
+
+/// The work-session tree every spelling below is scanned through: one entry per path-keyed
+/// protection fact the scan records (agent-data checkouts by a top-level WAL or log, a
+/// git-initialised task dir, a task dir's child checkout, an allowlisted dependency dir directly
+/// in the session), plus the clean controls that must stay removable.
+fn build_session(ah: &Path) {
+    let s = ah.join("work/s");
+    fake_checkout(&s.join("agentdata"));
+    put(&s.join("agentdata/run.wal"), 200);
+    fake_checkout(&s.join("agentlog"));
+    put(&s.join("agentlog/x.jsonl"), 200);
+    fake_checkout(&s.join("tg"));
+    put(&s.join("tg/run-receipt.json"), 200);
+    fake_checkout(&s.join("clean"));
+    put(&s.join("task/notes.md"), 100);
+    put(&s.join("task/results.tsv"), 100);
+    fake_checkout(&s.join("task/wt"));
+    put(&s.join("plain/package.json"), 2);
+    put(&s.join("plain/node_modules/a.js"), 400);
+}
+
+/// What each spelling must produce: the agent-data checkouts and the git-initialised task dir
+/// are never removing; the clean checkouts in carve-out positions are `backup-then-remove`; the
+/// allowlisted `node_modules` keeps its regenerable action; and no removing item is, contains or
+/// lies inside an agent-named file (found with a plain walk of the real tree).
+fn assert_session_plan(label: &str, s: &ScanResult, real_ah: &Path) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 400 * DAY;
+    let p = plan(s, &opts(now));
+    let find = |suffix: &str| {
+        p.items
+            .iter()
+            .find(|i| i.path.ends_with(suffix))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: no item ending {suffix}: {:?}",
+                    p.items.iter().map(|i| &i.path).collect::<Vec<_>>()
+                )
+            })
+    };
+    for held in ["/s/agentdata", "/s/agentlog", "/s/tg"] {
+        let it = find(held);
+        assert!(
+            !it.action.removes() && it.hold.is_some(),
+            "{label}: {held} is {:?}: {}",
+            it.action,
+            it.reason
+        );
+    }
+    for clean in ["/s/clean", "/s/task/wt"] {
+        let it = find(clean);
+        assert_eq!(
+            it.action,
+            Action::BackupThenRemove,
+            "{label}: {clean}: {}",
+            it.reason
+        );
+    }
+    let nm = find("/s/plain/node_modules");
+    assert_eq!(
+        nm.action,
+        Action::RemoveRegenerable,
+        "{label}: {}",
+        nm.reason
+    );
+    let files: Vec<PathBuf> = agent_named_files(real_ah)
+        .into_iter()
+        .map(|f| fs::canonicalize(f).unwrap())
+        .collect();
+    assert!(files.len() >= 3, "{label}: fixture has agent files");
+    for it in p.items.iter().filter(|i| i.action.removes()) {
+        let r = fs::canonicalize(&it.path).unwrap();
+        for f in &files {
+            assert!(
+                !(f.starts_with(&r) || r.starts_with(f)),
+                "{label}: removing {} touches {}",
+                it.path,
+                f.display()
+            );
+        }
+    }
+}
+
+fn scan_roots(home: &Path, roots: Vec<PathBuf>) -> ScanResult {
+    let mut o = crate::scan::ScanOptions::new(roots);
+    o.collect_facts = false;
+    o.context = ctx_for(home);
+    let mut s = crate::scan::scan(&o).unwrap();
+    patch_clean(&mut s);
+    s
+}
+
+/// `.agent-harness` is a symlink to a directory elsewhere and the scan root is that real
+/// target: the walk never spells `.agent-harness`, yet an agent-data checkout must be held.
+#[cfg(unix)]
+fn symlinked_harness_scanned_at_real_target() {
+    let (tmp, home) = fixture_home();
+    let real = fs::canonicalize(tmp.path()).unwrap().join("ah-data");
+    fs::remove_dir_all(home.join(".agent-harness")).unwrap();
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, home.join(".agent-harness")).unwrap();
+    build_session(&real);
+    let s = scan_roots(&home, vec![real.clone()]);
+    assert_session_plan("scan root at the real target", &s, &real);
+}
+
+/// Guard over every path-keyed protection fact (class P): each one must be judged the same
+/// whichever spelling the walk used. Spellings: the plain home, a scan root that is another
+/// symlink to `.agent-harness`, `.agent-harness` itself a symlink scanned through its link, and
+/// scanned at its real target.
+#[cfg(unix)]
+#[test]
+fn path_keyed_facts_hold_under_every_spelling() {
+    // `.agent-harness` a real directory.
+    {
+        let (tmp, home) = fixture_home();
+        let ah = home.join(".agent-harness");
+        build_session(&ah);
+        let s = scan_roots(&home, vec![home.clone()]);
+        assert_session_plan("plain home", &s, &ah);
+        let alias = fs::canonicalize(tmp.path()).unwrap().join("alias");
+        std::os::unix::fs::symlink(&ah, &alias).unwrap();
+        let s = scan_roots(&home, vec![alias]);
+        assert_session_plan("scan root a symlink to .agent-harness", &s, &ah);
+    }
+    // `.agent-harness` a symlink to a directory outside the home.
+    {
+        let (tmp, home) = fixture_home();
+        let real = fs::canonicalize(tmp.path()).unwrap().join("ah-data");
+        fs::remove_dir_all(home.join(".agent-harness")).unwrap();
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, home.join(".agent-harness")).unwrap();
+        build_session(&real);
+        let s = scan_roots(&home, vec![home.join(".agent-harness")]);
+        assert_session_plan("scan root the .agent-harness link", &s, &real);
+        let s = scan_roots(&home, vec![real.clone()]);
+        assert_session_plan("scan root the real target", &s, &real);
+    }
+}
+
+// ---------------------------------------------------------------- class X: exemption scope
+
+/// The work-dir allowlist exempts only the hold whose cause it exempts: the agent harness root's
+/// hold on `work/<session>/`, or the roots that put the enclosing carve-out checkout in its
+/// carve-out position. Every other root kind keeps its hold on an allowlisted directory.
+#[test]
+fn allowlist_exempts_only_the_harness_hold() {
+    let (_t, home) = fixture_home();
+    let s = home.join(".agent-harness/work/s");
+    fs::create_dir_all(home.join("Dropbox/p")).unwrap();
+    for d in ["ccd", "cx", "xdg/claude", "cfg", "clone2/node_modules"] {
+        fs::create_dir_all(s.join(d)).unwrap();
+    }
+    fs::create_dir_all(home.join(".claude/worktrees/wt/target")).unwrap();
+    let mut ctx = ctx_for(&home);
+    ctx.claude_config_dir = Some(s.join("ccd").to_string_lossy().into_owned());
+    ctx.codex_home = Some(s.join("cx").to_string_lossy().into_owned());
+    ctx.xdg_config_home = Some(s.join("xdg").to_string_lossy().into_owned());
+    ctx.extra_paths = vec![
+        "~/.agent-harness/work/s/cfg".into(),
+        "~/.agent-harness/work/s/clone2/node_modules".into(),
+        "~/.claude/worktrees/wt/target".into(),
+    ];
+    let pc = resolve(&ctx).unwrap();
+    // Every root kind is in the resolved context (the matrix below is built from it).
+    for src in [
+        "built-in",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "XDG_CONFIG_HOME",
+        "config",
+    ] {
+        assert!(pc.roots.iter().any(|r| r.source == src), "{src}");
+    }
+    assert!(pc.roots.iter().any(|r| r.code == HoldCode::Synced));
+
+    let allow = |path: PathBuf, real: Option<PathBuf>, rule: &str| {
+        let mut n = node(path, Class::Regenerable, all_yes());
+        n.rule = Some(rule.into());
+        n.agent_files = Some(0);
+        n.real_path = real.map(|r| r.to_string_lossy().into_owned());
+        n
+    };
+    // (label, node, removable?) for a node with no checkout above it.
+    let alone: Vec<(&str, Node, bool)> = vec![
+        (
+            "harness only",
+            allow(s.join("plain/node_modules"), None, "node_modules"),
+            true,
+        ),
+        (
+            "CLAUDE_CONFIG_DIR",
+            allow(s.join("ccd/node_modules"), None, "node_modules"),
+            false,
+        ),
+        (
+            "CODEX_HOME",
+            allow(s.join("cx/p/.venv"), None, ".venv"),
+            false,
+        ),
+        (
+            "XDG_CONFIG_HOME/claude",
+            allow(s.join("xdg/claude/node_modules"), None, "node_modules"),
+            false,
+        ),
+        (
+            "protected_paths",
+            allow(s.join("cfg/node_modules"), None, "node_modules"),
+            false,
+        ),
+        (
+            "built-in .claude by real path",
+            allow(
+                s.join("p/node_modules"),
+                Some(home.join(".claude/p/node_modules")),
+                "node_modules",
+            ),
+            false,
+        ),
+        (
+            "prefix root by real path",
+            allow(
+                s.join("q/node_modules"),
+                Some(home.join(".claude.json.d/node_modules")),
+                "node_modules",
+            ),
+            false,
+        ),
+        (
+            "synced by real path",
+            allow(
+                s.join("d/node_modules"),
+                Some(home.join("Dropbox/p/node_modules")),
+                "node_modules",
+            ),
+            false,
+        ),
+        (
+            "package",
+            allow(
+                s.join("Foo.app/Contents/node_modules"),
+                None,
+                "node_modules",
+            ),
+            false,
+        ),
+        (
+            // Spelled under work/<s>/ through a symlink, really elsewhere in the harness root:
+            // not on `work/<s>/` by every identity, so not exempt.
+            "harness alias from outside work",
+            allow(
+                s.join("alias/node_modules"),
+                Some(home.join(".agent-harness/other/proj/node_modules")),
+                "node_modules",
+            ),
+            false,
+        ),
+    ];
+    fs::create_dir_all(home.join(".claude.json.d")).unwrap();
+    let pc = resolve(&ctx).unwrap();
+    for (label, n, removable) in alone {
+        let p = plan(&scan_of(pc.clone(), vec![n]), &opts(300 * DAY));
+        let it = &p.items[0];
+        assert_eq!(
+            it.action.removes(),
+            removable,
+            "{label}: {:?} {:?}: {}",
+            it.action,
+            it.hold,
+            it.reason
+        );
+        if !removable {
+            assert!(it.hold.is_some(), "{label}: no hold");
+        }
+    }
+    // Inside a checkout in a carve-out position: the roots that put it there are exempt; a root
+    // that covers only the allowlisted directory is not (and the checkout, containing that root,
+    // is held itself), nor is another root the directory reaches by its canonical path.
+    type Row<'a> = (&'a str, PathBuf, PathBuf, Option<PathBuf>, &'a str, bool);
+    let inside: Vec<Row> = vec![
+        (
+            "work clone, harness only",
+            s.join("clone"),
+            s.join("clone/node_modules"),
+            None,
+            "node_modules",
+            true,
+        ),
+        (
+            "work clone, config root on it",
+            s.join("clone2"),
+            s.join("clone2/node_modules"),
+            None,
+            "node_modules",
+            false,
+        ),
+        (
+            "worktree, built-in only",
+            home.join(".claude/worktrees/wt2"),
+            home.join(".claude/worktrees/wt2/target"),
+            None,
+            "target",
+            true,
+        ),
+        (
+            "worktree, config root on it",
+            home.join(".claude/worktrees/wt"),
+            home.join(".claude/worktrees/wt/target"),
+            None,
+            "target",
+            false,
+        ),
+        (
+            "worktree, dir really in .codex",
+            home.join(".claude/worktrees/wt3"),
+            home.join(".claude/worktrees/wt3/target"),
+            Some(home.join(".codex/x/target")),
+            "target",
+            false,
+        ),
+        (
+            // Inside the checkout's own root, but by its canonical path outside the checkout.
+            "worktree, dir really elsewhere in .claude",
+            home.join(".claude/worktrees/wt4"),
+            home.join(".claude/worktrees/wt4/target"),
+            Some(home.join(".claude/projects/x/target")),
+            "target",
+            false,
+        ),
+    ];
+    for (label, co, dep, real, rule, removable) in inside {
+        let x = node(&co, Class::Repo, all_yes());
+        let mut k = allow(dep, real, rule);
+        k.parent = Some(0);
+        let p = plan(&scan_of(pc.clone(), vec![x, k]), &opts(300 * DAY));
+        // The checkout is removable after a backup only when nothing below it is held.
+        assert_eq!(
+            p.items[0].action == Action::BackupThenRemove,
+            removable,
+            "{label}: checkout {:?}: {}",
+            p.items[0].action,
+            p.items[0].reason
+        );
+        let it = &p.items[1];
+        assert_eq!(
+            it.action.removes(),
+            removable,
+            "{label}: {:?} {:?}: {}",
+            it.action,
+            it.hold,
+            it.reason
+        );
     }
 }

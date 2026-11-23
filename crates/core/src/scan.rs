@@ -262,8 +262,6 @@ struct Walk {
     pruned_hit: HashSet<usize>,
     /// What the inbound-reference pass needs (see [`link_inbound`]).
     refs: Refs,
-    /// Task directories seen (see `ProtectContext::task_dirs`).
-    task_dirs: HashSet<PathBuf>,
     /// Directories whose listing failed, each once (bounded), for `coverage`.
     unreadable_dirs: HashSet<PathBuf>,
     /// Where the walk could not look (counts and examples; `complete` is set at the end).
@@ -488,9 +486,6 @@ impl Walk {
         agg.files += 1;
         if is_file && crate::protect::is_agent_file_name(&name) {
             agg.agent_files += 1;
-            if crate::protect::is_task_dir_path(entry.parent_path()) {
-                self.task_dirs.insert(entry.parent_path().to_path_buf());
-            }
         }
         if is_output {
             agg.output_bytes += alloc;
@@ -1014,7 +1009,6 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         canon_roots: plan_r.canon.clone(),
         pruned_hit: HashSet::new(),
         refs: Refs::default(),
-        task_dirs: HashSet::new(),
         unreadable_dirs: HashSet::new(),
         coverage: Coverage::default(),
     };
@@ -1096,17 +1090,9 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         skipped_overflow,
         refs,
         mut coverage,
-        task_dirs,
+        unreadable_dirs,
         ..
     } = walk;
-    protect_ctx.task_dirs = {
-        let mut v: Vec<String> = task_dirs
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        v.sort();
-        v
-    };
     issues.truncate(MAX_ISSUES);
     coverage.mount_points_skipped = totals.mount_points_skipped;
     coverage.complete = totals.unreadable == 0
@@ -1140,8 +1126,14 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
 
     // Attribute directory aggregates to their owners.
     let mut other_bytes: u64 = 0;
+    // Agent files at a node's own top level: counted from its own directory's entries below.
+    // A directory whose listing failed (or any, once the bounded list overflowed) has no count,
+    // which the plan treats as nonzero.
+    let listing_unknown = unreadable_dirs.len() >= MAX_ISSUE_PATHS;
     for b in builds.iter_mut() {
         b.node.agent_files = Some(0);
+        b.node.top_agent_files =
+            (!listing_unknown && !unreadable_dirs.contains(&b.path)).then_some(0);
     }
     let mut files_self: Vec<u64> = vec![0; builds.len()];
     for (di, (dir, agg)) in dirs.iter().enumerate() {
@@ -1152,6 +1144,11 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 let in_package = builds[o].node.class.is_artifact()
                     && has_package_evidence(&builds[o], &dirs, di);
                 let b = &mut builds[o];
+                if dir == &b.path {
+                    if let Some(c) = b.node.top_agent_files.as_mut() {
+                        *c = agg.agent_files;
+                    }
+                }
                 b.node.bytes_self += agg.bytes;
                 b.node.output_bytes += agg.output_bytes;
                 files_self[o] += agg.files;

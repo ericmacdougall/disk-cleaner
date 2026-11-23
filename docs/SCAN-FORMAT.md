@@ -210,6 +210,8 @@ One entry per classified directory. A directory belongs to its innermost classif
 | `repo` | present for `repo`, `worktree` and `bare-repo` |
 | `real_path` | the node's canonical path (symlinks resolved; on macOS the `/System/Volumes/Data` prefix removed), resolved by the scan; `path` is the lexical one. Omitted when it could not be resolved |
 | `real_unreadable` | the canonical path could not be resolved because of a permission error: the plan holds the node (`protected: unreadable`) (omitted when false) |
+| `agent_files` | files below the node (outside `.git`, nested nodes included; for regenerable and cache dirs outside installed-package directories) whose names look like agent data; a missing count is treated as nonzero |
+| `top_agent_files` | files directly in the node's own directory whose names look like agent data; a checkout directly below `.agent-harness/work/<session>/` with any is an agent-data checkout. Missing (an unreadable listing, or an older scan) is treated as nonzero |
 
 Classification rules (design section 3): a directory with a `.git` directory is a `repo`; with a
 `.git` file a `worktree`; a directory with `HEAD`, `objects` and `refs` and no `.git` is a `bare-repo`.
@@ -853,14 +855,21 @@ directory (any direct child of the session that is not itself a checkout), or a 
 any other action that removes it becomes `keep` with `protected: unsaved work inside agent dir`.
 An agent-data checkout is a checkout directly below a session that holds, at its own top level, a
 file whose name (case-insensitively) ends `.jsonl`, contains `receipt`, or has `wal` as a whole
-word or extension; the scan records every directory below a session that holds one in
-`protect.task_dirs`, and such a checkout is held and never a candidate. Every other node inside a
-protected root is held, session directories included.
+word or extension. The scan records that count per node (`top_agent_files`); the plan judges the
+position by the node's lexical and canonical paths against both paths of the agent-harness root,
+so a symlinked `.agent-harness` or a scan root at its real target gives the same answer. Such a
+checkout is held and never a candidate. Every other node inside a protected root is held, session
+directories included.
 
 Under `work/<session>/` (inside a carve-out checkout or anywhere else) only dirs matched by a rule
 named `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`,
 `.tox`, `.gradle`, `.turbo`, `.parcel-cache` or `target` keep their normal action, and only when
-the node's `agent_files` is 0 (a missing count counts as nonzero). Every other rule name there
+the node's `agent_files` is 0 (a missing count counts as nonzero). The allowlist lifts only the
+hold whose cause it covers: the agent-harness root's hold, when every identity of the node that
+lies inside that root is on `work/<session>/`, and the hold of a root that puts the enclosing
+carve-out checkout in its carve-out position, when every identity of the node inside that root
+is inside the checkout. Holds from config `protected_paths`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+other roots reached by another identity, sync folders and packages stay. Every other rule name there
 (`out`, `build`, `dist`, `coverage`...) is held with `protected: build output inside agent dir`.
 `agent_files` counts files below the node (outside `.git`, and for regenerable and cache dirs
 outside installed-package directories) whose names end `.jsonl`, contain `receipt`, or have `wal` as

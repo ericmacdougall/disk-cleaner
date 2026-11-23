@@ -363,6 +363,13 @@ pub struct Node {
     /// data (see `protect::is_agent_file_name`). A missing count is treated as nonzero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_files: Option<u64>,
+    /// Files directly in this node's own directory (its top level, not below) whose names look
+    /// like agent data. A checkout directly below `.agent-harness/work/<session>/` with any is an
+    /// agent-data checkout (held, never a candidate); the plan judges that by the node's position
+    /// under the harness root on every identity, not by how the walk spelled it. A missing count
+    /// is treated as nonzero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_agent_files: Option<u64>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -391,6 +398,7 @@ impl Node {
             real_path: None,
             real_unreadable: false,
             agent_files: None,
+            top_agent_files: None,
         }
     }
 }
@@ -583,11 +591,6 @@ pub struct ProtectContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xdg_config_home: Option<String>,
     pub roots: Vec<ProtectedRoot>,
-    /// Directories directly below `.agent-harness/work/<session>/` that hold agent files at their
-    /// own top level (as spelled by the walk). One of them that is a checkout is an agent-data
-    /// checkout: held, never a candidate.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub task_dirs: Vec<String>,
 }
 
 pub fn default_scope() -> String {
