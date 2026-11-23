@@ -313,14 +313,29 @@ pub fn plan_summary(p: &Plan) -> String {
         "\nProtected and held back (kept whatever their age or facts; bytes are what the scan \
          walked under each root):"
     );
-    let mut any_held = false;
+    // Largest first (a package directory by its held items' bytes); roots with nothing walked
+    // under them and nothing held are folded into one line.
+    let size_of = |h: &disk_cleaner_core::HeldTotal| h.bytes.or(h.item_bytes);
+    let mut listed: Vec<&disk_cleaner_core::HeldTotal> = Vec::new();
+    let mut folded = 0u64;
     for h in &p.totals.held {
-        use disk_cleaner_core::HoldCode;
-        if h.code != HoldCode::Package && h.bytes.is_none() {
-            continue;
+        if h.bytes == Some(0) && h.items == 0 {
+            folded += 1;
+        } else {
+            listed.push(h);
         }
-        any_held = true;
-        let size = h.bytes.map(human_bytes).unwrap_or_else(|| "-".to_string());
+    }
+    listed.sort_by(|a, b| {
+        size_of(b)
+            .unwrap_or(0)
+            .cmp(&size_of(a).unwrap_or(0))
+            .then_with(|| a.code.as_str().cmp(b.code.as_str()))
+            .then_with(|| a.root.cmp(&b.root))
+    });
+    for h in &listed {
+        let size = size_of(h)
+            .map(human_bytes)
+            .unwrap_or_else(|| "-".to_string());
         let _ = writeln!(
             o,
             "  {:<10} {:>10}  {:>10} held  {}",
@@ -330,7 +345,15 @@ pub fn plan_summary(p: &Plan) -> String {
             esc(&h.root)
         );
     }
-    if !any_held {
+    if folded > 0 {
+        let _ = writeln!(
+            o,
+            "  {} more {}, empty or outside the scanned folders (0 B, nothing held)",
+            folded,
+            if folded == 1 { "root" } else { "roots" }
+        );
+    }
+    if listed.is_empty() && folded == 0 {
         let _ = writeln!(o, "  (no protected root exists in this scan)");
     }
     let _ = writeln!(o, "\nKept, by reason:");

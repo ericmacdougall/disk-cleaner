@@ -80,6 +80,9 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let home = fs::canonicalize(tmp.path()).unwrap().join("user");
     old_project(&home.join(".claude/projects/p"), 20_000);
+    // Two protected roots that exist but hold nothing: folded into one summary line.
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::create_dir_all(home.join(".gemini")).unwrap();
     write(
         &home.join(".claude/projects/p/rollout-1.jsonl"),
         &"y".repeat(50_000),
@@ -179,6 +182,11 @@ fn plan_summary_classes() {
         .unwrap()
         .ends_with("/Applications/Foo.app"));
     assert_eq!(package["items"], 2, "{package}");
+    // A package directory has no scan-attributed bytes; its held items' bytes are given apart
+    // (nested items counted once: the project and its node_modules, 7 kB and more).
+    assert!(package.get("bytes").is_none(), "{package}");
+    let pkg_bytes = package["item_bytes"].as_u64().expect("package item_bytes");
+    assert!(pkg_bytes >= 7_000, "{package}");
     let items = v["items"].as_array().unwrap();
     // NEG-8: ~/.cache/pip keeps its normal action and is not counted as held.
     let pip = items
@@ -266,6 +274,52 @@ fn plan_summary_classes() {
     assert!(
         !held_lines.iter().any(|l| l.contains(".cache/pip")),
         "{held_lines:?}"
+    );
+    // The package line shows its items' bytes, not a dash.
+    let pkg_line = held_lines
+        .iter()
+        .find(|l| l.contains("/Applications/Foo.app"))
+        .unwrap();
+    assert!(!pkg_line.contains(" - "), "{pkg_line}");
+    // Roots with 0 B and nothing held are folded into one line, not listed one by one.
+    for empty in [".codex", ".gemini"] {
+        let r = home.join(empty);
+        assert!(
+            !held_lines.iter().any(|l| l.ends_with(r.to_str().unwrap())),
+            "{empty} listed: {held_lines:?}"
+        );
+    }
+    let fold = held_lines
+        .iter()
+        .find(|l| l.contains("more roots"))
+        .unwrap_or_else(|| panic!("no folded line: {held_lines:?}"));
+    let folded = held
+        .iter()
+        .filter(|h| h["bytes"] == 0 && h["items"] == 0)
+        .count();
+    assert!(folded >= 2, "{held:?}");
+    assert!(
+        fold.trim_start()
+            .starts_with(&format!("{folded} more roots")),
+        "{fold}"
+    );
+    // Listed roots are sorted by bytes, largest first.
+    let size_of = |root: &str| -> u64 {
+        let h = held.iter().find(|h| h["root"] == root).unwrap();
+        h["bytes"]
+            .as_u64()
+            .or_else(|| h["item_bytes"].as_u64())
+            .unwrap_or(0)
+    };
+    let sizes: Vec<u64> = held_lines
+        .iter()
+        .filter(|l| !l.contains("more roots"))
+        .map(|l| size_of(l.rsplit("  ").next().unwrap()))
+        .collect();
+    assert!(sizes.len() >= 3, "{held_lines:?}");
+    assert!(
+        sizes.windows(2).all(|w| w[0] >= w[1]),
+        "not sorted by bytes: {sizes:?} {held_lines:?}"
     );
     let asks_text = section("Needs a person");
     assert!(

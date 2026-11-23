@@ -837,8 +837,11 @@ whose action removes a git node, `preserve` (see "The preserve obligation").
 `totals` holds `reclaimable_bytes`, `ready_bytes`, `by_action`, and since schema 16 `by_class`
 (removing items by class: `items` and `reclaimable_bytes`, an item nested in another removing item
 counted once), `held` (per `code` and `root`: `items` held and, for a protected or synced root, the
-`bytes` the scan attributed to the root, not a sum of the items) and `ask_by_reason` (`ask` items by
-`ask_code`, with their `bytes_total`; an ask nested in another ask item is counted once).
+`bytes` the scan attributed to the root, not a sum of the items; for a package directory
+`item_bytes`, the `bytes_total` of its held items, an item inside another it holds counted once)
+and `ask_by_reason` (`ask` items by
+`ask_code`, with their `bytes_total`; an ask nested in another ask item is counted once). The text
+summary lists held roots largest first and folds the roots with 0 B and nothing held into one line.
 
 ### Holds
 

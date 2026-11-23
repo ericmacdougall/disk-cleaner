@@ -226,6 +226,10 @@ pub struct HeldTotal {
     /// not a sum of the items; absent for package directories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    /// Package directories only (the scan attributes no bytes to them): the `bytes_total` of
+    /// the items held by this package, an item inside another item it holds counted once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_bytes: Option<u64>,
 }
 
 /// `ask` items with one reason code.
@@ -915,19 +919,48 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 root: r.spelled.clone(),
                 items: 0,
                 bytes: Some(r.bytes),
+                item_bytes: None,
             },
         );
     }
+    let mut hold_of: Vec<Option<&Hold>> = vec![None; scan.nodes.len()];
+    for it in &items {
+        hold_of[it.node] = it.hold.as_ref();
+    }
     for it in &items {
         if let Some(h) = &it.hold {
-            held.entry((h.code, h.root.clone()))
+            let slot = held
+                .entry((h.code, h.root.clone()))
                 .or_insert_with(|| HeldTotal {
                     code: h.code,
                     root: h.root.clone(),
                     items: 0,
                     bytes: None,
-                })
-                .items += 1;
+                    item_bytes: None,
+                });
+            slot.items += 1;
+            if h.code == HoldCode::Package {
+                // Counted once: skip an item below another item held by the same package
+                // (bounded walk: the parent links may be corrupt).
+                let mut cur = ctx.parent[it.node];
+                let mut steps = 0;
+                let mut nested = false;
+                while let Some(p) = cur {
+                    if p >= hold_of.len() || steps > hold_of.len() {
+                        break;
+                    }
+                    if hold_of[p].is_some_and(|ph| ph.code == h.code && ph.root == h.root) {
+                        nested = true;
+                        break;
+                    }
+                    cur = ctx.parent[p];
+                    steps += 1;
+                }
+                let b = slot.item_bytes.get_or_insert(0);
+                if !nested {
+                    *b = b.saturating_add(it.bytes_total);
+                }
+            }
         }
     }
     totals.held = held.into_values().collect();
