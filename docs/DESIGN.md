@@ -135,7 +135,9 @@ holds nothing. A live session is recognised from several independent sources (th
 registry, agent processes, process working directories, recent transcripts, recent files and
 same-named entries), and an agent process that maps to no place makes removals under the harness
 work directories ask rather than guess. Transcripts are read for their recorded working directory
-only, from a bounded head of the file.
+only, from a bounded head of the file; a Claude Code transcript with none there is placed by its
+project directory name, holding every existing directory that encodes to it (the encoding is
+lossy), and one that places nowhere is a disclosed gap.
 
 Disclosed limits of the process evidence:
 

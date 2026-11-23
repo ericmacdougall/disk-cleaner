@@ -414,7 +414,8 @@ pub const TRANSCRIPT_UNREADABLE: &str = "transcript-unreadable";
 /// Only that one string is kept; nothing else of the file is held, logged or returned. A file
 /// in neither shape within the bound (another line kind, a first line longer than 64 KiB,
 /// text that is not JSON) is `Err(TRANSCRIPT_CWD_UNKNOWN)`; one that cannot be read is
-/// `Err(TRANSCRIPT_UNREADABLE)`. Callers count these as gaps and note the path only.
+/// `Err(TRANSCRIPT_UNREADABLE)`. Callers fall back to a Claude Code transcript's project
+/// directory name ([`slug_candidates`]) and otherwise count a gap, noting the path only.
 pub fn transcript_cwd(path: &Path) -> Result<String, &'static str> {
     use std::io::Read;
     // Deserialize into structs that hold only these fields: every other field is skipped.
@@ -458,6 +459,119 @@ pub fn transcript_cwd(path: &Path) -> Result<String, &'static str> {
         }
     }
     Err(TRANSCRIPT_CWD_UNKNOWN)
+}
+
+/// The class of a transcript whose project directory name could not be fully decoded: the walk
+/// hit its bound, a listing cap, or a directory it had to list could not be listed.
+pub const TRANSCRIPT_SLUG_INCOMPLETE: &str = "transcript-slug-incomplete";
+
+/// Most directories listed while decoding one project directory name.
+#[cfg(not(test))]
+pub const MAX_SLUG_DIRS: usize = 2048;
+/// Small in tests, so the bound can be reached.
+#[cfg(test)]
+pub const MAX_SLUG_DIRS: usize = 32;
+/// Most entries looked at in all while decoding one project directory name (names only).
+const MAX_SLUG_ENTRIES: usize = 4_000_000;
+
+/// Claude Code's project directory name for a path: every character that is not an ASCII
+/// letter or digit becomes `-` (so `/`, `.`, `_` and spaces all do; the encoding is lossy).
+pub fn claude_slug(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// What decoding a project directory name found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SlugMatch {
+    /// Every existing directory whose encoding equals the name, sorted.
+    pub candidates: Vec<PathBuf>,
+    /// The walk was incomplete (bound, listing cap, or a matching directory not listable), so
+    /// the true directory may be one it did not see.
+    pub incomplete: bool,
+}
+
+/// Every existing directory whose [`claude_slug`] equals `slug`, by a walk from `/` that reads
+/// directory names only (no file is opened) and lists at most `max_dirs` directories.
+pub fn slug_candidates(slug: &str, max_dirs: usize) -> SlugMatch {
+    let mut out = SlugMatch::default();
+    let s = slug.as_bytes();
+    if s.first() != Some(&b'-') || s.len() > 4096 {
+        return out;
+    }
+    let mut stack: Vec<(PathBuf, usize)> = vec![(PathBuf::from("/"), 0)];
+    let mut listed = 0usize;
+    let mut seen = 0usize;
+    while let Some((dir, at)) = stack.pop() {
+        if at == s.len() {
+            out.candidates.push(dir);
+            continue;
+        }
+        if listed >= max_dirs {
+            out.incomplete = true;
+            break;
+        }
+        listed += 1;
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            out.incomplete = true;
+            continue;
+        };
+        for e in rd {
+            seen += 1;
+            if seen > MAX_SLUG_ENTRIES {
+                out.incomplete = true;
+                break;
+            }
+            let Ok(e) = e else {
+                out.incomplete = true;
+                continue;
+            };
+            let name = e.file_name();
+            let enc = claude_slug(&name.to_string_lossy());
+            let rest = &s[at..];
+            if rest.len() < 1 + enc.len()
+                || rest[0] != b'-'
+                || !rest[1..].starts_with(enc.as_bytes())
+            {
+                continue;
+            }
+            let end = at + 1 + enc.len();
+            if end < s.len() && s[end] != b'-' {
+                continue;
+            }
+            let p = dir.join(&name);
+            let is_dir = match e.file_type() {
+                Ok(t) if t.is_symlink() => p.is_dir(),
+                Ok(t) => t.is_dir(),
+                Err(_) => false,
+            };
+            if is_dir {
+                stack.push((p, end));
+            }
+        }
+    }
+    // By bytes, as the oracle sorts.
+    out.candidates
+        .sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+    out
+}
+
+/// The project directory name of a Claude Code transcript
+/// (`projects/<name>/<id>.jsonl` or `projects/<name>/<id>/subagents/<agent>.jsonl`).
+fn claude_project_slug(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    if !name.ends_with(".jsonl") || name.starts_with("rollout-") {
+        return None;
+    }
+    let mut cur = path.parent()?;
+    loop {
+        let parent = cur.parent()?;
+        if parent.file_name().is_some_and(|n| n == "projects") {
+            return cur.file_name().map(|n| n.to_string_lossy().into_owned());
+        }
+        cur = parent;
+    }
 }
 
 /// The three fields of a Claude Code session registry entry this module reads.
@@ -1017,21 +1131,61 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         projects_dirs.extend(named_dirs(base, "projects", 2));
     }
     let mut read_count = 0usize;
-    let mut read_cwd = |ev: &mut Evidence, path: &Path| -> Option<String> {
+    let mut slug_cache: HashMap<String, SlugMatch> = HashMap::new();
+    // The working directories a transcript records. A Claude Code transcript with no cwd
+    // within the bound falls back to its project directory name: every existing directory
+    // whose encoding equals it is a candidate, and all are held. No match, an incomplete walk,
+    // or a candidate under an agent directory outside every session (nothing can hold it) is
+    // a gap, recent when the transcript is.
+    let mut read_cwd = |ev: &mut Evidence, path: &Path| -> Vec<String> {
         if read_count >= MAX_TRANSCRIPTS {
             gap(ev, "transcripts-not-read", true);
-            return None;
+            return Vec::new();
         }
         read_count += 1;
-        match transcript_cwd(path) {
-            Ok(c) => Some(c),
-            Err(class) => {
-                let m = std::fs::metadata(path).ok().as_ref().and_then(mtime_of);
-                gap(ev, class, m.is_none_or(|m| recent(Some(m))));
-                note(ev, format!("{class}: {}", path.display()));
-                None
-            }
+        let class = match transcript_cwd(path) {
+            Ok(c) => return vec![c],
+            Err(class) => class,
+        };
+        let m = std::fs::metadata(path).ok().as_ref().and_then(mtime_of);
+        let fresh = m.is_none_or(|m| recent(Some(m)));
+        let Some(slug) = claude_project_slug(path) else {
+            gap(ev, class, fresh);
+            note(ev, format!("{class}: {}", path.display()));
+            return Vec::new();
+        };
+        let sm = slug_cache
+            .entry(slug)
+            .or_insert_with_key(|s| slug_candidates(s, MAX_SLUG_DIRS))
+            .clone();
+        if sm.incomplete {
+            gap(ev, TRANSCRIPT_SLUG_INCOMPLETE, fresh);
+            note(
+                ev,
+                format!("{TRANSCRIPT_SLUG_INCOMPLETE}: {}", path.display()),
+            );
         }
+        let unheld = sm
+            .candidates
+            .iter()
+            .any(|c| host.session_of(c).is_none() && host.under_agent_dir(c));
+        if unheld || (sm.candidates.is_empty() && !sm.incomplete) {
+            gap(ev, class, fresh);
+            note(ev, format!("{class}: {}", path.display()));
+        } else if !sm.candidates.is_empty() {
+            note(
+                ev,
+                format!(
+                    "transcript-cwd-from-project-name ({}): {}",
+                    count(sm.candidates.len() as u64, "candidate", "candidates"),
+                    path.display()
+                ),
+            );
+        }
+        sm.candidates
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect()
     };
     for (pid, entry) in &registry {
         let mut via_id = false;
@@ -1103,7 +1257,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                     for e in rd.flatten().take(10_000) {
                         let t = e.path().join(format!("{id}.jsonl"));
                         if t.is_file() {
-                            if let Some(c) = read_cwd(&mut ev, &t) {
+                            for c in read_cwd(&mut ev, &t) {
                                 loci.push((PathBuf::from(c), true));
                             }
                         }
@@ -1118,7 +1272,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             let fp = Path::new(f);
             if is_transcript_path(fp) {
                 open_transcript = true;
-                if let Some(c) = read_cwd(&mut ev, fp) {
+                for c in read_cwd(&mut ev, fp) {
                     loci.push((PathBuf::from(c), true));
                 }
                 continue;
@@ -1251,7 +1405,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         transcripts.retain(|(_, m)| recent(*m));
         transcripts.sort_by_key(|t| std::cmp::Reverse(t.1));
         for (t, _) in transcripts {
-            if let Some(c) = read_cwd(&mut ev, &t) {
+            for c in read_cwd(&mut ev, &t) {
                 if let Some(s) = host.session_of(Path::new(&c)) {
                     live(&mut ev, &s, "a transcript modified within the active window records its working directory in it".to_string());
                 }

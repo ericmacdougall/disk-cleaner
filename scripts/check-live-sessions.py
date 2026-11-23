@@ -28,7 +28,12 @@ A transcript is read for its working directory only, from its first 64 KiB or 20
 is smaller: the top-level `cwd` (Claude Code) or `payload.cwd` of a `session_meta` line (Codex,
 also in .codex/archived_sessions). Any other shape is counted and printed as a gap class
 (`transcript-cwd-unknown`, like an unreadable file or a registry file without a pid); nothing else
-of it is kept or printed. Output names sessions, gap counts and item paths only.
+of it is kept or printed. A Claude Code transcript with no cwd within the bound is placed by its
+project directory name: every existing directory whose encoding (each non-alphanumeric character
+to `-`) equals it, found by a walk from / that reads names only; no match, a candidate under an
+agent dir in no session, or an incomplete walk (`transcript-slug-incomplete`) is a gap.
+`--slug-candidates -- NAME...` prints that decoding. Output names sessions, gap counts and item
+paths only.
 `--transcript-cwd FILE...` prints each file's result under that contract (the tool's tests compare).
 
 Exit 1, naming each one, when an oracle-live session has an item the plan removes, or when the
@@ -51,6 +56,9 @@ HEAD_LINES = 20
 AGENT_NAMES = {"claude", "codex", "kimi", "cursor-agent"}
 REMOVING = {"remove-regenerable", "backup-then-remove", "recover-backup-then-remove"}
 WALK_BUDGET = 200_000
+SLUG_MAX_DIRS = 2048  # directories listed while decoding one project directory name
+SLUG_MAX_ENTRIES = 4_000_000  # entries looked at in all by one such walk (names only)
+SLUG_INCOMPLETE = "transcript-slug-incomplete"
 
 
 def transcript_cwd(path):
@@ -88,9 +96,71 @@ def transcript_cwd(path):
     return None, "transcript-cwd-unknown"
 
 
+def claude_slug(name):
+    """Claude Code's project directory name: every non-alphanumeric character becomes `-`."""
+    return re.sub(r"[^A-Za-z0-9]", "-", name)
+
+
+def slug_candidates(slug, max_dirs=SLUG_MAX_DIRS):
+    """(sorted candidate dirs, incomplete): every existing directory whose encoding equals
+    `slug`, by a walk from / that reads names only. Incomplete when the walk hit its bound, a
+    listing cap, or a directory it had to list could not be listed."""
+    cands, incomplete = [], False
+    if not slug.startswith("-") or len(slug) > 4096:
+        return cands, incomplete
+    stack, listed, seen = [("/", 0)], 0, 0
+    while stack:
+        d, at = stack.pop()
+        if at == len(slug):
+            cands.append(d)
+            continue
+        if listed >= max_dirs:
+            incomplete = True
+            break
+        listed += 1
+        try:
+            it = os.scandir(d)
+        except OSError:
+            incomplete = True
+            continue
+        with it:
+            for e in it:
+                seen += 1
+                if seen > SLUG_MAX_ENTRIES:
+                    incomplete = True
+                    break
+                enc = "-" + claude_slug(e.name)
+                if not slug.startswith(enc, at):
+                    continue
+                end = at + len(enc)
+                if end < len(slug) and slug[end] != "-":
+                    continue
+                try:
+                    isdir = e.is_dir()
+                except OSError:
+                    isdir = False
+                if isdir:
+                    stack.append((os.path.join(d, e.name), end))
+    return sorted(cands), incomplete
+
+
+def claude_project_slug(path):
+    """The project directory name of a Claude Code transcript, or None."""
+    name = os.path.basename(path)
+    if not name.endswith(".jsonl") or name.startswith("rollout-"):
+        return None
+    parts = os.path.normpath(path).split(os.sep)
+    for i in range(len(parts) - 2, 0, -1):
+        if parts[i - 1] == "projects":
+            return parts[i]
+    return None
+
+
 class Oracle:
-    def __init__(self, home, now, window_days, processes=True):
+    def __init__(self, home, now, window_days, processes=True, slug_max_dirs=SLUG_MAX_DIRS):
         self.processes = processes
+        self.slug_max_dirs = slug_max_dirs
+        self.slugs = {}
         self.home = os.path.realpath(home)
         self.work = os.path.join(self.home, ".agent-harness", "work")
         self.now = now
@@ -123,11 +193,27 @@ class Oracle:
             p.startswith(b + os.sep) for d in self.agent_dirs for b in {d, os.path.realpath(d)}
         )
 
-    def cwd_of(self, path):
+    def cwds_of(self, path):
+        """The working directories a transcript records: its cwd, or, for a Claude Code
+        transcript with none within the bound, every candidate of its project directory name.
+        No match, an incomplete walk, or a candidate under an agent dir in no session is a
+        gap."""
         cwd, gap = transcript_cwd(path)
-        if gap:
+        if not gap:
+            return [cwd]
+        slug = claude_project_slug(path)
+        if slug is None:
             self.gap(gap, path)
-        return cwd
+            return []
+        if slug not in self.slugs:
+            self.slugs[slug] = slug_candidates(slug, self.slug_max_dirs)
+        cands, incomplete = self.slugs[slug]
+        if incomplete:
+            self.gap(SLUG_INCOMPLETE, path)
+        unheld = any(self.session_of(c) is None and self.in_agent_dir(c) for c in cands)
+        if unheld or (not cands and not incomplete):
+            self.gap(gap, path)
+        return cands
 
     def recent(self, mtime):
         return mtime >= self.now - self.window
@@ -192,9 +278,10 @@ class Oracle:
                 if s:
                     self.mark(s, "agent pid %d works in it" % pid)
                 elif p and p.endswith(".jsonl"):
-                    s = self.session_of(self.cwd_of(p))
-                    if s:
-                        self.mark(s, "agent pid %d holds a transcript" % pid)
+                    for c in self.cwds_of(p):
+                        s = self.session_of(c)
+                        if s:
+                            self.mark(s, "agent pid %d holds a transcript" % pid)
 
     # -- recent files below session dirs
     def session_files(self):
@@ -265,9 +352,10 @@ class Oracle:
                             continue
                     except OSError:
                         continue
-                    s = self.session_of(self.cwd_of(p))
-                    if s:
-                        self.mark(s, "recent transcript")
+                    for c in self.cwds_of(p):
+                        s = self.session_of(c)
+                        if s:
+                            self.mark(s, "recent transcript")
 
     def ground_truth(self, cmd):
         out = subprocess.run(
@@ -452,6 +540,15 @@ def main(argv, processes=True):
     ap.add_argument("--now", type=float, default=None)
     ap.add_argument("--ground-truth")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--no-processes", action="store_true",
+                    help="read no running process (for fixture homes)")
+    ap.add_argument("--slug-max-dirs", type=int, default=SLUG_MAX_DIRS)
+    ap.add_argument(
+        "--slug-candidates", action="store_true",
+        help="for each NAME (after --) print NAME<TAB>candidates (or `none`, `incomplete`): "
+        "the contract test shared with the tool",
+    )
+    ap.add_argument("names", nargs="*", metavar="NAME")
     ap.add_argument(
         "--transcript-cwd", nargs="+", metavar="FILE",
         help="print FILE<TAB>cwd (or `gap`) for each file: the contract test shared with the tool",
@@ -459,6 +556,11 @@ def main(argv, processes=True):
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
+    if a.slug_candidates:
+        for n in a.names:
+            cands, incomplete = slug_candidates(n, a.slug_max_dirs)
+            print("\t".join([n] + (["incomplete"] if incomplete else cands or ["none"])))
+        return 0
     if a.transcript_cwd:
         for f in a.transcript_cwd:
             cwd, _ = transcript_cwd(f)
@@ -469,7 +571,8 @@ def main(argv, processes=True):
     with open(a.plan) as f:
         plan = json.load(f)
     now = a.now if a.now is not None else time.time()
-    oracle = Oracle(a.home, now, a.window_days, processes)
+    oracle = Oracle(a.home, now, a.window_days, processes and not a.no_processes,
+                    a.slug_max_dirs)
     try:
         live = oracle.run(a.ground_truth)
     except (subprocess.SubprocessError, OSError) as e:
@@ -521,7 +624,7 @@ def self_test():
                         os.utime(p, (now - 400 * 86400, now - 400 * 86400))
 
         for s in ["old", "reg", "dead", "tr", "recent", "wal", "gt", "abc", "abcd", "cx", "cxa",
-                  "sub"]:
+                  "sub", "so"]:
             put(".agent-harness/work/%s/wt/src/lib.rs" % s)
         age_all()
         # Registry: this process (alive, started before the entry) for `reg`; a reaped child's
@@ -567,6 +670,11 @@ def self_test():
             json.dumps({"cwd": work + "/old", "pad": "x" * HEAD_BYTES}), ago=3600)
         put(".claude/projects/-p/garbage.jsonl", "not json\n", ago=3600)
         put(".claude/sessions/77.json", json.dumps({"sessionId": "x"}), ago=3600)
+        # The AC-10 shape: a session-owner first line and a second line past the bound; the
+        # project directory name places it in `so`.
+        put(".claude/projects/%s/0001.jsonl" % claude_slug(work + "/so/wt"),
+            json.dumps({"type": "session-owner", "sessionId": "0001"}) + "\n"
+            + json.dumps({"pad": "x" * (70 * 1024), "cwd": work + "/so/wt"}) + "\n", ago=3600)
 
         def item(s, action):
             return {"path": work + "/%s/wt" % s, "action": action}
@@ -596,7 +704,7 @@ def self_test():
         o = Oracle(home, now, 7, processes=False)
         live = o.run("echo 'owner gt running; abc; xabcdx'")
         problems = []
-        want = {"reg", "tr", "recent", "wal", "gt", "abc", "cx", "cxa", "sub"}
+        want = {"reg", "tr", "recent", "wal", "gt", "abc", "cx", "cxa", "sub", "so"}
         if set(live) != want:
             problems.append("live sessions %s, expected %s" % (sorted(live), sorted(want)))
         gaps = {"transcript-cwd-unknown": 4, "registry-entry-unknown": 1}

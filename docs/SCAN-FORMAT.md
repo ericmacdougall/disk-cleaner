@@ -858,8 +858,9 @@ information could not be read at all), `process_check_note`, `process_counts` (`
 `idle_agents`, `unmapped_agents` (pids), `fully_unknown`), `coverage_gaps` (`privacy`,
 `permission`, `mount`, `other`, `overflowed`, `top_folders`, and `agent_data`: agent data the
 live-session rule could not use, by class: `transcript-cwd-unknown`, `transcript-unreadable`,
-`registry-entry-unknown`, `transcripts-not-read`), `evidence_notes` (for example
-`transcript-cwd-unknown: <path>`), `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
+`registry-entry-unknown`, `transcripts-not-read`, `transcript-slug-incomplete`), `evidence_notes`
+(for example `transcript-cwd-unknown: <path>` or
+`transcript-cwd-from-project-name (2 candidates): <path>`), `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
 `remote_facts_note`, `enclosing_repos`, `scope`, `coverage_complete`, `coverage_note` (only when
 coverage is incomplete), `accepted_incomplete_coverage` (see "Incomplete coverage" and
 "Accepting incomplete coverage"), `active`, `totals` and `items`.
@@ -1015,14 +1016,26 @@ whose `type` is `session_meta` (Codex). Nothing else is kept or printed. Any oth
 bound (another line kind, a first line longer than 64 KiB, text that is not JSON) is the coverage
 gap `transcript-cwd-unknown`, a file that cannot be read is `transcript-unreadable`, a registry file
 without an integer `pid` is `registry-entry-unknown`, and transcripts past the listing or read
-limit, or without a modification time, are `transcripts-not-read`. These are counted in
+limit, or without a modification time, are `transcripts-not-read`.
+
+A Claude Code transcript (`projects/<name>/...jsonl`) with no cwd within the bound, in any shape
+(empty included), falls back to its project directory name: Claude Code encodes a working directory
+by turning each character that is not an ASCII letter or digit into `-`, so `/`, `.`, `_` and
+spaces are indistinguishable. Every existing directory whose encoding equals the name is a
+candidate, found by a walk from `/` that reads directory names only (at most 2048 directories
+listed and 4,000,000 entries looked at), and every candidate is held as the transcript's working
+directory. A name no directory matches stays `transcript-cwd-unknown`; so does a candidate under an
+agent directory in no session, which nothing could hold. A walk that hits its bound, or a matching
+directory that cannot be listed, is `transcript-slug-incomplete` (any candidates found are still
+held). No transcript content beyond the bound above is read for this. These are counted in
 `coverage_gaps.agent_data`, noted by path only, and printed in the header: each may hide a live
 session, so they are disclosed rather than silently mapping nothing. One modified within the
 active window (or of unknown age, or past a limit) is also counted in
 `coverage_gaps.agent_data_recent` and makes every removing item under a harness `work/` directory or
 an agent home's `worktrees/` directory ask (`agent data unreadable: N entries ...`, ask code
-`agent-data`); items elsewhere are unaffected, and older ones are only counted. `scripts/check-live-sessions.py --transcript-cwd FILE...` applies the same contract and
-a test runs both over the same fixtures.
+`agent-data`); items elsewhere are unaffected, and older ones are only counted.
+`scripts/check-live-sessions.py --transcript-cwd FILE...` and `--slug-candidates -- NAME...` apply
+the same contracts, and tests run both over the same fixtures and plans.
 
 An agent process whose every locus (working directory, registry `cwd`, recorded transcript `cwd`,
 command-line and open-file paths under the home, outside its own install and configuration) is an

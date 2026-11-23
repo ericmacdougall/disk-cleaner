@@ -4,6 +4,7 @@
 use super::*;
 use crate::plan::{plan, Action, Plan, PlanItem, PlanOptions};
 use crate::procs::{read_proc_entry, Probe};
+use std::collections::BTreeMap;
 use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1531,4 +1532,298 @@ fn coverage_per_item() {
     accept.accept_incomplete_coverage = true;
     let p = plan(&s, &accept);
     assert_eq!(action(&p, &r), Action::BackupThenRemove, "{}", why(&p, &r));
+}
+
+/// Claude Code's project directory name for a path (every non-alphanumeric character to `-`),
+/// written out here so the test also compiles where the tool has no encoder.
+fn slug_of(p: &Path) -> String {
+    p.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// The AC-10 shape: a `session-owner` first line (no cwd) and a second line past the 64 KiB
+/// bound, so the cwd is never reached. Every value is synthetic.
+fn session_owner_transcript(cwd: &Path) -> String {
+    format!(
+        "{{\"type\":\"session-owner\",\"accountUuid\":\"0\",\"organizationUuid\":\"0\",\
+         \"sessionId\":\"0000\"}}\n{{\"type\":\"user\",\"pad\":\"{}\",\"cwd\":\"{}\"}}\n",
+        "x".repeat(70 * 1024),
+        cwd.display()
+    )
+}
+
+/// goodqa#16711 slug fallback (wal:w6043f204c8a): a recent Claude transcript with no cwd
+/// within the bound (the session-owner shape, or empty) is placed by its project directory
+/// name; its candidate in a session holds that session, and no gap is left. (Fails at 78d584a,
+/// where it was a recent gap and the checkout asked.)
+#[test]
+fn claude_slug_fallback_holds() {
+    for body in [Some(()), None] {
+        let l = live_fixture();
+        let rel = format!(".claude/projects/{}/0000.jsonl", slug_of(&l.wt));
+        let text = body.map_or(String::new(), |_| session_owner_transcript(&l.wt));
+        l.fx.write(&rel, &text);
+        l.fx.date(&rel, 3600);
+        let p = l.fx.plan(ProcessSnapshot::none_running());
+        let what = if body.is_some() {
+            "session-owner"
+        } else {
+            "empty"
+        };
+        kept(&l, &p, what);
+        assert!(
+            p.coverage_gaps.agent_data_recent.is_empty(),
+            "{what}: {:?}",
+            p.coverage_gaps
+        );
+    }
+}
+
+fn oracle_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-live-sessions.py")
+}
+
+/// The slug contract (wal:w6043f204c8a): the tool and the oracle decode project directory
+/// names to the same candidates. Ambiguous names (every candidate kept), each lossy character
+/// (`.`, `_`, space, `-`, `/`), no match, and the walk bound (incomplete).
+#[test]
+fn claude_slug_contract() {
+    let fx = Fx::new();
+    let b = fx.p("slugs");
+    let ways = ["a.b", "a_b", "a b", "a-b"];
+    for d in ways.iter().chain(&["x/y", "x-y", "p.q/r"]) {
+        fs::create_dir_all(b.join(d)).unwrap();
+    }
+    // Four ways at each of three levels: far more listings than MAX_SLUG_DIRS.
+    let mut lvl = vec![b.join("deep")];
+    for _ in 0..3 {
+        lvl = lvl
+            .iter()
+            .flat_map(|d| ways.iter().map(move |n| d.join(n)))
+            .collect();
+    }
+    for d in &lvl {
+        fs::create_dir_all(d.join("end")).unwrap();
+    }
+    let base = slug_of(&b);
+    let mut ab: Vec<PathBuf> = ways.iter().map(|n| b.join(n)).collect();
+    ab.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+    let mut xy = vec![b.join("x-y"), b.join("x/y")];
+    xy.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+    let cases: Vec<(String, Vec<PathBuf>, bool)> = vec![
+        (format!("{base}-a-b"), ab, false),
+        (format!("{base}-x-y"), xy, false),
+        (format!("{base}-p-q-r"), vec![b.join("p.q/r")], false),
+        (format!("{base}-nothing-here"), vec![], false),
+        (format!("{base}-deep-a-b-a-b-a-b-end"), vec![], true),
+    ];
+    for (s, want, inc) in &cases {
+        let got = slug_candidates(s, MAX_SLUG_DIRS);
+        assert_eq!(got.incomplete, *inc, "{s}");
+        if !inc {
+            assert_eq!(&got.candidates, want, "{s}");
+        }
+    }
+    let out = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(oracle_script())
+        .arg("--slug-max-dirs")
+        .arg(MAX_SLUG_DIRS.to_string())
+        .arg("--slug-candidates")
+        .arg("--")
+        .args(cases.iter().map(|c| &c.0))
+        .output()
+        .expect("python3 runs the oracle");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), cases.len(), "{text}");
+    for (line, (s, want, inc)) in lines.iter().zip(&cases) {
+        let mut f = line.split('\t');
+        assert_eq!(f.next(), Some(s.as_str()), "{line}");
+        let rest: Vec<&str> = f.collect();
+        if *inc {
+            assert_eq!(rest, vec!["incomplete"], "{s}");
+        } else if want.is_empty() {
+            assert_eq!(rest, vec!["none"], "{s}");
+        } else {
+            let w: Vec<String> = want.iter().map(|p| p.display().to_string()).collect();
+            assert_eq!(rest, w, "{s}");
+        }
+    }
+}
+
+/// The oracle, run on the fixture home with no real process read, agrees with the plan: exit
+/// 0, the same agent-data gap counts and the same live sessions.
+fn oracle_agrees(l: &Live, p: &Plan, what: &str) {
+    let plan_file = l.fx.home.parent().unwrap().join("plan.json");
+    fs::write(&plan_file, serde_json::to_string(p).unwrap()).unwrap();
+    let out = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(oracle_script())
+        .args(["--plan", &plan_file.to_string_lossy()])
+        .args(["--home", &l.fx.s("")])
+        .args(["--now", &l.fx.now.to_string()])
+        .args(["--slug-max-dirs", &MAX_SLUG_DIRS.to_string()])
+        .arg("--no-processes")
+        .output()
+        .expect("python3 runs the oracle");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{what}: {text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut gaps: BTreeMap<String, u64> = BTreeMap::new();
+    let mut live: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if let Some(r) = line.strip_prefix("  gap   ") {
+            let mut w = r.split_whitespace();
+            let n: u64 = w.next().unwrap().parse().unwrap();
+            gaps.insert(w.next().unwrap().to_string(), n);
+        } else if let Some(r) = line.strip_prefix("  live  ") {
+            live.push(r.split("  (").next().unwrap().to_string());
+        }
+    }
+    let tool_gaps: BTreeMap<String, u64> = p
+        .coverage_gaps
+        .agent_data
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    assert_eq!(gaps, tool_gaps, "{what}: gap counts differ\n{text}");
+    let mut tool_live: Vec<String> = p
+        .totals
+        .sessions
+        .iter()
+        .filter(|s| s.live)
+        .map(|s| s.session.clone())
+        .collect();
+    tool_live.sort();
+    live.sort();
+    assert_eq!(live, tool_live, "{what}: live sessions differ\n{text}");
+}
+
+/// The slug fallback through the plan, each case checked against the oracle: ambiguous
+/// candidates in two sessions (both held); a candidate under an agent dir in no session
+/// (the gap stays, fail closed); a recent name with no match (ask); an old one (counted only);
+/// an incomplete walk (a recent gap, ask).
+#[test]
+fn claude_slug_fallback_plan() {
+    // Held: the session-owner shape.
+    let l = live_fixture();
+    let rel = format!(".claude/projects/{}/0000.jsonl", slug_of(&l.wt));
+    l.fx.write(&rel, &session_owner_transcript(&l.wt));
+    l.fx.date(&rel, 3600);
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    kept(&l, &p, "held");
+    assert!(p
+        .evidence_notes
+        .iter()
+        .any(|n| n.starts_with("transcript-cwd-from-project-name (1 candidate): ")));
+    oracle_agrees(&l, &p, "held");
+
+    // Ambiguous: two sessions whose checkouts encode alike are both held.
+    let l = live_fixture();
+    let q1 = l.fx.repo(".agent-harness/work/q.1/wt");
+    let q2 = l.fx.repo(".agent-harness/work/q_1/wt");
+    l.fx.age_all();
+    let rel = format!(".claude/projects/{}/0000.jsonl", slug_of(&q1));
+    l.fx.write(&rel, "");
+    l.fx.date(&rel, 3600);
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    for (c, s) in [(&q1, "q.1"), (&q2, "q_1")] {
+        assert_eq!(action(&p, c), Action::Keep, "{}", why(&p, c));
+        assert!(session(&p, s).live, "{s}");
+    }
+    assert!(p.coverage_gaps.agent_data_recent.is_empty());
+    assert_eq!(
+        action(&p, &l.wt),
+        Action::BackupThenRemove,
+        "{}",
+        why(&p, &l.wt)
+    );
+    oracle_agrees(&l, &p, "ambiguous");
+
+    // A candidate under an agent dir but in no session: nothing can hold it, the gap stays.
+    let l = live_fixture();
+    let w1 = l.fx.repo(".claude/worktrees/w1");
+    l.fx.age_all();
+    let rel = format!(".claude/projects/{}/0000.jsonl", slug_of(&w1));
+    l.fx.write(&rel, "");
+    l.fx.date(&rel, 3600);
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    for c in [&w1, &l.wt] {
+        assert_eq!(action(&p, c), Action::Ask, "{}", why(&p, c));
+    }
+    assert_eq!(
+        p.coverage_gaps
+            .agent_data_recent
+            .get(TRANSCRIPT_CWD_UNKNOWN),
+        Some(&1)
+    );
+    oracle_agrees(&l, &p, "unheld candidate");
+
+    // No match: recent asks, old is counted only.
+    for (ago, want) in [(3600, Action::Ask), (30 * DAY, Action::BackupThenRemove)] {
+        let l = live_fixture();
+        let rel = ".claude/projects/-nowhere-0b7d-none/0000.jsonl";
+        l.fx.write(rel, "");
+        l.fx.date(rel, ago);
+        // Held open by an agent working in session abc, so that the old one is read too.
+        let mut a = agent(540, "claude", &l.fx.s(".agent-harness/work/abc/wt"));
+        a.open_files = Some(vec![l.fx.s(rel)]);
+        let p = l.fx.plan(snap(vec![a]));
+        assert_eq!(action(&p, &l.wt), want, "{ago}: {}", why(&p, &l.wt));
+        assert_eq!(
+            p.coverage_gaps.agent_data.get(TRANSCRIPT_CWD_UNKNOWN),
+            // A recent one is read twice: held open, and as a recent transcript.
+            Some(&if ago == 3600 { 2 } else { 1 }),
+            "{ago}"
+        );
+        assert_eq!(
+            p.coverage_gaps
+                .agent_data_recent
+                .contains_key(TRANSCRIPT_CWD_UNKNOWN),
+            ago == 3600
+        );
+    }
+
+    // Incomplete walk: a recent gap of its own class.
+    let l = live_fixture();
+    let ways = ["a.b", "a_b", "a b", "a-b"];
+    let mut lvl = vec![l.fx.p("deep")];
+    for _ in 0..3 {
+        lvl = lvl
+            .iter()
+            .flat_map(|d| ways.iter().map(move |n| d.join(n)))
+            .collect();
+    }
+    for d in &lvl {
+        fs::create_dir_all(d.join("end")).unwrap();
+    }
+    l.fx.age_all();
+    let rel = format!(
+        ".claude/projects/{}/0000.jsonl",
+        slug_of(&l.fx.p("deep/a-b/a-b/a-b/end"))
+    );
+    l.fx.write(&rel, "");
+    l.fx.date(&rel, 3600);
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    assert_eq!(
+        p.coverage_gaps
+            .agent_data_recent
+            .get(TRANSCRIPT_SLUG_INCOMPLETE),
+        Some(&1),
+        "{:?}",
+        p.coverage_gaps
+    );
+    assert_eq!(action(&p, &l.wt), Action::Ask, "{}", why(&p, &l.wt));
+    oracle_agrees(&l, &p, "incomplete");
 }
