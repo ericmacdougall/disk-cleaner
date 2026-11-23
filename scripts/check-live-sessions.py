@@ -473,7 +473,7 @@ def self_test():
         with open(pf, "w") as f:
             json.dump(plan, f)
         args = ["--plan", pf, "--home", home, "--now", str(now),
-                "--ground-truth", "echo 'owner gt running; abc'"]
+                "--ground-truth", "echo 'owner gt running; abc; xabcdx'"]
         buf = io.StringIO()
         if hasattr(__import__("signal"), "alarm"):
             import signal
@@ -485,7 +485,7 @@ def self_test():
             signal.alarm(0)
         out = buf.getvalue()
         o = Oracle(home, now, 7, processes=False)
-        live = o.run("echo 'owner gt running; abc'")
+        live = o.run("echo 'owner gt running; abc; xabcdx'")
         problems = []
         want = {"reg", "tr", "recent", "wal", "gt", "abc"}
         if set(live) != want:
