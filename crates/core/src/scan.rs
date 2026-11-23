@@ -43,6 +43,9 @@ pub struct ScanOptions {
     pub git_jobs: usize,
     /// Artifact and cache rules.
     pub rules: Arc<RuleSet>,
+    /// The user, home and environment the protected roots are resolved from (see
+    /// [`crate::protect`]). The CLI fills it from the real process.
+    pub context: crate::protect::ScanContext,
 }
 
 impl ScanOptions {
@@ -57,6 +60,7 @@ impl ScanOptions {
             facts: FactsConfig::default(),
             git_jobs: 4,
             rules: Arc::new(RuleSet::builtin()),
+            context: crate::protect::ScanContext::from_env(Vec::new()),
         }
     }
 }
@@ -136,6 +140,8 @@ fn meta_from(md: &Metadata) -> EntryMeta {
 struct DirAgg {
     /// Allocated bytes of the directory entry itself plus its direct non-directory entries.
     bytes: u64,
+    /// Of `bytes`, those of the direct non-directory entries only.
+    file_bytes: u64,
     files: u64,
     output_bytes: u64,
     newest: Option<i64>,
@@ -168,6 +174,8 @@ struct DirAgg {
     small_outputs_more: u64,
     /// Name of the first direct entry that is a symlink.
     first_symlink: Option<String>,
+    /// Direct files whose names look like agent data.
+    agent_files: u64,
     /// Direct entries below a `.git` directory that are not what git writes there
     /// ([`crate::gitshape`]): their paths below the git directory (the first few) and how many.
     git_local: Vec<String>,
@@ -477,7 +485,11 @@ impl Walk {
             agg.first_symlink = Some(name.clone());
         }
         agg.bytes += alloc;
+        agg.file_bytes += alloc;
         agg.files += 1;
+        if is_file && crate::protect::is_agent_file_name(&name) {
+            agg.agent_files += 1;
+        }
         if is_output {
             agg.output_bytes += alloc;
         }
@@ -776,11 +788,18 @@ fn marker_beside(dirs: &[(PathBuf, DirAgg)], path: &Path, markers: &[String]) ->
 }
 
 fn match_rule<'a>(dirs: &[(PathBuf, DirAgg)], i: usize, rules: &'a RuleSet) -> Option<&'a Rule> {
+    matching_rules(dirs, i, rules).into_iter().next()
+}
+
+/// Every rule whose name and markers match the directory, in the order of the rules file (the
+/// first is the one that classifies it).
+fn matching_rules<'a>(dirs: &[(PathBuf, DirAgg)], i: usize, rules: &'a RuleSet) -> Vec<&'a Rule> {
     let path = &dirs[i].0;
     rules
         .candidates(path)
         .into_iter()
-        .find(|r| r.markers.is_empty() || marker_beside(dirs, path, &r.markers))
+        .filter(|r| r.markers.is_empty() || marker_beside(dirs, path, &r.markers))
+        .collect()
 }
 
 fn bare_shape(agg: &DirAgg) -> bool {
@@ -878,6 +897,14 @@ fn classify(
                     let mut node = Node::new(path.to_string_lossy().into_owned(), class);
                     node.parent = owner;
                     node.rule = rule.map(|r| r.name.clone());
+                    node.rule_id = rule.map(|r| r.id.clone());
+                    if let Some(r) = rule {
+                        node.rule_also = matching_rules(dirs, i, rules)
+                            .into_iter()
+                            .filter(|o| o.id != r.id)
+                            .map(|o| o.id.clone())
+                            .collect();
+                    }
                     let parent_is_loose = match owner {
                         None => true,
                         Some(o) => builds[o].node.class == Class::LooseCode,
@@ -967,6 +994,8 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     if opts.roots.is_empty() {
         return Err(Error::NoRoots);
     }
+    // Protection first: a scan that cannot say what it protects is not made.
+    let mut protect_ctx = crate::protect::resolve(&opts.context)?;
     let mut spelled: Vec<PathBuf> = Vec::new();
     for r in &opts.roots {
         let abs = std::path::absolute(r).map_err(|e| Error::Root {
@@ -1079,6 +1108,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         skipped_overflow,
         refs,
         mut coverage,
+        unreadable_dirs,
         ..
     } = walk;
     issues.truncate(MAX_ISSUES);
@@ -1093,6 +1123,12 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
     // Phase 2: classification.
     let mut dirs: Vec<(PathBuf, DirAgg)> = aggs.into_iter().collect();
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    crate::protect::attribute_bytes(
+        &mut protect_ctx.roots,
+        dirs.iter()
+            .map(|(p, a)| (p.as_path(), a.bytes, a.file_bytes)),
+        &|p| real_under(&roots, &plan_r.canon, p),
+    );
     let root_set: HashSet<PathBuf> = roots.iter().cloned().collect();
     let mut odd_dirs: Vec<PathBuf> = Vec::new();
     let mut builds = classify(&mut dirs, &opts.rules, &root_set, &mut odd_dirs);
@@ -1109,14 +1145,37 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
 
     // Attribute directory aggregates to their owners.
     let mut other_bytes: u64 = 0;
+    // Agent files at a node's own top level: counted from its own directory's entries below.
+    // A directory whose listing failed (or any, once the bounded list overflowed) has no count,
+    // which the plan treats as nonzero.
+    let listing_unknown = unreadable_dirs.len() >= MAX_ISSUE_PATHS;
+    for b in builds.iter_mut() {
+        b.node.agent_files = Some(0);
+        b.node.top_agent_files =
+            (!listing_unknown && !unreadable_dirs.contains(&b.path)).then_some(0);
+    }
     let mut files_self: Vec<u64> = vec![0; builds.len()];
-    for (dir, agg) in dirs.iter() {
+    for (di, (dir, agg)) in dirs.iter().enumerate() {
         match agg.owner {
             Some(o) => {
+                // Files inside an installed package of a regenerable or cache directory are not
+                // counted as agent data: packages ship fixtures and docs of every name.
+                let in_package = builds[o].node.class.is_artifact()
+                    && has_package_evidence(&builds[o], &dirs, di);
                 let b = &mut builds[o];
+                if dir == &b.path {
+                    if let Some(c) = b.node.top_agent_files.as_mut() {
+                        *c = agg.agent_files;
+                    }
+                }
                 b.node.bytes_self += agg.bytes;
                 b.node.output_bytes += agg.output_bytes;
                 files_self[o] += agg.files;
+                if !agg.in_git && !in_package {
+                    if let Some(c) = b.node.agent_files.as_mut() {
+                        *c += agg.agent_files;
+                    }
+                }
                 if agg.in_git {
                     b.git_bytes += agg.bytes;
                     let first = agg.first_symlink.as_ref();
@@ -1156,7 +1215,11 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 builds[i].node.output_bytes,
             );
             let is_artifact = builds[i].node.class.is_artifact();
+            let af = builds[i].node.agent_files.unwrap_or(0);
             let parent = &mut builds[p];
+            if let Some(c) = parent.node.agent_files.as_mut() {
+                *c += af;
+            }
             parent.node.bytes_total += bt;
             parent.node.files_total += ft;
             parent.node.output_bytes += ob;
@@ -1439,7 +1502,15 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             git_facts: opts.collect_facts,
         },
         totals,
-        nodes: builds.into_iter().map(|b| b.node).collect(),
+        nodes: builds
+            .into_iter()
+            .map(|mut b| {
+                let (real, unreadable) = crate::protect::node_real_path(&b.path);
+                b.node.real_path = real;
+                b.node.real_unreadable = unreadable;
+                b.node
+            })
+            .collect(),
         outputs,
         big_files,
         issues,
@@ -1447,6 +1518,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         enclosing_repos,
         scope: roots_scope(&roots).to_string(),
         coverage,
+        protect: protect_ctx,
     })
 }
 

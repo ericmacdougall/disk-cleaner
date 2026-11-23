@@ -248,6 +248,7 @@ fn synthetic(nodes: Vec<Node>, coverage: Coverage) -> ScanResult {
         enclosing_repos: vec![],
         scope: "subtree".to_string(),
         coverage,
+        protect: Default::default(),
     }
 }
 

@@ -109,7 +109,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
     let json = fs::read_to_string(&out_file).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["schema_version"], 15);
+    assert_eq!(v["schema_version"], 16);
 
     let o = run(bin()
         .args([
@@ -898,6 +898,14 @@ fn g1_inherited_git_config_never_runs_a_filter_and_is_not_applied() {
         }
         c.env("APPDATA", t.join("appdata"));
         setup(&mut c);
+        // The scan refuses a HOME that is not the passwd home unless `--home` names it too.
+        let fixture_home = c
+            .get_envs()
+            .find(|(k, _)| *k == "HOME")
+            .and_then(|(_, v)| v.map(|v| v.to_owned()));
+        if let Some(h) = fixture_home {
+            c.arg("--home").arg(h);
+        }
         let o = run(&mut c);
         if !o.status.success() {
             failures.push(format!(
@@ -1372,7 +1380,7 @@ fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
     let now = far_future();
 
     let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
-    assert_eq!(pv["schema_version"], 15);
+    assert_eq!(pv["schema_version"], 16);
     let it = item_of(&pv, &a);
     assert_eq!(it["action"], "backup-then-remove", "{it}");
     let pre = &it["preserve"]["git_admin"];
@@ -1409,17 +1417,35 @@ fn r15_object_data_is_backed_up_and_no_verification_is_accepted() {
 
     let cfg = tmp.path().join("verify.toml");
     write(&cfg, "verify_objects = true\n");
-    let refused: [&[&str]; 2] = [&["--verify-objects"], &["--config", cfg.to_str().unwrap()]];
-    for extra in refused {
-        let mut c = bin();
-        c.args(["scan", root.to_str().unwrap()]).args(extra);
-        isolate(&mut c, &home);
-        let o = run(&mut c);
-        assert_eq!(o.status.code(), Some(2), "{extra:?} was accepted");
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert!(err.contains("unexpected argument"), "{extra:?}: {err}");
-        assert!(err.contains(extra[0]), "{extra:?}: {err}");
-    }
+    let mut c = bin();
+    c.args(["scan", root.to_str().unwrap(), "--verify-objects"]);
+    isolate(&mut c, &home);
+    let o = run(&mut c);
+    assert_eq!(o.status.code(), Some(2), "--verify-objects was accepted");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("unexpected argument"), "{err}");
+    assert!(err.contains("--verify-objects"), "{err}");
+    // `scan --config FILE` exists again (goodqa#16670: scan and plan read the same
+    // `protected_paths`), but a file that still sets `verify_objects` is refused, never used.
+    let out = tmp.path().join("verify-scan.json");
+    let mut c = bin();
+    c.args([
+        "scan",
+        root.to_str().unwrap(),
+        "--config",
+        cfg.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    isolate(&mut c, &home);
+    let o = run(&mut c);
+    assert!(
+        !o.status.success(),
+        "scan accepted a config with verify_objects"
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("verify_objects"), "{err}");
+    assert!(!out.exists(), "a scan file was written");
 
     let scan_file = tmp.path().join("scan.json");
     let v = scan_to_file(&root, &scan_file);

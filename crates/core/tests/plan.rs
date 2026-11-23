@@ -45,6 +45,7 @@ fn synthetic(nodes: Vec<Node>) -> ScanResult {
             complete: true,
             ..Default::default()
         },
+        protect: Default::default(),
     }
 }
 

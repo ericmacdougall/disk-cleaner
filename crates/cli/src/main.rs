@@ -1,13 +1,17 @@
 //! `disk-cleaner` command line. Phase 1 is read-only: `scan` and `plan` never change anything
 //! except the output file named with `--out`.
 
+#![deny(unsafe_code)]
+
 mod report;
+#[allow(unsafe_code)]
+mod sysctx;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use disk_cleaner_core::{
-    config, plan, read_scan, resolve_active, running_cwds, scan, write_json, ConfigSource,
-    FactsConfig, Git, PlanOptions, ScanOptions,
+    config, plan, protect, read_scan, resolve_active, running_cwds, scan, write_json, ConfigSource,
+    FactsConfig, Git, PlanOptions, ScanContext, ScanOptions,
 };
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -62,6 +66,14 @@ struct ScanArgs {
     /// Number of git processes to run at once.
     #[arg(long, default_value_t = 4)]
     git_jobs: usize,
+    /// Resolve the protected agent homes under DIR instead of the passwd home (a disposable
+    /// fixture home); HOME must be set to the same directory. The real home stays protected too.
+    #[arg(long, value_name = "DIR")]
+    home: Option<PathBuf>,
+    /// Config file whose `protected_paths` add protected roots (default: <platform config
+    /// dir>/disk-cleaner/config.toml). Give `plan` the same file.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -119,6 +131,21 @@ fn run_scan(a: ScanArgs) -> Result<()> {
     opts.git_jobs = a.git_jobs;
     let git = Git::new("git", Duration::from_secs(a.git_timeout_secs.max(1)));
     opts.facts = FactsConfig::default().with_git(git);
+    // Who is running and where agent data lives: asked of the system here, passed to the core.
+    // The config's `protected_paths` add roots: from `--config FILE`, or the default location.
+    // `plan` refuses entries this scan did not resolve, so the two must read the same file.
+    let (cfg, _) = config::load(a.config.as_deref()).context("invalid configuration")?;
+    let mut ctx = ScanContext::from_env(cfg.protected_paths);
+    ctx.euid = sysctx::euid();
+    ctx.passwd_home = ctx.euid.and_then(sysctx::passwd_home);
+    if ctx.euid.is_some() && ctx.passwd_home.is_none() {
+        anyhow::bail!(
+            "cannot read this user's home directory from the passwd database, so the agent \
+             homes to protect cannot be located; refusing to scan"
+        );
+    }
+    ctx.declared_home = a.home;
+    opts.context = ctx;
     let result = scan(&opts).context("scan failed")?;
     if let Some(out) = &a.out {
         write_json(out, &result).context("cannot write scan file")?;
@@ -144,6 +171,8 @@ fn run_plan(a: PlanArgs) -> Result<()> {
         );
     }
     let scan_result = read_scan(&a.scan).context("cannot read scan file")?;
+    // The plan trusts the scan's protected roots only when they are there and are this user's.
+    protect::check_plan_scan(&scan_result, sysctx::euid()).context("scan file not accepted")?;
     let now = a.now.unwrap_or_else(|| {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -154,6 +183,9 @@ fn run_plan(a: PlanArgs) -> Result<()> {
     // The config is always loaded and validated, even when a flag overrides it, so a broken
     // file is reported instead of being ignored.
     let (cfg, source) = config::load(a.config.as_deref()).context("invalid configuration")?;
+    // Roots are resolved by the scan: an entry it did not protect is refused, never ignored.
+    protect::check_config_paths(&scan_result, &cfg.protected_paths)
+        .context("configuration not covered by the scan")?;
     let (window, window_source) = match (a.active_window_days, source) {
         (Some(n), _) => (n, "--active-window-days".to_string()),
         (None, ConfigSource::File(p)) => {

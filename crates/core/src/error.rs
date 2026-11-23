@@ -37,6 +37,10 @@ pub enum Error {
     /// counts that overflow).
     #[error("invalid scan file: {field}: {message}")]
     InvalidScan { field: String, message: String },
+    /// Protection could not be set up or does not hold (a bad override, euid 0, `HOME` not the
+    /// passwd home, or a scan the plan will not trust).
+    #[error("protection: {0}")]
+    Protect(String),
     /// The scan file was written with a schema this build does not understand.
     #[error("scan file has schema_version {found}, this build reads {expected}")]
     Schema { found: u32, expected: u32 },

@@ -1,7 +1,8 @@
 //! User settings: `active_window_days`, how recent activity must be for a project to count as
 //! active (default 7), `max_git_admin_bytes`, how much of its own content one git directory may
 //! hold and still be removed after a backup (default 64 MiB), and two opt-ins,
-//! `trust_partial_process_check` and `accept_incomplete_coverage`.
+//! `trust_partial_process_check` and `accept_incomplete_coverage`; and `protected_paths`, extra
+//! roots that are never removed (add-only).
 //!
 //! A config file that exists but cannot be understood is an error. It never falls back to a
 //! default, because a silent fallback could shorten the window and make projects look idle.
@@ -41,6 +42,9 @@ pub struct Config {
     /// Most allocated bytes of its own files (everything but object files) one git directory may
     /// hold and still be removed after a backup; more asks.
     pub max_git_admin_bytes: u64,
+    /// Extra protected roots (absolute or `~/`-relative): nothing inside or containing one is
+    /// ever removed. Add-only: no key removes a built-in root.
+    pub protected_paths: Vec<String>,
 }
 
 impl Default for Config {
@@ -50,6 +54,7 @@ impl Default for Config {
             trust_partial_process_check: false,
             accept_incomplete_coverage: false,
             max_git_admin_bytes: DEFAULT_MAX_GIT_ADMIN_BYTES,
+            protected_paths: Vec::new(),
         }
     }
 }
@@ -67,6 +72,7 @@ struct RawConfig {
     trust_partial_process_check: Option<bool>,
     accept_incomplete_coverage: Option<bool>,
     max_git_admin_bytes: Option<u64>,
+    protected_paths: Option<Vec<String>>,
     /// Read only to refuse it with a message naming its replacement, whatever its value.
     require_full_coverage: Option<toml::Value>,
     /// Read only to refuse it with a message saying why, whatever its value.
@@ -116,6 +122,13 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
             ),
         });
     }
+    let protected_paths = raw.protected_paths.unwrap_or_default();
+    for p in &protected_paths {
+        crate::protect::validate_config_path(p).map_err(|e| Error::Config {
+            path: origin.to_path_buf(),
+            message: format!("protected_paths: {e}"),
+        })?;
+    }
     Ok(Config {
         active_window_days: raw.active_window_days.unwrap_or(DEFAULT_ACTIVE_WINDOW_DAYS),
         trust_partial_process_check: raw.trust_partial_process_check.unwrap_or(false),
@@ -123,6 +136,7 @@ pub fn parse(text: &str, origin: &Path) -> Result<Config> {
         max_git_admin_bytes: raw
             .max_git_admin_bytes
             .unwrap_or(DEFAULT_MAX_GIT_ADMIN_BYTES),
+        protected_paths,
     })
 }
 
@@ -183,6 +197,49 @@ mod tests {
             let e = parse(bad, Path::new("c.toml")).expect_err(bad);
             assert!(e.to_string().contains("c.toml"), "{e}");
         }
+    }
+
+    #[test]
+    fn protected_paths_add_only() {
+        // The key adds roots; it is validated like an override.
+        let c = parse(
+            "protected_paths = [\"/data/agents\", \"~/notes\"]\n",
+            Path::new("c.toml"),
+        )
+        .unwrap();
+        assert_eq!(c.protected_paths, vec!["/data/agents", "~/notes"]);
+        assert!(Config::default().protected_paths.is_empty());
+        for bad in ["\"\"", "\"rel/x\"", "\"~\"", "\"/\"", "\"~/\""] {
+            let e =
+                parse(&format!("protected_paths = [{bad}]"), Path::new("c.toml")).expect_err(bad);
+            assert!(e.to_string().contains("protected_paths"), "{e}");
+        }
+        // No key removes a built-in root: the only keys are additions, and an unprotect-style
+        // key is refused as unknown.
+        for key in ["unprotected_paths", "protected_roots", "protect_builtin"] {
+            assert!(parse(&format!("{key} = []"), Path::new("c.toml")).is_err());
+        }
+        // Resolving with the extras keeps every built-in root and adds the configured ones.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let ctx = crate::protect::ScanContext {
+            passwd_home: Some(home.clone()),
+            euid: Some(1000),
+            home_env: Some(home.to_string_lossy().into_owned()),
+            extra_paths: c.protected_paths.clone(),
+            ..Default::default()
+        };
+        let pc = crate::protect::resolve(&ctx).unwrap();
+        for (rel, _) in crate::protect::BUILTIN_PROTECTED {
+            let want = home.join(rel).to_string_lossy().into_owned();
+            assert!(pc.roots.iter().any(|r| r.spelled == want), "{rel} missing");
+        }
+        assert!(pc.roots.iter().any(|r| r.spelled == "/data/agents"));
+        assert!(pc.roots.iter().any(|r| r.spelled.ends_with("/notes")));
+        // A configured path equal to the home stops the scan.
+        let mut ctx2 = ctx.clone();
+        ctx2.extra_paths = vec!["~/".to_string()];
+        assert!(crate::protect::resolve(&ctx2).is_err());
     }
 
     #[test]

@@ -126,6 +126,21 @@ the config file, is editable in the app's settings and can be overridden per run
 always active or mark one inactive. Active projects and everything under them are left untouched,
 including their regenerable directories.
 
+### 3.1 Protection
+
+Plan never proposes removing anything that is, contains or lies inside an agent home
+(transcripts, WALs, harness state), a cloud-sync folder or an application package. The roots are
+resolved at scan time from the passwd home, the environment overrides and the config's
+`protected_paths` (add-only) and recorded in the scan with the bytes under each; the plan reads
+only the scan, and refuses a config whose `protected_paths` the scan did not resolve. Each node carries its lexical and its canonical path and is compared on both. A
+hold sets the node's own action to `keep` before the nested-veto pass, so a removing parent of a
+held node asks. Inside a protected root the only exceptions are clean, fully pushed checkouts in
+named positions (agent work directories and worktree directories), which may be backed up then
+removed; anything with unsaved work stays. Threat model: careless agents and ordinary mistakes,
+not an adversary with write access to the home directory. Apply must recompute protection and
+walk its candidates on one device before removing anything (bind mounts are out of scope for
+plan). Scan refuses to run as root or under a changed `HOME`. Details: `docs/SCAN-FORMAT.md`.
+
 ## 4. Recovery for ambiguous repos
 
 Modes: `ask` (per item), `auto` (apply the default action), `report` (list only).
