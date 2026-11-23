@@ -214,6 +214,14 @@ pub struct GapSummary {
     /// The folders holding the most gaps (path, gaps), up to five.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub top_folders: Vec<(String, u64)>,
+    /// Agent data the live-session rule could not use, by class: `transcript-cwd-unknown` (a
+    /// transcript head in no known shape: not a top-level `cwd`, not a Codex `session_meta`
+    /// line with `payload.cwd`), `transcript-unreadable` (it could not be opened or read),
+    /// `registry-entry-unknown` (a registry file without a readable integer `pid`),
+    /// `transcripts-not-read` (beyond the read or listing limit, or no modification time).
+    /// Each may hide a live session; the header lists them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_data: BTreeMap<String, u64>,
 }
 
 impl GapSummary {
@@ -385,48 +393,62 @@ pub const TRANSCRIPT_HEAD_BYTES: usize = 64 * 1024;
 /// Most lines of a transcript read.
 pub const TRANSCRIPT_HEAD_LINES: usize = 20;
 
-/// The top-level `cwd` recorded in a transcript (Claude Code `projects/*/<id>.jsonl`, Codex
-/// `rollout-*.jsonl`), from its first 64 KiB or 20 lines, whichever is smaller. Only that one
-/// string is kept; nothing else of the file is held, logged or returned. `Err` is
-/// `transcript unreadable: <path>`, with no content.
-pub fn transcript_cwd(path: &Path) -> Result<Option<String>, String> {
+/// The class of a transcript whose working directory could not be taken.
+pub const TRANSCRIPT_CWD_UNKNOWN: &str = "transcript-cwd-unknown";
+/// The class of a transcript that could not be opened or read.
+pub const TRANSCRIPT_UNREADABLE: &str = "transcript-unreadable";
+
+/// The working directory a transcript records, from its first 64 KiB or 20 lines, whichever
+/// is smaller. The one extractor for every transcript source. Two shapes are known: a line
+/// with a top-level `cwd` string (Claude Code `projects/**/<id>.jsonl`), and a Codex
+/// `session_meta` line (`"type": "session_meta"`) with `payload.cwd` (`rollout-*.jsonl`).
+/// Only that one string is kept; nothing else of the file is held, logged or returned. A file
+/// in neither shape within the bound (another line kind, a first line longer than 64 KiB,
+/// text that is not JSON) is `Err(TRANSCRIPT_CWD_UNKNOWN)`; one that cannot be read is
+/// `Err(TRANSCRIPT_UNREADABLE)`. Callers count these as gaps and note the path only.
+pub fn transcript_cwd(path: &Path) -> Result<String, &'static str> {
     use std::io::Read;
-    // Deserialize into a struct that holds only `cwd`: every other field is skipped unread.
+    // Deserialize into structs that hold only these fields: every other field is skipped.
     #[derive(Deserialize)]
-    struct CwdOnly {
+    struct PayloadCwd {
         #[serde(default)]
         cwd: Option<String>,
     }
-    let unreadable = || format!("transcript unreadable: {}", path.display());
-    let file = std::fs::File::open(path).map_err(|_| unreadable())?;
+    #[derive(Deserialize)]
+    struct Head {
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default, rename = "type")]
+        kind: Option<String>,
+        #[serde(default)]
+        payload: Option<PayloadCwd>,
+    }
+    let file = std::fs::File::open(path).map_err(|_| TRANSCRIPT_UNREADABLE)?;
     let mut buf = Vec::with_capacity(8192);
     file.take(TRANSCRIPT_HEAD_BYTES as u64)
         .read_to_end(&mut buf)
-        .map_err(|_| unreadable())?;
+        .map_err(|_| TRANSCRIPT_UNREADABLE)?;
     let full = buf.len() < TRANSCRIPT_HEAD_BYTES;
     let mut lines: Vec<&[u8]> = buf.split(|b| *b == b'\n').collect();
-    if !full && lines.len() > 1 {
-        // The last line was cut by the byte bound.
+    if !full {
+        // The last line was cut by the byte bound (a first line longer than the bound leaves
+        // nothing).
         lines.pop();
     }
-    let mut parsed_any = false;
     for line in lines.into_iter().take(TRANSCRIPT_HEAD_LINES) {
-        if line.iter().all(u8::is_ascii_whitespace) {
+        let Ok(h) = serde_json::from_slice::<Head>(line) else {
             continue;
+        };
+        if let Some(c) = h.cwd.filter(|c| c.starts_with('/')) {
+            return Ok(c);
         }
-        if let Ok(v) = serde_json::from_slice::<CwdOnly>(line) {
-            parsed_any = true;
-            if let Some(c) = v.cwd.filter(|c| c.starts_with('/')) {
-                return Ok(Some(c));
+        if h.kind.as_deref() == Some("session_meta") {
+            if let Some(c) = h.payload.and_then(|p| p.cwd).filter(|c| c.starts_with('/')) {
+                return Ok(c);
             }
         }
     }
-    drop(buf);
-    if parsed_any {
-        Ok(None)
-    } else {
-        Err(unreadable())
-    }
+    Err(TRANSCRIPT_CWD_UNKNOWN)
 }
 
 /// The three fields of a Claude Code session registry entry this module reads.
@@ -486,6 +508,7 @@ fn files_below(
     depth: usize,
     cap: usize,
     want: &dyn Fn(&str) -> bool,
+    truncated: &mut bool,
 ) -> Vec<(PathBuf, Option<i64>)> {
     let mut out = Vec::new();
     let mut seen = 0usize;
@@ -497,6 +520,7 @@ fn files_below(
         for e in rd.flatten() {
             seen += 1;
             if seen > cap {
+                *truncated = true;
                 return out;
             }
             let Ok(ft) = e.file_type() else {
@@ -762,6 +786,10 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         }
     };
 
+    let gap = |ev: &mut Evidence, class: &str| {
+        *ev.gaps.agent_data.entry(class.to_string()).or_insert(0) += 1;
+    };
+
     // ---- node identities: the path as the scan spelled it and its real path.
     let ids: Vec<Vec<PathBuf>> = scan
         .nodes
@@ -924,16 +952,22 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                 }
                 let Ok(md) = e.metadata() else { continue };
                 if !md.is_file() || md.len() > 64 * 1024 {
+                    gap(&mut ev, "registry-entry-unknown");
                     continue;
                 }
                 let Ok(text) = std::fs::read(e.path()) else {
+                    gap(&mut ev, "registry-entry-unknown");
                     continue;
                 };
                 let Ok(entry) = serde_json::from_slice::<RegistryEntry>(&text) else {
+                    gap(&mut ev, "registry-entry-unknown");
                     continue;
                 };
                 drop(text);
-                let Some(pid) = entry.pid else { continue };
+                let Some(pid) = entry.pid else {
+                    gap(&mut ev, "registry-entry-unknown");
+                    continue;
+                };
                 let Some(p) = by_pid.get(&pid) else { continue };
                 // Pid reuse: the process must have started no later than the entry was written.
                 let ok = match (p.start_time, mtime_of(&md)) {
@@ -950,13 +984,15 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
     let mut read_count = 0usize;
     let mut read_cwd = |ev: &mut Evidence, path: &Path| -> Option<String> {
         if read_count >= MAX_TRANSCRIPTS {
+            gap(ev, "transcripts-not-read");
             return None;
         }
         read_count += 1;
         match transcript_cwd(path) {
-            Ok(c) => c,
-            Err(e) => {
-                note(ev, e);
+            Ok(c) => Some(c),
+            Err(class) => {
+                gap(ev, class);
+                note(ev, format!("{class}: {}", path.display()));
                 None
             }
         }
@@ -1142,15 +1178,37 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
     // ---- recent transcripts whose recorded cwd is in a session (no process needed).
     if !ev.sessions.is_empty() {
         let mut transcripts: Vec<(PathBuf, Option<i64>)> = Vec::new();
+        let mut truncated = false;
+        // Claude Code: projects/<project>/<id>.jsonl and, for subagents,
+        // projects/<project>/<id>/subagents/<agent>.jsonl.
         for pd in &projects_dirs {
-            transcripts.extend(files_below(pd, 4, 1_000_000, &|n| n.ends_with(".jsonl")));
+            transcripts.extend(files_below(
+                pd,
+                4,
+                1_000_000,
+                &|n| n.ends_with(".jsonl"),
+                &mut truncated,
+            ));
         }
+        // Codex: sessions/YYYY/MM/DD/rollout-*.jsonl and archived_sessions/rollout-*.jsonl.
         for base in &host.codex_bases {
-            for sd in named_dirs(base, "sessions", 1) {
-                transcripts.extend(files_below(&sd, 5, 1_000_000, &|n| {
-                    n.starts_with("rollout-") && n.ends_with(".jsonl")
-                }));
+            for name in ["sessions", "archived_sessions"] {
+                for sd in named_dirs(base, name, 1) {
+                    transcripts.extend(files_below(
+                        &sd,
+                        5,
+                        1_000_000,
+                        &|n| n.starts_with("rollout-") && n.ends_with(".jsonl"),
+                        &mut truncated,
+                    ));
+                }
             }
+        }
+        if truncated {
+            gap(&mut ev, "transcripts-not-read");
+        }
+        for _ in transcripts.iter().filter(|(_, m)| m.is_none()) {
+            gap(&mut ev, "transcripts-not-read");
         }
         transcripts.retain(|(_, m)| recent(*m));
         transcripts.sort_by_key(|t| std::cmp::Reverse(t.1));

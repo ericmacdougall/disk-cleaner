@@ -856,8 +856,10 @@ node inside the repo (matched by identity, not by count); the reason names the o
 information could not be read at all), `process_check_note`, `process_counts` (`readable`,
 `by_command_line`, `kernel_threads`, `gone`, `container_processes`, `runtime`, `agents`,
 `idle_agents`, `unmapped_agents` (pids), `fully_unknown`), `coverage_gaps` (`privacy`,
-`permission`, `mount`, `other`, `overflowed`, `top_folders`), `evidence_notes` (for example
-`transcript unreadable: <path>`), `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
+`permission`, `mount`, `other`, `overflowed`, `top_folders`, and `agent_data`: agent data the
+live-session rule could not use, by class: `transcript-cwd-unknown`, `transcript-unreadable`,
+`registry-entry-unknown`, `transcripts-not-read`), `evidence_notes` (for example
+`transcript-cwd-unknown: <path>`), `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
 `remote_facts_note`, `enclosing_repos`, `scope`, `coverage_complete`, `coverage_note` (only when
 coverage is incomplete), `accepted_incomplete_coverage` (see "Incomplete coverage" and
 "Accepting incomplete coverage"), `active`, `totals` and `items`.
@@ -1001,11 +1003,23 @@ never opened) whose pid is alive and started no later than the entry was written
 in the session or whose `sessionId` is its name; an agent process (`claude`, `codex`, `kimi`,
 `cursor-agent`, or `node`/`bun` running a Claude Code or Codex entry point) working in it, naming it
 as a whole argument or path segment, or holding open a transcript that records a `cwd` in it; any
-process's working directory in it; a transcript (`projects/**/*.jsonl`, `rollout-*.jsonl`) modified
-within the window that records a `cwd` in it; a file below it modified within the window; an entry
-named after it within depth 3 of a protected root modified within the window. A transcript is read
-for its top-level `cwd` only, from its first 64 KiB or 20 lines, whichever is smaller; nothing else
-is kept or printed, and a parse failure is the note `transcript unreadable: <path>`.
+process's working directory in it; a transcript modified within the window that records a `cwd` in
+it (Claude Code `projects/<project>/<id>.jsonl` and subagent `projects/<project>/<id>/subagents/*.jsonl`;
+Codex `sessions/YYYY/MM/DD/rollout-*.jsonl` and `archived_sessions/rollout-*.jsonl`); a file below
+it modified within the window; an entry named after it within depth 3 of a protected root modified
+within the window.
+
+One extractor reads every transcript, from its first 64 KiB or 20 lines, whichever is smaller, for
+the working-directory field only: the top-level `cwd` (Claude Code), or `payload.cwd` of a line
+whose `type` is `session_meta` (Codex). Nothing else is kept or printed. Any other shape within the
+bound (another line kind, a first line longer than 64 KiB, text that is not JSON) is the coverage
+gap `transcript-cwd-unknown`, a file that cannot be read is `transcript-unreadable`, a registry file
+without an integer `pid` is `registry-entry-unknown`, and transcripts past the listing or read
+limit, or without a modification time, are `transcripts-not-read`. These are counted in
+`coverage_gaps.agent_data`, noted by path only, and printed in the header: each may hide a live
+session, so they are disclosed rather than silently mapping nothing. They do not by themselves make
+an item ask. `scripts/check-live-sessions.py --transcript-cwd FILE...` applies the same contract and
+a test runs both over the same fixtures.
 
 An agent process whose every locus (working directory, registry `cwd`, recorded transcript `cwd`,
 command-line and open-file paths under the home, outside its own install and configuration) is an

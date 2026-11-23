@@ -801,8 +801,187 @@ fn live_session() {
     );
 }
 
+/// A Codex rollout: its first line is a `session_meta` record whose `payload.cwd` is the
+/// session's working directory (no top-level `cwd`). Every value is synthetic.
+fn codex_rollout(cwd: &str, secret: &str) -> String {
+    format!(
+        "{{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_meta\",\
+         \"payload\":{{\"id\":\"0000\",\"cwd\":\"{cwd}\",\"instructions\":\"{secret}\"}}}}\n\
+         {{\"timestamp\":\"2026-01-01T00:00:01Z\",\"type\":\"response_item\",\
+         \"payload\":{{\"type\":\"message\",\"text\":\"{secret}\"}}}}\n"
+    )
+}
+
+/// goodqa#16711 repair: a recently modified Codex rollout whose `session_meta` line records
+/// `payload.cwd` in the session makes it live, with no process running, in `sessions/` and in
+/// `archived_sessions/`; an agent holding an old rollout open gets that cwd as its locus. The
+/// canary beside it reaches no output. (Run against 53b9bc0 too, where it fails: the
+/// top-level-only read mapped nothing.)
+#[test]
+fn codex_session_meta_transcript() {
+    for dir in [".codex/sessions/2026/01/01", ".codex/archived_sessions"] {
+        let l = live_fixture();
+        let rel = format!("{dir}/rollout-2026-01-01T00-00-00-0000.jsonl");
+        let cwd = l.fx.s(".agent-harness/work/s1/wt");
+        l.fx.write(&rel, &codex_rollout(&cwd, CANARY));
+        l.fx.date(&rel, 3600);
+        let p = l.fx.plan(ProcessSnapshot::none_running());
+        kept(&l, &p, dir);
+        assert!(!serde_json::to_string(&p).unwrap().contains(CANARY));
+    }
+    let l = live_fixture();
+    let rel = ".codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-0001.jsonl";
+    let t = l.fx.write(
+        rel,
+        &codex_rollout(&l.fx.s(".agent-harness/work/s1"), CANARY),
+    );
+    l.fx.date(rel, 30 * DAY);
+    let mut a = agent(520, "codex", &l.fx.s(""));
+    a.open_files = Some(vec![t.to_string_lossy().into_owned()]);
+    let p = l.fx.plan(snap(vec![a, child_of(521, 520)]));
+    kept(&l, &p, "open Codex rollout");
+    assert!(!serde_json::to_string(&p).unwrap().contains(CANARY));
+}
+
+/// A Claude Code subagent transcript (`projects/<p>/<id>/subagents/<agent>.jsonl`) is read like
+/// any other transcript.
+#[test]
+fn subagent_transcript_layout() {
+    let l = live_fixture();
+    let rel = ".claude/projects/-proj/0000-aaaa/subagents/agent-1.jsonl";
+    let cwd = l.fx.s(".agent-harness/work/s1/task");
+    l.fx.write(rel, &format!("{{\"type\":\"user\",\"cwd\":\"{cwd}\"}}\n"));
+    l.fx.date(rel, 3600);
+    kept(
+        &l,
+        &l.fx.plan(ProcessSnapshot::none_running()),
+        "subagent transcript",
+    );
+}
+
+/// The five cases of the transcript-cwd contract as files in `dir`, each with its expected
+/// cwd (`None`: a coverage gap). `with_mapped` false writes only the three gap shapes.
+fn contract_fixtures(dir: &Path, with_mapped: bool) -> Vec<(PathBuf, Option<String>)> {
+    let cases: Vec<(&str, String, Option<&str>)> = vec![
+        (
+            "claude.jsonl",
+            "{\"type\":\"summary\",\"summary\":\"x\"}\n\
+             {\"type\":\"user\",\"cwd\":\"/w/claude\",\"sessionId\":\"0000\"}\n"
+                .to_string(),
+            Some("/w/claude"),
+        ),
+        (
+            "codex-meta.jsonl",
+            codex_rollout("/w/codex", "x"),
+            Some("/w/codex"),
+        ),
+        (
+            "codex-other.jsonl",
+            "{\"timestamp\":\"t\",\"type\":\"response_item\",\"payload\":{\"cwd\":\"/w/not-meta\"}}\n"
+                .to_string(),
+            None,
+        ),
+        (
+            "oversized.jsonl",
+            format!(
+                "{{\"cwd\":\"/w/too-late\",\"pad\":\"{}\"}}",
+                "x".repeat(TRANSCRIPT_HEAD_BYTES + 10)
+            ),
+            None,
+        ),
+        (
+            "garbage.jsonl",
+            "not json at all\n\u{0}\u{1}\n".to_string(),
+            None,
+        ),
+    ];
+    fs::create_dir_all(dir).unwrap();
+    cases
+        .into_iter()
+        .filter(|(_, _, want)| with_mapped || want.is_none())
+        .map(|(name, text, want)| {
+            let p = dir.join(name);
+            fs::write(&p, text).unwrap();
+            (p, want.map(str::to_string))
+        })
+        .collect()
+}
+
+/// The transcript-cwd contract (goodqa#16711 repair, wal:w1f09cb4cf9a): one extractor; the cwd
+/// field only (top-level for Claude, `payload.cwd` of the `session_meta` line for Codex); any
+/// other shape is a coverage gap. The tool's extractor and the independent oracle
+/// (`scripts/check-live-sessions.py --transcript-cwd`) agree on every fixture.
+#[test]
+fn transcript_cwd_contract() {
+    let fx = Fx::new();
+    let cases = contract_fixtures(&fx.p("contract"), true);
+    let rust: Vec<Option<String>> = cases
+        .iter()
+        .map(|(p, want)| {
+            let got = transcript_cwd(p);
+            match want {
+                Some(w) => assert_eq!(got.as_deref(), Ok(w.as_str()), "{}", p.display()),
+                None => assert_eq!(got, Err(TRANSCRIPT_CWD_UNKNOWN), "{}", p.display()),
+            }
+            got.ok()
+        })
+        .collect();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-live-sessions.py");
+    let out = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(&script)
+        .arg("--transcript-cwd")
+        .args(cases.iter().map(|(p, _)| p))
+        .output()
+        .expect("python3 runs the oracle");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let oracle: Vec<Option<String>> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| {
+            let (_, v) = l.split_once('\t').expect("path<TAB>result");
+            (v != "gap").then(|| v.to_string())
+        })
+        .collect();
+    assert_eq!(oracle, rust, "the oracle and the tool disagree");
+
+    // Through the plan: recent transcripts in the three gap shapes are counted as coverage
+    // gaps by class, never mapped and never a crash; so is a registry file without a pid.
+    let l = live_fixture();
+    for (p, _) in contract_fixtures(&l.fx.p(".claude/projects/-proj"), false) {
+        set_mtime(&p, l.fx.now - 3600);
+    }
+    l.fx.write(".claude/sessions/77.json", "{\"sessionId\":\"x\"}");
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    assert_eq!(
+        p.coverage_gaps.agent_data.get(TRANSCRIPT_CWD_UNKNOWN),
+        Some(&3),
+        "{:?}",
+        p.coverage_gaps
+    );
+    assert_eq!(
+        p.coverage_gaps.agent_data.get("registry-entry-unknown"),
+        Some(&1),
+        "{:?}",
+        p.coverage_gaps
+    );
+    assert!(p
+        .evidence_notes
+        .iter()
+        .any(|n| n.starts_with("transcript-cwd-unknown: ") && n.ends_with("oversized.jsonl")));
+    assert_eq!(
+        action(&p, &l.wt),
+        Action::BackupThenRemove,
+        "{}",
+        why(&p, &l.wt)
+    );
+}
+
 /// The bounded transcript read (AC-5): only `cwd` is kept, nothing past 20 lines or 64 KiB is
-/// read, and an unparsable file is reported by path only.
+/// read, and a file with no usable head is a gap class, never its content.
 #[test]
 fn transcript_cwd_is_bounded() {
     let fx = Fx::new();
@@ -810,16 +989,16 @@ fn transcript_cwd_is_bounded() {
         "t/a.jsonl",
         &format!("{{\"x\":1}}\n{{\"cwd\":\"/w/s\",\"k\":\"{CANARY}\"}}\n"),
     );
-    assert_eq!(transcript_cwd(&t).unwrap().as_deref(), Some("/w/s"));
+    assert_eq!(transcript_cwd(&t).as_deref(), Ok("/w/s"));
     let mut late = String::new();
     for _ in 0..TRANSCRIPT_HEAD_LINES {
         late.push_str("{\"x\":1}\n");
     }
     late.push_str("{\"cwd\":\"/w/late\"}\n");
     let t = fx.write("t/b.jsonl", &late);
-    assert_ne!(
-        transcript_cwd(&t).ok().flatten().as_deref(),
-        Some("/w/late"),
+    assert_eq!(
+        transcript_cwd(&t),
+        Err(TRANSCRIPT_CWD_UNKNOWN),
         "line 21 is not read"
     );
     let big = format!(
@@ -827,19 +1006,15 @@ fn transcript_cwd_is_bounded() {
         "x".repeat(TRANSCRIPT_HEAD_BYTES)
     );
     let t = fx.write("t/c.jsonl", &big);
-    assert_ne!(
-        transcript_cwd(&t).ok().flatten().as_deref(),
-        Some("/w/far"),
+    assert_eq!(
+        transcript_cwd(&t),
+        Err(TRANSCRIPT_CWD_UNKNOWN),
         "nothing past 64 KiB is read"
     );
-    let t = fx.write("t/d.jsonl", &format!("not json {CANARY}\n"));
-    match transcript_cwd(&t) {
-        Err(e) => assert!(
-            e.starts_with("transcript unreadable: ") && !e.contains(CANARY),
-            "{e}"
-        ),
-        Ok(v) => assert_eq!(v, None),
-    }
+    assert_eq!(
+        transcript_cwd(&fx.p("t/missing.jsonl")),
+        Err(TRANSCRIPT_UNREADABLE)
+    );
 }
 
 // ------------------------------------------------------------------------------------- AC-6

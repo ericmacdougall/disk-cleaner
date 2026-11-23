@@ -268,6 +268,18 @@ pub fn plan_summary(p: &Plan) -> String {
             let _ = writeln!(o, "  {:>6}  {}", n, esc(folder));
         }
     }
+    if !g.agent_data.is_empty() {
+        let parts: Vec<String> = g
+            .agent_data
+            .iter()
+            .map(|(class, n)| format!("{n} {class}"))
+            .collect();
+        let _ = writeln!(
+            o,
+            "Agent data the live-session check could not use (each may hide a live session): {}",
+            esc(&parts.join(", "))
+        );
+    }
     for n in &p.evidence_notes {
         let _ = writeln!(o, "note: {}", esc(n));
     }

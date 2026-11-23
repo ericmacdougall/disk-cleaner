@@ -24,8 +24,12 @@ sources:
     listing). A session name that appears in its output as a whole token is live. If the command
     fails, the check cannot be made: exit 2.
 
-A transcript is read for its top-level `cwd` only, from its first 64 KiB or 20 lines, whichever
-is smaller; nothing else of it is kept or printed. Output names sessions and item paths only.
+A transcript is read for its working directory only, from its first 64 KiB or 20 lines, whichever
+is smaller: the top-level `cwd` (Claude Code) or `payload.cwd` of a `session_meta` line (Codex,
+also in .codex/archived_sessions). Any other shape is counted and printed as a gap class
+(`transcript-cwd-unknown`, like an unreadable file or a registry file without a pid); nothing else
+of it is kept or printed. Output names sessions, gap counts and item paths only.
+`--transcript-cwd FILE...` prints each file's result under that contract (the tool's tests compare).
 
 Exit 1, naming each one, when an oracle-live session has an item the plan removes, or when the
 plan lists an oracle-live session (one owning plan items) as idle. Exit 0 otherwise.
@@ -50,20 +54,38 @@ WALK_BUDGET = 200_000
 
 
 def transcript_cwd(path):
-    """The top-level cwd a transcript records, within the bound; None when there is none."""
+    """(cwd, None) or (None, gap class) for a transcript, within the bound.
+
+    The contract the tool follows too: the cwd field only, top-level for Claude Code, and
+    `payload.cwd` of a `"type": "session_meta"` line for Codex. Any other shape within the
+    first 64 KiB or 20 lines (another line kind, a first line longer than the bound, text that
+    is not JSON) is the gap `transcript-cwd-unknown`; a file that cannot be read is
+    `transcript-unreadable`.
+    """
     try:
         with open(path, "rb") as f:
             head = f.read(HEAD_BYTES)
     except OSError:
-        return None
-    for line in head.split(b"\n")[:HEAD_LINES]:
+        return None, "transcript-unreadable"
+    lines = head.split(b"\n")
+    if len(head) >= HEAD_BYTES:
+        lines = lines[:-1]  # the last line was cut by the byte bound
+    for line in lines[:HEAD_LINES]:
         try:
             obj = json.loads(line)
         except ValueError:
             continue
-        if isinstance(obj, dict) and isinstance(obj.get("cwd"), str):
-            return obj["cwd"]
-    return None
+        if not isinstance(obj, dict):
+            continue
+        cwd = obj.get("cwd")
+        if isinstance(cwd, str) and cwd.startswith("/"):
+            return cwd, None
+        payload = obj.get("payload")
+        if obj.get("type") == "session_meta" and isinstance(payload, dict):
+            cwd = payload.get("cwd")
+            if isinstance(cwd, str) and cwd.startswith("/"):
+                return cwd, None
+    return None, "transcript-cwd-unknown"
 
 
 class Oracle:
@@ -80,6 +102,16 @@ class Oracle:
         except OSError:
             self.sessions = []
         self.live = {}  # session -> first source
+        self.gaps = {}  # gap class -> count
+
+    def gap(self, cls):
+        self.gaps[cls] = self.gaps.get(cls, 0) + 1
+
+    def cwd_of(self, path):
+        cwd, gap = transcript_cwd(path)
+        if gap:
+            self.gap(gap)
+        return cwd
 
     def recent(self, mtime):
         return mtime >= self.now - self.window
@@ -113,13 +145,15 @@ class Oracle:
                 with open(path, "rb") as f:
                     raw = json.loads(f.read(HEAD_BYTES))
             except (OSError, ValueError):
+                self.gap("registry-entry-unknown")
                 continue
-            if not isinstance(raw, dict):
+            if not isinstance(raw, dict) or not isinstance(raw.get("pid"), int):
+                self.gap("registry-entry-unknown")
                 continue
             pid, cwd = raw.get("pid"), raw.get("cwd")
             sid = raw.get("sessionId")
             del raw  # only the three fields are kept
-            if not isinstance(pid, int) or not pid_alive(pid):
+            if not pid_alive(pid):
                 continue
             start = pid_start(pid)
             if start is not None and start > mtime + 1:
@@ -142,7 +176,7 @@ class Oracle:
                 if s:
                     self.mark(s, "agent pid %d works in it" % pid)
                 elif p and p.endswith(".jsonl"):
-                    s = self.session_of(transcript_cwd(p))
+                    s = self.session_of(self.cwd_of(p))
                     if s:
                         self.mark(s, "agent pid %d holds a transcript" % pid)
 
@@ -197,6 +231,10 @@ class Oracle:
                 os.path.join(self.home, ".codex", "sessions"),
                 lambda n: n.startswith("rollout-") and n.endswith(".jsonl"),
             ),
+            (
+                os.path.join(self.home, ".codex", "archived_sessions"),
+                lambda n: n.startswith("rollout-") and n.endswith(".jsonl"),
+            ),
         ]
         for top, want in roots:
             for root, dirs, files in os.walk(top):
@@ -211,7 +249,7 @@ class Oracle:
                             continue
                     except OSError:
                         continue
-                    s = self.session_of(transcript_cwd(p))
+                    s = self.session_of(self.cwd_of(p))
                     if s:
                         self.mark(s, "recent transcript")
 
@@ -392,9 +430,18 @@ def main(argv, processes=True):
     ap.add_argument("--now", type=float, default=None)
     ap.add_argument("--ground-truth")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument(
+        "--transcript-cwd", nargs="+", metavar="FILE",
+        help="print FILE<TAB>cwd (or `gap`) for each file: the contract test shared with the tool",
+    )
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
+    if a.transcript_cwd:
+        for f in a.transcript_cwd:
+            cwd, _ = transcript_cwd(f)
+            print("%s\t%s" % (f, cwd or "gap"))
+        return 0
     if not a.plan:
         ap.error("--plan is required")
     with open(a.plan) as f:
@@ -409,6 +456,8 @@ def main(argv, processes=True):
     print("oracle: %d of %d sessions live" % (len(live), len(oracle.sessions)))
     for s in sorted(live):
         print("  live  %s  (%s)" % (s, live[s]))
+    for g in sorted(oracle.gaps):
+        print("  gap   %d %s (each may hide a live session)" % (oracle.gaps[g], g))
     offered, missed = check(plan, oracle)
     mapped = [i for i in plan.get("items", []) if oracle.session_of(i.get("path"))]
     print("plan: %d of %d items lie in a session directory" % (len(mapped), len(plan.get("items", []))))
@@ -445,7 +494,8 @@ def self_test():
                     if not os.path.islink(p) and not stat_fifo(p):
                         os.utime(p, (now - 400 * 86400, now - 400 * 86400))
 
-        for s in ["old", "reg", "dead", "tr", "recent", "wal", "gt", "abc", "abcd"]:
+        for s in ["old", "reg", "dead", "tr", "recent", "wal", "gt", "abc", "abcd", "cx", "cxa",
+                  "sub"]:
             put(".agent-harness/work/%s/wt/src/lib.rs" % s)
         age_all()
         # Registry: this process (alive, started before the entry) for `reg`; a reaped child's
@@ -471,6 +521,26 @@ def self_test():
         # A transcript recording `old` but read past the bound: line 21.
         put(".claude/projects/-p/late.jsonl",
             "{}\n" * HEAD_LINES + json.dumps({"cwd": work + "/old"}) + "\n", ago=3600)
+        # Codex rollouts: the cwd is `payload.cwd` of the session_meta line (no top-level cwd),
+        # in sessions/YYYY/MM/DD/ and in archived_sessions/. A Claude subagent transcript.
+        def rollout(cwd):
+            return (json.dumps({"timestamp": "t", "type": "session_meta",
+                                "payload": {"id": "0", "cwd": cwd, "instructions": canary}})
+                    + "\n" + json.dumps({"type": "response_item", "payload": {"text": canary}})
+                    + "\n")
+        put(".codex/sessions/2026/01/01/rollout-1.jsonl", rollout(work + "/cx/wt"), ago=3600)
+        put(".codex/archived_sessions/rollout-2.jsonl", rollout(work + "/cxa"), ago=3600)
+        put(".claude/projects/-p/0000/subagents/agent-1.jsonl",
+            json.dumps({"type": "user", "cwd": work + "/sub/wt"}) + "\n", ago=3600)
+        # Gap shapes: a non-session_meta Codex line naming `old` under payload, an oversized
+        # first line, garbage; and a registry file without a pid.
+        put(".codex/sessions/2026/01/01/rollout-3.jsonl",
+            json.dumps({"type": "response_item", "payload": {"cwd": work + "/old"}}) + "\n",
+            ago=3600)
+        put(".claude/projects/-p/big.jsonl",
+            json.dumps({"cwd": work + "/old", "pad": "x" * HEAD_BYTES}), ago=3600)
+        put(".claude/projects/-p/garbage.jsonl", "not json\n", ago=3600)
+        put(".claude/sessions/77.json", json.dumps({"sessionId": "x"}), ago=3600)
 
         def item(s, action):
             return {"path": work + "/%s/wt" % s, "action": action}
@@ -500,9 +570,14 @@ def self_test():
         o = Oracle(home, now, 7, processes=False)
         live = o.run("echo 'owner gt running; abc; xabcdx'")
         problems = []
-        want = {"reg", "tr", "recent", "wal", "gt", "abc"}
+        want = {"reg", "tr", "recent", "wal", "gt", "abc", "cx", "cxa", "sub"}
         if set(live) != want:
             problems.append("live sessions %s, expected %s" % (sorted(live), sorted(want)))
+        gaps = {"transcript-cwd-unknown": 4, "registry-entry-unknown": 1}
+        if o.gaps != gaps:
+            problems.append("gaps %s, expected %s" % (o.gaps, gaps))
+        if "gap   4 transcript-cwd-unknown" not in out:
+            problems.append("the transcript gaps were not printed")
         if code != 1:
             problems.append("exit %d, expected 1" % code)
         if "OFFERED: live session tr" not in out:
