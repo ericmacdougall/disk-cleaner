@@ -137,7 +137,7 @@ struct RawRules {
 }
 
 /// A compiled rule set with the lookup tables the scanner needs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RuleSet {
     rules: Vec<Rule>,
     by_last: HashMap<String, Vec<usize>>,
@@ -263,6 +263,31 @@ impl RuleSet {
             scan_dir_names,
             state_files: raw.state_file,
         })
+    }
+
+    /// A copy of this rule set in which the rule with identity `id` matches a directory named
+    /// `alias` wherever it stands and needs no marker beside it. `apply` scans a quarantined
+    /// directory (renamed, its marker left behind in the parent) with it, so the copy is judged
+    /// by the scan's own classifier. `None` when no rule has that identity.
+    pub fn with_alias(&self, id: &str, alias: &str) -> Option<RuleSet> {
+        let mut rs = self.clone();
+        let i = rs.rules.iter().position(|r| r.id == id)?;
+        let old_last = rs.rules[i]
+            .name
+            .rsplit('/')
+            .next()
+            .unwrap_or(&rs.rules[i].name)
+            .to_string();
+        if let Some(v) = rs.by_last.get_mut(&old_last) {
+            v.retain(|&k| k != i);
+        }
+        rs.rules[i].name = alias.to_string();
+        rs.rules[i].markers.clear();
+        rs.by_last.entry(alias.to_string()).or_default().push(i);
+        if rs.rules[i].scan_outputs {
+            rs.scan_dir_names.insert(alias.to_string());
+        }
+        Some(rs)
     }
 
     /// All rules.

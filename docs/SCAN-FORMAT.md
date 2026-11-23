@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **17** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **18** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -863,11 +863,15 @@ live-session rule could not use, by class: `transcript-cwd-unknown`, `transcript
 `transcript-cwd-from-project-name (2 candidates): <path>`), `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
 `remote_facts_note`, `enclosing_repos`, `scope`, `coverage_complete`, `coverage_note` (only when
 coverage is incomplete), `accepted_incomplete_coverage` (see "Incomplete coverage" and
-"Accepting incomplete coverage"), `active`, `totals` and `items`.
+"Accepting incomplete coverage"), `active`, `scan_roots`, `scan_options`, `plan_options` and
+`protect` (since schema 18: the scan roots and options and the plan options the plan was made
+with, and the protected roots the scan resolved; `disk-cleaner apply` scans and plans again from
+them and protects the union of those roots and a fresh resolution), `totals` and `items`.
 
 Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `state` (`active`,
 `idle` or `unknown`), `state_reason` (why it was judged so), `reason` (plain language),
 `reclaimable_bytes`, `bytes_total`, `days_since_activity` (if there is any evidence), `facts`
+`rule_id` (since schema 18: the identity of the rule that matched a regenerable or cache item),
 `hold` (`code`: `protected`, `synced` or `package`, and the `root` responsible; present on a held
 item, see "Holds" below), `ask_code` (a short code for why an `ask` item asks) and, on every item
 whose action removes a git node, `preserve` (see "The preserve obligation"), and `evidence`

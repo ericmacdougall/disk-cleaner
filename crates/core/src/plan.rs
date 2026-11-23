@@ -114,6 +114,27 @@ impl PlanOptions {
     }
 }
 
+/// The plan options a reviewed plan recorded, with the current time and host: what `apply` plans
+/// again with (`active` is the record's paths after `resolve_active` on the fresh scan).
+pub fn plan_options_from(
+    rec: &PlanOptionsRecord,
+    active: Vec<PathBuf>,
+    now: i64,
+    host: &crate::evidence::HostInputs,
+) -> PlanOptions {
+    PlanOptions {
+        active,
+        active_window_days: rec.active_window_days,
+        window_source: rec.window_source.clone(),
+        now,
+        process: host.processes.clone(),
+        containers: host.containers.clone(),
+        trust_partial_process_check: rec.trust_partial_process_check,
+        accept_incomplete_coverage: rec.accept_incomplete_coverage,
+        max_git_admin_bytes: rec.max_git_admin_bytes,
+    }
+}
+
 /// What must be backed up, and the backup verified, before a removing action removes anything.
 /// Set on every removing item that removes a git node (repo, worktree or bare repo), whether its
 /// own or one nested inside it, and only there.
@@ -190,6 +211,10 @@ pub struct PlanItem {
     /// and project, gaps inside.
     #[serde(default)]
     pub evidence: ItemEvidence,
+    /// Identity of the rule that matched (regenerable and cache items): what `apply` compares
+    /// between the reviewed plan and its fresh one, never the display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
 }
 
 /// Count and bytes for one action.
@@ -258,6 +283,19 @@ pub struct AskTotal {
     pub bytes: u64,
 }
 
+/// The inputs the plan was made with, recorded so that `apply` can make the same plan again
+/// from a fresh scan (it proceeds only with items both plans agree on).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanOptionsRecord {
+    /// The `--active` paths, resolved.
+    pub active: Vec<String>,
+    pub active_window_days: u64,
+    pub window_source: String,
+    pub trust_partial_process_check: bool,
+    pub accept_incomplete_coverage: bool,
+    pub max_git_admin_bytes: u64,
+}
+
 /// A dry-run plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
@@ -313,6 +351,15 @@ pub struct Plan {
     #[serde(default)]
     pub accepted_incomplete_coverage: bool,
     pub active: Vec<String>,
+    /// The scan roots the plan's scan walked (`apply` scans them again).
+    pub scan_roots: Vec<String>,
+    /// The scan options of that scan.
+    pub scan_options: ScanOptionsRecord,
+    /// The plan options (`apply` plans again with them).
+    pub plan_options: PlanOptionsRecord,
+    /// The home, environment and protected roots the scan resolved: `apply` protects the union of
+    /// these roots and a fresh resolution.
+    pub protect: ProtectContext,
     pub totals: PlanTotals,
     pub items: Vec<PlanItem>,
 }
@@ -679,6 +726,13 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             }
             _ => {}
         }
+        // A directory inside a quarantine of `apply` (itself or an earlier run's) is never a
+        // target: the quarantine is that run's, to finish or restore with `--resume`.
+        if in_quarantine(&node.path) {
+            reason = format!("{QUARANTINE_REASON}; on its own: {reason}");
+            action = Action::Keep;
+            reclaim = 0;
+        }
         // The one choke point for locus holds (rules 4 and 5, wal:w34c987e0ea8): every removing
         // action becomes keep. Then a checkout in a live session or an agent worktree with no
         // locus asks while its activity is under 14 days old (E1b wal:w3016875c8d9, G1).
@@ -787,6 +841,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             hold,
             ask_code: None,
             evidence: item_evidence,
+            rule_id: node.rule_id.clone(),
         });
     }
 
@@ -1142,6 +1197,21 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect(),
+        scan_roots: scan.roots.clone(),
+        scan_options: scan.options.clone(),
+        plan_options: PlanOptionsRecord {
+            active: opts
+                .active
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+            active_window_days: opts.active_window_days,
+            window_source: opts.window_source.clone(),
+            trust_partial_process_check: opts.trust_partial_process_check,
+            accept_incomplete_coverage: opts.accept_incomplete_coverage,
+            max_git_admin_bytes: opts.max_git_admin_bytes,
+        },
+        protect: scan.protect.clone(),
         totals,
         items,
     }
@@ -1170,8 +1240,25 @@ fn hold_why(h: &Hold) -> String {
     }
 }
 
+/// Prefix of the name `apply` gives a directory it has moved aside for removal.
+pub const QUARANTINE_PREFIX: &str = ".prunedisk-q-";
+
+/// The reason (and the start of every reason) of an item inside a quarantine.
+pub const QUARANTINE_REASON: &str = "quarantine of another run";
+
+/// Is any component of `path` a quarantine directory of `apply`?
+pub fn in_quarantine(path: &str) -> bool {
+    Path::new(path).components().any(|c| {
+        matches!(c, std::path::Component::Normal(n)
+            if n.to_string_lossy().starts_with(QUARANTINE_PREFIX))
+    })
+}
+
 /// A short code for the reason an item is kept.
 pub fn keep_code(it: &PlanItem) -> &'static str {
+    if it.reason.starts_with(QUARANTINE_REASON) {
+        return "quarantine";
+    }
     if let Some(h) = &it.hold {
         if it.reason.contains("unsaved work inside agent dir") {
             return "unsaved-agent-dir";

@@ -587,3 +587,72 @@ fn plan_is_a_dry_run_and_serializes_with_a_schema_version() {
     assert_eq!(v["schema_version"], SCHEMA_VERSION);
     assert_eq!(v["items"][0]["action"], "backup-then-remove");
 }
+
+/// Schema 18: the plan carries what `apply` needs to make the same plan again, and a plan file
+/// of another schema is refused by the reader.
+#[test]
+fn plan_records_the_inputs_apply_replays() {
+    let mut node = Node::new("/w/proj/node_modules", Class::Regenerable);
+    node.rule = Some("node_modules".into());
+    node.rule_id = Some("node_modules".into());
+    node.bytes_total = 10;
+    let mut s = synthetic(vec![node]);
+    s.roots = vec!["/w".into()];
+    s.options = ScanOptionsRecord {
+        one_file_system: true,
+        top_files: 7,
+        min_output_bytes: 9,
+        git_facts: false,
+    };
+    s.protect.home = "/h".into();
+    let mut o = opts(vec![], 30, 365 * DAY);
+    o.accept_incomplete_coverage = true;
+    let p = plan(&s, &o);
+    assert_eq!(p.scan_roots, vec!["/w".to_string()]);
+    assert_eq!(p.scan_options.top_files, 7);
+    assert!(p.scan_options.one_file_system);
+    assert_eq!(p.plan_options.active_window_days, 30);
+    assert!(p.plan_options.accept_incomplete_coverage);
+    assert_eq!(p.protect.home, "/h");
+    assert_eq!(p.items[0].rule_id.as_deref(), Some("node_modules"));
+
+    let text = serde_json::to_string(&p).unwrap();
+    let back = disk_cleaner_core::plan_from_json(&text).unwrap();
+    assert_eq!(back.plan_options, p.plan_options);
+    assert_eq!(back.items[0].rule_id, p.items[0].rule_id);
+
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    v["schema_version"] = serde_json::json!(17);
+    let err = disk_cleaner_core::plan_from_json(&v.to_string()).unwrap_err();
+    assert!(err.to_string().contains("schema_version 17"), "{err}");
+}
+
+/// A directory inside a quarantine of `apply` is never a target, whatever its facts.
+#[test]
+fn nodes_inside_a_quarantine_are_held() {
+    let mk = |path: &str| {
+        let mut n = Node::new(path, Class::Regenerable);
+        n.rule = Some("node_modules".into());
+        n.rule_id = Some("node_modules".into());
+        n.bytes_total = 10;
+        n.newest_mtime = Some(0);
+        n.agent_files = Some(0);
+        n
+    };
+    let s = synthetic(vec![
+        mk("/w/proj/node_modules"),
+        mk("/w/.prunedisk-q-0123456789abcdef-3/proj/node_modules"),
+    ]);
+    let p = plan(&s, &opts(vec![], 30, 365 * DAY));
+    assert_eq!(p.items[0].action, Action::RemoveRegenerable, "control");
+    assert_eq!(p.items[1].action, Action::Keep);
+    assert!(
+        p.items[1].reason.starts_with("quarantine of another run"),
+        "{}",
+        p.items[1].reason
+    );
+    assert_eq!(
+        disk_cleaner_core::plan::keep_code(&p.items[1]),
+        "quarantine"
+    );
+}

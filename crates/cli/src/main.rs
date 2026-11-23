@@ -1,5 +1,6 @@
-//! `disk-cleaner` command line. Phase 1 is read-only: `scan` and `plan` never change anything
-//! except the output file named with `--out`.
+//! `disk-cleaner` command line. `scan` and `plan` are read-only (they change nothing except the
+//! output file named with `--out`). `apply` removes the regenerable directories of a reviewed
+//! plan under a journal; it is for a person at their own terminal.
 
 #![deny(unsafe_code)]
 
@@ -21,7 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[command(
     name = "disk-cleaner",
     version,
-    about = "Understand what fills a disk. Read-only: scans and dry-run plans only."
+    about = "Understand what fills a disk. Scans and dry-run plans are read-only; `apply` removes \
+             the regenerable directories of a reviewed plan, under a journal"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -34,6 +36,52 @@ enum Command {
     Scan(ScanArgs),
     /// Turn a scan into a dry-run plan. Nothing is changed.
     Plan(PlanArgs),
+    /// Remove the regenerable directories of a reviewed plan, journalled, or finish an
+    /// interrupted run with `--resume`. Meant for a person at their own terminal.
+    Apply(ApplyArgs),
+}
+
+#[derive(Args)]
+struct ApplyArgs {
+    /// The reviewed plan (`plan --json`).
+    #[arg(long, value_name = "FILE")]
+    plan: Option<PathBuf>,
+    /// The plan's id (the first 16 hex characters of the SHA-256 of the plan file). Without the
+    /// right one nothing is changed: the id and a dry run are printed.
+    #[arg(long, value_name = "ID")]
+    plan_id: Option<String>,
+    /// The lane: only `regenerable` exists.
+    #[arg(long, value_name = "LANE")]
+    only: Option<String>,
+    /// Finish or roll back the unfinished items of this plan id's journal.
+    #[arg(long)]
+    resume: bool,
+    /// With --resume: the plan id, when the plan file is not at hand.
+    #[arg(long, value_name = "ID")]
+    journal: Option<String>,
+    /// Act on at most this many items.
+    #[arg(long, value_name = "N")]
+    max_items: Option<usize>,
+    /// A disposable fixture directory under a temporary root (holding `.prunedisk-sandbox`,
+    /// containing every candidate): waives the terminal and agent-marker checks only.
+    #[arg(long, value_name = "DIR")]
+    sandbox: Option<PathBuf>,
+    /// Resolve the home (and its `.prunedisk` state directory) under DIR instead of the passwd
+    /// home; HOME must be set to the same directory.
+    #[arg(long, value_name = "DIR")]
+    home: Option<PathBuf>,
+    /// Config file whose `protected_paths` add protected roots (as for `scan`).
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Plans older than this many days are refused.
+    #[arg(long, default_value_t = 3)]
+    max_plan_age_days: u64,
+    /// Read the process snapshot and container state from this JSON file; for tests.
+    #[arg(long, hide = true, value_name = "FILE")]
+    host_inputs: Option<PathBuf>,
+    /// Override the current time (unix seconds); for tests.
+    #[arg(long, hide = true)]
+    now: Option<i64>,
 }
 
 #[derive(Args)]
@@ -125,6 +173,91 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Scan(a) => run_scan(a),
         Command::Plan(a) => run_plan(a),
+        Command::Apply(a) => run_apply(a),
+    }
+}
+
+fn run_apply(a: ApplyArgs) -> Result<()> {
+    use disk_cleaner_core::apply::{self, mounts::HostMounts, Outcome};
+    use std::io::IsTerminal;
+    let (cfg, _) = config::load(a.config.as_deref()).context("invalid configuration")?;
+    let mut ctx = ScanContext::from_env(cfg.protected_paths);
+    ctx.euid = sysctx::euid();
+    ctx.passwd_home = ctx.euid.and_then(sysctx::passwd_home);
+    ctx.declared_home = a.home.clone();
+    let home = a
+        .home
+        .clone()
+        .or_else(|| ctx.passwd_home.clone())
+        .context("cannot find this user's home directory")?;
+    let now = a.now.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    });
+    let host = match &a.host_inputs {
+        Some(f) => {
+            let text = std::fs::read_to_string(f)
+                .with_context(|| format!("cannot read {}", f.display()))?;
+            serde_json::from_str::<HostInputs>(&text)
+                .with_context(|| format!("invalid host inputs in {}", f.display()))?
+        }
+        None => {
+            let processes = procs::snapshot(&sysctx::probe, sysctx::euid());
+            let containers = containers::query(&processes);
+            HostInputs {
+                processes,
+                containers,
+            }
+        }
+    };
+    // Until the install check and the in-use rules are built in, the guard is unverified and
+    // every item is reached: new work refuses, and `--resume` (which needs neither) works.
+    let guard = apply::Unverified;
+    let reach = apply::ReachUnbuilt;
+    let mounts = HostMounts;
+    let env = apply::Env {
+        state_dir: home.join(".prunedisk"),
+        home,
+        now,
+        max_plan_age_days: a.max_plan_age_days,
+        host,
+        scan_context: ctx,
+        facts: FactsConfig::default().with_git(Git::new("git", Duration::from_secs(30))),
+        guard: &guard,
+        reach: &reach,
+        mounts: &mounts,
+    };
+    let getenv = |k: &str| std::env::var(k).ok();
+    let req = apply::Request {
+        plan_file: a.plan.as_deref(),
+        plan_id: a.plan_id.as_deref(),
+        only: a.only.as_deref(),
+        resume: a.resume,
+        journal: a.journal.as_deref(),
+        max_items: a.max_items,
+        sandbox: a.sandbox.as_deref(),
+        stdin_is_terminal: std::io::stdin().is_terminal(),
+        getenv: &getenv,
+    };
+    match apply::run(&req, &env).context("apply failed")? {
+        Outcome::NothingChanged(text) => {
+            print!("{text}");
+            Ok(())
+        }
+        Outcome::Refused(why) => {
+            eprintln!("apply refused, nothing changed: {why}");
+            std::process::exit(2);
+        }
+        Outcome::Busy => {
+            eprintln!("another apply holds the host lock; nothing changed");
+            std::process::exit(3);
+        }
+        Outcome::Applied(r) | Outcome::Resumed(r) => {
+            print!("{r}");
+            Ok(())
+        }
     }
 }
 
