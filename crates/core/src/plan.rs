@@ -1915,6 +1915,7 @@ mod tests {
             ".codex",
             ".agent-harness",
             ".prunedisk",
+            ".disk-cleaner",
             ".kimi",
             ".kimi-code",
             ".gemini",
@@ -1923,6 +1924,11 @@ mod tests {
             ".local/share/claude",
             "Library/Application Support/Claude",
         ];
+        // Home-level files that are protected roots of their own (prefix entries).
+        let root_files = [".claude.json", ".claude.json.backup"];
+        for f in root_files {
+            write_file(&home.join(f), 800);
+        }
         for r in roots {
             let base = home.join(r);
             write_file(&base.join("rollout-2026-01-01.jsonl"), 3_000);
@@ -1951,6 +1957,38 @@ mod tests {
         // this one holds a receipt, so it is held.
         write_file(&s1.join("proj/node_modules/c.js"), 5_000);
         write_file(&s1.join("proj/node_modules/run-receipt.json"), 100);
+        // One with no agent file keeps its regenerable action (the walk sees remove-regenerable
+        // under the harness).
+        write_file(&s1.join("proj2/package.json"), 2);
+        write_file(&s1.join("proj2/node_modules/e.js"), 5_000);
+        // Checkouts in carve-out positions (facts patched below). `clean-co` is clean and fully
+        // pushed, so it is backed up then removed; its x.jsonl is tracked, so in git. `dirty-co`
+        // holds an untracked x.jsonl, so it is not clean and must be kept. Their logs sit below
+        // the top level: one at the top would make an agent-data checkout, never a candidate.
+        let fake_checkout = |dir: &Path| {
+            std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+            std::fs::create_dir_all(dir.join(".git/refs")).unwrap();
+            std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+            write_file(&dir.join("src/lib.rs"), 500);
+        };
+        let clean_co = s1.join("clean-co");
+        fake_checkout(&clean_co);
+        write_file(&clean_co.join("fixtures/x.jsonl"), 500);
+        let dirty_co = s1.join("dirty-co");
+        fake_checkout(&dirty_co);
+        write_file(&dirty_co.join("notes/x.jsonl"), 500);
+        let wt = home.join(".claude/worktrees/wt");
+        fake_checkout(&wt);
+        write_file(&wt.join("fixtures/run-receipt.json"), 500);
+        // What git would list for each carve-out checkout (the walk's own knowledge, not the
+        // module's): the tracked files, relative to the checkout.
+        let carve_tracked: [(&Path, &[&str]); 3] = [
+            (&clean_co, &["src/lib.rs", "fixtures/x.jsonl"]),
+            (&dirty_co, &["src/lib.rs"]),
+            (&wt, &["src/lib.rs", "fixtures/run-receipt.json"]),
+        ];
+        // Allowlisted dependency directories under the session, by the walk's own list.
+        let dep_dirs = [s1.join("proj/node_modules"), s1.join("proj2/node_modules")];
         // Control outside every root: removable, so the check below is not vacuous.
         write_file(&home.join("work/proj/package.json"), 2);
         write_file(&home.join("work/proj/node_modules/d.js"), 5_000);
@@ -1972,11 +2010,19 @@ mod tests {
             ..Default::default()
         };
         let mut scan = crate::scan::scan(&so).unwrap();
-        // The scan ran without git facts: patch the pushed repo to look fully saved.
+        // The scan ran without git facts: patch the pushed repo and the clean checkouts to look
+        // fully saved, and the dirty checkout to hold an untracked file.
         for n in scan.nodes.iter_mut() {
-            if n.path.ends_with("work/repo") {
+            let clean = ["work/repo", "s1/clean-co", "worktrees/wt"]
+                .iter()
+                .any(|e| n.path.ends_with(e));
+            let dirty = n.path.ends_with("s1/dirty-co");
+            if clean || dirty {
                 let info = n.repo.as_mut().expect("repo node");
                 info.facts = all_yes_facts();
+                if dirty {
+                    info.facts.tree_clean = Tri::No;
+                }
                 info.git_admin = Some(GitAdminSurvey {
                     files: 1,
                     bytes: 4096,
@@ -1996,9 +2042,16 @@ mod tests {
         let p = plan(&scan, &PlanOptions::new(7, now));
 
         // Independent of the module's root list and of its name patterns: agent files are every
-        // file inside the hard-coded protected roots, the top-level files of work session
-        // directories, and Claude or Codex log shapes (rollout-*.jsonl, a UUID-named .jsonl)
-        // anywhere.
+        // file inside the hard-coded protected roots, except that inside a carve-out checkout
+        // only agent-named files git does not track count, and inside an allowlisted dependency
+        // directory only agent-named files; plus Claude or Codex log shapes (rollout-*.jsonl, a
+        // UUID-named .jsonl) anywhere.
+        let agent_named = |n: &str| {
+            let n = n.to_ascii_lowercase();
+            n.ends_with(".jsonl")
+                || n.contains("receipt")
+                || n.split(['.', '_', '-']).any(|part| part == "wal")
+        };
         let mut files = Vec::new();
         walk_files(&home, &mut files);
         let is_uuid = |s: &str| {
@@ -2015,16 +2068,66 @@ mod tests {
                 let first = rel.components().next().unwrap();
                 let in_root = roots
                     .iter()
+                    .chain(root_files.iter())
                     .any(|r| rel.starts_with(r) || first.as_os_str().to_string_lossy() == *r);
                 let n = f.file_name().unwrap().to_string_lossy().to_string();
                 let stem = n.strip_suffix(".jsonl");
                 let log_shape =
                     n.starts_with("rollout-") && n.ends_with(".jsonl") || stem.is_some_and(is_uuid);
-                in_root || log_shape
+                if log_shape {
+                    return true;
+                }
+                if !in_root {
+                    return false;
+                }
+                if let Some((co, tracked)) = carve_tracked.iter().find(|(c, _)| f.starts_with(c)) {
+                    let in_co = f.strip_prefix(co).unwrap();
+                    return !in_co.starts_with(".git")
+                        && agent_named(&n)
+                        && !tracked.iter().any(|t| in_co == Path::new(t));
+                }
+                if dep_dirs.iter().any(|d| f.starts_with(d)) {
+                    return agent_named(&n);
+                }
+                true
             })
             .collect();
         assert!(agent.len() >= roots.len() * 4, "fixture has agent files");
+        for f in [".claude.json", ".disk-cleaner/wal/session.jsonl"] {
+            assert!(agent.iter().any(|a| a.ends_with(f)), "walk covers {f}");
+        }
+        assert!(
+            agent.iter().any(|a| a.starts_with(&dirty_co)),
+            "the untracked log in the dirty checkout is an agent file"
+        );
         let removing: Vec<&PlanItem> = p.items.iter().filter(|i| i.action.removes()).collect();
+        // Guard: every removing action kind the plan can give inside a protected root appears
+        // there in this fixture, so the walk below is never vacuous for one of them.
+        for kind in [Action::RemoveRegenerable, Action::BackupThenRemove] {
+            assert!(
+                removing
+                    .iter()
+                    .any(|i| i.action == kind && i.path.contains("/.agent-harness/work/")),
+                "no {kind:?} under the harness work dir: {:?}",
+                p.items
+                    .iter()
+                    .map(|i| (&i.path, i.action, &i.reason))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let action_of = |suffix: &str| {
+            p.items
+                .iter()
+                .find(|i| i.path.ends_with(suffix))
+                .map(|i| i.action)
+        };
+        assert_eq!(action_of("s1/clean-co"), Some(Action::BackupThenRemove));
+        assert_eq!(action_of("worktrees/wt"), Some(Action::BackupThenRemove));
+        assert_eq!(
+            action_of("s1/proj2/node_modules"),
+            Some(Action::RemoveRegenerable)
+        );
+        assert_eq!(action_of("s1/dirty-co"), Some(Action::Keep));
         assert!(
             removing.iter().any(|i| i.path.ends_with("work/repo")),
             "control: the pushed repo with a tracked fixtures/x.jsonl is a valid removal: {:?}",
