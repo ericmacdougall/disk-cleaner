@@ -301,18 +301,20 @@ fn r15b_known_over_ask_a_pth_file_straight_in_site_packages() {
 }
 
 /// A version 14 scan file may leave a small nested output in an artifact unlisted, so it is
-/// refused; the current version is 15.
+/// refused (as is a version 15 file, which lacks the protected roots); the current version is 16.
 #[test]
 fn r15b_a_version_14_scan_file_is_refused() {
     let (_tmp, root, _) = workspace();
     let py = project(&root, "py", "requirements.txt");
     stock_venv(&py.join(".venv"));
     let res = scan_at(&root);
-    assert_eq!(res.schema_version, 15);
+    assert_eq!(res.schema_version, 16);
     let mut v = serde_json::to_value(&res).unwrap();
     assert!(scan_from_json(&v.to_string()).is_ok());
-    v["schema_version"] = serde_json::json!(14);
-    assert!(scan_from_json(&v.to_string()).is_err());
+    for old in [14, 15] {
+        v["schema_version"] = serde_json::json!(old);
+        assert!(scan_from_json(&v.to_string()).is_err(), "version {old}");
+    }
 }
 
 // ---------------------------------------------------------------- controls

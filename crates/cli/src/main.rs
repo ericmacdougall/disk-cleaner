@@ -66,10 +66,6 @@ struct ScanArgs {
     /// Number of git processes to run at once.
     #[arg(long, default_value_t = 4)]
     git_jobs: usize,
-    /// Config file (default: <platform config dir>/disk-cleaner/config.toml); its
-    /// `protected_paths` add protected roots.
-    #[arg(long, value_name = "FILE")]
-    config: Option<PathBuf>,
     /// Resolve the protected agent homes under DIR instead of the passwd home (a disposable
     /// fixture home); HOME must be set to the same directory. The real home stays protected too.
     #[arg(long, value_name = "DIR")]
@@ -132,7 +128,8 @@ fn run_scan(a: ScanArgs) -> Result<()> {
     let git = Git::new("git", Duration::from_secs(a.git_timeout_secs.max(1)));
     opts.facts = FactsConfig::default().with_git(git);
     // Who is running and where agent data lives: asked of the system here, passed to the core.
-    let (cfg, _) = config::load(a.config.as_deref()).context("invalid configuration")?;
+    // The config's `protected_paths` add roots; scan reads the config from its default location.
+    let (cfg, _) = config::load(None).context("invalid configuration")?;
     let mut ctx = ScanContext::from_env(cfg.protected_paths);
     ctx.euid = sysctx::euid();
     ctx.passwd_home = ctx.euid.and_then(sysctx::passwd_home);
