@@ -676,7 +676,13 @@ struct Host {
     claude_bases: Vec<PathBuf>,
     codex_bases: Vec<PathBuf>,
     uid: Option<u32>,
+    /// Keys of the shared places that name no place besides those above a work dir: the
+    /// system temp roots and every ancestor of a home (wal:waf84dc6656a).
+    no_place: HashSet<String>,
 }
+
+/// The system temp roots of the ancestor-exception list (`$TMPDIR` is added at run time).
+const TEMP_ROOTS: [&str; 4] = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
 
 impl Host {
     fn new(scan: &ScanResult) -> Host {
@@ -734,7 +740,23 @@ impl Host {
         let work_dirs: Vec<PathBuf> = harness.iter().map(|h| h.join("work")).collect();
         let mut agent_dirs = work_dirs.clone();
         agent_dirs.extend(worktree_dirs);
+        let mut no_place: HashSet<String> = HashSet::new();
+        let mut temps: Vec<PathBuf> = TEMP_ROOTS.iter().map(PathBuf::from).collect();
+        if let Some(t) = std::env::var_os("TMPDIR").filter(|t| !t.is_empty()) {
+            temps.push(PathBuf::from(t));
+        }
+        for t in &temps {
+            for id in ids_of(t) {
+                no_place.insert(key_of(&id));
+            }
+        }
+        for h in &homes {
+            for a in h.ancestors() {
+                no_place.insert(key_of(a));
+            }
+        }
         Host {
+            no_place,
             homes,
             harness,
             work_dirs,
@@ -772,12 +794,17 @@ impl Host {
         self.work_dirs.iter().any(|w| under(w, &n))
     }
 
-    /// The one ancestor-exception list, shared by process and transcript loci: `/`, a home,
-    /// the harness root, `work/` (anything at or above a harness work dir). A working directory
-    /// there names no place, so it holds nothing below it.
+    /// The one ancestor-exception list, shared by process and transcript loci: `/`, a home and
+    /// every ancestor of one (`/home`, `/Users`), the harness root, `work/` (anything at or
+    /// above a harness work dir), and the system temp roots (`/tmp`, `/var/tmp`,
+    /// `/private/tmp`, `/private/var/tmp`, `$TMPDIR`). A working directory there names no
+    /// place, so it holds nothing below it.
     fn holds_nothing_below(&self, p: &Path) -> bool {
         let n = normalize(p);
-        self.ancestor_of_work(&n) || self.homes.iter().any(|h| key_of(h) == key_of(&n))
+        self.ancestor_of_work(&n)
+            || ids_of(&n)
+                .iter()
+                .any(|id| self.no_place.contains(&key_of(id)))
     }
 
     fn under_home(&self, p: &Path) -> bool {

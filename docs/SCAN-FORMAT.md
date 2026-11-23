@@ -1002,8 +1002,11 @@ rule in `evidence.rule`) when:
 
 A process working directory or argument that is an ancestor of the item, or inside a sibling,
 never holds it: a shell at the home holds nothing below the home. One ancestor-exception list
-serves process and transcript working directories alike: `/`, a home, the harness root, `work/`,
-or anything above a harness work directory names no place, so it holds nothing (rule 5 included).
+serves process and transcript working directories alike: `/`, a home and every ancestor of one
+(`/home`, `/Users`), the harness root, `work/` or anything above a harness work directory, and the
+system temp roots (`/tmp`, `/var/tmp`, `/private/tmp`, `/private/var/tmp`, `$TMPDIR`; compared after
+canonicalising both sides, and not `$TMPDIR`'s parents) name no place, so they hold nothing
+(rule 5 included). A directory below one of them (`/tmp/x`, `/home/u/x`) is an ordinary locus.
 
 A session is **live** when any of these says so: a Claude Code registry entry
 (`<claude dir>/sessions/<digits>.json`; only `pid`, `sessionId` and `cwd` are read, `.key` files are

@@ -60,6 +60,7 @@ WALK_BUDGET = 200_000
 SLUG_MAX_DIRS = 2048  # directories listed while decoding one project directory name
 SLUG_MAX_ENTRIES = 4_000_000  # entries looked at in all by one such walk (names only)
 SLUG_INCOMPLETE = "transcript-slug-incomplete"
+TEMP_ROOTS = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"]
 
 
 def transcript_cwd(path):
@@ -190,13 +191,25 @@ class Oracle:
             self.recent_gaps[cls] = self.recent_gaps.get(cls, 0) + 1
 
     def holds_nothing_below(self, path):
-        """The one ancestor-exception list: /, the home, the harness root, work/ (anything at
-        or above the harness work dir) names no place and holds nothing."""
+        """The one ancestor-exception list: /, the home and every ancestor of it, the harness
+        root, work/ (anything at or above the harness work dir), and the system temp roots
+        (/tmp, /var/tmp, /private/tmp, /private/var/tmp, $TMPDIR) name no place and hold
+        nothing."""
         p = os.path.normpath(path)
         for w in {self.work, os.path.realpath(self.work)}:
             if p == w or p == "/" or w.startswith(p.rstrip(os.sep) + os.sep):
                 return True
-        return p in {self.home, os.path.realpath(self.home)}
+        places = set()
+        for t in TEMP_ROOTS + ([os.environ["TMPDIR"]] if os.environ.get("TMPDIR") else []):
+            places.update({os.path.normpath(t), os.path.realpath(t)})
+        for h in {self.home, os.path.realpath(self.home)}:
+            while True:
+                places.add(h)
+                up = os.path.dirname(h)
+                if up == h:
+                    break
+                h = up
+        return p in places or os.path.realpath(p) in places
 
     def held_by_recent(self, path):
         """The recent transcript cwd that equals, contains or lies inside `path`, or None."""
@@ -775,6 +788,14 @@ def self_test():
             problems.append("an item inside a recent transcript's cwd was not flagged")
         if "other/y" in out:
             problems.append("a transcript cwd at the home held an item below it")
+        # The shared exception list: temp roots, the home and its ancestors name no place.
+        for c in ["/", "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", home,
+                  os.path.dirname(home), work]:
+            if not o.holds_nothing_below(c):
+                problems.append("%s is not on the exception list" % c)
+        for c in [home + "/x", "/tmp/x", work + "/s"]:
+            if o.holds_nothing_below(c):
+                problems.append("%s is on the exception list" % c)
         # A clean plan passes once the unreadable agent data is older than the window (then it
         # is only counted).
         for rel in [".claude/projects/-p/late.jsonl", ".claude/projects/-p/big.jsonl",

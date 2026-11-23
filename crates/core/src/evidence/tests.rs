@@ -1969,3 +1969,132 @@ fn recent_cwd_holds_every_removing_kind() {
         assert!(ok, "cwd {cwd}: {out}");
     }
 }
+
+/// goodqa#16711 shared ancestor-exception list (wal:waf84dc6656a, NEG-13): `/`, the system
+/// temp roots (`/tmp`, `/private/tmp`, `/var/tmp`, `/private/var/tmp`, `$TMPDIR`), the home
+/// and every ancestor of it hold nothing below them, through a recent transcript and a process
+/// alike; `/tmp/<d>/x` and `<home>/x` hold `x` (and a cwd inside it does) but not the sibling
+/// `y`. The home lives under the build's target directory and has no harness root, so no list
+/// entry is also an ancestor of a harness work dir. Synthetic paths only.
+#[test]
+fn shared_exception_list() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/evidence-fixtures");
+    fs::create_dir_all(&fixtures).unwrap();
+    let tb = tempfile::tempdir_in(&fixtures).unwrap();
+    let base = fs::canonicalize(tb.path()).unwrap();
+    let tt = tempfile::tempdir().unwrap();
+    let tbase = fs::canonicalize(tt.path()).unwrap();
+    let fx = Fx {
+        _tmp: tb,
+        home: base.join("home"),
+        now: real_now() + 400 * DAY,
+    };
+    for d in [".claude", ".codex"] {
+        fs::create_dir_all(fx.home.join(d)).unwrap();
+    }
+    let (tx, ty, hx, hy) = (
+        tbase.join("x"),
+        tbase.join("y"),
+        fx.home.join("x"),
+        fx.home.join("y"),
+    );
+    for p in [&tx, &ty, &hx, &hy] {
+        fs::create_dir_all(p.join(".git/objects")).unwrap();
+        fs::create_dir_all(p.join(".git/refs")).unwrap();
+        fs::write(p.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::create_dir_all(p.join("src")).unwrap();
+        fs::write(p.join("src/lib.rs"), "fn x() {}\n").unwrap();
+        let mut stack = vec![p.clone()];
+        while let Some(d) = stack.pop() {
+            for e in fs::read_dir(&d).unwrap().flatten() {
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(e.path());
+                } else {
+                    set_mtime(&e.path(), fx.now - 400 * DAY);
+                }
+            }
+        }
+    }
+    let plan_with = |cwd: &Path, by_process: bool| -> Plan {
+        let rel = ".claude/projects/-shared-none/t.jsonl";
+        if by_process {
+            fx.write(rel, "{}\n");
+            fx.date(rel, 400 * DAY);
+        } else {
+            fx.write(rel, &format!("{{\"cwd\":\"{}\"}}\n", cwd.display()));
+            fx.date(rel, 3600);
+        }
+        let mut so = crate::scan::ScanOptions::new(vec![tbase.clone(), hx.clone(), hy.clone()]);
+        so.collect_facts = false;
+        so.context = crate::protect::ScanContext {
+            passwd_home: Some(fx.home.clone()),
+            euid: Some(1000),
+            home_env: Some(fx.home.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let mut scan = crate::scan::scan(&so).unwrap();
+        for n in scan.nodes.iter_mut() {
+            if let Some(info) = n.repo.as_mut() {
+                info.facts = all_yes();
+                info.git_admin = Some(GitAdminSurvey {
+                    files: 1,
+                    bytes: 4096,
+                    ..Default::default()
+                });
+                info.object_store = Some(ObjectStoreSurvey {
+                    files: 1,
+                    bytes: 4096,
+                });
+            }
+        }
+        let procs = if by_process {
+            vec![proc(700, &cwd.to_string_lossy(), &["bash"])]
+        } else {
+            vec![]
+        };
+        plan(&scan, &fx.opts(snap(procs)))
+    };
+    let src = |b: bool| if b { "process" } else { "transcript" };
+    let expect = |p: &Plan, c: &Path, want: Action, what: &str| {
+        assert_eq!(action(p, c), want, "{what}: {}", why(p, c));
+    };
+    let all = [&tx, &ty, &hx, &hy];
+    // Control: every checkout is offered.
+    let p = plan_with(Path::new("/nonexistent-0b7d"), false);
+    for c in all {
+        expect(&p, c, Action::BackupThenRemove, "control");
+    }
+    // The list holds nothing, for both sources.
+    let mut list: Vec<PathBuf> = ["/", "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    list.push(std::env::temp_dir());
+    list.push(base.clone());
+    list.push(fx.home.clone());
+    for cwd in &list {
+        for b in [false, true] {
+            let p = plan_with(cwd, b);
+            for c in all {
+                let what = format!("{} by {}", cwd.display(), src(b));
+                expect(&p, c, Action::BackupThenRemove, &what);
+            }
+        }
+    }
+    // x, or a place inside it, holds x and not its sibling y, for both sources.
+    for (x, y) in [(&tx, &ty), (&hx, &hy)] {
+        for cwd in [x.to_path_buf(), x.join("src")] {
+            for b in [false, true] {
+                let p = plan_with(&cwd, b);
+                let what = format!("{} by {}", cwd.display(), src(b));
+                expect(&p, x, Action::Keep, &what);
+                expect(&p, y, Action::BackupThenRemove, &what);
+            }
+        }
+    }
+    // A recent transcript at `/tmp/<d>` (not on the list) holds everything below it.
+    let p = plan_with(&tbase, false);
+    for c in [&tx, &ty] {
+        expect(&p, c, Action::Keep, "/tmp/<d> by transcript");
+    }
+}
