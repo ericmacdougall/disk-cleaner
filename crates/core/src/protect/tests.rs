@@ -155,15 +155,10 @@ fn every_class_in_every_root() {
             assert!(h.root.ends_with(r), "{} for {r}", h.root);
         }
     }
-}
-
-#[test]
-fn dotfiles_repo_at_home_contains_the_roots_and_is_held() {
-    // NEG-7: a repo at ~ contains protected roots, so it is held and never removing.
-    let (_t, home) = fixture_home();
-    let pc = resolve(&ctx_for(&home)).unwrap();
+    // NEG-7: a dotfiles git repo at ~ contains the protected roots, so it is held and never
+    // removing (its control, the same repo elsewhere, is removable above).
     let dot = node(&home, Class::Repo, all_yes());
-    let p = plan(&scan_of(pc, vec![dot]), &opts(300 * DAY));
+    let p = plan(&scan_of(pc, vec![dot]), &opts(now));
     assert!(held_protected(&p, 0), "{:?}", p.items);
 }
 
@@ -367,11 +362,40 @@ fn spellings() {
     );
     let p = plan(&scan_of(pc2, vec![n]), &opts(300 * DAY));
     assert!(p.items[0].hold.is_none());
+
+    // A root whose canonical path fails with a permission error.
+    #[cfg(unix)]
+    permission_denied_root_case();
+
+    // A real scan whose root is a symlink to `.codex`: every node is held through its canonical
+    // path alone (the spelled path never mentions `.codex`).
+    #[cfg(unix)]
+    {
+        let (_t2, home2) = fixture_home();
+        let proj = home2.join(".codex/sessions/p");
+        fs::create_dir_all(proj.join("node_modules")).unwrap();
+        fs::write(proj.join("package.json"), "{}").unwrap();
+        fs::write(proj.join("node_modules/a.js"), vec![b'x'; 9_000]).unwrap();
+        let link = home2.join("shortcut");
+        std::os::unix::fs::symlink(home2.join(".codex"), &link).unwrap();
+        let mut o = crate::scan::ScanOptions::new(vec![link]);
+        o.collect_facts = false;
+        o.context = ctx_for(&home2);
+        let s = crate::scan::scan(&o).unwrap();
+        assert!(s.nodes.iter().any(|n| n.path.ends_with("node_modules")));
+        let p = plan(&s, &opts(i64::MAX / 4));
+        for it in &p.items {
+            assert!(!it.path.contains(".codex"), "spelled path: {}", it.path);
+            assert_eq!(it.action, Action::Keep, "{}: {}", it.path, it.reason);
+            assert_eq!(it.hold.as_ref().unwrap().code, HoldCode::Protected);
+        }
+    }
 }
 
+/// NEG-4: a root whose canonical path fails with a permission error holds every node that could
+/// be inside it, or contain it, by lexical path.
 #[cfg(unix)]
-#[test]
-fn a_root_whose_real_path_fails_with_permission_is_compared_by_spelling() {
+fn permission_denied_root_case() {
     use std::os::unix::fs::PermissionsExt;
     let (_t, home) = fixture_home();
     let locked = home.join("locked");
@@ -393,13 +417,24 @@ fn a_root_whose_real_path_fails_with_permission_is_compared_by_spelling() {
         .unwrap();
     assert!(r.exists && r.unreadable && r.canonical.is_none(), "{r:?}");
     // Every node that could be inside it by lexical path is held.
-    let n = node(
+    let inside = node(
         home.join("locked/secret/proj/node_modules"),
         Class::Regenerable,
         all_yes(),
     );
-    let p = plan(&scan_of(pc, vec![n]), &opts(300 * DAY));
-    assert!(held_protected(&p, 0));
+    let contains = node(home.join("locked"), Class::LooseCode, all_yes());
+    let unrelated = node(
+        home.join("other/node_modules"),
+        Class::Regenerable,
+        all_yes(),
+    );
+    let p = plan(
+        &scan_of(pc, vec![inside, contains, unrelated]),
+        &opts(300 * DAY),
+    );
+    assert!(held_protected(&p, 0), "inside: {:?}", p.items[0]);
+    assert!(held_protected(&p, 1), "contains: {:?}", p.items[1]);
+    assert!(p.items[2].hold.is_none(), "unrelated: {:?}", p.items[2]);
 }
 
 // ---------------------------------------------------------------- AC-5, NEG-5, NEG-6

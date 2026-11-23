@@ -405,8 +405,9 @@ pub fn resolve(ctx: &ScanContext) -> Result<ProtectContext> {
 pub fn node_real_path(path: &Path) -> (Option<String>, bool) {
     match std::fs::canonicalize(path) {
         Ok(c) => (Some(lossy(&normalize(&c))), false),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (None, true),
-        Err(_) => (None, false),
+        // Any failure, not only a permission error, means the node cannot be shown to be
+        // outside protected data: it is held.
+        Err(_) => (None, true),
     }
 }
 
@@ -560,16 +561,18 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
         for (r, rids) in &roots {
             let mut inside = false;
             let mut contains = false;
-            let mut carve_here = false;
+            let mut inside_pairs = 0usize;
+            let mut carve_pairs = 0usize;
             for np in my {
                 for rp in rids {
                     if let Some(rel) = rel_below(np, rp) {
                         inside = true;
+                        inside_pairs += 1;
                         if r.code == HoldCode::Protected
                             && !rel.is_empty()
                             && carve_position(r.carve, &rel, rp, &is_git_path)
                         {
-                            carve_here = true;
+                            carve_pairs += 1;
                         }
                     } else if rel_below(rp, np).is_some() {
                         contains = true;
@@ -580,10 +583,10 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
                 HoldCode::Protected => {
                     if inside {
                         inside_protected.push(r);
-                        // Every identity pair that puts the node inside must be a carve
-                        // position; one that is not makes it a plain hold. Approximated per
-                        // root: this root must carve for the node.
-                        if !carve_here {
+                        // Every identity pair (lexical or canonical path of the node against
+                        // either path of the root) that puts the node inside must be a carve
+                        // position; one that is not makes it a plain hold.
+                        if carve_pairs != inside_pairs {
                             all_carve = false;
                         }
                     } else if contains && contained_protected.is_none() {

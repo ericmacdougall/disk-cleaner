@@ -133,6 +133,12 @@ fn run_scan(a: ScanArgs) -> Result<()> {
     let mut ctx = ScanContext::from_env(cfg.protected_paths);
     ctx.euid = sysctx::euid();
     ctx.passwd_home = ctx.euid.and_then(sysctx::passwd_home);
+    if ctx.euid.is_some() && ctx.passwd_home.is_none() {
+        anyhow::bail!(
+            "cannot read this user's home directory from the passwd database, so the agent \
+             homes to protect cannot be located; refusing to scan"
+        );
+    }
     ctx.declared_home = a.home;
     opts.context = ctx;
     let result = scan(&opts).context("scan failed")?;

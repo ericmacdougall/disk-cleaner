@@ -86,6 +86,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     );
     old_project(&home.join("Dropbox/proj"), 6_000);
     old_project(&home.join("work/proj"), 10_000);
+    old_project(&home.join("Applications/Foo.app/Contents/Resources"), 7_000);
     write(&home.join(".cache/pip/wheel.txt"), &"w".repeat(8_000));
     set_old(&home.join(".cache/pip/wheel.txt"), 400);
     for i in 0..25 {
@@ -168,6 +169,16 @@ fn plan_summary_classes() {
         .find(|h| h["root"] == home.join("Dropbox").to_str().unwrap())
         .expect("the sync folder is listed");
     assert_eq!(dropbox["items"], 2, "{dropbox}");
+    // A project inside an application package is held `package`.
+    let package = held
+        .iter()
+        .find(|h| h["code"] == "package")
+        .expect("the package directory is listed");
+    assert!(package["root"]
+        .as_str()
+        .unwrap()
+        .ends_with("/Applications/Foo.app"));
+    assert_eq!(package["items"], 2, "{package}");
     let items = v["items"].as_array().unwrap();
     // NEG-8: ~/.cache/pip keeps its normal action and is not counted as held.
     let pip = items
@@ -232,6 +243,12 @@ fn plan_summary_classes() {
     assert!(held_lines
         .iter()
         .any(|l| l.contains("synced") && l.contains("/Dropbox")));
+    assert!(
+        held_lines
+            .iter()
+            .any(|l| l.contains("package") && l.contains("/Applications/Foo.app")),
+        "{held_lines:?}"
+    );
     assert!(
         !held_lines.iter().any(|l| l.contains(".cache/pip")),
         "{held_lines:?}"
