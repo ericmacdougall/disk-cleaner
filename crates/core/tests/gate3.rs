@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use disk_cleaner_core::{plan, Action, PlanOptions, ProcessCheck, ScanResult, Tri};
+use disk_cleaner_core::{plan, Action, PlanOptions, ProcessSnapshot, ScanResult, Tri};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -265,10 +265,7 @@ fn j4_partial_process_check_asks_and_leaves_no_ready_bytes() {
     write(&nm.join("dep").join("package.json"), "{}");
     let res = scan_plain(&root);
     let mut o = PlanOptions::new(7, far_future());
-    o.process = ProcessCheck::Partial {
-        cwds: vec![PathBuf::from("/somewhere/unrelated")],
-        unreadable: 1,
-    };
+    o.process = ProcessSnapshot::with_hidden(&["/somewhere/unrelated"], 1);
     let p = plan(&res, &o);
     let item = p
         .items
@@ -292,10 +289,7 @@ fn j4_with_the_opt_in_a_partial_check_still_allows_removal_and_the_plan_says_so(
     write(&nm.join("dep").join("package.json"), "{}");
     let res = scan_plain(&root);
     let mut o = PlanOptions::new(7, far_future());
-    o.process = ProcessCheck::Partial {
-        cwds: vec![PathBuf::from("/somewhere/unrelated")],
-        unreadable: 1,
-    };
+    o.process = ProcessSnapshot::with_hidden(&["/somewhere/unrelated"], 1);
     o.trust_partial_process_check = true;
     let p = plan(&res, &o);
     let item = p
@@ -307,10 +301,7 @@ fn j4_with_the_opt_in_a_partial_check_still_allows_removal_and_the_plan_says_so(
     assert!(p.trusted_partial_process_check);
     assert!(p.totals.ready_bytes > 0);
     // A partial check that does find a process inside still keeps it.
-    o.process = ProcessCheck::Partial {
-        cwds: vec![nm.join("dep")],
-        unreadable: 1,
-    };
+    o.process = ProcessSnapshot::with_hidden(&[nm.join("dep").to_str().unwrap()], 1);
     let p = plan(&res, &o);
     let item = p
         .items

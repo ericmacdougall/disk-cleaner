@@ -4,9 +4,8 @@ mod common;
 
 use common::*;
 use disk_cleaner_core::{
-    plan, running_cwds, Action, Class, Facts, Node, Plan, PlanOptions, ProcessCheck, ProjectState,
-    RepoInfo, ScanOptionsRecord, ScanResult, Totals, Tri, DEFAULT_ACTIVE_WINDOW_DAYS,
-    SCHEMA_VERSION,
+    plan, Action, Class, Facts, Node, Plan, PlanOptions, ProcessSnapshot, ProjectState, RepoInfo,
+    ScanOptionsRecord, ScanResult, Totals, Tri, DEFAULT_ACTIVE_WINDOW_DAYS, SCHEMA_VERSION,
 };
 use std::path::{Path, PathBuf};
 
@@ -46,6 +45,7 @@ fn synthetic(nodes: Vec<Node>) -> ScanResult {
             ..Default::default()
         },
         protect: Default::default(),
+        work_sessions: Vec::new(),
     }
 }
 
@@ -236,14 +236,14 @@ fn a_running_process_inside_a_project_makes_it_and_its_regenerable_dirs_active()
     assert_eq!(p.items[1].action, Action::RemoveRegenerable);
 
     let mut o = opts(vec![], 7, now);
-    o.process = ProcessCheck::Ok {
-        cwds: vec![PathBuf::from("/work/r/src/deep")],
-    };
+    o.process = ProcessSnapshot::from_cwds(&["/work/r/src/deep"]);
     let p = plan(&s, &o);
     assert_eq!(p.items[0].action, Action::Keep);
     assert_eq!(p.items[1].action, Action::Keep);
-    assert!(p.items[0].state_reason.contains("running process"));
-    assert_eq!(p.process_check, "ok");
+    assert!(p.items[0]
+        .state_reason
+        .contains("working directory of process"));
+    assert_eq!(p.process_check, "per-item");
 }
 
 #[test]
@@ -256,9 +256,7 @@ fn unknown_process_check_is_recorded_and_blocks_removal() {
     nm.bytes_total = 100;
     let s = synthetic(vec![repo, nm]);
     let mut o = opts(vec![], 7, now);
-    o.process = ProcessCheck::Unknown {
-        reason: "denied".to_string(),
-    };
+    o.process = ProcessSnapshot::unknown("denied");
     let p = plan(&s, &o);
     assert_eq!(p.process_check, "unknown");
     assert_eq!(p.process_check_note.as_deref(), Some("denied"));
@@ -271,18 +269,22 @@ fn unknown_process_check_is_recorded_and_blocks_removal() {
 
 #[test]
 fn real_process_check_does_not_panic_and_reports_a_status() {
-    let st = running_cwds();
-    assert!(matches!(st.status(), "ok" | "partial" | "unknown"));
-    // This test process runs somewhere; if cwds are readable, one is inside the current dir.
-    if let Ok(cwd) = std::env::current_dir() {
-        if !st.cwds().is_empty() {
-            let real = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
-            assert!(
-                st.inside(&real).is_some() || st.inside(&cwd).is_some(),
-                "the test process itself should be seen in {}",
-                cwd.display()
-            );
-        }
+    let st = disk_cleaner_core::procs::snapshot(&|_| disk_cleaner_core::Probe::Unknown, None);
+    assert!(st.error.is_none(), "{:?}", st.error);
+    // This test process runs somewhere: it is seen, with its working directory.
+    let me = std::process::id();
+    let found = st
+        .procs
+        .iter()
+        .find(|p| p.pid == me)
+        .expect("this process is listed");
+    if let (Ok(cwd), Some(seen)) = (std::env::current_dir(), found.cwd.as_deref()) {
+        let real = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+        assert!(
+            std::path::Path::new(seen) == real || std::path::Path::new(seen) == cwd,
+            "the test process itself should be seen in {}",
+            cwd.display()
+        );
     }
 }
 

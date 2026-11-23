@@ -75,6 +75,8 @@ struct EntryMeta {
     ino: u64,
     nlink: u64,
     mtime: i64,
+    /// The OS error number when `lstat` failed (`ok` is then false).
+    err: Option<i32>,
     mount_skipped: bool,
     /// This directory is another scan root, walked on its own: not entered here (index of that
     /// root in the walk plan).
@@ -105,6 +107,7 @@ fn meta_from(md: &Metadata) -> EntryMeta {
         ino: md.ino(),
         nlink: md.nlink(),
         mtime: md.mtime(),
+        err: None,
         mount_skipped: false,
         pruned_root: None,
         link_target: None,
@@ -129,6 +132,7 @@ fn meta_from(md: &Metadata) -> EntryMeta {
         ino: 0,
         nlink: 1,
         mtime,
+        err: None,
         mount_skipped: false,
         pruned_root: None,
         link_target: None,
@@ -270,6 +274,20 @@ struct Walk {
     coverage: Coverage,
 }
 
+/// Owner uid of `path` from `lstat`, when that works.
+fn owner_uid(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).ok().map(|m| m.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 const MAX_ISSUE_PATHS: usize = 100_000;
 
 /// Most small output files listed one by one per directory (see `DirAgg::small_outputs`); the
@@ -308,6 +326,26 @@ impl Refs {
 }
 
 impl Walk {
+    /// Record one place the walk could not look (bounded; beyond the bound the record says it
+    /// overflowed).
+    fn gap(&mut self, path: &Path, class: GapClass) {
+        if self.coverage.gaps.len() < MAX_COVERAGE_GAPS {
+            self.coverage.gaps.push(CoverageGap {
+                path: path.to_string_lossy().into_owned(),
+                class,
+                owner_uid: owner_uid(path),
+            });
+        } else {
+            self.coverage.gaps_overflowed = true;
+        }
+    }
+
+    /// An entry other than a directory listing that could not be read.
+    fn other_gap(&mut self, path: &Path, errno: Option<i32>) {
+        self.coverage.other_unreadable_entries += 1;
+        self.gap(path, GapClass::from_errno(errno));
+    }
+
     fn issue(&mut self, path: &Path, message: String) {
         self.totals.unreadable += 1;
         if self.issue_paths.len() < MAX_ISSUE_PATHS {
@@ -325,7 +363,7 @@ impl Walk {
 
     /// A directory whose contents could not be listed: anything inside it, links and clones
     /// included, was never seen.
-    fn unreadable_dir(&mut self, path: &Path) {
+    fn unreadable_dir(&mut self, path: &Path, errno: Option<i32>) {
         let new = if self.unreadable_dirs.len() < MAX_ISSUE_PATHS {
             self.unreadable_dirs.insert(path.to_path_buf())
         } else {
@@ -334,6 +372,7 @@ impl Walk {
         };
         if new {
             self.coverage.unreadable_dirs += 1;
+            self.gap(path, GapClass::from_errno(errno));
             if self.coverage.unreadable_dir_examples.len() < COVERAGE_EXAMPLES {
                 self.coverage
                     .unreadable_dir_examples
@@ -355,11 +394,12 @@ impl Walk {
         };
         if !meta.ok {
             self.issue(&path, "cannot read metadata".to_string());
-            self.coverage.other_unreadable_entries += 1;
+            self.other_gap(&path, meta.err);
         }
         if let Some(err) = entry.read_children.as_ref().and_then(|rc| rc.error()) {
             self.issue(&path, format!("cannot read directory: {err}"));
-            self.unreadable_dir(&path);
+            let errno = err.io_error().and_then(|e| e.raw_os_error());
+            self.unreadable_dir(&path, errno);
         }
         let ft = entry.file_type;
         let name = entry.file_name.to_string_lossy().into_owned();
@@ -379,6 +419,7 @@ impl Walk {
             self.totals.logical_bytes += meta.logical;
             if meta.mount_skipped {
                 self.totals.mount_points_skipped += 1;
+                self.gap(&path, GapClass::Mount);
                 if self.coverage.mount_point_examples.len() < COVERAGE_EXAMPLES {
                     self.coverage
                         .mount_point_examples
@@ -1058,7 +1099,12 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                             }
                             entry.client_state = m;
                         }
-                        Err(_) => entry.client_state = EntryMeta::default(),
+                        Err(e) => {
+                            entry.client_state = EntryMeta {
+                                err: e.raw_os_error(),
+                                ..EntryMeta::default()
+                            }
+                        }
                     }
                 }
             });
@@ -1068,13 +1114,14 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 Err(err) => {
                     let p = err.path().map(Path::to_path_buf).unwrap_or_default();
                     walk.issue(&p, err.to_string());
+                    let errno = err.io_error().and_then(|e| e.raw_os_error());
                     let is_dir = std::fs::symlink_metadata(&p)
                         .map(|m| m.is_dir())
                         .unwrap_or(false);
                     if is_dir {
-                        walk.unreadable_dir(&p);
+                        walk.unreadable_dir(&p, errno);
                     } else {
-                        walk.coverage.other_unreadable_entries += 1;
+                        walk.other_gap(&p, errno);
                     }
                 }
             }
@@ -1102,12 +1149,21 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         && totals.mount_points_skipped == 0
         && !issue_overflow
         && !skipped_overflow;
+    // The gap record is only as complete as the walk's own bounded lists.
+    if issue_overflow || skipped_overflow || unreadable_dirs.len() >= MAX_ISSUE_PATHS {
+        coverage.gaps_overflowed = true;
+    }
+    coverage.gaps.sort_by(|a, b| a.path.cmp(&b.path));
     coverage.unreadable_dir_examples.sort();
     coverage.mount_point_examples.sort();
 
     // Phase 2: classification.
     let mut dirs: Vec<(PathBuf, DirAgg)> = aggs.into_iter().collect();
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    let work_sessions = crate::evidence::work_sessions(
+        &protect_ctx.roots,
+        dirs.iter().map(|(p, a)| (p.as_path(), a.newest)),
+    );
     crate::protect::attribute_bytes(
         &mut protect_ctx.roots,
         dirs.iter()
@@ -1220,6 +1276,45 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
             .ok()
             .and_then(|k| dirs[k].1.owner)
     };
+    // The owning project of each regenerable or cache directory (design: Activity): its parent
+    // directory when that holds a marker some rule uses (`package.json`, `Cargo.toml`, ...), and
+    // the newest file time below that directory outside every artifact and `.git`. The plan
+    // judges the directory by its project's activity, never by an enclosing top-level folder's.
+    {
+        let mut cache: HashMap<PathBuf, Option<i64>> = HashMap::new();
+        let artifact_owner: Vec<bool> = builds.iter().map(|b| b.node.class.is_artifact()).collect();
+        for b in builds.iter_mut() {
+            if !b.node.class.is_artifact() {
+                continue;
+            }
+            let Some(parent) = b.path.parent() else {
+                continue;
+            };
+            let Ok(k) = dirs.binary_search_by(|(q, _)| q.as_path().cmp(parent)) else {
+                continue;
+            };
+            if dirs[k].1.markers.is_empty() {
+                continue;
+            }
+            let newest = *cache.entry(parent.to_path_buf()).or_insert_with(|| {
+                let mut newest: Option<i64> = None;
+                for (q, agg) in dirs[k..].iter() {
+                    if !q.starts_with(parent) {
+                        break;
+                    }
+                    if agg.in_git || agg.owner.is_some_and(|o| artifact_owner[o]) {
+                        continue;
+                    }
+                    if let Some(t) = agg.newest {
+                        newest = Some(newest.map_or(t, |n: i64| n.max(t)));
+                    }
+                }
+                newest
+            });
+            b.node.project = Some(parent.to_string_lossy().into_owned());
+            b.node.project_newest_mtime = newest;
+        }
+    }
     // Entries that could not be read make the node that holds them incomplete.
     if issue_overflow {
         for b in builds.iter_mut() {
@@ -1504,6 +1599,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         scope: roots_scope(&roots).to_string(),
         coverage,
         protect: protect_ctx,
+        work_sessions,
     })
 }
 

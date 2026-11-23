@@ -9,7 +9,7 @@ mod common;
 
 use common::*;
 use disk_cleaner_core::{
-    plan, scan, Action, Plan, PlanItem, PlanOptions, ProcessCheck, ScanOptions, ScanResult, Tri,
+    plan, scan, Action, Plan, PlanItem, PlanOptions, ProcessSnapshot, ScanOptions, ScanResult, Tri,
 };
 use std::path::{Path, PathBuf};
 
@@ -153,10 +153,7 @@ fn q1_control_two_unrelated_clean_clones_stay_archivable() {
     assert_eq!(action_for(&res, &b), Action::BackupThenRemove);
     // With the trust flag and a partial process check they are still archivable.
     let mut o = PlanOptions::new(7, far_future());
-    o.process = ProcessCheck::Partial {
-        cwds: vec![],
-        unreadable: 1,
-    };
+    o.process = ProcessSnapshot::with_hidden(&[], 1);
     o.trust_partial_process_check = true;
     let p = plan(&res, &o);
     assert_eq!(

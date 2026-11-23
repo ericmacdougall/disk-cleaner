@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod error;
+pub mod evidence;
 pub mod facts;
 pub mod git;
 mod gitshape;
@@ -26,6 +27,7 @@ pub mod words;
 
 pub use config::{Config, ConfigSource, DEFAULT_ACTIVE_WINDOW_DAYS, DEFAULT_MAX_GIT_ADMIN_BYTES};
 pub use error::{Error, Result};
+pub use evidence::{Container, ContainerState, HostInputs, ItemEvidence, SessionTotal};
 pub use facts::{is_network_url, FactsConfig};
 pub use git::{Git, GitError};
 pub use model::*;
@@ -34,7 +36,7 @@ pub use plan::{
     PreserveGitAdmin, PreserveObjectStore, ProjectState,
 };
 pub use preserve::{git_admin_files, object_store_files};
-pub use procs::{running_cwds, ProcessCheck};
+pub use procs::{Probe, Proc, ProcKind, ProcessSnapshot};
 pub use protect::{Hold, ScanContext, Verdict};
 pub use rules::RuleSet;
 pub use scan::{scan, ScanOptions};
@@ -241,7 +243,8 @@ pub fn validate_scan(scan: &ScanResult) -> Result<()> {
     checked_total("big_files[].bytes", scan.big_files.iter().map(|x| x.bytes))?;
     // A scan that says it looked everywhere must not also record places it could not look.
     let c = &scan.coverage;
-    let gaps = c.unreadable_dirs > 0
+    let gaps = !c.gaps.is_empty()
+        || c.unreadable_dirs > 0
         || c.other_unreadable_entries > 0
         || c.mount_points_skipped > 0
         || scan.totals.unreadable > 0

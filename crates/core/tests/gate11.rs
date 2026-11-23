@@ -7,7 +7,7 @@ mod common;
 
 use common::*;
 use disk_cleaner_core::{
-    plan, Action, Class, Coverage, Facts, Node, Plan, PlanItem, PlanOptions, ProcessCheck,
+    plan, Action, Class, Coverage, Facts, Node, Plan, PlanItem, PlanOptions, ProcessSnapshot,
     RepoInfo, ScanOptionsRecord, ScanResult, Totals, Tri, SCHEMA_VERSION,
 };
 use std::path::Path;
@@ -249,6 +249,7 @@ fn synthetic(nodes: Vec<Node>, coverage: Coverage) -> ScanResult {
         scope: "subtree".to_string(),
         coverage,
         protect: Default::default(),
+        work_sessions: Vec::new(),
     }
 }
 
@@ -385,10 +386,7 @@ fn s2f_a_nested_veto_leads_the_reason_with_or_without_the_process_check() {
     build.contains_outputs = true;
     let s = synthetic(vec![outer, build], complete());
     let mut partial = opts();
-    partial.process = ProcessCheck::Partial {
-        cwds: vec![],
-        unreadable: 3,
-    };
+    partial.process = ProcessSnapshot::with_hidden(&[], 3);
     for o in [opts(), partial] {
         let p = plan(&s, &o);
         let it = &p.items[0];

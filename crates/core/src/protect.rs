@@ -122,7 +122,7 @@ impl ScanContext {
 // ---------------------------------------------------------------- path helpers
 
 /// macOS volumes are case-insensitive: compare path components without case there only.
-fn comp_eq(a: &OsStr, b: &OsStr) -> bool {
+pub(crate) fn comp_eq(a: &OsStr, b: &OsStr) -> bool {
     if cfg!(target_os = "macos") {
         a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     } else {
@@ -157,7 +157,7 @@ pub fn normalize(p: &Path) -> PathBuf {
 }
 
 /// The components of `path` below `root`: `Some` (possibly empty) when `path` is `root` or below.
-fn rel_below(path: &Path, root: &Path) -> Option<Vec<OsString>> {
+pub(crate) fn rel_below(path: &Path, root: &Path) -> Option<Vec<OsString>> {
     let mut p = path.components();
     for r in root.components() {
         let c = p.next()?;

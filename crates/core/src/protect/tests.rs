@@ -91,6 +91,7 @@ fn scan_of(pc: ProtectContext, nodes: Vec<Node>) -> ScanResult {
             ..Default::default()
         },
         protect: pc,
+        work_sessions: Vec::new(),
     }
 }
 
@@ -1368,8 +1369,15 @@ fn allowlist_exempts_only_the_harness_hold() {
     ];
     fs::create_dir_all(home.join(".claude.json.d")).unwrap();
     let pc = resolve(&ctx).unwrap();
+    // The fixture's session directory was just created, which makes its session live (a
+    // same-named entry in a protected root changed within the window): plan 400 days later.
+    let late = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 400 * DAY;
     for (label, n, removable) in alone {
-        let p = plan(&scan_of(pc.clone(), vec![n]), &opts(300 * DAY));
+        let p = plan(&scan_of(pc.clone(), vec![n]), &opts(late));
         let it = &p.items[0];
         assert_eq!(
             it.action.removes(),
@@ -1442,7 +1450,7 @@ fn allowlist_exempts_only_the_harness_hold() {
         let x = node(&co, Class::Repo, all_yes());
         let mut k = allow(dep, real, rule);
         k.parent = Some(0);
-        let p = plan(&scan_of(pc.clone(), vec![x, k]), &opts(300 * DAY));
+        let p = plan(&scan_of(pc.clone(), vec![x, k]), &opts(late));
         // The checkout is removable after a backup only when nothing below it is held.
         assert_eq!(
             p.items[0].action == Action::BackupThenRemove,

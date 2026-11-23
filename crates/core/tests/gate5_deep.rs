@@ -35,6 +35,7 @@ fn chain(len: usize) -> ScanResult {
             ..Default::default()
         },
         protect: Default::default(),
+        work_sessions: Vec::new(),
     }
 }
 

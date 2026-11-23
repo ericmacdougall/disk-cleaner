@@ -109,7 +109,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
     let json = fs::read_to_string(&out_file).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["schema_version"], 16);
+    assert_eq!(v["schema_version"], 17);
 
     let o = run(bin()
         .args([
@@ -1201,7 +1201,7 @@ fn assert_process_check_usable(plan: &serde_json::Value) {
 
 #[cfg(unix)]
 #[test]
-fn r1_t2_unreadable_folder_clone_asks_by_default_and_archives_when_accepted() {
+fn r1_t2_unreadable_folder_elsewhere_is_counted_and_an_overflowed_record_asks() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("scan");
@@ -1242,19 +1242,26 @@ fn r1_t2_unreadable_folder_clone_asks_by_default_and_archives_when_accepted() {
     fs::create_dir_all(&home).unwrap();
     let now = far_future();
 
-    // Gate 98f8764 T2, default: the clone was not seen (it cannot be), so A's dependents are
-    // unknown and it asks, naming what was not read and the opt-in.
+    // goodqa#16711 AC-8: the gap lies outside A, so A's own facts stand and it is offered, its
+    // reason giving the count of gaps outside it and what was not looked for there.
     let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
     assert_process_check_usable(&pv);
     let it = item_of(&pv, &a);
     let reason = it["reason"].as_str().unwrap();
-    assert_eq!(it["action"], "ask", "{reason}");
-    assert_eq!(it["reclaimable_bytes"], 0);
-    assert_eq!(it["facts"]["no_dependents"], "unknown");
-    assert!(reason.contains("1 folder could not be read"), "{reason}");
-    assert!(reason.contains("--accept-incomplete-coverage"), "{reason}");
+    assert_eq!(it["action"], "backup-then-remove", "{reason}");
+    assert_eq!(it["facts"]["no_dependents"], "yes");
+    assert!(
+        reason.contains("1 place outside it could not be read or entered")
+            && reason.contains("alternates clones"),
+        "{reason}"
+    );
     assert_eq!(pv["coverage_complete"], false);
     assert_eq!(pv["accepted_incomplete_coverage"], false);
+    assert_eq!(
+        pv["coverage_gaps"]["permission"], 1,
+        "{}",
+        pv["coverage_gaps"]
+    );
     assert!(pv.get("required_full_coverage").is_none(), "{pv}");
     let note = pv["coverage_note"].as_str().unwrap_or_default();
     assert!(
@@ -1262,7 +1269,7 @@ fn r1_t2_unreadable_folder_clone_asks_by_default_and_archives_when_accepted() {
         "{note}"
     );
 
-    // The scan file records where coverage stopped.
+    // The scan file records where coverage stopped, gap by gap.
     let cov = &sv["coverage"];
     assert_eq!(cov["complete"], false, "{cov}");
     assert_eq!(cov["unreadable_dirs"], 1, "{cov}");
@@ -1274,17 +1281,46 @@ fn r1_t2_unreadable_folder_clone_asks_by_default_and_archives_when_accepted() {
         .filter_map(|e| e.as_str())
         .collect();
     assert_eq!(examples, vec![&*vault.to_string_lossy()]);
+    assert_eq!(
+        cov["gaps"][0]["path"],
+        vault.to_string_lossy().as_ref(),
+        "{cov}"
+    );
+    assert_eq!(cov["gaps"][0]["class"], "permission", "{cov}");
 
-    // The human plan says it in the header.
+    // The human plan says it in the header, by errno class.
     let mut c = bin();
-    c.args(["plan", "--scan", scan_file.to_str().unwrap(), "--now", &now]);
+    c.args([
+        "plan",
+        "--scan",
+        scan_file.to_str().unwrap(),
+        "--now",
+        &now,
+        "--trust-partial-process-check",
+    ]);
     isolate(&mut c, &home);
     let text = stdout(&run(&mut c));
     assert!(text.contains("1 folder could not be read"), "{text}");
-    assert!(text.contains("--accept-incomplete-coverage"), "{text}");
+    assert!(text.contains("1 permission (EACCES)"), "{text}");
 
-    // Opt-in, by flag: the disclosure behaviour. A is archived, its reason carries the coverage
-    // sentence, and the plan records that the user accepted incomplete coverage.
+    // An overflowed gap record: the old whole-scan rule, every repository asks, naming what was
+    // not read and the opt-in.
+    let mut over: serde_json::Value = sv.clone();
+    over["coverage"]["gaps_overflowed"] = serde_json::json!(true);
+    let over_file = tmp.path().join("over.json");
+    fs::write(&over_file, over.to_string()).unwrap();
+    let pv = plan_value(&plan_json(&over_file, &home, &["--now", &now]));
+    let it = item_of(&pv, &a);
+    let reason = it["reason"].as_str().unwrap();
+    assert_eq!(it["action"], "ask", "{reason}");
+    assert_eq!(it["reclaimable_bytes"], 0);
+    assert_eq!(it["facts"]["no_dependents"], "unknown");
+    assert!(reason.contains("1 folder could not be read"), "{reason}");
+    assert!(reason.contains("--accept-incomplete-coverage"), "{reason}");
+    assert_eq!(pv["coverage_gaps"]["overflowed"], true);
+
+    // Opt-in, by flag (overflowed record): the disclosure behaviour. A is archived, its reason
+    // carries the coverage sentence, and the plan records that the user accepted it.
     let accepted = |pv: &serde_json::Value| {
         let it = item_of(pv, &a);
         let reason = it["reason"].as_str().unwrap();
@@ -1298,16 +1334,16 @@ fn r1_t2_unreadable_folder_clone_asks_by_default_and_archives_when_accepted() {
         assert_eq!(pv["accepted_incomplete_coverage"], true);
     };
     let flag = ["--now", &now, "--accept-incomplete-coverage"];
-    accepted(&plan_value(&plan_json(&scan_file, &home, &flag)));
+    accepted(&plan_value(&plan_json(&over_file, &home, &flag)));
 
     // Opt-in, by config.
     let cfg = tmp.path().join("accept.toml");
     fs::write(&cfg, "accept_incomplete_coverage = true\n").unwrap();
     let by_config = ["--now", &now, "--config", cfg.to_str().unwrap()];
-    accepted(&plan_value(&plan_json(&scan_file, &home, &by_config)));
+    accepted(&plan_value(&plan_json(&over_file, &home, &by_config)));
 
     let mut c = bin();
-    c.args(["plan", "--scan", scan_file.to_str().unwrap()])
+    c.args(["plan", "--scan", over_file.to_str().unwrap()])
         .args(flag);
     isolate(&mut c, &home);
     let text = stdout(&run(&mut c));
@@ -1380,7 +1416,7 @@ fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
     let now = far_future();
 
     let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
-    assert_eq!(pv["schema_version"], 16);
+    assert_eq!(pv["schema_version"], 17);
     let it = item_of(&pv, &a);
     assert_eq!(it["action"], "backup-then-remove", "{it}");
     let pre = &it["preserve"]["git_admin"];

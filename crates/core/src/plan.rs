@@ -2,12 +2,16 @@
 //!
 //! The plan is advice: per classified directory an action, a plain-language reason and the
 //! bytes that would be reclaimed. There is no built-in age: the active window and the active
-//! paths are inputs. A project is active when an `--active` path covers it, when its newest
-//! activity is inside the window, or when a running process has its working directory inside it.
+//! paths are inputs. An item is active when an `--active` path covers it, when it is in use or
+//! its owning session is live, or when its own activity (a regenerable directory: its owning
+//! project's) is inside the window; [`crate::evidence`] decides all of these per item.
 //! A repo whose facts are not all `Yes` never gets a removing action.
 
+use crate::evidence::{
+    self, ContainerState, Evidence, GapSummary, ItemEvidence, ProcessCounts, SessionTotal,
+};
 use crate::model::*;
-use crate::procs::ProcessCheck;
+use crate::procs::ProcessSnapshot;
 use crate::protect::{self, Hold, Verdict};
 use crate::words::{agree, count, kib, size, some_of};
 use serde::{Deserialize, Serialize};
@@ -74,16 +78,18 @@ pub struct PlanOptions {
     pub window_source: String,
     /// Current time, unix seconds (an input so plans are reproducible).
     pub now: i64,
-    /// Working directories of running processes.
-    pub process: ProcessCheck,
-    /// The user accepts a partial process check (some processes could not be inspected) as
-    /// enough to remove things. Off by default: an unreadable process may be working inside the
-    /// candidate.
+    /// Every running process, as read at plan time (see [`crate::procs`]).
+    pub process: ProcessSnapshot,
+    /// The container runtime's running containers, queried when a runtime process runs.
+    pub containers: ContainerState,
+    /// The user accepts processes whose working directory and command line are both unreadable
+    /// (as under `hidepid`) as not using anything. Off by default: one of them may be working
+    /// inside the candidate, so every removing item asks.
     pub trust_partial_process_check: bool,
-    /// The user accepts a scan that could not look everywhere (unreadable folders, mount points
-    /// not entered) as enough to remove repositories: each such reason then says what was not
-    /// read. Off by default: with incomplete coverage every repository's `no_dependents = yes`
-    /// becomes `unknown`, so it asks.
+    /// The user accepts a scan whose record of unreadable places overflowed as enough to remove
+    /// repositories: each such reason then says what was not read. Off by default: with an
+    /// overflowed record every repository's `no_dependents = yes` becomes `unknown`, so it asks.
+    /// (With a complete record, coverage is judged per item and this changes nothing.)
     pub accept_incomplete_coverage: bool,
     /// Most allocated bytes of its own files ([`PlanItem::preserve`]) one git directory may hold
     /// and still be removed after a backup; more asks, naming the largest files (a big file
@@ -99,7 +105,8 @@ impl PlanOptions {
             active_window_days,
             window_source: "input".to_string(),
             now,
-            process: ProcessCheck::none_running(),
+            process: ProcessSnapshot::none_running(),
+            containers: ContainerState::NotQueried,
             trust_partial_process_check: false,
             accept_incomplete_coverage: false,
             max_git_admin_bytes: crate::config::DEFAULT_MAX_GIT_ADMIN_BYTES,
@@ -179,6 +186,10 @@ pub struct PlanItem {
     /// For an `ask` item: a short code for why a person must decide (see [`ask_code`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_code: Option<String>,
+    /// What the per-item rules found: the in-use rule and path that matched, the owning session
+    /// and project, gaps inside.
+    #[serde(default)]
+    pub evidence: ItemEvidence,
 }
 
 /// Count and bytes for one action.
@@ -213,6 +224,9 @@ pub struct PlanTotals {
     /// item is counted once.
     #[serde(default)]
     pub keep_by_reason: BTreeMap<String, AskTotal>,
+    /// Agent-harness sessions, live and idle, with the bytes offered and kept below each.
+    #[serde(default)]
+    pub sessions: Vec<SessionTotal>,
 }
 
 /// Held items under one root.
@@ -256,10 +270,20 @@ pub struct Plan {
     pub active_window_days: u64,
     /// Where the window came from.
     pub window_source: String,
-    /// `ok`, `partial` or `unknown`: could running processes be inspected?
+    /// `per-item` (each item judged by the processes that name it), or `unknown` when process
+    /// information could not be read at all.
     pub process_check: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_check_note: Option<String>,
+    /// What the per-item process rules could use.
+    #[serde(default)]
+    pub process_counts: ProcessCounts,
+    /// Where the scan could not look, by errno class.
+    #[serde(default)]
+    pub coverage_gaps: GapSummary,
+    /// Notes from gathering the evidence (an unreadable transcript, by path only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_notes: Vec<String>,
     /// The user chose to treat a partial process check as sufficient
     /// (`trust_partial_process_check` / `--trust-partial-process-check`).
     #[serde(default)]
@@ -357,16 +381,6 @@ pub fn resolve_active(
     Ok(out)
 }
 
-/// A running process's working directory inside this node's directory.
-fn process_hit(node: &Node, process: &ProcessCheck) -> Option<String> {
-    let raw = Path::new(&node.path);
-    let real = canon(raw);
-    process
-        .inside(raw)
-        .or_else(|| process.inside(&real))
-        .map(|c| format!("{} (working directory of a running process)", c.display()))
-}
-
 /// What the plan needs to know about every node, computed once with no recursion (a scan file can
 /// describe a tree of any depth): parents first, then per-node results inherited down the tree.
 ///
@@ -377,12 +391,11 @@ struct Ctx {
     parent: Vec<Option<usize>>,
     /// Node indexes, every node after its parent.
     order: Vec<usize>,
-    /// Active path covering the node or a node enclosing it.
+    /// Active path covering the node or a node enclosing it (the user's word covers everything
+    /// below it).
     active: Vec<Option<String>>,
-    /// Running process inside the node or a node enclosing it.
-    process: Vec<Option<String>>,
-    /// Newest activity evidence of the project the node belongs to.
-    activity: Vec<Option<i64>>,
+    /// Per-item evidence: in use, session, activity, coverage.
+    ev: Evidence,
 }
 
 fn build_ctx(scan: &ScanResult, opts: &PlanOptions) -> Ctx {
@@ -428,44 +441,39 @@ fn build_ctx(scan: &ScanResult, opts: &PlanOptions) -> Ctx {
     order.sort_by_key(|&i| depth[i]);
 
     let mut active: Vec<Option<String>> = vec![None; n];
-    let mut process: Vec<Option<String>> = vec![None; n];
-    let mut activity: Vec<Option<i64>> = vec![None; n];
     for &i in &order {
         let node = &scan.nodes[i];
         let par = parent[i];
         active[i] = under_active(Path::new(&node.path), &opts.active)
             .or_else(|| par.and_then(|p| active[p].clone()));
-        process[i] =
-            process_hit(node, &opts.process).or_else(|| par.and_then(|p| process[p].clone()));
-        // Regenerable directories use their owning project.
-        activity[i] = match par {
-            Some(p) if node.class.is_artifact() => activity[p],
-            _ => {
-                let commit = node.repo.as_ref().and_then(|r| r.last_commit_time);
-                max_opt(node.newest_mtime, commit)
-            }
-        };
     }
+    let host = evidence::HostInputs {
+        processes: opts.process.clone(),
+        containers: opts.containers.clone(),
+    };
+    let ev = evidence::gather(
+        scan,
+        &parent,
+        &evidence::Opts {
+            now: opts.now,
+            window_days: opts.active_window_days,
+            host: &host,
+            trust_partial_process_check: opts.trust_partial_process_check,
+        },
+    );
     Ctx {
         parent,
         order,
         active,
-        process,
-        activity,
+        ev,
     }
 }
 
-fn max_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.max(y)),
-        (x, None) => x,
-        (None, y) => y,
-    }
-}
-
-/// Judge one node: active (path, process or recent activity), idle or unknown, with the reason.
+/// Judge one node: active (path, in use, live session or recent activity), idle or unknown,
+/// with the reason.
 fn judge(ctx: &Ctx, idx: usize, opts: &PlanOptions) -> (ProjectState, String, Option<u64>) {
-    let last = ctx.activity[idx];
+    let e = &ctx.ev.nodes[idx];
+    let last = e.activity;
     let days = last.map(|t| (opts.now.saturating_sub(t).max(0) / 86_400) as u64);
     if let Some(a) = ctx.active[idx].as_deref() {
         return (
@@ -474,8 +482,21 @@ fn judge(ctx: &Ctx, idx: usize, opts: &PlanOptions) -> (ProjectState, String, Op
             days,
         );
     }
-    if let Some(p) = ctx.process[idx].as_deref() {
-        return (ProjectState::Active, format!("in use: {p}"), days);
+    if let Some(h) = &e.in_use {
+        return (
+            ProjectState::Active,
+            format!("in use: {} ({}) [rule {}]", h.path, h.detail, h.rule),
+            days,
+        );
+    }
+    if let Some(s) = e.session.map(|k| &ctx.ev.sessions[k]) {
+        if let Some(why) = &s.live {
+            return (
+                ProjectState::Active,
+                format!("session {} is live: {why} [rule 4]", s.name),
+                days,
+            );
+        }
     }
     let window = opts.active_window_days;
     match (last, days) {
@@ -560,13 +581,15 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     // Holds are decided per node from the scan alone and applied before the nested-veto pass.
     let verdicts = protect::judge(scan);
     let complete = scan.coverage.complete;
-    // Strict coverage, the default: what was not read, unless the user accepted that it does not
-    // block removal.
-    let strict: Option<String> = if !opts.accept_incomplete_coverage && !complete {
-        Some(coverage_gaps(&scan.coverage))
-    } else {
-        None
-    };
+    // Coverage is judged per item from the scan's record of every gap. Only when that record is
+    // incomplete (it overflowed) does the whole-scan rule apply: every repository's
+    // `no_dependents = yes` is unproven, unless the user accepted that.
+    let strict: Option<String> =
+        if !opts.accept_incomplete_coverage && !complete && ctx.ev.gaps_incomplete {
+            Some(coverage_gaps(&scan.coverage))
+        } else {
+            None
+        };
     let mut items: Vec<PlanItem> = Vec::new();
     // Per item: its action from its own facts and contents, before the process check (which
     // downgrades every removing item alike, so it is no reason for one item to veto another).
@@ -582,8 +605,17 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         // the reason says what was not read whenever the facts show it.
         let (mut action, mut reason, mut reclaim) = decide(scan, idx, state, &state_reason, None);
         let removing = action.removes();
+        let gaps_inside = ctx.ev.nodes[idx].gaps_inside;
         if removing {
-            if let Some(why) = node.ask_reason.as_deref() {
+            if gaps_inside > 0 && !ctx.ev.gaps_incomplete {
+                // A place inside it could not be read: what is there was never looked at.
+                reason = format!(
+                    "{reason}; but {} inside could not be read, so the scan of it is incomplete",
+                    count(gaps_inside, "folder or entry", "folders or entries")
+                );
+                action = Action::Ask;
+                reclaim = 0;
+            } else if let Some(why) = node.ask_reason.as_deref() {
                 reason = format!("{reason}; but it {why}");
                 action = Action::Ask;
                 reclaim = 0;
@@ -656,29 +688,46 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         }
         own_action.push(action);
         if action.removes() {
-            match &opts.process {
-                ProcessCheck::Unknown { reason: why } => {
-                    // Cannot prove nothing is using it: a person decides.
-                    reason =
-                        format!("{reason}; but running processes could not be inspected ({why})");
-                    action = Action::Ask;
-                    reclaim = 0;
-                }
-                ProcessCheck::Partial { unreadable, .. } if !opts.trust_partial_process_check => {
-                    // One of the processes nobody could look at may be working inside it.
-                    let n = *unreadable as u64;
-                    reason = format!(
-                        "{reason}; but {} could not be inspected, so {} may be using it \
-                         (--trust-partial-process-check accepts that risk)",
-                        count(n, "running process", "running processes"),
-                        agree(n, "it", "one of them")
-                    );
-                    action = Action::Ask;
-                    reclaim = 0;
-                }
-                _ => {}
+            // Evidence that cannot be placed on one item (processes nobody could look at, a
+            // container runtime that could not be queried, an agent with no locus) downgrades
+            // every item it may concern alike, so it is no reason for one item to veto another.
+            let ne = &ctx.ev.nodes[idx];
+            let mut whys: Vec<&String> = ctx.ev.global_asks.iter().collect();
+            if ne.under_work {
+                whys.extend(ctx.ev.work_asks.iter());
+            }
+            if !whys.is_empty() {
+                let list: Vec<&str> = whys.iter().map(|w| w.as_str()).collect();
+                reason = format!("{reason}; but {}", list.join("; and "));
+                action = Action::Ask;
+                reclaim = 0;
             }
         }
+        let ne = &ctx.ev.nodes[idx];
+        let item_evidence = ItemEvidence {
+            rule: ne.in_use.as_ref().map(|h| h.rule).or_else(|| {
+                ne.session
+                    .filter(|k| ctx.ev.sessions[*k].live.is_some())
+                    .map(|_| 4)
+            }),
+            path: ne.in_use.as_ref().map(|h| h.path.clone()),
+            detail: ne.in_use.as_ref().map(|h| h.detail.clone()).or_else(|| {
+                ne.session.and_then(|k| {
+                    let s = &ctx.ev.sessions[k];
+                    s.live
+                        .as_ref()
+                        .map(|w| format!("session {} is live: {w}", s.name))
+                })
+            }),
+            session: ne.session.map(|k| ctx.ev.sessions[k].name.clone()),
+            project: ne.project.clone(),
+            gaps_inside: ne.gaps_inside,
+            last_commit_days: node
+                .repo
+                .as_ref()
+                .and_then(|r| r.last_commit_time)
+                .map(|t| (opts.now.saturating_sub(t).max(0) / 86_400) as u64),
+        };
         items.push(PlanItem {
             node: idx,
             path: node.path.clone(),
@@ -697,6 +746,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             preserve: None,
             hold,
             ask_code: None,
+            evidence: item_evidence,
         });
     }
 
@@ -806,13 +856,34 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
 
     // Every decision that rests on "nothing depends on it" says where the scan could not look.
     // Last, so it is only added to items that are still removed or recovered.
-    if let Some(gap) = coverage_reason(&scan.coverage, complete) {
+    if ctx.ev.gaps_incomplete {
+        if let Some(gap) = coverage_reason(&scan.coverage, complete) {
+            for it in items.iter_mut() {
+                if matches!(
+                    it.action,
+                    Action::BackupThenRemove | Action::RecoverBackupThenRemove
+                ) {
+                    it.reason.push_str(&gap);
+                }
+            }
+        }
+    } else if !complete {
+        // Per item: the gaps outside it, and what that means for dependents there.
+        let total = scan.coverage.gaps.len() as u64;
         for it in items.iter_mut() {
             if matches!(
                 it.action,
                 Action::BackupThenRemove | Action::RecoverBackupThenRemove
             ) {
-                it.reason.push_str(&gap);
+                let outside = total.saturating_sub(it.evidence.gaps_inside);
+                it.reason.push_str(&format!(
+                    "; {} outside it could not be read or entered, so dependents there \
+                     (alternates clones) were not looked for; its linked worktrees are known from \
+                     its own metadata, and the objects its refs reach are on the remote or in its \
+                     verified bundle, from which a dependent found later can be repaired by \
+                     fetching",
+                    count(outside, "place", "places")
+                ));
             }
         }
     }
@@ -971,6 +1042,34 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
     }
     totals.held = held.into_values().collect();
 
+    // Sessions: live or idle, with bytes offered and kept below each (nested items once).
+    let mut per: Vec<SessionTotal> = ctx
+        .ev
+        .sessions
+        .iter()
+        .map(|s| SessionTotal {
+            session: s.name.clone(),
+            live: s.live.is_some(),
+            source: s.live.clone(),
+            newest_age_days: s
+                .newest
+                .map(|t| (opts.now.saturating_sub(t).max(0) / 86_400) as u64),
+            bytes_offered: 0,
+            bytes_kept: 0,
+        })
+        .collect();
+    for it in &items {
+        let Some(k) = ctx.ev.nodes[it.node].session else {
+            continue;
+        };
+        if it.action.removes() && !nested_in_removing[it.node] {
+            per[k].bytes_offered = per[k].bytes_offered.saturating_add(it.reclaimable_bytes);
+        } else if it.action == Action::Keep && !nested_in_keep[it.node] {
+            per[k].bytes_kept = per[k].bytes_kept.saturating_add(it.bytes_total);
+        }
+    }
+    totals.sessions = per;
+
     Plan {
         schema_version: SCHEMA_VERSION,
         dry_run: true,
@@ -978,8 +1077,15 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         scan_generated_at: scan.generated_at,
         active_window_days: opts.active_window_days,
         window_source: opts.window_source.clone(),
-        process_check: opts.process.status().to_string(),
-        process_check_note: opts.process.note(),
+        process_check: if opts.process.error.is_some() {
+            "unknown".to_string()
+        } else {
+            "per-item".to_string()
+        },
+        process_check_note: opts.process.error.clone(),
+        process_counts: ctx.ev.counts.clone(),
+        coverage_gaps: ctx.ev.gaps.clone(),
+        evidence_notes: ctx.ev.notes.clone(),
         trusted_partial_process_check: opts.trust_partial_process_check,
         remote_facts_verified: false,
         remote_facts_note:
@@ -1043,10 +1149,12 @@ pub fn keep_code(it: &PlanItem) -> &'static str {
 
 /// A short code for the reason an item asks, from its final reason text.
 pub fn ask_code(reason: &str) -> &'static str {
-    const TABLE: [(&str, &str); 14] = [
+    const TABLE: [(&str, &str); 16] = [
         ("the nested ", "nested-veto"),
         ("running processes could not be inspected", "process-check"),
-        ("could not be inspected, so", "process-check"),
+        ("could not be inspected (neither", "process-check"),
+        ("(fail closed)", "agent-check"),
+        ("container", "containers"),
         ("bare repos are never removed", "bare-repo"),
         ("source outside any repo", "loose-code"),
         ("source inside a repository", "loose-code"),
@@ -1815,6 +1923,7 @@ mod tests {
                 roots,
                 ..Default::default()
             },
+            work_sessions: Vec::new(),
         }
     }
 

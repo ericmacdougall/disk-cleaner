@@ -3,6 +3,7 @@
 
 #![deny(unsafe_code)]
 
+mod containers;
 mod report;
 #[allow(unsafe_code)]
 mod sysctx;
@@ -10,8 +11,8 @@ mod sysctx;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use disk_cleaner_core::{
-    config, plan, protect, read_scan, resolve_active, running_cwds, scan, write_json, ConfigSource,
-    FactsConfig, Git, PlanOptions, ScanContext, ScanOptions,
+    config, plan, procs, protect, read_scan, resolve_active, scan, write_json, ConfigSource,
+    FactsConfig, Git, HostInputs, PlanOptions, ScanContext, ScanOptions,
 };
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -94,15 +95,16 @@ struct PlanArgs {
     /// Print the plan as JSON.
     #[arg(long)]
     json: bool,
-    /// Accept a partial process check: when some running processes cannot be inspected, still
-    /// offer removal based on the ones that could. Without this (or the config setting
-    /// `trust_partial_process_check = true`) every removing action becomes `ask` then.
+    /// Accept processes whose working directory and command line are both unreadable (as
+    /// under `hidepid`) as not using anything. Without this (or the config setting
+    /// `trust_partial_process_check = true`) every removing action becomes `ask` while such a
+    /// process runs. Other processes are judged per item either way.
     #[arg(long)]
     trust_partial_process_check: bool,
-    /// Accept incomplete coverage: when the scan could not read some folders or did not enter
-    /// some mount points, still offer repositories for removal after a backup, each reason
-    /// saying what was not read (same as the config setting `accept_incomplete_coverage =
-    /// true`). Without it every repository's dependents are unknown then, so each one asks.
+    /// Accept an overflowed coverage record: when the scan could not record every place it
+    /// could not read, still offer repositories for removal after a backup, each reason saying
+    /// what was not read (same as the config setting `accept_incomplete_coverage = true`).
+    /// Without it every repository asks then. A complete record is judged per item either way.
     #[arg(long)]
     accept_incomplete_coverage: bool,
     /// Retired: strict coverage is now the default. Refused with a message naming
@@ -112,6 +114,10 @@ struct PlanArgs {
     /// Override the current time (unix seconds); for reproducible plans and tests.
     #[arg(long, hide = true)]
     now: Option<i64>,
+    /// Read the process snapshot and container state from this JSON file instead of asking the
+    /// system; for reproducible plans and tests on fixture homes.
+    #[arg(long, hide = true, value_name = "FILE")]
+    host_inputs: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -193,12 +199,29 @@ fn run_plan(a: PlanArgs) -> Result<()> {
         }
         (None, ConfigSource::Default) => (cfg.active_window_days, "default".to_string()),
     };
+    let host = match &a.host_inputs {
+        Some(f) => {
+            let text = std::fs::read_to_string(f)
+                .with_context(|| format!("cannot read {}", f.display()))?;
+            serde_json::from_str::<HostInputs>(&text)
+                .with_context(|| format!("invalid host inputs in {}", f.display()))?
+        }
+        None => {
+            let processes = procs::snapshot(&sysctx::probe, sysctx::euid());
+            let containers = containers::query(&processes);
+            HostInputs {
+                processes,
+                containers,
+            }
+        }
+    };
     let opts = PlanOptions {
         active,
         active_window_days: window,
         window_source,
         now,
-        process: running_cwds(),
+        process: host.processes,
+        containers: host.containers,
         trust_partial_process_check: a.trust_partial_process_check
             || cfg.trust_partial_process_check,
         accept_incomplete_coverage: a.accept_incomplete_coverage || cfg.accept_incomplete_coverage,

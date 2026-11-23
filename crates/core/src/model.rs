@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Version of the scan and plan JSON schemas. Bumped on any incompatible change.
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// Primary class of a directory (design section 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -370,6 +370,14 @@ pub struct Node {
     /// is treated as nonzero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_agent_files: Option<u64>,
+    /// Regenerable and cache only: the owning project directory (the parent directory, when it
+    /// holds a marker some rule uses), recorded at scan time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Newest file time below [`Node::project`], outside artifacts and `.git`: the project's
+    /// activity, which the directory is judged by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_newest_mtime: Option<i64>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -399,6 +407,8 @@ impl Node {
             real_unreadable: false,
             agent_files: None,
             top_agent_files: None,
+            project: None,
+            project_newest_mtime: None,
         }
     }
 }
@@ -466,6 +476,79 @@ pub struct Coverage {
     pub mount_points_skipped: u64,
     /// Up to 20 of them.
     pub mount_point_examples: Vec<String>,
+    /// Every place the walk could not look (unreadable folders and entries, mount points not
+    /// entered), each once, up to [`MAX_COVERAGE_GAPS`]. The plan judges coverage per item from
+    /// it: a gap inside an item makes that item ask, a gap elsewhere does not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<CoverageGap>,
+    /// More gaps than [`MAX_COVERAGE_GAPS`] (or more unreadable entries than the walk could
+    /// track): the record is incomplete, so the plan falls back to the whole-scan rule (every
+    /// repository asks unless incomplete coverage is accepted). A scan whose `gaps` hold fewer
+    /// entries than its counts is treated the same way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gaps_overflowed: bool,
+}
+
+/// Most coverage gaps recorded one by one.
+pub const MAX_COVERAGE_GAPS: usize = 100_000;
+
+/// Why a place could not be looked at, from the error number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GapClass {
+    /// `EPERM`: refused by a privacy control (macOS TCC and the like).
+    Privacy,
+    /// `EACCES`: file permissions.
+    Permission,
+    /// A mount point `--one-file-system` did not enter.
+    Mount,
+    /// Any other error.
+    Other,
+}
+
+impl GapClass {
+    /// From an `io::Error`'s raw OS error number (`EPERM` and `EACCES` are told apart; Rust's
+    /// `ErrorKind::PermissionDenied` would conflate them).
+    pub fn from_errno(errno: Option<i32>) -> GapClass {
+        match errno {
+            Some(1) => GapClass::Privacy,
+            Some(13) => GapClass::Permission,
+            _ => GapClass::Other,
+        }
+    }
+
+    /// JSON and display name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GapClass::Privacy => "privacy",
+            GapClass::Permission => "permission",
+            GapClass::Mount => "mount",
+            GapClass::Other => "other",
+        }
+    }
+}
+
+/// One place the walk could not look.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageGap {
+    pub path: String,
+    pub class: GapClass,
+    /// Owner of the entry, from `lstat`, when that worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_uid: Option<u32>,
+}
+
+/// Newest modification time of the files the walk saw below one agent-harness session
+/// directory (`<harness root>/work/<name>/`), recursively: one live-session source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkSession {
+    /// The harness root as the scan spelled it.
+    pub root: String,
+    /// The session directory's name.
+    pub name: String,
+    /// Unix seconds; `None` when no file was seen below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_mtime: Option<i64>,
 }
 
 /// Most example paths kept per kind in [`Coverage`].
@@ -508,6 +591,10 @@ pub struct ScanResult {
     /// The home, user and environment the protected roots were resolved from, and the roots
     /// (required: the plan refuses a scan without it).
     pub protect: ProtectContext,
+    /// Agent-harness session directories under the walked roots and the newest file time below
+    /// each (see [`WorkSession`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_sessions: Vec<WorkSession>,
 }
 
 /// Why a node is held (kept whatever its facts): see `docs/DESIGN.md`.

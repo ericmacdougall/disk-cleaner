@@ -254,6 +254,7 @@ fn synthetic(nodes: Vec<disk_cleaner_core::Node>, coverage: Coverage) -> ScanRes
         scope: "subtree".to_string(),
         coverage,
         protect: Default::default(),
+        work_sessions: Vec::new(),
     }
 }
 

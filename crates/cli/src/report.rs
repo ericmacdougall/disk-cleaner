@@ -205,11 +205,72 @@ pub fn plan_summary(p: &Plan) -> String {
         count(p.active_window_days, "day", "days"),
         p.window_source
     );
+    let c = &p.process_counts;
     let _ = write!(o, "Running-process check: {}", p.process_check);
     if let Some(n) = &p.process_check_note {
-        let _ = write!(o, " ({n})");
+        let _ = write!(o, " ({})", esc(n));
     }
-    let _ = writeln!(o);
+    let _ = writeln!(
+        o,
+        " ({} readable, {} judged by command line, {} kernel {}, {} gone, {} container {} \
+         (runtime {}), {} agent {} ({} idle, {} unmapped), {} fully unknown)",
+        c.readable,
+        c.by_command_line,
+        c.kernel_threads,
+        if c.kernel_threads == 1 {
+            "thread"
+        } else {
+            "threads"
+        },
+        c.gone,
+        c.container_processes,
+        if c.container_processes == 1 {
+            "process"
+        } else {
+            "processes"
+        },
+        esc(&c.runtime),
+        c.agents,
+        if c.agents == 1 {
+            "process"
+        } else {
+            "processes"
+        },
+        c.idle_agents,
+        c.unmapped_agents.len(),
+        c.fully_unknown
+    );
+    if !c.unmapped_agents.is_empty() {
+        let pids: Vec<String> = c.unmapped_agents.iter().map(|x| x.to_string()).collect();
+        let _ = writeln!(
+            o,
+            "Agent processes with no locus (removing items under the harness work directories \
+             ask): {}",
+            pids.join(", ")
+        );
+    }
+    let g = &p.coverage_gaps;
+    if g.total() > 0 || g.overflowed {
+        let _ = writeln!(
+            o,
+            "Coverage gaps: {} privacy (EPERM), {} permission (EACCES), {} mount, {} other{}",
+            g.privacy,
+            g.permission,
+            g.mount,
+            g.other,
+            if g.overflowed {
+                "; the record overflowed, so every repository asks"
+            } else {
+                "; each item is judged by the gaps inside it"
+            }
+        );
+        for (folder, n) in &g.top_folders {
+            let _ = writeln!(o, "  {:>6}  {}", n, esc(folder));
+        }
+    }
+    for n in &p.evidence_notes {
+        let _ = writeln!(o, "note: {}", esc(n));
+    }
     if p.scope == "volume" {
         let _ = writeln!(
             o,
@@ -249,11 +310,12 @@ pub fn plan_summary(p: &Plan) -> String {
              --accept-incomplete-coverage): repositories may be backed up then removed although \
              links or clones in places the scan could not read were not checked"
         );
-    } else if !p.coverage_complete {
+    } else if !p.coverage_complete && p.coverage_gaps.overflowed {
         let _ = writeln!(
             o,
-            "Because coverage is incomplete, no repository is offered for removal: each one \
-             asks (--accept-incomplete-coverage offers them anyway, saying what was not read)"
+            "Because the record of unreadable places overflowed, no repository is offered for \
+             removal: each one asks (--accept-incomplete-coverage offers them anyway, saying \
+             what was not read)"
         );
     }
     if p.trusted_partial_process_check {
@@ -382,6 +444,92 @@ pub fn plan_summary(p: &Plan) -> String {
             count(t.items, "item", "items"),
             human_bytes(t.bytes)
         );
+    }
+    if !p.totals.sessions.is_empty() {
+        let _ = writeln!(o, "\nAgent-harness sessions:");
+        let mut sessions: Vec<&disk_cleaner_core::SessionTotal> =
+            p.totals.sessions.iter().collect();
+        sessions.sort_by(|a, b| {
+            b.live
+                .cmp(&a.live)
+                .then_with(|| b.bytes_offered.cmp(&a.bytes_offered))
+                .then_with(|| a.session.cmp(&b.session))
+        });
+        for s in sessions {
+            let why = match (&s.source, s.newest_age_days) {
+                (Some(src), _) => src.clone(),
+                (None, Some(d)) => format!("newest evidence {} ago", count(d, "day", "days")),
+                (None, None) => "no evidence found".to_string(),
+            };
+            let _ = writeln!(
+                o,
+                "  {:<5} {:>10} offered {:>10} kept  {}  ({})",
+                if s.live { "live" } else { "idle" },
+                human_bytes(s.bytes_offered),
+                human_bytes(s.bytes_kept),
+                esc(&s.session),
+                esc(&why)
+            );
+        }
+    }
+    let mut offered: Vec<&disk_cleaner_core::PlanItem> = p
+        .items
+        .iter()
+        .filter(|i| i.action.removes() && i.class.is_git())
+        .collect();
+    offered.sort_by_key(|i| std::cmp::Reverse(i.reclaimable_bytes));
+    if !offered.is_empty() {
+        let _ = writeln!(o, "\nOffered checkouts and the evidence checked:");
+        for it in offered.iter().take(20) {
+            let e = &it.evidence;
+            let days = |d: Option<u64>| {
+                d.map(|d| count(d, "day", "days"))
+                    .unwrap_or_else(|| "unknown".to_string())
+            };
+            let _ = writeln!(
+                o,
+                "  {:>10}  {}",
+                human_bytes(it.reclaimable_bytes),
+                esc(&it.path)
+            );
+            let _ = writeln!(
+                o,
+                "      idle {}, last commit {} ago; session {}; checked: working directories \
+                 and open files of readable processes, every command line, container binds, \
+                 session liveness; {} inside could not be read",
+                days(it.days_since_activity),
+                days(e.last_commit_days),
+                e.session
+                    .as_deref()
+                    .map(|s| format!("{} (idle)", esc(s)))
+                    .unwrap_or_else(|| "none".to_string()),
+                count(e.gaps_inside, "place", "places")
+            );
+        }
+    }
+    let mut asks: Vec<&disk_cleaner_core::PlanItem> = p
+        .items
+        .iter()
+        .filter(|i| i.action == disk_cleaner_core::Action::Ask)
+        .collect();
+    asks.sort_by(|a, b| {
+        b.bytes_total
+            .cmp(&a.bytes_total)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    if !asks.is_empty() {
+        let _ = writeln!(o, "\nLargest items a person still decides (ask):");
+        for it in asks.iter().take(10) {
+            let _ = writeln!(
+                o,
+                "  {:>10}  {}  [{}]",
+                human_bytes(it.bytes_total),
+                esc(&it.path),
+                it.ask_code.as_deref().unwrap_or("other")
+            );
+            let reason: String = it.reason.chars().take(200).collect();
+            let _ = writeln!(o, "      {}", esc(&reason));
+        }
     }
     let mut biggest: Vec<&disk_cleaner_core::PlanItem> = p.items.iter().collect();
     biggest.sort_by(|a, b| {
