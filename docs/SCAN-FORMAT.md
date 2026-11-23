@@ -206,7 +206,9 @@ One entry per classified directory. A directory belongs to its innermost classif
 |---|---|
 | `path`, `class` | `repo`, `worktree`, `bare-repo`, `regenerable`, `cache`, `loose-code` |
 | `parent` | index of the enclosing classified node, if any |
-| `rule` | the rule that matched (regenerable and cache) |
+| `rule` | the name of the rule that matched (regenerable and cache); several rules may share a name (`target`), so it is for display only |
+| `rule_id` | the identity of the rule that matched (`id` in `rules/artifacts.toml`, unique per rule; `cargo-target`, `maven-target`). Absent in scans written before rules had identities: the plan then takes the one built-in rule with that `rule` name, and a name that several rules share is treated as unknown |
+| `rule_also` | identities of other rules whose name and markers also matched the directory (a `target/` beside both `Cargo.toml` and `pom.xml`); omitted when empty. The plan then treats the directory as matching no allowlisted rule |
 | `bytes_self` | bytes attributed to this node, excluding nested nodes |
 | `bytes_total` | `bytes_self` plus all nested nodes |
 | `files_total` | files in the subtree |
@@ -908,9 +910,13 @@ checkout is held and never a candidate. Every other node inside a protected root
 directories included.
 
 Under `work/<session>/` (inside a carve-out checkout or anywhere else) only dirs matched by a rule
-named `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`,
-`.tox`, `.gradle`, `.turbo`, `.parcel-cache` or `target` keep their normal action, and only when
-the node's `agent_files` is 0 (a missing count counts as nonzero). The allowlist lifts only the
+whose identity (`rule_id`, never the shared name) is `node_modules`, `.venv`, `venv`,
+`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`, `.gradle`, `.turbo`,
+`.parcel-cache` or `cargo-target` keep their normal action, and only when the node's
+`agent_files` is 0 (a missing count counts as nonzero). Maven's and sbt's `target`
+(`maven-target`: test reports, packaged jars), a directory more than one rule matched
+(`rule_also`), and an older scan's bare `target` (two rules carry that name) are held as build
+output. The allowlist lifts only the
 hold whose cause it covers: the agent-harness root's hold, when every identity of the node that
 lies inside that root is on `work/<session>/`, and the hold of a root that puts the enclosing
 carve-out checkout in its carve-out position, when every identity of the node inside that root
@@ -926,11 +932,17 @@ The home-level entries whose names start with `.claude`, `.codex`, `.kimi`, `.ag
 groups `keep` items by reason (`protected`, `synced`, `package`, `unsaved-agent-dir`, `active`,
 `dependents`, `other`) with `items` and `bytes`. A node or root whose canonical path fails for any
 reason (permission, a symlink loop...) is held; only a lexical path that does not exist is absent.
-`scripts/check-agent-files.py` is an independent check of a plan against a home (see its header);
-`--self-test` proves it on a fixture home. `scripts/check-live-sessions.py` is the independent
-oracle for live sessions: run while the plan is made, it lists the live sessions from its own
-sources (plus `--ground-truth CMD`, a source the tool does not read) and exits 1 naming any live
-session with a removing item, or one the plan lists as idle (see its header).
+`scripts/check-agent-files.py` is an independent check of a plan against a home (see its header):
+`check-agent-files.py --home ~ --plan PLAN.json --scan SCAN.json`. It treats a `target/` as Cargo
+build output only when the scan records `rule_id` `cargo-target` for it and it finds `Cargo.toml`,
+and no `pom.xml` or `build.sbt`, beside it on disk (without `--scan` no `target/` is), and it fails
+any removing item below a work session or inside a carve-out checkout that is neither such a
+checkout nor an allowlisted directory. `--self-test` proves it on a fixture home, and
+`protect::tests::checker_agrees_with_plan_on_rule_identity` runs it against the plan.
+`scripts/check-live-sessions.py` is the independent oracle for live sessions: run while the plan is
+made, it lists the live sessions from its own sources (plus `--ground-truth CMD`, a source the tool
+does not read) and exits 1 naming any live session with a removing item, or one the plan lists as
+idle (see its header).
 
 ### The active window
 

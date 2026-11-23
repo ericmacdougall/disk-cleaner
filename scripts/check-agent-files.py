@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Independent check that a disk-cleaner plan removes no agent data.
 
-    check-agent-files.py --home DIR --plan PLAN.json
+    check-agent-files.py --home DIR --plan PLAN.json [--scan SCAN.json]
     check-agent-files.py --self-test
 
 The check knows nothing of the tool's code: it carries its own protected-root list, carve-out
-positions and name patterns, walks the home itself and reads the plan only for the paths of its
-removing items. It fails (exit 1) when a removing item is equal to, above or below an agent file.
-Nothing is filtered by hand: every hit is printed for triage. Roots are resolved to their real
-paths and walked there (a symlinked `.agent-harness` is followed to its target), and every path,
-agent file and removal alike, is compared by its real path.
+positions, allowlist and name patterns, walks the home itself and reads the plan only for the
+paths of its removing items. It fails (exit 1) when a removing item is equal to, above or below an
+agent file, or when a removing item under `.agent-harness/work/<session>/` or inside a carve-out
+checkout is neither such a checkout nor an allowlisted directory. Nothing is filtered by hand:
+every hit is printed for triage. Roots are resolved to their real paths and walked there (a
+symlinked `.agent-harness` is followed to its target), and every path, agent file and removal
+alike, is compared by its real path.
+
+Allowlisted directories are judged by what they are, never by name alone: a `target/` is Cargo
+build output only when the scan (`--scan`) records the Cargo rule's identity for it AND the check
+itself finds `Cargo.toml`, and neither `pom.xml` nor `build.sbt`, beside it on disk. A Maven or
+sbt `target/` (test reports, packaged jars) is not allowlisted; without `--scan` no `target/` is.
 
 Agent files are:
   * files inside a protected root, except files inside a carve-out-position checkout and files
@@ -34,10 +41,15 @@ ROOTS = [
     "Library/Application Support/Claude",
 ]
 PREFIXES = (".claude", ".codex", ".kimi", ".agent-harness", ".prunedisk")
+# Directory names that only one kind of tool makes: the name tells what the directory is.
 ALLOWLIST = {
     "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", ".tox", ".gradle", ".turbo", ".parcel-cache", "target",
+    ".ruff_cache", ".tox", ".gradle", ".turbo", ".parcel-cache",
 }
+# `target` is Cargo's and Maven's or sbt's: allowlisted only as Cargo build output (see
+# cargo_target).
+CARGO_ID = "cargo-target"
+NOT_CARGO_MARKERS = ("pom.xml", "build.sbt")
 REMOVING = {"remove-regenerable", "backup-then-remove", "recover-backup-then-remove"}
 UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 WAL = re.compile(r"(^|[._-])wal([._-]|$)", re.I)
@@ -146,6 +158,36 @@ def in_package(path, top):
     return False
 
 
+def scan_identities(scan):
+    """Real path -> (rule identity, other matching identities) of every scan node, or None when no
+    scan was given (then no `target/` is allowlisted)."""
+    if scan is None:
+        return None
+    out = {}
+    for n in scan.get("nodes", []):
+        p = n.get("real_path") or n.get("path")
+        if p:
+            out[os.path.realpath(p)] = (n.get("rule_id"), tuple(n.get("rule_also") or ()))
+    return out
+
+
+def cargo_target(d, ident):
+    """Is `d` Cargo build output? The scan must record the Cargo rule's identity for it, with no
+    other rule matching, and the disk must agree: Cargo.toml beside it, no pom.xml or build.sbt."""
+    if os.path.basename(d) != "target" or ident is None:
+        return False
+    if ident.get(os.path.realpath(d)) != (CARGO_ID, ()):
+        return False
+    parent = os.path.dirname(d)
+    return os.path.isfile(os.path.join(parent, "Cargo.toml")) and not any(
+        os.path.exists(os.path.join(parent, m)) for m in NOT_CARGO_MARKERS
+    )
+
+
+def allowlisted(d, ident):
+    return os.path.basename(d) in ALLOWLIST or cargo_target(d, ident)
+
+
 def tracked(checkout):
     try:
         r = subprocess.run(
@@ -172,7 +214,7 @@ def walk_files(top):
     return out
 
 
-def agent_files(home):
+def agent_files(home, ident=None):
     home = os.path.realpath(home)
     roots = protected_roots(home)
     root_paths = [r for r, _ in roots]
@@ -226,13 +268,42 @@ def agent_files(home):
             wbase = os.path.join(h, "work")
             d = dp
             while under(d, wbase) and d.count(os.sep) > wbase.count(os.sep) + 1:
-                if os.path.basename(d) in ALLOWLIST and dep_clean(d):
+                if allowlisted(d, ident) and dep_clean(d):
                     exempt = True
                     break
                 d = os.path.dirname(d)
         if not exempt:
             found.append(p)
     return found
+
+
+def dep_has_agent_file(d):
+    for dp, _dn, fn in os.walk(d):
+        for f in fn:
+            if agent_name(f) and not in_package(os.path.join(dp, f), d):
+                return True
+    return False
+
+
+def misplaced(home, removals, ident):
+    """Removing items below a work session (`.agent-harness/work/<s>/...`) or inside a carve-out
+    checkout that are neither a carve-out checkout nor an allowlisted directory holding no agent
+    file. The tool may remove nothing else there: any other directory can hold agent results."""
+    roots = protected_roots(os.path.realpath(home))
+    carves = set(carve_nodes(roots))
+    works = [os.path.join(r, "work") for r, lay in roots if lay == "harness"]
+    out = []
+    for r in removals:
+        below_session = any(
+            under(r, w) and r.count(os.sep) >= w.count(os.sep) + 2 for w in works
+        )
+        in_carve = any(under(r, c) and r != c for c in carves)
+        if not (below_session or in_carve) or r in carves:
+            continue
+        if allowlisted(r, ident) and not dep_has_agent_file(r):
+            continue
+        out.append(r)
+    return out
 
 
 def removing_paths(plan):
@@ -258,10 +329,14 @@ def hits(removals, files):
     return out
 
 
-def check(home, plan):
-    files = agent_files(home)
+def check(home, plan, scan=None):
+    ident = scan_identities(scan)
+    files = agent_files(home, ident)
     removals = [os.path.realpath(p) for p in removing_paths(plan)]
     bad = hits(removals, files)
+    for r in misplaced(home, removals, ident):
+        if r not in bad:
+            bad.append(r)
     return files, removals, bad
 
 
@@ -298,10 +373,10 @@ def self_test():
         write(os.path.join(work, "task", "node_modules", "pkg", "test", "a.jsonl"))
         write(os.path.join(home, "work", "repo", "src", "lib.rs"))
 
-        def run(label, removals, want_fail):
+        def run(label, removals, want_fail, scan=None):
             nonlocal ok
             plan = {"items": [{"path": p, "action": "remove-regenerable"} for p in removals]}
-            _files, _rem, bad = check(home, plan)
+            _files, _rem, bad = check(home, plan, scan)
             good = bool(bad) == want_fail
             ok &= good
             print(("ok   " if good else "FAIL ") + label + (f" (hits: {len(bad)})" if bad else ""))
@@ -323,6 +398,52 @@ def self_test():
         run("carve-out checkout again, clean", [clone], False)
         write(os.path.join(work, "task", "node_modules", "x.jsonl"))
         run("node_modules holding a planted x.jsonl", [os.path.join(work, "task", "node_modules")], True)
+
+        # Class N: `target` is allowlisted only as Cargo build output. A Maven or sbt target/
+        # (test reports, packaged jars) in a task dir or inside a carve-out checkout must fail.
+        for kind, marker in (("maven", "pom.xml"), ("sbt", "build.sbt"), ("cargo", "Cargo.toml")):
+            task = os.path.join(work, kind + "-task")
+            write(os.path.join(task, "session.jsonl"))
+            write(os.path.join(task, marker))
+            write(os.path.join(task, "target", "surefire-reports", "TEST-a.xml"))
+            co = os.path.join(work, kind + "-clone")
+            os.makedirs(co)
+            git(co, "init", "-q")
+            write(os.path.join(co, marker))
+            write(os.path.join(co, ".gitignore"), "target/\n")
+            git(co, "add", ".")
+            git(co, "commit", "-q", "-m", "init")
+            write(os.path.join(co, "target", "surefire-reports", "TEST-a.xml"))
+            targets = [os.path.join(task, "target"), os.path.join(co, "target")]
+            # What the scan records: Cargo's identity for a Cargo target/, Maven's otherwise.
+            ids = {"nodes": [
+                {"path": t, "rule": "target", "rule_id": CARGO_ID if kind == "cargo" else "maven-target"}
+                for t in targets
+            ]}
+            bad = kind != "cargo"
+            run(kind + " target/ in a task dir", targets[:1], bad, ids)
+            run(kind + " target/ inside a carve-out checkout", targets[1:], bad, ids)
+            if kind == "cargo":
+                # Fail closed: no scan, a scan recording another identity or a second matching
+                # rule, a scan lying about a Maven target/, or a pom.xml beside the Cargo.toml.
+                run("cargo target/ without --scan", targets, True)
+                lied = {"nodes": [dict(n, rule_id="maven-target") for n in ids["nodes"]]}
+                run("cargo target/ the scan calls maven-target", targets, True, lied)
+                also = {"nodes": [dict(n, rule_also=["maven-target"]) for n in ids["nodes"]]}
+                run("cargo target/ the scan says two rules matched", targets, True, also)
+                write(os.path.join(task, "pom.xml"))
+                run("target/ beside both Cargo.toml and pom.xml", targets[:1], True, ids)
+                os.remove(os.path.join(task, "pom.xml"))
+                run("cargo target/ again, Cargo.toml alone", targets[:1], False, ids)
+            else:
+                lie = {"nodes": [dict(n, rule_id=CARGO_ID) for n in ids["nodes"]]}
+                run(kind + " target/ the scan calls cargo-target", targets, True, lie)
+        # Any other removal inside a carve-out checkout or below a session fails, even one that
+        # holds no agent-named file (build output can hold agent results under any name).
+        write(os.path.join(clone, "out", "results.tsv"))
+        run("out/ inside a carve-out checkout", [os.path.join(clone, "out")], True)
+        write(os.path.join(work, "task", "dist", "report.html"))
+        run("dist/ in a task dir", [os.path.join(work, "task", "dist")], True)
 
     # `.agent-harness` a symlink to a directory outside the home: the check must follow the root
     # to its real path, or it would see no agent file there and pass anything.
@@ -380,7 +501,13 @@ def main(argv):
         return 2
     with open(args["--plan"]) as f:
         plan = json.load(f)
-    files, removals, bad = check(args["--home"], plan)
+    scan = None
+    if "--scan" in args:
+        with open(args["--scan"]) as f:
+            scan = json.load(f)
+    else:
+        print("no --scan: no target/ is treated as Cargo build output")
+    files, removals, bad = check(args["--home"], plan, scan)
     print(f"agent files: {len(files)}; removing items: {len(removals)}; hits: {len(bad)}")
     for b in bad:
         print("HIT", b)

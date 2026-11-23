@@ -516,8 +516,10 @@ impl Hold {
     }
 }
 
-/// Rule names that keep their removing action under `.agent-harness/work/<session>/` (inside a
-/// carve-out checkout or anywhere else there), and only when no agent file is below them.
+/// Rule identities (`rules::Rule::id`, not names) that keep their removing action under
+/// `.agent-harness/work/<session>/` (inside a carve-out checkout or anywhere else there), and only
+/// when no agent file is below them. Cargo's `target` is on it; Maven's and sbt's `target`
+/// (`maven-target`: test reports, packaged jars) is not.
 pub const WORK_DIR_ALLOWLIST: [&str; 12] = [
     "node_modules",
     ".venv",
@@ -530,8 +532,28 @@ pub const WORK_DIR_ALLOWLIST: [&str; 12] = [
     ".gradle",
     ".turbo",
     ".parcel-cache",
-    "target",
+    "cargo-target",
 ];
+
+/// The identity of the rule that matched `node`, when it can be told: the scan's `rule_id`, or
+/// for a scan written before rules had identities the one built-in rule carrying its `rule`
+/// name. `None` when no rule matched, the name is shared by several rules (`target`), or more
+/// than one rule matched the directory (`rule_also`): callers fail closed.
+pub fn rule_identity(node: &Node) -> Option<&str> {
+    if !node.rule_also.is_empty() {
+        return None;
+    }
+    match (&node.rule_id, &node.rule) {
+        (Some(id), _) => Some(id.as_str()),
+        (None, Some(name)) => crate::rules::RuleSet::builtin_shared().legacy_id(name),
+        (None, None) => None,
+    }
+}
+
+/// Is `node` a directory of an allowlisted rule (judged by the rule's identity, never its name)?
+pub fn work_dir_allowlisted(node: &Node) -> bool {
+    rule_identity(node).is_some_and(|id| WORK_DIR_ALLOWLIST.contains(&id))
+}
 
 /// Why a non-allowlisted dependency, cache or build directory under a work session is held.
 pub const BUILD_OUTPUT_DETAIL: &str = "protected: build output inside agent dir";
@@ -827,12 +849,10 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
         }
         // Inside a carve-out checkout or anywhere else under `work/<session>/`, only dependency
         // and cache directories on the allowlist keep their normal action, and only when no
-        // agent file is below them (a missing count counts as nonzero). Every other rule name
-        // (`out`, `build`, `dist`...) is held as build output.
-        let allowed = node
-            .rule
-            .as_deref()
-            .is_some_and(|r| WORK_DIR_ALLOWLIST.contains(&r));
+        // agent file is below them (a missing count counts as nonzero). Every other rule
+        // (`out`, `build`, `dist`, Maven's `target`...), and a directory whose rule cannot be
+        // told, is held as build output.
+        let allowed = work_dir_allowlisted(node);
         if !allowed {
             if let Verdict::Hold(h) = &mut verdicts[i] {
                 h.detail = Some(BUILD_OUTPUT_DETAIL.to_string());
