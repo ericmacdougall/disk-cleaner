@@ -333,6 +333,19 @@ pub fn plan_summary(p: &Plan) -> String {
     if !any_held {
         let _ = writeln!(o, "  (no protected root exists in this scan)");
     }
+    let _ = writeln!(o, "\nKept, by reason:");
+    if p.totals.keep_by_reason.is_empty() {
+        let _ = writeln!(o, "  (nothing is kept)");
+    }
+    for (code, t) in &p.totals.keep_by_reason {
+        let _ = writeln!(
+            o,
+            "  {:<18} {:>10}  {:>10}",
+            code,
+            count(t.items, "item", "items"),
+            human_bytes(t.bytes)
+        );
+    }
     let _ = writeln!(o, "\nNeeds a person (ask), by reason:");
     if p.totals.ask_by_reason.is_empty() {
         let _ = writeln!(o, "  (nothing asks)");

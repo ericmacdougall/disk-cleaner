@@ -208,6 +208,11 @@ pub struct PlanTotals {
     /// item is not counted again).
     #[serde(default)]
     pub ask_by_reason: BTreeMap<String, AskTotal>,
+    /// `keep` items by reason code (`protected`, `synced`, `package`, `unsaved-agent-dir`,
+    /// `active`, `dependents`, `other`) with their `bytes_total`; a keep nested in another keep
+    /// item is counted once.
+    #[serde(default)]
+    pub keep_by_reason: BTreeMap<String, AskTotal>,
 }
 
 /// Held items under one root.
@@ -625,7 +630,10 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         let mut hold: Option<Hold> = None;
         match &verdicts[idx] {
             Verdict::Hold(h) => {
-                reason = format!("{}: {}; on its own: {reason}", h.code.as_str(), hold_why(h));
+                reason = match &h.detail {
+                    Some(d) => format!("{d}; on its own: {reason}"),
+                    None => format!("{}: {}; on its own: {reason}", h.code.as_str(), hold_why(h)),
+                };
                 action = Action::Keep;
                 reclaim = 0;
                 hold = Some(h.clone());
@@ -634,10 +642,7 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
                 reason = format!("protected: unsaved work inside agent dir; on its own: {reason}");
                 action = Action::Keep;
                 reclaim = 0;
-                hold = Some(Hold {
-                    code: HoldCode::Protected,
-                    root: root.clone(),
-                });
+                hold = Some(Hold::new(HoldCode::Protected, root.clone()));
             }
             _ => {}
         }
@@ -877,6 +882,29 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             slot.bytes = slot.bytes.saturating_add(it.bytes_total);
         }
     }
+    // Keep items by reason code, a keep inside another keep item counted once.
+    let mut keeping = vec![false; scan.nodes.len()];
+    for it in &items {
+        if it.action == Action::Keep {
+            keeping[it.node] = true;
+        }
+    }
+    let mut nested_in_keep = vec![false; scan.nodes.len()];
+    for &i in &ctx.order {
+        nested_in_keep[i] = ctx.parent[i]
+            .map(|p| keeping[p] || nested_in_keep[p])
+            .unwrap_or(false);
+    }
+    for it in &items {
+        if it.action == Action::Keep && !nested_in_keep[it.node] {
+            let slot = totals
+                .keep_by_reason
+                .entry(keep_code(it).to_string())
+                .or_default();
+            slot.items += 1;
+            slot.bytes = slot.bytes.saturating_add(it.bytes_total);
+        }
+    }
     // Held items by code and root.
     let mut held: BTreeMap<(HoldCode, String), HeldTotal> = BTreeMap::new();
     for r in scan.protect.roots.iter().filter(|r| r.exists) {
@@ -954,6 +982,23 @@ fn hold_why(h: &Hold) -> String {
             "it is inside {}, an application or library package, which is not taken apart",
             h.root
         ),
+    }
+}
+
+/// A short code for the reason an item is kept.
+pub fn keep_code(it: &PlanItem) -> &'static str {
+    if let Some(h) = &it.hold {
+        if it.reason.contains("unsaved work inside agent dir") {
+            return "unsaved-agent-dir";
+        }
+        return h.code.as_str();
+    }
+    if it.reason.starts_with("active") {
+        "active"
+    } else if it.reason.contains("depend") {
+        "dependents"
+    } else {
+        "other"
     }
 }
 
@@ -1861,10 +1906,21 @@ mod tests {
         let s1 = home.join(".agent-harness/work/s1");
         write_file(&s1.join("transcript.jsonl"), 3_000);
         write_file(&s1.join("proj/package.json"), 2);
+        // Under a work session a node_modules is removable only when no agent file is below it:
+        // this one holds a receipt, so it is held.
         write_file(&s1.join("proj/node_modules/c.js"), 5_000);
+        write_file(&s1.join("proj/node_modules/run-receipt.json"), 100);
         // Control outside every root: removable, so the check below is not vacuous.
         write_file(&home.join("work/proj/package.json"), 2);
         write_file(&home.join("work/proj/node_modules/d.js"), 5_000);
+        // A pushed repo (facts patched below) with a tracked fixtures/x.jsonl: a valid removal,
+        // because that file is neither under a protected root nor a Claude or Codex log.
+        let repo_dir = home.join("work/repo");
+        std::fs::create_dir_all(repo_dir.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(repo_dir.join(".git/refs")).unwrap();
+        std::fs::write(repo_dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        write_file(&repo_dir.join("fixtures/x.jsonl"), 500);
+        write_file(&repo_dir.join("src/lib.rs"), 500);
 
         let mut so = crate::scan::ScanOptions::new(vec![home.clone()]);
         so.collect_facts = false;
@@ -1874,7 +1930,23 @@ mod tests {
             home_env: Some(home.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        let scan = crate::scan::scan(&so).unwrap();
+        let mut scan = crate::scan::scan(&so).unwrap();
+        // The scan ran without git facts: patch the pushed repo to look fully saved.
+        for n in scan.nodes.iter_mut() {
+            if n.path.ends_with("work/repo") {
+                let info = n.repo.as_mut().expect("repo node");
+                info.facts = all_yes_facts();
+                info.git_admin = Some(GitAdminSurvey {
+                    files: 1,
+                    bytes: 4096,
+                    ..Default::default()
+                });
+                info.object_store = Some(ObjectStoreSurvey {
+                    files: 1,
+                    bytes: 4096,
+                });
+            }
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1882,18 +1954,44 @@ mod tests {
             + 400 * 86_400;
         let p = plan(&scan, &PlanOptions::new(7, now));
 
-        // Independent of the module's root list: a plain walk for agent data files.
+        // Independent of the module's root list and of its name patterns: agent files are every
+        // file inside the hard-coded protected roots, the top-level files of work session
+        // directories, and Claude or Codex log shapes (rollout-*.jsonl, a UUID-named .jsonl)
+        // anywhere.
         let mut files = Vec::new();
         walk_files(&home, &mut files);
+        let is_uuid = |s: &str| {
+            s.len() == 36
+                && s.char_indices().all(|(i, c)| match i {
+                    8 | 13 | 18 | 23 => c == '-',
+                    _ => c.is_ascii_hexdigit(),
+                })
+        };
         let agent: Vec<&PathBuf> = files
             .iter()
             .filter(|f| {
-                let n = f.file_name().unwrap().to_string_lossy();
-                n.ends_with(".jsonl") || n.starts_with("rollout-") || n.contains("receipt")
+                let rel = f.strip_prefix(&home).unwrap();
+                let first = rel.components().next().unwrap();
+                let in_root = roots
+                    .iter()
+                    .any(|r| rel.starts_with(r) || first.as_os_str().to_string_lossy() == *r);
+                let n = f.file_name().unwrap().to_string_lossy().to_string();
+                let stem = n.strip_suffix(".jsonl");
+                let log_shape =
+                    n.starts_with("rollout-") && n.ends_with(".jsonl") || stem.is_some_and(is_uuid);
+                in_root || log_shape
             })
             .collect();
         assert!(agent.len() >= roots.len() * 4, "fixture has agent files");
         let removing: Vec<&PlanItem> = p.items.iter().filter(|i| i.action.removes()).collect();
+        assert!(
+            removing.iter().any(|i| i.path.ends_with("work/repo")),
+            "control: the pushed repo with a tracked fixtures/x.jsonl is a valid removal: {:?}",
+            p.items
+                .iter()
+                .map(|i| (&i.path, i.action, &i.reason))
+                .collect::<Vec<_>>()
+        );
         assert!(
             removing
                 .iter()

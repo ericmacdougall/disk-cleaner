@@ -847,12 +847,32 @@ or when it lies inside a directory whose name ends `.app`, `.photoslibrary`, `.f
 removing node that contains a held node becomes `ask`, naming it.
 
 Carve-outs inside a protected root: a repo or worktree that is a direct child of
-`.agent-harness/work/<session>/`, a direct child of `.agent-harness/work/<session>/<task>/` where
-`<task>` is not itself a checkout, or a direct child of `.claude/worktrees/` or `.codex/worktrees/`
-may get `backup-then-remove` (all its facts are yes); any other action that removes it becomes
-`keep` with `protected: unsaved work inside agent dir`. Regenerable and cache directories inside
-such a checkout keep their normal action. Every other node inside a protected root is held, session
-directories included.
+`.agent-harness/work/<session>/` and is not an agent-data checkout, a direct child of a task
+directory (any direct child of the session that is not itself a checkout), or a direct child of
+`.claude/worktrees/` or `.codex/worktrees/` may get `backup-then-remove` (all its facts are yes);
+any other action that removes it becomes `keep` with `protected: unsaved work inside agent dir`.
+An agent-data checkout is a checkout directly below a session that holds, at its own top level, a
+file whose name (case-insensitively) ends `.jsonl`, contains `receipt`, or has `wal` as a whole
+word or extension; the scan records every directory below a session that holds one in
+`protect.task_dirs`, and such a checkout is held and never a candidate. Every other node inside a
+protected root is held, session directories included.
+
+Under `work/<session>/` (inside a carve-out checkout or anywhere else) only dirs matched by a rule
+named `node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`,
+`.tox`, `.gradle`, `.turbo`, `.parcel-cache` or `target` keep their normal action, and only when
+the node's `agent_files` is 0 (a missing count counts as nonzero). Every other rule name there
+(`out`, `build`, `dist`, `coverage`...) is held with `protected: build output inside agent dir`.
+`agent_files` counts files below the node (outside `.git`, and for regenerable and cache dirs
+outside installed-package directories) whose names end `.jsonl`, contain `receipt`, or have `wal` as
+a whole word or extension; `.md` does not count.
+
+The home-level entries whose names start with `.claude`, `.codex`, `.kimi`, `.agent-harness` or
+`.prunedisk` (files included), and `.disk-cleaner`, are protected roots. `totals.keep_by_reason`
+groups `keep` items by reason (`protected`, `synced`, `package`, `unsaved-agent-dir`, `active`,
+`dependents`, `other`) with `items` and `bytes`. A node or root whose canonical path fails for any
+reason (permission, a symlink loop...) is held; only a lexical path that does not exist is absent.
+`scripts/check-agent-files.py` is an independent check of a plan against a home (see its header);
+`--self-test` proves it on a fixture home.
 
 ### The active window
 

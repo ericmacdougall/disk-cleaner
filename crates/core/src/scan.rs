@@ -172,6 +172,8 @@ struct DirAgg {
     small_outputs_more: u64,
     /// Name of the first direct entry that is a symlink.
     first_symlink: Option<String>,
+    /// Direct files whose names look like agent data.
+    agent_files: u64,
     /// Direct entries below a `.git` directory that are not what git writes there
     /// ([`crate::gitshape`]): their paths below the git directory (the first few) and how many.
     git_local: Vec<String>,
@@ -260,6 +262,8 @@ struct Walk {
     pruned_hit: HashSet<usize>,
     /// What the inbound-reference pass needs (see [`link_inbound`]).
     refs: Refs,
+    /// Task directories seen (see `ProtectContext::task_dirs`).
+    task_dirs: HashSet<PathBuf>,
     /// Directories whose listing failed, each once (bounded), for `coverage`.
     unreadable_dirs: HashSet<PathBuf>,
     /// Where the walk could not look (counts and examples; `complete` is set at the end).
@@ -482,6 +486,12 @@ impl Walk {
         }
         agg.bytes += alloc;
         agg.files += 1;
+        if is_file && crate::protect::is_agent_file_name(&name) {
+            agg.agent_files += 1;
+            if crate::protect::is_task_dir_path(entry.parent_path()) {
+                self.task_dirs.insert(entry.parent_path().to_path_buf());
+            }
+        }
         if is_output {
             agg.output_bytes += alloc;
         }
@@ -1004,6 +1014,7 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         canon_roots: plan_r.canon.clone(),
         pruned_hit: HashSet::new(),
         refs: Refs::default(),
+        task_dirs: HashSet::new(),
         unreadable_dirs: HashSet::new(),
         coverage: Coverage::default(),
     };
@@ -1085,8 +1096,17 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
         skipped_overflow,
         refs,
         mut coverage,
+        task_dirs,
         ..
     } = walk;
+    protect_ctx.task_dirs = {
+        let mut v: Vec<String> = task_dirs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
     issues.truncate(MAX_ISSUES);
     coverage.mount_points_skipped = totals.mount_points_skipped;
     coverage.complete = totals.unreadable == 0
@@ -1120,14 +1140,26 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
 
     // Attribute directory aggregates to their owners.
     let mut other_bytes: u64 = 0;
+    for b in builds.iter_mut() {
+        b.node.agent_files = Some(0);
+    }
     let mut files_self: Vec<u64> = vec![0; builds.len()];
-    for (dir, agg) in dirs.iter() {
+    for (di, (dir, agg)) in dirs.iter().enumerate() {
         match agg.owner {
             Some(o) => {
+                // Files inside an installed package of a regenerable or cache directory are not
+                // counted as agent data: packages ship fixtures and docs of every name.
+                let in_package = builds[o].node.class.is_artifact()
+                    && has_package_evidence(&builds[o], &dirs, di);
                 let b = &mut builds[o];
                 b.node.bytes_self += agg.bytes;
                 b.node.output_bytes += agg.output_bytes;
                 files_self[o] += agg.files;
+                if !agg.in_git && !in_package {
+                    if let Some(c) = b.node.agent_files.as_mut() {
+                        *c += agg.agent_files;
+                    }
+                }
                 if agg.in_git {
                     b.git_bytes += agg.bytes;
                     let first = agg.first_symlink.as_ref();
@@ -1167,7 +1199,11 @@ pub fn scan(opts: &ScanOptions) -> Result<ScanResult> {
                 builds[i].node.output_bytes,
             );
             let is_artifact = builds[i].node.class.is_artifact();
+            let af = builds[i].node.agent_files.unwrap_or(0);
             let parent = &mut builds[p];
+            if let Some(c) = parent.node.agent_files.as_mut() {
+                *c += af;
+            }
             parent.node.bytes_total += bt;
             parent.node.files_total += ft;
             parent.node.output_bytes += ob;

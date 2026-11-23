@@ -359,6 +359,10 @@ pub struct Node {
     /// the node (`protected: unreadable`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub real_unreadable: bool,
+    /// Files below this node (outside `.git`, nested nodes included) whose names look like agent
+    /// data (see `protect::is_agent_file_name`). A missing count is treated as nonzero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_files: Option<u64>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -386,6 +390,7 @@ impl Node {
             repo: None,
             real_path: None,
             real_unreadable: false,
+            agent_files: None,
         }
     }
 }
@@ -578,6 +583,11 @@ pub struct ProtectContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xdg_config_home: Option<String>,
     pub roots: Vec<ProtectedRoot>,
+    /// Directories directly below `.agent-harness/work/<session>/` that hold agent files at their
+    /// own top level (as spelled by the walk). One of them that is a checkout is an agent-data
+    /// checkout: held, never a candidate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_dirs: Vec<String>,
 }
 
 pub fn default_scope() -> String {

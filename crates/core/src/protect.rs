@@ -18,11 +18,12 @@ use std::path::{Component, Path, PathBuf};
 
 /// Built-in protected roots, relative to the home, and where a clean checkout inside may be
 /// removed after a backup.
-pub const BUILTIN_PROTECTED: [(&str, CarveLayout); 11] = [
+pub const BUILTIN_PROTECTED: [(&str, CarveLayout); 12] = [
     (".claude", CarveLayout::Worktrees),
     (".codex", CarveLayout::Worktrees),
     (".agent-harness", CarveLayout::AgentHarness),
     (".prunedisk", CarveLayout::None),
+    (".disk-cleaner", CarveLayout::None),
     (".kimi", CarveLayout::None),
     (".kimi-code", CarveLayout::None),
     (".gemini", CarveLayout::None),
@@ -31,6 +32,11 @@ pub const BUILTIN_PROTECTED: [(&str, CarveLayout); 11] = [
     (".local/share/claude", CarveLayout::None),
     ("Library/Application Support/Claude", CarveLayout::None),
 ];
+
+/// Every home-level entry (directory or file) whose name starts with one of these is protected:
+/// `.claude.json` and its backups, `.kimi-work`, and the like.
+pub const PROTECTED_PREFIXES: [&str; 5] =
+    [".claude", ".codex", ".kimi", ".agent-harness", ".prunedisk"];
 
 /// Cloud-sync folders at fixed places below the home.
 pub const SYNCED_FIXED: [&str; 2] = ["Library/Mobile Documents", "Library/CloudStorage"];
@@ -55,6 +61,35 @@ pub const PACKAGE_SUFFIXES: [&str; 13] = [
     ".pvm",
     ".utm",
 ];
+
+/// Is `wal` present in the lower-case `n` as a whole word or extension, that is
+/// `(^|[._-])wal([._-]|$)`?
+fn has_wal_word(n: &str) -> bool {
+    let b = n.as_bytes();
+    let sep = |c: u8| matches!(c, b'.' | b'_' | b'-');
+    (0..b.len().saturating_sub(2)).any(|i| {
+        &b[i..i + 3] == b"wal" && (i == 0 || sep(b[i - 1])) && (i + 3 == b.len() || sep(b[i + 3]))
+    })
+}
+
+/// Does a file name look like agent data? Compared case-insensitively: it ends `.jsonl`, contains
+/// `receipt`, or has `wal` as a whole word or extension. (`.md` does not count here: READMEs are
+/// in every installed package.)
+pub fn is_agent_file_name(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.ends_with(".jsonl") || n.contains("receipt") || has_wal_word(&n)
+}
+
+/// Is `p` a direct child of `.agent-harness/work/<session>/` (by spelling)? The scan calls it for
+/// a directory that holds an agent file at its top level, which makes it a task directory.
+pub fn is_task_dir_path(p: &Path) -> bool {
+    let comps: Vec<String> = normalize(p)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    let n = comps.len();
+    n >= 5 && comps[n - 3] == "work" && comps[n - 4] == ".agent-harness"
+}
 
 /// The process context a scan resolves its protected roots from. Everything is an input; the CLI
 /// fills it from the real process, tests pass values explicitly.
@@ -240,7 +275,15 @@ fn lossy(p: &Path) -> String {
 fn make_root(spelled: PathBuf, code: HoldCode, carve: CarveLayout, source: &str) -> ProtectedRoot {
     let (canonical, exists, unreadable) = match std::fs::canonicalize(&spelled) {
         Ok(c) => (Some(lossy(&normalize(&c))), true, false),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, false, false),
+        // Absent only when the lexical path itself does not exist (lstat ENOENT): a dangling
+        // symlink, a loop or a permission error leaves it present and unresolved.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && matches!(std::fs::symlink_metadata(&spelled),
+                    Err(l) if l.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            (None, false, false)
+        }
         // Permission denied or anything else: it exists as far as we can tell, and its real path
         // is unknown, so it is compared by its spelled path and nodes that cannot be resolved are
         // held.
@@ -342,6 +385,17 @@ pub fn resolve(ctx: &ScanContext) -> Result<ProtectContext> {
             names.sort();
             for name in names {
                 let lower = name.to_string_lossy().to_lowercase();
+                if PROTECTED_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+                    push(
+                        make_root(
+                            home.join(&name),
+                            HoldCode::Protected,
+                            CarveLayout::None,
+                            source,
+                        ),
+                        &mut roots,
+                    );
+                }
                 if SYNCED_PREFIXES
                     .iter()
                     .any(|p| lower.starts_with(&p.to_lowercase()))
@@ -398,6 +452,7 @@ pub fn resolve(ctx: &ScanContext) -> Result<ProtectContext> {
         codex_home: ctx.codex_home.clone(),
         xdg_config_home: ctx.xdg_config_home.clone(),
         roots,
+        task_dirs: Vec::new(),
     })
 }
 
@@ -407,6 +462,14 @@ pub fn node_real_path(path: &Path) -> (Option<String>, bool) {
         Ok(c) => (Some(lossy(&normalize(&c))), false),
         // Any failure, not only a permission error, means the node cannot be shown to be
         // outside protected data: it is held.
+        // The one exception: the lexical path itself vanished (ENOENT) between the walk and now.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && matches!(std::fs::symlink_metadata(path),
+                    Err(l) if l.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            (None, false)
+        }
         Err(_) => (None, true),
     }
 }
@@ -444,7 +507,40 @@ pub struct Hold {
     pub code: HoldCode,
     /// The root (or package directory) responsible; `(unreadable)` for an unresolvable node.
     pub root: String,
+    /// A more specific reason than the code gives, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
+
+impl Hold {
+    pub fn new(code: HoldCode, root: String) -> Hold {
+        Hold {
+            code,
+            root,
+            detail: None,
+        }
+    }
+}
+
+/// Rule names that keep their removing action under `.agent-harness/work/<session>/` (inside a
+/// carve-out checkout or anywhere else there), and only when no agent file is below them.
+pub const WORK_DIR_ALLOWLIST: [&str; 12] = [
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".gradle",
+    ".turbo",
+    ".parcel-cache",
+    "target",
+];
+
+/// Why a non-allowlisted dependency, cache or build directory under a work session is held.
+pub const BUILD_OUTPUT_DETAIL: &str = "protected: build output inside agent dir";
 
 /// The protection verdict for one node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,13 +607,20 @@ fn carve_position(
     rel: &[OsString],
     root: &Path,
     git_paths: &dyn Fn(&Path) -> bool,
+    task_paths: &dyn Fn(&Path) -> bool,
 ) -> bool {
     let first = |name: &str| rel.first().is_some_and(|c| comp_eq(c, OsStr::new(name)));
     match layout {
         CarveLayout::None => false,
         CarveLayout::Worktrees => rel.len() == 2 && first("worktrees"),
         CarveLayout::AgentHarness => {
-            (rel.len() == 3 && first("work"))
+            // A checkout that is a direct child of a session directory and not an agent-data
+            // checkout (one with agent files at its top level, recorded by the scan), or a
+            // direct child of a task directory (any child of the session that is not itself a
+            // checkout).
+            (rel.len() == 3
+                && first("work")
+                && !task_paths(&root.join(&rel[0]).join(&rel[1]).join(&rel[2])))
                 || (rel.len() == 4
                     && first("work")
                     && !git_paths(&root.join(&rel[0]).join(&rel[1]).join(&rel[2])))
@@ -544,14 +647,31 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
         .flat_map(|(_, v)| v.iter())
         .collect();
     let is_git_path = |p: &Path| git_ids.iter().any(|g| same_path(g, p));
+    let task_ids: Vec<PathBuf> = scan
+        .protect
+        .task_dirs
+        .iter()
+        .map(|t| normalize(Path::new(t)))
+        .collect();
+    let is_task_path = |p: &Path| task_ids.iter().any(|t| same_path(t, p));
+    // Is the node below `work/<session>/` of an agent-harness root (by any identity)?
+    let under_work_session = |my: &[PathBuf]| {
+        roots.iter().any(|(r, rids)| {
+            r.carve == CarveLayout::AgentHarness
+                && my.iter().any(|np| {
+                    rids.iter().any(|rp| {
+                        rel_below(np, rp).is_some_and(|rel| {
+                            rel.len() >= 3 && comp_eq(&rel[0], OsStr::new("work"))
+                        })
+                    })
+                })
+        })
+    };
 
     let raw = |i: usize, exempt_protected_inside: bool| -> Verdict {
         let node = &scan.nodes[i];
         if node.real_unreadable {
-            return Verdict::Hold(Hold {
-                code: HoldCode::Protected,
-                root: "(unreadable)".into(),
-            });
+            return Verdict::Hold(Hold::new(HoldCode::Protected, "(unreadable)".into()));
         }
         let my = &ids[i];
         let mut inside_protected: Vec<&ProtectedRoot> = Vec::new();
@@ -570,7 +690,7 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
                         inside_pairs += 1;
                         if r.code == HoldCode::Protected
                             && !rel.is_empty()
-                            && carve_position(r.carve, &rel, rp, &is_git_path)
+                            && carve_position(r.carve, &rel, rp, &is_git_path, &is_task_path)
                         {
                             carve_pairs += 1;
                         }
@@ -603,33 +723,31 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
         }
         let mut carve_root: Option<String> = None;
         if !inside_protected.is_empty() && !exempt_protected_inside {
+            // A task directory is never a candidate, even when it is a checkout.
+            if my.iter().any(|p| is_task_path(p)) {
+                return Verdict::Hold(Hold::new(
+                    HoldCode::Protected,
+                    inside_protected[0].spelled.clone(),
+                ));
+            }
             if all_carve && is_git_checkout(node.class) {
                 carve_root = Some(inside_protected[0].spelled.clone());
             } else {
-                return Verdict::Hold(Hold {
-                    code: HoldCode::Protected,
-                    root: inside_protected[0].spelled.clone(),
-                });
+                return Verdict::Hold(Hold::new(
+                    HoldCode::Protected,
+                    inside_protected[0].spelled.clone(),
+                ));
             }
         }
         if let Some(r) = contained_protected {
-            return Verdict::Hold(Hold {
-                code: HoldCode::Protected,
-                root: r.spelled.clone(),
-            });
+            return Verdict::Hold(Hold::new(HoldCode::Protected, r.spelled.clone()));
         }
         if let Some(r) = synced {
-            return Verdict::Hold(Hold {
-                code: HoldCode::Synced,
-                root: r.spelled.clone(),
-            });
+            return Verdict::Hold(Hold::new(HoldCode::Synced, r.spelled.clone()));
         }
         for p in my {
             if let Some(pkg) = package_above(p) {
-                return Verdict::Hold(Hold {
-                    code: HoldCode::Package,
-                    root: lossy(&pkg),
-                });
+                return Verdict::Hold(Hold::new(HoldCode::Package, lossy(&pkg)));
             }
         }
         match carve_root {
@@ -665,10 +783,24 @@ pub fn judge(scan: &ScanResult) -> Vec<Verdict> {
             cur = scan.nodes[c].parent;
             steps += 1;
         }
-        if let Some(a) = anc {
-            if matches!(verdicts[a], Verdict::CarveOut(_)) {
-                verdicts[i] = raw(i, true);
+        let in_carve = anc.is_some_and(|a| matches!(verdicts[a], Verdict::CarveOut(_)));
+        if !in_carve && !under_work_session(&ids[i]) {
+            continue;
+        }
+        // Inside a carve-out checkout or anywhere else under `work/<session>/`, only dependency
+        // and cache directories on the allowlist keep their normal action, and only when no
+        // agent file is below them (a missing count counts as nonzero). Every other rule name
+        // (`out`, `build`, `dist`...) is held as build output.
+        let allowed = node
+            .rule
+            .as_deref()
+            .is_some_and(|r| WORK_DIR_ALLOWLIST.contains(&r));
+        if !allowed {
+            if let Verdict::Hold(h) = &mut verdicts[i] {
+                h.detail = Some(BUILD_OUTPUT_DETAIL.to_string());
             }
+        } else if node.agent_files == Some(0) {
+            verdicts[i] = raw(i, true);
         }
     }
     verdicts

@@ -199,6 +199,19 @@ fn plan_summary_classes() {
         }
     }
     // Ask items grouped by reason code with bytes (the repo's facts are unknown under --no-git).
+    let keeps = totals["keep_by_reason"].as_object().unwrap();
+    assert_eq!(
+        keeps["protected"]["items"], 1,
+        "nested items are counted once: {keeps:?}"
+    );
+    assert_eq!(
+        keeps["synced"]["items"], 1,
+        "nested items are counted once: {keeps:?}"
+    );
+    assert_eq!(
+        keeps["package"]["items"], 1,
+        "nested items are counted once: {keeps:?}"
+    );
     let asks = totals["ask_by_reason"].as_object().unwrap();
     assert!(!asks.is_empty(), "{totals}");
     assert!(asks.values().all(|a| a["items"].as_u64().unwrap() >= 1));
@@ -211,6 +224,7 @@ fn plan_summary_classes() {
         "By action:",
         "Reclaimable by class",
         "Protected and held back",
+        "Kept, by reason:",
         "Needs a person (ask), by reason:",
         "Biggest items (top 20):",
     ] {

@@ -113,6 +113,7 @@ fn every_class_in_every_root() {
         ".codex",
         ".agent-harness",
         ".prunedisk",
+        ".disk-cleaner",
         ".kimi",
         ".kimi-code",
         ".gemini",
@@ -173,7 +174,16 @@ fn dirty(mutate: fn(&mut Facts)) -> Facts {
 #[test]
 fn carve_outs() {
     let (_t, home) = fixture_home();
-    let pc = resolve(&ctx_for(&home)).unwrap();
+    let mut pc = resolve(&ctx_for(&home)).unwrap();
+    // The scan records the task directories: ones holding agent files at their top level.
+    pc.task_dirs = vec![
+        home.join(".agent-harness/work/s1/task")
+            .to_string_lossy()
+            .into_owned(),
+        home.join(".agent-harness/work/s2/task")
+            .to_string_lossy()
+            .into_owned(),
+    ];
     let positions = [
         ".agent-harness/work/s1/clone",
         ".agent-harness/work/s1/task/clone",
@@ -185,7 +195,8 @@ fn carve_outs() {
         let x = node(home.join(pos), Class::Repo, all_yes());
         let mut target = node(home.join(pos).join("target"), Class::Regenerable, all_yes());
         target.parent = Some(0);
-        target.rule = Some("cargo-target".into());
+        target.rule = Some("target".into());
+        target.agent_files = Some(0);
         let p = plan(&scan_of(pc.clone(), vec![x, target]), &opts(300 * DAY));
         let xi = &p.items[0];
         assert_eq!(xi.action, Action::BackupThenRemove, "{pos}: {}", xi.reason);
@@ -279,6 +290,47 @@ fn carve_outs() {
         &opts(300 * DAY),
     );
     assert_eq!(p.items[0].action, Action::BackupThenRemove);
+
+    // A checkout directly below a session with no agent files at its top level (the scan records
+    // none) is a carve-out; with agent files at its top level (recorded) it is an agent-data
+    // checkout: held, never a candidate.
+    let mut recorded = resolve(&ctx_for(&home)).unwrap();
+    recorded.task_dirs = vec![home
+        .join(".agent-harness/work/s2/task")
+        .to_string_lossy()
+        .into_owned()];
+    let agent_data = node(
+        home.join(".agent-harness/work/s2/task"),
+        Class::Repo,
+        all_yes(),
+    );
+    let p = plan(&scan_of(recorded, vec![agent_data]), &opts(300 * DAY));
+    assert!(held_protected(&p, 0), "{:?}", p.items[0]);
+
+    // A task dir holding only notes.md and results.tsv (so not a checkout, and no node of its
+    // own) with a clean, pushed `wt/`: `wt/` is removable after a backup, nothing else is.
+    let pc = resolve(&ctx_for(&home)).unwrap();
+    let wt = node(
+        home.join(".agent-harness/work/s6/notes-task/wt"),
+        Class::Repo,
+        all_yes(),
+    );
+    let mut target = node(
+        home.join(".agent-harness/work/s6/notes-task/wt/target"),
+        Class::Regenerable,
+        all_yes(),
+    );
+    target.parent = Some(0);
+    target.rule = Some("target".into());
+    target.agent_files = Some(0);
+    let p = plan(&scan_of(pc, vec![wt, target]), &opts(300 * DAY));
+    assert_eq!(
+        p.items[0].action,
+        Action::BackupThenRemove,
+        "{}",
+        p.items[0].reason
+    );
+    assert_eq!(p.items[1].action, Action::RemoveRegenerable);
 }
 
 // ---------------------------------------------------------------- AC-4, NEG-4
@@ -366,6 +418,37 @@ fn spellings() {
     // A root whose canonical path fails with a permission error.
     #[cfg(unix)]
     permission_denied_root_case();
+
+    // A symlink loop (ELOOP): a root behind it is present and unresolved, so it is compared by
+    // its spelled path, and a node behind it cannot be shown to be outside protected data.
+    #[cfg(unix)]
+    {
+        let (_t3, home3) = fixture_home();
+        std::os::unix::fs::symlink(home3.join("loop-b"), home3.join("loop-a")).unwrap();
+        std::os::unix::fs::symlink(home3.join("loop-a"), home3.join("loop-b")).unwrap();
+        let mut ctx = ctx_for(&home3);
+        ctx.extra_paths = vec!["~/loop-a/inner".into()];
+        let pc3 = resolve(&ctx).unwrap();
+        let r = pc3
+            .roots
+            .iter()
+            .find(|r| r.spelled.ends_with("/loop-a/inner"))
+            .unwrap();
+        assert!(r.exists && r.unreadable && r.canonical.is_none(), "{r:?}");
+        let n = node(
+            home3.join("loop-a/inner/x/node_modules"),
+            Class::Regenerable,
+            all_yes(),
+        );
+        let p = plan(&scan_of(pc3, vec![n]), &opts(300 * DAY));
+        assert!(held_protected(&p, 0));
+        // A node path that loops resolves to nothing: held as unreadable by the scan.
+        let (real, unreadable) = node_real_path(&home3.join("loop-a/x"));
+        assert!(real.is_none() && unreadable);
+        // A path that simply does not exist is not a failure.
+        let (real, unreadable) = node_real_path(&home3.join("missing"));
+        assert!(real.is_none() && !unreadable);
+    }
 
     // A real scan whose root is a symlink to `.codex`: every node is held through its canonical
     // path alone (the spelled path never mentions `.codex`).
@@ -691,6 +774,228 @@ fn normalize_resolves_dots_without_leaving_the_root() {
         PathBuf::from("/a/c/d")
     );
     assert_eq!(normalize(Path::new("/../..")), PathBuf::from("/"));
+}
+
+fn put(path: &Path, bytes: usize) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, vec![b'q'; bytes]).unwrap();
+}
+
+fn scan_home(home: &Path) -> ScanResult {
+    let mut o = crate::scan::ScanOptions::new(vec![home.to_path_buf()]);
+    o.collect_facts = false;
+    o.context = ctx_for(home);
+    crate::scan::scan(&o).unwrap()
+}
+
+fn action_at(p: &Plan, suffix: &str) -> Action {
+    p.items
+        .iter()
+        .find(|i| i.path.ends_with(suffix))
+        .unwrap_or_else(|| {
+            panic!(
+                "no item ending {suffix}: {:?}",
+                p.items.iter().map(|i| &i.path).collect::<Vec<_>>()
+            )
+        })
+        .action
+}
+
+#[test]
+fn task_dirs_and_prefixes() {
+    let (_t, home) = fixture_home();
+    let work = home.join(".agent-harness/work/s");
+    // A git-initialised task dir holding a log and receipts.
+    let tg = work.join("tg");
+    fs::create_dir_all(tg.join(".git/objects")).unwrap();
+    fs::create_dir_all(tg.join(".git/refs")).unwrap();
+    fs::write(tg.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    put(&tg.join("session.jsonl"), 500);
+    put(&tg.join("run-receipt.json"), 500);
+    put(&tg.join("src/main.rs"), 500);
+    // A task dir (it has a log at its top level) with a realistic installed tree: READMEs in
+    // packages, an estree-walker package, walk.js and a fixture log inside a package.
+    let u = work.join("u");
+    put(&u.join("session.jsonl"), 500);
+    put(&u.join("package.json"), 2);
+    put(&u.join("node_modules/estree-walker/package.json"), 2);
+    put(&u.join("node_modules/estree-walker/README.md"), 500);
+    put(&u.join("node_modules/estree-walker/src/walk.js"), 500);
+    put(
+        &u.join("node_modules/estree-walker/test/fixtures/a.jsonl"),
+        500,
+    );
+    put(&u.join("node_modules/left-pad/package.json"), 2);
+    put(&u.join("node_modules/left-pad/README.md"), 500);
+    // Agent files outside package dirs hold the directory: x.JSONL, run-receipt.json, db.wal.
+    for (dir, file) in [("v", "x.JSONL"), ("w", "run-receipt.json"), ("y", "db.wal")] {
+        let d = work.join(dir);
+        put(&d.join("session.jsonl"), 500);
+        put(&d.join("package.json"), 2);
+        put(&d.join("node_modules").join(file), 500);
+    }
+    // Prefix roots: a file and directories whose names start like an agent home.
+    put(&home.join(".claude.json"), 800);
+    put(&home.join(".kimi-work/proj/package.json"), 2);
+    put(&home.join(".kimi-work/proj/node_modules/a.js"), 800);
+    put(&home.join(".disk-cleaner/manifests/m1.json"), 800);
+
+    let s = scan_home(&home);
+    for want in [".claude.json", ".kimi-work", ".disk-cleaner"] {
+        let r = s
+            .protect
+            .roots
+            .iter()
+            .find(|r| r.spelled.ends_with(&format!("/{want}")))
+            .unwrap_or_else(|| panic!("{want} is not a protected root"));
+        assert!(r.exists && r.code == HoldCode::Protected, "{r:?}");
+    }
+    for t in ["tg", "u", "v", "w", "y"] {
+        assert!(
+            s.protect
+                .task_dirs
+                .iter()
+                .any(|d| d.ends_with(&format!("/s/{t}"))),
+            "{t} is not recorded as a task dir: {:?}",
+            s.protect.task_dirs
+        );
+    }
+    let nm = |d: &str| {
+        s.nodes
+            .iter()
+            .find(|n| n.path.ends_with(&format!("/s/{d}/node_modules")))
+            .unwrap()
+    };
+    // Counts: packages are not looked into; files straight in node_modules are counted.
+    assert_eq!(nm("u").agent_files, Some(0));
+    for d in ["v", "w", "y"] {
+        assert_eq!(nm(d).agent_files, Some(1), "{d}");
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 400 * DAY;
+    let p = plan(&s, &opts(now));
+    // The git-initialised task dir and its contents are never removing.
+    for it in &p.items {
+        if it.path.contains("/s/tg") {
+            assert!(!it.action.removes(), "{}: {:?}", it.path, it.action);
+        }
+    }
+    assert!(p.items.iter().any(|i| i.path.ends_with("/s/tg")));
+    // The realistic installed tree is not held and gets its normal regenerable action.
+    let u_nm = p
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("/s/u/node_modules"))
+        .unwrap();
+    assert_eq!(u_nm.action, Action::RemoveRegenerable, "{}", u_nm.reason);
+    assert!(u_nm.hold.is_none());
+    // With an agent file outside package dirs it is held.
+    for d in ["v", "w", "y"] {
+        let it = p
+            .items
+            .iter()
+            .find(|i| i.path.ends_with(&format!("/s/{d}/node_modules")))
+            .unwrap();
+        assert_eq!(it.action, Action::Keep, "{d}: {}", it.reason);
+        assert_eq!(it.hold.as_ref().unwrap().code, HoldCode::Protected);
+    }
+    // Inside a prefix root.
+    assert_eq!(action_at(&p, "/.kimi-work/proj/node_modules"), Action::Keep);
+}
+
+#[test]
+fn work_dir_allowlist() {
+    // Real scan: a task dir `clicktest` with package.json and out/results.tsv; node_modules
+    // beside them is removable, out/ is held as build output.
+    let (_t, home) = fixture_home();
+    let ct = home.join(".agent-harness/work/s/clicktest");
+    put(&ct.join("package.json"), 2);
+    put(&ct.join("session.jsonl"), 100);
+    put(&ct.join("out/results.tsv"), 500);
+    put(&ct.join("node_modules/a.js"), 500);
+    let s = scan_home(&home);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 400 * DAY;
+    let p = plan(&s, &opts(now));
+    assert_eq!(
+        action_at(&p, "/clicktest/node_modules"),
+        Action::RemoveRegenerable
+    );
+    let out = p
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("/clicktest/out"))
+        .unwrap();
+    assert_eq!(out.action, Action::Keep, "{}", out.reason);
+    assert!(
+        out.reason
+            .contains("protected: build output inside agent dir"),
+        "{}",
+        out.reason
+    );
+    assert!(!action_at(&p, "/clicktest").removes());
+
+    // Synthetic: inside a carve-out checkout, out/ and dist/ are held and node_modules is not.
+    let pc = resolve(&ctx_for(&home)).unwrap();
+    let base = home.join(".agent-harness/work/s9/clone");
+    let x = node(&base, Class::Repo, all_yes());
+    let mut kids = Vec::new();
+    for (name, rule) in [
+        ("out", "out"),
+        ("dist", "dist"),
+        ("node_modules", "node_modules"),
+        ("target", "target"),
+        ("coverage", "coverage"),
+        ("htmlcov", "htmlcov"),
+    ] {
+        let mut k = node(base.join(name), Class::Regenerable, all_yes());
+        k.parent = Some(0);
+        k.rule = Some(rule.into());
+        k.agent_files = Some(0);
+        kids.push(k);
+    }
+    // One allowlisted dir with an agent file below it stays held; one with no count is held.
+    let mut with_file = node(base.join(".venv"), Class::Regenerable, all_yes());
+    with_file.parent = Some(0);
+    with_file.rule = Some(".venv".into());
+    with_file.agent_files = Some(2);
+    let mut no_count = node(base.join("venv"), Class::Regenerable, all_yes());
+    no_count.parent = Some(0);
+    no_count.rule = Some("venv".into());
+    let mut nodes = vec![x];
+    nodes.extend(kids);
+    nodes.push(with_file);
+    nodes.push(no_count);
+    let p = plan(&scan_of(pc, nodes), &opts(300 * DAY));
+    for (name, removes) in [
+        ("out", false),
+        ("dist", false),
+        ("node_modules", true),
+        ("target", true),
+        ("coverage", false),
+        ("htmlcov", false),
+        (".venv", false),
+        ("venv", false),
+    ] {
+        let it = p
+            .items
+            .iter()
+            .find(|i| i.path.ends_with(&format!("/clone/{name}")))
+            .unwrap();
+        assert_eq!(it.action.removes(), removes, "{name}: {}", it.reason);
+    }
+    let out = p
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("/clone/out"))
+        .unwrap();
+    assert!(out.reason.contains("build output inside agent dir"));
 }
 
 #[test]
