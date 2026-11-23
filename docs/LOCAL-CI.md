@@ -18,7 +18,8 @@ That runs, in order:
 2. `cargo clippy --workspace --all-targets --locked -- -D warnings`
 3. `cargo test --workspace --locked --no-fail-fast`
 4. `cargo deny check licenses` (the former `licenses` job; needs `cargo install --locked cargo-deny`. The script fails if cargo-deny is missing, unless `LOCAL_CI_ALLOW_NO_DENY=1` is set, which skips it with a loud warning.)
-5. `python3 -m unittest discover -s site/tests -v`
+5. `python3 scripts/check-agent-files.py --self-test` and `python3 scripts/check-live-sessions.py --self-test` (the independent oracles)
+6. `python3 -m unittest discover -s site/tests -v`
 
 ## Not covered (dropped from the old workflows)
 

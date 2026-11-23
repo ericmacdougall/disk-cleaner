@@ -114,17 +114,42 @@ makes redundant and keeps them for now.
 
 "Active" is a user decision informed by evidence, never a hard-coded age. Evidence gathered: newest
 modification time of non-regenerable files, last commit time, running processes whose working
-directory is inside the tree, and agent sessions that reference it.
+directory, open files or command line name the tree, container binds, and agent sessions that
+reference it.
 
-The **active window** is a setting (`active_window_days`, default 7). A project is active when a
-process is running inside it, or when its non-regenerable files were modified or its last commit
-falls within the window. Files under `.git` do not count, and a regenerable directory such as
-`node_modules` takes its project's activity, so a write only inside it does not make the project
-active. The setting lives in
-the config file, is editable in the app's settings and can be overridden per run on the CLI
-(`--active-window-days`). The tool proposes the resulting active set; the user can pin a project as
-always active or mark one inactive. Active projects and everything under them are left untouched,
-including their regenerable directories.
+The **active window** is a setting (`active_window_days`, default 7). An item's activity is its own:
+a repository's or worktree's own non-regenerable files and last commit, and for a regenerable
+directory such as `node_modules` its owning project's files (so a write only inside it does not make
+the project active). Files under `.git` do not count, and a top-level folder's activity never
+reaches the items below it. The setting lives in the config file, is editable in the app's settings
+and can be overridden per run on the CLI (`--active-window-days`). The tool proposes the resulting
+active set; the user can pin a project as always active (`--active`, which covers everything below
+it) or mark one inactive.
+
+Evidence is judged per item by one module (`evidence`, see docs/SCAN-FORMAT.md "Per-item
+evidence"); nothing is inherited from a parent node except through the owning project or the owning
+harness session. An item is in use when a readable process works in it or holds a file open in it,
+when any process's command line names a path in it, when a running container binds it, or when its
+harness session is live. A process working in an ancestor (a shell at the home) or in a sibling
+holds nothing. A live session is recognised from several independent sources (the Claude Code
+registry, agent processes, process working directories, recent transcripts, recent files and
+same-named entries), and an agent process that maps to no place makes removals under the harness
+work directories ask rather than guess. Transcripts are read for their recorded working directory
+only, from a bounded head of the file.
+
+Disclosed limits of the process evidence:
+
+- Processes that rewrite their argv (postgres, sshd, nginx workers) name nothing on their command
+  line; when their working directory is unreadable too (another user's), they are judged by the
+  other rules only, so a database whose data directory sits in an offered checkout is not seen
+  through its command line. One whose working directory and command line are both unreadable makes
+  every removal ask.
+- A live agent working only by absolute paths, whose working directory is an ancestor (the home),
+  caught between tool calls with no child process and no open transcript, looks idle; its session
+  is then judged by the other sources, including recent transcripts and files.
+- Unreadable folders outside an item do not block it: dependents there (alternates clones) were not
+  looked for, and docs/SCAN-FORMAT.md "Repairing a dependent found later" says how such a dependent
+  is repaired from the remote or the verified bundle.
 
 ### 3.1 Protection
 

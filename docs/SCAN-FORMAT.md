@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **16** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **17** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -46,6 +46,12 @@ in a dependency directory such as `.venv` unflagged, so it is refused. Version 1
 of any size anywhere inside an artifact unless it sits in an installed package's directory (see
 "Outputs"), with the node field `outputs_unlisted`; a version 14 scan could leave a small nested
 output (a `.venv/data/model.pt`) unlisted and its directory offered for removal, so it is refused.
+Version 16 added protected roots (`protect`) and per-node real paths. Version 17 records every
+coverage gap one by one (`coverage.gaps`, `coverage.gaps_overflowed`), each artifact's owning
+project (`nodes[].project`, `nodes[].project_newest_mtime`) and the harness work sessions
+(`work_sessions`), and the plan judges in-use, live sessions, activity and coverage per item (see
+"Per-item evidence"); a version 16 scan has no gap record, so a plan from it would have to fall
+back to every repository asking, and it is refused.
 All sizes are bytes. All times are unix seconds (UTC).
 Paths are strings; a path that is not valid UTF-8 is converted lossily, so it will not round-trip.
 Such a node therefore gets an `ask_reason` and is never offered for removal (see "File names git
@@ -60,7 +66,7 @@ you name.
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | integer, currently 16 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification, 13 `checked` and the files git never reads, 14 no object verification and outputs in every artifact, 15 small outputs anywhere in an artifact outside installed packages, 16 protected roots and per-node real paths; an older scan lacks the checks that fill them, so it is refused) |
+| `schema_version` | integer, currently 16 (3 added `enclosing_repos`, 4 the `plain_layout` fact, `layout_issue` and `scope`, 5 the inbound-reference checks, 6 `coverage` and `precious_objects`, 7 `hidden_index_entries` and `links_into_git_dir`, 8 byte-exact file names from git, 9 pseudorefs and the top-level layout rule, 10 the git directory's own files, 11 the `git_admin` survey behind the preserve obligation, 12 the object-store class and its verification, 13 `checked` and the files git never reads, 14 no object verification and outputs in every artifact, 15 small outputs anywhere in an artifact outside installed packages, 16 protected roots and per-node real paths, 17 the per-gap coverage record, owning projects and work sessions; an older scan lacks the checks that fill them, so it is refused) |
 | `tool_version` | version of the tool that wrote the file |
 | `generated_at` | when the scan finished |
 | `roots` | absolute scan roots that were walked, as spelled (a kept inner root under the spelling of the root that encloses it); overlapping roots are normalised first (see "Overlapping scan roots") |
@@ -72,7 +78,8 @@ you name.
 | `issues` | up to 1000 unreadable entries: `path`, `message`; `totals.unreadable` has the full count |
 | `warnings` | notes about limits that applied to this run |
 | `scope` | `volume` when every scan root is a mount point (its device differs from its parent's) or a file system root, otherwise `subtree`. A subtree scan cannot see clones that live elsewhere, so `no_dependents` means "no dependents were found within the scanned roots"; the plan header repeats the scope and, for `subtree`, every `backup-then-remove` reason says other clones outside the scanned folders were not checked (disclosure only: the apply phase re-verifies, and the plan is not downgraded to `ask` on scope alone) |
-| `coverage` | where the walk could not look, so links, clones and alternates files there were not seen: `complete` (no entry was unreadable and no mount point was skipped), `unreadable_dirs` (directories whose contents could not be listed, each counted once) with up to 20 `unreadable_dir_examples`, `other_unreadable_entries` (entries whose metadata could not be read, and walk errors), and `mount_points_skipped` with up to 20 `mount_point_examples`. See "Incomplete coverage" below |
+| `coverage` | where the walk could not look, so links, clones and alternates files there were not seen: `complete` (no entry was unreadable and no mount point was skipped), `unreadable_dirs` (directories whose contents could not be listed, each counted once) with up to 20 `unreadable_dir_examples`, `other_unreadable_entries` (entries whose metadata could not be read, and walk errors), and `mount_points_skipped` with up to 20 `mount_point_examples`; `gaps` lists every unreadable directory, unreadable entry and skipped mount point one by one (`path`, `class`: `privacy` for EPERM, `permission` for EACCES, `mount`, `other`; `owner_uid` from `lstat` when it could be read), up to 100000, and `gaps_overflowed` is `true` when more were found than recorded. See "Incomplete coverage" below |
+| `work_sessions` | the session directories `<harness root>/work/<s>/` the scan covered: `root`, `name` and `newest_mtime` (the newest modification time of any file below it). Used for the live-session rule |
 | `protect` | what protection was resolved from and the roots (see "Protected roots" below); required: `plan` refuses a scan without it |
 | `enclosing_repos` | scan roots that lie inside a git repository the scan did not cover: `root`, `repo`, `note`. Before the walk each root is looked at upward for a `.git` directory or file in any ancestor (the real path first, then the spelled one; symlinks are not followed). That repository is not a node and never gets a plan item, but the regenerable and cache directories below the root that no scanned repo encloses are decided by its git exactly as in a full scan: the config allowlist and work-tree checks run on it, and a directory is removable only if git lists it as wholly ignored and untracked. A refused config, a git failure or timeout, `--no-git`, or an ancestor `.git` that is not a plain directory or file makes them ask. The plan header and the human outputs say the repository was not assessed |
 
@@ -207,6 +214,8 @@ One entry per classified directory. A directory belongs to its innermost classif
 | `contains_outputs` | regenerable or cache directory that holds a listed output file (see "Outputs"); never offered for removal |
 | `outputs_unlisted` | output files that make this directory ask but are not in `outputs` one by one: small ones the scan did not list after the first 16 of one directory (see "Outputs"; omitted when 0) |
 | `newest_mtime` | newest modification time of files attributed to this node, excluding `.git` and nested nodes |
+| `project` | for an artifact (a regenerable or cache directory) whose parent directory holds a project marker: that parent, its owning project. Omitted otherwise |
+| `project_newest_mtime` | the owning project's newest modification time: files of the project outside `.git`, outside its artifacts and outside nested repositories. The artifact's activity |
 | `unreadable` | entries inside this node that could not be read (omitted when 0) |
 | `skipped_mounts` | directories inside this node on another file system that `--one-file-system` did not enter (omitted when 0) |
 | `ask_reason` | why this node is never offered for removal (a regenerable or cache node for the reasons below; any node whose path is not valid UTF-8) |
@@ -693,18 +702,38 @@ explicitly. What the plan does:
 - the plan records `coverage_complete`, and when it is `false` a one-sentence `coverage_note`
   that the human header prints (`Coverage is incomplete: 3 folders could not be read and 1 mount
   point was not entered (--one-file-system), so links or clones inside them were not checked.`);
-- by default (strict coverage) every repository, worktree and bare repository whose
-  `no_dependents` was `yes` gets `unknown` in the plan (`items[].facts` shows the value used), so
-  none is removed or recovered: it asks, and the reason names what was not read and the opt-in
-  (`the scan was incomplete (3 folders could not be read), so links or clones there may depend on
-  this repository; make them readable and scan again, or accept incomplete coverage with
-  --accept-incomplete-coverage [no_dependents]`). The human header says that no repository is
-  offered for removal because coverage is incomplete.
+- each item is judged by the gaps inside it (since schema 17): a gap inside an item makes it
+  `ask` (`N folders or entries inside could not be read`), and the nested rule makes every
+  removing item around it ask too; a skipped mount point is a gap inside the node that contains
+  it. A gap outside an item leaves its facts as they are: a clean, pushed repository is still
+  `backup-then-remove`, and its reason gives the count of places outside it that could not be
+  read and says that dependents there (alternates clones) were not looked for. Linked worktrees
+  are known from the repository's own metadata, and the objects its refs reach are on the
+  remote or in its verified bundle, so a dependent found later is repaired by fetching (see
+  "Repairing a dependent found later");
+- when the gap record overflowed (more than 100000 gaps), or a scan counted gaps it did not
+  record, the earlier strict behaviour applies: every repository, worktree and bare repository
+  whose `no_dependents` was `yes` gets `unknown` in the plan, so none is removed or recovered: it
+  asks, and the reason names what was not read and the opt-in (`the scan was incomplete (3
+  folders could not be read), so links or clones there may depend on this repository; make them
+  readable and scan again, or accept incomplete coverage with --accept-incomplete-coverage
+  [no_dependents]`). The human header then says that no repository is offered for removal
+  because coverage is incomplete.
+
+**Repairing a dependent found later.** A clone made with `--shared` or `--reference`, or one
+with an `objects/info/alternates` file, borrows objects from another repository. If that
+repository was removed, `git fsck` in the dependent reports missing objects. Restore the objects
+from the remote or from the verified bundle the backup made (`git clone --mirror <remote or bundle>
+<dir>`), replace the removed path in the dependent's `objects/info/alternates` with `<dir>/objects`,
+run `git repack -a -d` in the dependent so it holds every object itself, then delete the
+alternates line and check with `git fsck`. Residual: objects the removed repository held but no longer referenced (a
+deleted local branch with an expired reflog) lived only there; they are recoverable only if the
+dependent's own branches were pushed.
 
 **Accepting incomplete coverage.** On a real home folder some directories are almost always
 unreadable (privacy-protected folders, other users' files). The config setting
 `accept_incomplete_coverage = true` or `plan --accept-incomplete-coverage` (the same kind of
-opt-in as `--trust-partial-process-check`) restores removal after a backup: `no_dependents` keeps the scan's
+opt-in as `--trust-partial-process-check`) applies to the overflowed record only, since schema 17 (with a complete record each item is judged by its own gaps), and restores removal after a backup: `no_dependents` keeps the scan's
 value, and every `backup-then-remove` and `recover-backup-then-remove` reason ends with what was not read, for
 example `; 3 folders in this scan could not be read; dependents inside them were not checked`
 (after the subtree-scope sentence when that applies). The plan records
@@ -821,8 +850,12 @@ node inside the repo (matched by identity, not by count); the reason names the o
 ## Plan file
 
 `schema_version`, `dry_run` (always `true`), `generated_at`, `scan_generated_at`,
-`active_window_days`, `window_source`, `process_check` (`ok`, `partial` or `unknown`),
-`process_check_note`, `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
+`active_window_days`, `window_source`, `process_check` (`per-item`, or `unknown` when process
+information could not be read at all), `process_check_note`, `process_counts` (`readable`,
+`by_command_line`, `kernel_threads`, `gone`, `container_processes`, `runtime`, `agents`,
+`idle_agents`, `unmapped_agents` (pids), `fully_unknown`), `coverage_gaps` (`privacy`,
+`permission`, `mount`, `other`, `overflowed`, `top_folders`), `evidence_notes` (for example
+`transcript unreadable: <path>`), `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
 `remote_facts_note`, `enclosing_repos`, `scope`, `coverage_complete`, `coverage_note` (only when
 coverage is incomplete), `accepted_incomplete_coverage` (see "Incomplete coverage" and
 "Accepting incomplete coverage"), `active`, `totals` and `items`.
@@ -832,14 +865,19 @@ Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `s
 `reclaimable_bytes`, `bytes_total`, `days_since_activity` (if there is any evidence), `facts`
 `hold` (`code`: `protected`, `synced` or `package`, and the `root` responsible; present on a held
 item, see "Holds" below), `ask_code` (a short code for why an `ask` item asks) and, on every item
-whose action removes a git node, `preserve` (see "The preserve obligation").
+whose action removes a git node, `preserve` (see "The preserve obligation"), and `evidence`
+(since schema 17, on every item; fields omitted when empty): `rule` (the in-use rule that matched,
+1 to 4) with the `path` that matched and a `detail` in words, `session` (the owning session),
+`project` (the owning project, when it is not the node itself), `gaps_inside` and, for a
+repository or worktree, `last_commit_days`.
 
 `totals` holds `reclaimable_bytes`, `ready_bytes`, `by_action`, and since schema 16 `by_class`
 (removing items by class: `items` and `reclaimable_bytes`, an item nested in another removing item
 counted once), `held` (per `code` and `root`: `items` held and, for a protected or synced root, the
 `bytes` the scan attributed to the root, not a sum of the items, and its `file_bytes`; for a package directory
 `item_bytes`, the `bytes_total` of its held items, an item inside another it holds counted once)
-and `ask_by_reason` (`ask` items by
+`sessions` (since schema 17: each harness session owning a plan item, with `session`, `live`, the
+liveness `source`, `newest_age_days`, `bytes_offered` and `bytes_kept`) and `ask_by_reason` (`ask` items by
 `ask_code`, with their `bytes_total`; an ask nested in another ask item is counted once). The text
 summary lists held roots largest first and folds into one line the roots with no file bytes
 (`file_bytes` 0) and nothing held; a root with files in it, or without a recorded `file_bytes`, is
@@ -889,7 +927,10 @@ groups `keep` items by reason (`protected`, `synced`, `package`, `unsaved-agent-
 `dependents`, `other`) with `items` and `bytes`. A node or root whose canonical path fails for any
 reason (permission, a symlink loop...) is held; only a lexical path that does not exist is absent.
 `scripts/check-agent-files.py` is an independent check of a plan against a home (see its header);
-`--self-test` proves it on a fixture home.
+`--self-test` proves it on a fixture home. `scripts/check-live-sessions.py` is the independent
+oracle for live sessions: run while the plan is made, it lists the live sessions from its own
+sources (plus `--ground-truth CMD`, a source the tool does not read) and exits 1 naming any live
+session with a removing item, or one the plan lists as idle (see its header).
 
 ### The active window
 
@@ -918,20 +959,59 @@ A project is **active** when any of these holds:
 1. an `--active PATH` covers it, or an active path lies inside it (or inside the project that owns a
    regenerable directory). `--active` paths must exist and must lie inside or around something the
    scan covered, otherwise `plan` fails; both sides are compared as real (symlink-free) paths;
-2. its newest activity, the later of `newest_mtime` (non-regenerable, non-`.git` files) and
-   `last_commit_time`, is at most `active_window_days` old (exactly at the edge counts as active);
-3. a running process has its working directory inside it.
+2. its newest activity is at most `active_window_days` old (exactly at the edge counts as active).
+   The activity is the item's own: for a repository or worktree the later of its `newest_mtime`
+   (non-regenerable, non-`.git` files) and `last_commit_time`; for a regenerable or cache directory
+   its owning project's (`project_newest_mtime`). A top-level folder's activity never reaches the
+   items below it;
+3. it is in use, or its harness session is live (see "Per-item evidence").
 
-Process information comes from `sysinfo`. `process_check` is `ok` when every process's working
-directory was readable, `partial` when some (usually other users') were not, and `unknown` when none
-could be read. When `unknown`, a removing action is never proposed: it becomes `ask` and says so.
-When `partial`, the same holds: an unreadable process may be working inside the candidate, so every
-removing action becomes `ask` (reason: some running processes could not be inspected) and
-`totals.ready_bytes` is 0. The user can accept the risk with the setting
-`trust_partial_process_check = true` in the config file or `plan --trust-partial-process-check`;
-the plan then records `trusted_partial_process_check: true` and the human header says the user
-accepted it. A readable process inside a candidate still keeps it. With no evidence at all the
-state is `unknown`.
+### Per-item evidence
+
+One module (`evidence`) owns every per-item judgement. An item is **in use** (`keep`, with the
+rule in `evidence.rule`) when:
+
+1. a readable process's working directory or one of its open files (Linux `/proc/<pid>/fd`, macOS
+   one `lsof` run) lies inside the item, or inside its owning project for an artifact;
+2. a command-line argument of any process (readable or not), resolved against that process's
+   working directory when relative, lies inside the item or its owning project; `--flag=/path`
+   values and `:`-separated lists are split. `cargo test --manifest-path /abs/wt/Cargo.toml` from
+   the home holds `/abs/wt/target`;
+3. a running container's bind source contains the item, or the item contains it;
+4. its owning session (`<harness root>/work/<s>/`) is live.
+
+A working directory or argument that is an ancestor of the item, or inside a sibling, never holds
+it: a shell at the home holds nothing below the home.
+
+A session is **live** when any of these says so: a Claude Code registry entry
+(`<claude dir>/sessions/<digits>.json`; only `pid`, `sessionId` and `cwd` are read, `.key` files are
+never opened) whose pid is alive and started no later than the entry was written, and whose `cwd` is
+in the session or whose `sessionId` is its name; an agent process (`claude`, `codex`, `kimi`,
+`cursor-agent`, or `node`/`bun` running a Claude Code or Codex entry point) working in it, naming it
+as a whole argument or path segment, or holding open a transcript that records a `cwd` in it; any
+process's working directory in it; a transcript (`projects/**/*.jsonl`, `rollout-*.jsonl`) modified
+within the window that records a `cwd` in it; a file below it modified within the window; an entry
+named after it within depth 3 of a protected root modified within the window. A transcript is read
+for its top-level `cwd` only, from its first 64 KiB or 20 lines, whichever is smaller; nothing else
+is kept or printed, and a parse failure is the note `transcript unreadable: <path>`.
+
+An agent process whose every locus (working directory, registry `cwd`, recorded transcript `cwd`,
+command-line and open-file paths under the home, outside its own install and configuration) is an
+ancestor of a harness work directory has no locus. Unless it is idle (no child process, no open
+transcript, open files known), every removing item under a harness work directory asks, naming the
+pid (`agent-check`, fail closed).
+
+Processes that cannot be fully inspected: kernel threads (Linux `PF_KTHREAD`) are ignored; a zombie
+or dead process, or one whose `/proc` entry vanished and a signal-0 re-probe says `ESRCH`, is gone
+and ignored (`EPERM` means it exists); a process whose working directory is unreadable but whose
+command line is readable is judged by rule 2; one whose working directory and command line are both
+unreadable (`hidepid`) makes every removing item ask (`process-check`) unless
+`trust_partial_process_check` is set, its only remaining meaning. When a container runtime process
+runs (`containerd-shim*`, `conmon`, `runc`, `com.docker.*`), the command line lists the running
+containers' bind sources with `docker`/`podman` `ps` and `inspect`; when the runtime cannot be
+queried, or a shim maps to no returned container, every removing item asks (`containers`). When
+process information cannot be read at all, `process_check` is `unknown` and every removing item
+asks. With no evidence at all the state is `unknown`.
 
 `action` is one of `keep`, `remove-regenerable`, `recover-backup-then-remove`,
 `backup-then-remove` and `ask` (schema 10 called the two git actions `recover-then-archive` and

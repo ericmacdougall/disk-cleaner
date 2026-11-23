@@ -52,6 +52,10 @@ else
   exit 127
 fi
 
+echo "==> python3 scripts/check-agent-files.py --self-test && python3 scripts/check-live-sessions.py --self-test"
+python3 scripts/check-agent-files.py --self-test
+python3 scripts/check-live-sessions.py --self-test
+
 echo "==> python3 -m unittest discover -s site/tests -v"
 python3 -m unittest discover -s site/tests -v
 

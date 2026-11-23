@@ -1559,3 +1559,202 @@ fn r15_object_data_is_backed_up_and_no_verification_is_accepted() {
         assert!(!text.contains(gone), "{gone:?} in {text}");
     }
 }
+
+/// goodqa#16711 AC-9 (and the AC-5 canary through the binary): the header carries the per-item
+/// process counts and the coverage gaps by errno class; plan JSON has `evidence` per item and
+/// `totals.sessions`; a token beside `cwd` in a transcript reaches neither the JSON nor stdout
+/// nor stderr. The process snapshot comes from a host-inputs file, so the result does not depend
+/// on what runs on the test machine.
+#[cfg(unix)]
+#[test]
+fn plan_evidence_report() {
+    use std::os::unix::fs::PermissionsExt;
+    const CANARY: &str = "CANARY-c41e-not-for-output";
+    let tmp = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+    let s1 = home.join(".agent-harness/work/s1/wt");
+    let s2 = home.join(".agent-harness/work/s2/wt");
+    let out = home.join("projects/p");
+    for r in [&s1, &s2, &out] {
+        archivable_repo(r);
+    }
+    let now: i64 = far_future().parse().unwrap();
+    // A transcript written an hour before `now` records its cwd in s2, with a canary beside.
+    let t = home.join(".claude/projects/-p/t1.jsonl");
+    write(
+        &t,
+        &format!(
+            "{{\"cwd\":\"{}\",\"note\":\"{CANARY}\"}}\n{{\"text\":\"{CANARY}\"}}\n",
+            s2.display()
+        ),
+    );
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&t)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs((now - 3600) as u64))
+        .unwrap();
+    // A folder the scan cannot read, outside every item.
+    let vault = home.join("vault");
+    write(&vault.join("x"), "x");
+    fs::set_permissions(&vault, fs::Permissions::from_mode(0o000)).unwrap();
+    let readable_anyway = fs::read_dir(&vault).is_ok();
+
+    let scan_file = tmp.path().join("scan.json");
+    let mut c = bin();
+    c.args([
+        "scan",
+        home.to_str().unwrap(),
+        "--home",
+        home.to_str().unwrap(),
+    ])
+    .args(["--out", scan_file.to_str().unwrap()])
+    .env_remove("CLAUDE_CONFIG_DIR")
+    .env_remove("CODEX_HOME");
+    isolate(&mut c, &home);
+    let o = run(&mut c);
+    fs::set_permissions(&vault, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    // Keep only the fixture home's protected roots, so the plan reads no agent data of the user
+    // running the test.
+    let mut sv: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&scan_file).unwrap()).unwrap();
+    let h = home.to_string_lossy().into_owned();
+    sv["protect"]["passwd_home"] = serde_json::Value::String(h.clone());
+    sv["protect"]["claude_config_dir"] = serde_json::Value::Null;
+    sv["protect"]["codex_home"] = serde_json::Value::Null;
+    sv["protect"]["roots"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|r| r["spelled"].as_str().is_some_and(|s| s.starts_with(&h)));
+    fs::write(&scan_file, serde_json::to_string(&sv).unwrap()).unwrap();
+
+    // Processes: a kernel thread, a gone pid, a readable shell at /, and another user's process
+    // whose command line names a file inside `out`.
+    let inputs = tmp.path().join("host.json");
+    let host = serde_json::json!({
+        "processes": {"procs": [
+            {"pid": 10, "kind": "kernel-thread"},
+            {"pid": 11, "kind": "gone"},
+            {"pid": 12, "names": ["sh"], "cwd": "/", "cmdline": ["sh"], "open_files": []},
+            {"pid": 13, "uid": 0, "names": ["db"],
+             "cmdline": ["db", format!("{}/data/db.sqlite", out.display())]}
+        ]},
+        "containers": {"status": "not-queried"}
+    });
+    fs::write(&inputs, host.to_string()).unwrap();
+    let now_s = now.to_string();
+    let plan = |json: bool| {
+        let mut c = bin();
+        c.args([
+            "plan",
+            "--scan",
+            scan_file.to_str().unwrap(),
+            "--now",
+            &now_s,
+        ])
+        .args(["--host-inputs", inputs.to_str().unwrap()]);
+        if json {
+            c.arg("--json");
+        }
+        isolate(&mut c, &home);
+        let o = run(&mut c);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        o
+    };
+
+    let oj = plan(true);
+    let ot = plan(false);
+    for o in [&oj, &ot] {
+        assert!(!stdout(o).contains(CANARY), "the canary reached stdout");
+        assert!(
+            !String::from_utf8_lossy(&o.stderr).contains(CANARY),
+            "the canary reached stderr"
+        );
+    }
+    let pv: serde_json::Value = serde_json::from_str(&stdout(&oj)).unwrap();
+    assert_eq!(pv["schema_version"], 17);
+    // Evidence per item.
+    let i1 = item_of(&pv, &s1);
+    assert_eq!(i1["action"], "backup-then-remove", "{i1}");
+    assert_eq!(i1["evidence"]["session"], "s1", "{i1}");
+    let i2 = item_of(&pv, &s2);
+    assert_eq!(i2["action"], "keep", "{i2}");
+    assert_eq!(i2["evidence"]["rule"], 4, "{i2}");
+    assert_eq!(i2["evidence"]["session"], "s2", "{i2}");
+    let io = item_of(&pv, &out);
+    assert_eq!(io["action"], "keep", "{io}");
+    assert_eq!(io["evidence"]["rule"], 2, "{io}");
+    assert!(
+        io["evidence"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("13")),
+        "{io}"
+    );
+    assert!(pv["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|i| i["evidence"].is_object()));
+    // totals.sessions.
+    let sessions = pv["totals"]["sessions"].as_array().unwrap();
+    let ses = |name: &str| {
+        sessions
+            .iter()
+            .find(|s| s["session"] == name)
+            .unwrap_or_else(|| panic!("no session {name}: {sessions:?}"))
+    };
+    assert_eq!(ses("s1")["live"], false);
+    assert!(ses("s1")["bytes_offered"].as_u64().unwrap() > 0);
+    assert_eq!(ses("s2")["live"], true);
+    assert_eq!(ses("s2")["bytes_offered"], 0);
+    // Process counts and gaps in JSON.
+    let pc = &pv["process_counts"];
+    assert_eq!(pc["kernel_threads"], 1, "{pc}");
+    assert_eq!(pc["gone"], 1, "{pc}");
+    assert_eq!(pc["by_command_line"], 1, "{pc}");
+    assert_eq!(pc["fully_unknown"], 0, "{pc}");
+    assert_eq!(pv["process_check"], "per-item");
+
+    // The text header.
+    let text = stdout(&ot);
+    assert!(
+        text.contains("1 judged by command line, 1 kernel thread, 1 gone"),
+        "{text}"
+    );
+    assert!(text.contains("0 fully unknown"), "{text}");
+    assert!(text.contains("Agent-harness sessions:"), "{text}");
+    assert!(
+        text.lines().any(|l| l.contains("live") && l.contains("s2")),
+        "{text}"
+    );
+    assert!(
+        text.contains("Offered checkouts and the evidence checked:")
+            && text.contains(&*s1.to_string_lossy()),
+        "{text}"
+    );
+    if readable_anyway {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must not run this test as a user who can read a mode-000 folder"
+        );
+        eprintln!("running as a user who reads mode-000 folders: gap lines not checked");
+        return;
+    }
+    assert_eq!(
+        pv["coverage_gaps"]["permission"], 1,
+        "{}",
+        pv["coverage_gaps"]
+    );
+    assert!(
+        text.contains("Coverage gaps: 0 privacy (EPERM), 1 permission (EACCES), 0 mount, 0 other"),
+        "{text}"
+    );
+    assert!(
+        i1["reason"]
+            .as_str()
+            .unwrap()
+            .contains("1 place outside it could not be read"),
+        "{i1}"
+    );
+}
