@@ -12,6 +12,12 @@ const BUILTIN: &str = include_str!("../../../rules/artifacts.toml");
 /// One regenerable-directory or cache rule.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Rule {
+    /// The rule's identity: unique in the rule set and stable across releases. Safety decisions
+    /// (the work-dir allowlist) key on it, never on `name`, which several rules may share
+    /// (`target` is Cargo's and Maven's). Defaults to `name` when the file gives none; the load
+    /// refuses two rules with the same identity, so a shared name needs an explicit `id`.
+    #[serde(default)]
+    pub id: String,
     /// Directory name; a name containing `/` matches the trailing path components.
     pub name: String,
     /// Entries that must exist beside the directory or in an ancestor. Empty means none needed.
@@ -158,9 +164,31 @@ impl RuleSet {
         RuleSet::from_toml(BUILTIN).expect("embedded rules/artifacts.toml must be valid")
     }
 
+    /// The embedded rules, parsed once.
+    pub fn builtin_shared() -> &'static RuleSet {
+        static RULES: std::sync::OnceLock<RuleSet> = std::sync::OnceLock::new();
+        RULES.get_or_init(RuleSet::builtin)
+    }
+
     /// Parse a rules file.
     pub fn from_toml(text: &str) -> Result<RuleSet> {
-        let raw: RawRules = toml::from_str(text).map_err(|e| Error::Rules(e.to_string()))?;
+        let mut raw: RawRules = toml::from_str(text).map_err(|e| Error::Rules(e.to_string()))?;
+        let mut ids: HashSet<String> = HashSet::new();
+        for r in &mut raw.rule {
+            if r.id.is_empty() {
+                r.id = r.name.clone();
+            }
+            if r.id.trim() != r.id || r.id.chars().any(char::is_control) {
+                return Err(Error::Rules(format!("rule id {:?} is not valid", r.id)));
+            }
+            if !ids.insert(r.id.clone()) {
+                return Err(Error::Rules(format!(
+                    "two rules have the identity {:?}: give each an explicit, unique `id` (a \
+                     rule without one is identified by its name)",
+                    r.id
+                )));
+            }
+        }
         for r in &raw.rule {
             if !matches!(r.class, Class::Regenerable | Class::Cache) {
                 return Err(Error::Rules(format!(
@@ -240,6 +268,22 @@ impl RuleSet {
     /// All rules.
     pub fn rules(&self) -> &[Rule] {
         &self.rules
+    }
+
+    /// The rule with identity `id`.
+    pub fn by_id(&self, id: &str) -> Option<&Rule> {
+        self.rules.iter().find(|r| r.id == id)
+    }
+
+    /// The identity of the one rule named `name`, for a scan written before rules had
+    /// identities (it records only the name). `None` when no rule or more than one rule carries
+    /// the name: such a name cannot be tied to a rule, and a caller must fail closed.
+    pub fn legacy_id(&self, name: &str) -> Option<&str> {
+        let mut it = self.rules.iter().filter(|r| r.name == name);
+        match (it.next(), it.next()) {
+            (Some(r), None) => Some(&r.id),
+            _ => None,
+        }
     }
 
     /// Rules whose name matches the end of `path` (markers are not checked here).
@@ -446,6 +490,24 @@ mod tests {
                 .filter(|r| r.name == name)
                 .all(|r| r.fixture_files.is_empty() && r.fixture_dirs.is_empty()));
         }
+    }
+
+    /// Every rule has a unique identity: two rules with the same name and no explicit `id`, or
+    /// two explicit `id`s alike, are refused at load, so no safety decision can confuse them.
+    #[test]
+    fn duplicate_rule_identities_are_refused() {
+        let same_name = "[[rule]]\nname = \"target\"\nmarkers = [\"Cargo.toml\"]\nclass = \"regenerable\"\n\
+                         [[rule]]\nname = \"target\"\nmarkers = [\"pom.xml\"]\nclass = \"regenerable\"\n";
+        assert!(
+            RuleSet::from_toml(same_name).is_err(),
+            "two rules named target with no id must be refused"
+        );
+        let same_id = "[[rule]]\nid = \"a\"\nname = \"x\"\nclass = \"cache\"\n\
+                       [[rule]]\nid = \"a\"\nname = \"y\"\nclass = \"cache\"\n";
+        assert!(
+            RuleSet::from_toml(same_id).is_err(),
+            "two rules with id a must be refused"
+        );
     }
 
     #[test]

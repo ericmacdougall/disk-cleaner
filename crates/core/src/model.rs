@@ -317,9 +317,20 @@ pub struct Node {
     /// Index of the innermost classified directory that encloses this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<usize>,
-    /// Name of the rule that matched (regenerable and cache only).
+    /// Name of the rule that matched (regenerable and cache only). Several rules may share a
+    /// name (`target`): it is for display, never for a safety decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
+    /// Identity of the rule that matched (see `rules::Rule::id`). Absent in scans written
+    /// before rules had identities: the plan then maps `rule` to an identity only when exactly
+    /// one built-in rule carries that name, and otherwise treats it as unknown (held).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// Identities of other rules whose name and markers also matched this directory (a
+    /// `target/` beside both `Cargo.toml` and `pom.xml`): what it is cannot be told, so the plan
+    /// treats it as matching none of the allowlisted rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_also: Vec<String>,
     /// Bytes attributed to this node itself, excluding nested classified directories.
     pub bytes_self: u64,
     /// Bytes of this node including nested classified directories.
@@ -384,6 +395,8 @@ impl Node {
             class,
             parent: None,
             rule: None,
+            rule_id: None,
+            rule_also: Vec::new(),
             bytes_self: 0,
             bytes_total: 0,
             files_total: 0,

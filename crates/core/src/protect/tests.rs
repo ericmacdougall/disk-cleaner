@@ -189,6 +189,7 @@ fn carve_outs() {
         let mut target = node(home.join(pos).join("target"), Class::Regenerable, all_yes());
         target.parent = Some(0);
         target.rule = Some("target".into());
+        target.rule_id = Some("cargo-target".into());
         target.agent_files = Some(0);
         let p = plan(&scan_of(pc.clone(), vec![x, target]), &opts(300 * DAY));
         let xi = &p.items[0];
@@ -328,6 +329,7 @@ fn carve_outs() {
     );
     target.parent = Some(0);
     target.rule = Some("target".into());
+    target.rule_id = Some("cargo-target".into());
     target.agent_files = Some(0);
     let p = plan(&scan_of(pc, vec![wt, target]), &opts(300 * DAY));
     assert_eq!(
@@ -976,6 +978,9 @@ fn work_dir_allowlist() {
         let mut k = node(base.join(name), Class::Regenerable, all_yes());
         k.parent = Some(0);
         k.rule = Some(rule.into());
+        if rule == "target" {
+            k.rule_id = Some("cargo-target".into());
+        }
         k.agent_files = Some(0);
         kids.push(k);
     }
@@ -1015,6 +1020,316 @@ fn work_dir_allowlist() {
         .find(|i| i.path.ends_with("/clone/out"))
         .unwrap();
     assert!(out.reason.contains("build output inside agent dir"));
+}
+
+/// Class N: the allowlist judges a directory by the identity of the rule that matched it, never
+/// by the rule's name. Two built-in rules are named `target` (Cargo, and Maven or sbt); only the
+/// Cargo one is on the allowlist. A Maven or sbt `target/` can hold agent-produced results (test
+/// reports, packaged jars), so under a work session, in a task dir or inside a carve-out
+/// checkout in any position, it is held as build output, while a Cargo `target/` in the same
+/// position keeps its normal action.
+/// Kinds of `target/` in the class N fixture: `poly` is a project with both a Cargo.toml and a
+/// pom.xml beside its target/ (both rules match, so what it holds cannot be told).
+const TARGET_KINDS: [&str; 4] = ["cargo", "maven", "sbt", "poly"];
+/// Carve-out checkout positions the class N fixture fills (a task dir `t` sits in the session).
+const CHECKOUT_POSITIONS: [&str; 4] = [
+    ".agent-harness/work/s",
+    ".agent-harness/work/s/t",
+    ".claude/worktrees",
+    ".codex/worktrees",
+];
+
+/// The class N fixture: for each target kind, a task dir `work/s/<kind>-task` and a checkout in
+/// every carve-out position, each with its markers and a target/ holding a test report and a
+/// class file. Returns the scan, its checkouts patched clean and pushed and each checkout's
+/// target/ patched ignored (what git would say), as the scan ran without git.
+fn identity_fixture(home: &Path) -> ScanResult {
+    let markers = |kind: &str| -> &'static [&'static str] {
+        match kind {
+            "cargo" => &["Cargo.toml"],
+            "maven" => &["pom.xml"],
+            "sbt" => &["build.sbt"],
+            _ => &["Cargo.toml", "pom.xml"],
+        }
+    };
+    let fill_target = |dir: &Path, kind: &str| {
+        for m in markers(kind) {
+            put(&dir.join(m), 20);
+        }
+        put(&dir.join("target/surefire-reports/TEST-a.xml"), 400);
+        put(&dir.join("target/classes/A.class"), 400);
+    };
+    put(&home.join(".agent-harness/work/s/t/notes.md"), 100);
+    for kind in TARGET_KINDS {
+        // A task dir directly in the session (not a checkout).
+        let task = home.join(format!(".agent-harness/work/s/{kind}-task"));
+        put(&task.join("session.jsonl"), 100);
+        fill_target(&task, kind);
+        // A checkout in each carve-out position.
+        for pos in CHECKOUT_POSITIONS {
+            let co = home.join(pos).join(format!("{kind}-clone"));
+            fake_checkout(&co);
+            fill_target(&co, kind);
+        }
+    }
+    let mut s = scan_home(home);
+    patch_clean(&mut s);
+    for n in s.nodes.iter_mut() {
+        if n.path.ends_with("-clone/target") {
+            n.ask_reason = None;
+        }
+    }
+    s
+}
+
+fn far_future() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 400 * DAY
+}
+
+/// Class N: the allowlist judges a directory by the identity of the rule that matched it, never
+/// by the rule's name. Two built-in rules are named `target` (Cargo, and Maven or sbt); only the
+/// Cargo one is on the allowlist. A Maven or sbt `target/` can hold agent-produced results (test
+/// reports, packaged jars), so under a work session, in a task dir or inside a carve-out
+/// checkout in any position, it is held as build output, while a Cargo `target/` in the same
+/// position keeps its normal action. A `target/` both rules match is held too.
+#[test]
+fn work_dir_allowlist_by_rule_identity() {
+    let (_t, home) = fixture_home();
+    let s = identity_fixture(&home);
+    // The scan records each target/'s rule identity, and every other rule that matched it.
+    for n in s.nodes.iter().filter(|n| n.path.ends_with("/target")) {
+        let want: (&str, &[&str]) = if n.path.contains("/cargo-") {
+            ("cargo-target", &[])
+        } else if n.path.contains("/poly-") {
+            ("cargo-target", &["maven-target"])
+        } else {
+            ("maven-target", &[])
+        };
+        assert_eq!(n.rule.as_deref(), Some("target"), "{}", n.path);
+        assert_eq!(n.rule_id.as_deref(), Some(want.0), "{}", n.path);
+        assert_eq!(n.rule_also, want.1, "{}", n.path);
+    }
+    let p = plan(&s, &opts(far_future()));
+    let item = |suffix: &str| {
+        p.items
+            .iter()
+            .find(|i| i.path.ends_with(suffix))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no item ending {suffix}: {:?}",
+                    p.items.iter().map(|i| &i.path).collect::<Vec<_>>()
+                )
+            })
+    };
+    for kind in TARGET_KINDS {
+        let mut targets: Vec<String> = CHECKOUT_POSITIONS
+            .iter()
+            .map(|pos| format!("{pos}/{kind}-clone/target"))
+            .collect();
+        targets.push(format!("/work/s/{kind}-task/target"));
+        for t in &targets {
+            let it = item(t);
+            if kind == "cargo" {
+                assert!(it.hold.is_none(), "{t}: {:?}: {}", it.action, it.reason);
+            } else {
+                assert_eq!(it.action, Action::Keep, "{t}: {}", it.reason);
+                assert!(it.hold.is_some(), "{t}: no hold: {}", it.reason);
+                assert!(
+                    it.reason.contains(BUILD_OUTPUT_DETAIL),
+                    "{t}: {}",
+                    it.reason
+                );
+            }
+        }
+        for pos in CHECKOUT_POSITIONS {
+            let co = item(&format!("{pos}/{kind}-clone"));
+            let t = item(&format!("{pos}/{kind}-clone/target"));
+            if kind == "cargo" {
+                // AC-3: the clean, pushed checkout and its Cargo target are removable.
+                assert_eq!(t.action, Action::RemoveRegenerable, "{pos}: {}", t.reason);
+                assert_eq!(co.action, Action::BackupThenRemove, "{pos}: {}", co.reason);
+            } else {
+                // The held target vetoes its checkout.
+                assert!(!co.action.removes(), "{pos}/{kind}: {}", co.reason);
+            }
+        }
+    }
+}
+
+/// Runs `scripts/check-agent-files.py` on a home, a plan and (optionally) a scan. A missing
+/// `python3` fails the test: a contract that silently skips proves nothing. Unix only: the
+/// checker is written for the macOS and Linux homes it is run on.
+#[cfg(unix)]
+fn run_checker(home: &Path, plan: &Plan, scan: Option<&ScanResult>) -> (bool, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_path = dir.path().join("plan.json");
+    fs::write(&plan_path, serde_json::to_vec(plan).unwrap()).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-agent-files.py");
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script)
+        .arg("--home")
+        .arg(home)
+        .arg("--plan")
+        .arg(&plan_path);
+    if let Some(sc) = scan {
+        let scan_path = dir.path().join("scan.json");
+        fs::write(&scan_path, serde_json::to_vec(sc).unwrap()).unwrap();
+        cmd.arg("--scan").arg(&scan_path);
+    }
+    let out = cmd
+        .output()
+        .expect("python3 must be installed to run the checker contract test");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    match out.status.code() {
+        Some(0) => (true, text),
+        Some(1) => (false, text),
+        other => panic!("checker exited {other:?}: {text}"),
+    }
+}
+
+/// Contract (class N): the plan's judgment and the independent checker agree over the same
+/// fixture. The checker passes the plan as made (and the plan really removes Cargo target/s, so
+/// the pass is not vacuous); it fails a plan in which any Maven, sbt or two-rule target/ would
+/// be removed, naming each; and without the scan's identities it trusts no target/ at all.
+#[cfg(unix)]
+#[test]
+fn checker_agrees_with_plan_on_rule_identity() {
+    let (_t, home) = fixture_home();
+    let s = identity_fixture(&home);
+    let p = plan(&s, &opts(far_future()));
+    let cargo_removed = p
+        .items
+        .iter()
+        .filter(|i| {
+            i.path.ends_with("/cargo-clone/target") && i.action == Action::RemoveRegenerable
+        })
+        .count();
+    assert_eq!(
+        cargo_removed,
+        CHECKOUT_POSITIONS.len(),
+        "the plan removes every Cargo target"
+    );
+    let (ok, text) = run_checker(&home, &p, Some(&s));
+    assert!(ok, "checker refused the plan as made:\n{text}");
+
+    // Every held target/ made removing: the checker must name each one.
+    let mut bad = p.clone();
+    let mut flipped = Vec::new();
+    for it in bad.items.iter_mut() {
+        if it.path.ends_with("/target") && it.hold.is_some() {
+            it.action = Action::RemoveRegenerable;
+            flipped.push(it.path.clone());
+        }
+    }
+    // maven, sbt and poly, in a task dir and in every checkout position.
+    assert_eq!(
+        flipped.len(),
+        3 * (1 + CHECKOUT_POSITIONS.len()),
+        "{flipped:?}"
+    );
+    let (ok, text) = run_checker(&home, &bad, Some(&s));
+    assert!(!ok, "checker passed removing held target/s:\n{text}");
+    for f in &flipped {
+        let real = fs::canonicalize(f).unwrap();
+        assert!(
+            text.contains(&format!("HIT {}", real.display())),
+            "checker did not name {f}:\n{text}"
+        );
+    }
+
+    // Without the scan, no target/ is Cargo build output: the plan as made fails.
+    let (ok, text) = run_checker(&home, &p, None);
+    assert!(
+        !ok,
+        "checker trusted a target/ with no scan identity:\n{text}"
+    );
+}
+
+/// Every identity on the allowlist names exactly one built-in rule, and `cargo-target` is the
+/// Cargo rule alone: a rename or a new rule cannot silently widen the allowlist. Maven's and
+/// sbt's `target` is not on it, and the shared name `target` maps to no identity.
+#[test]
+fn allowlist_names_one_rule_each() {
+    let rs = crate::rules::RuleSet::builtin();
+    for id in WORK_DIR_ALLOWLIST {
+        let n = rs.rules().iter().filter(|r| r.id == id).count();
+        assert_eq!(n, 1, "allowlist id {id} must name exactly one rule");
+    }
+    let cargo = rs.by_id("cargo-target").unwrap();
+    assert_eq!(
+        (cargo.name.as_str(), &cargo.markers[..]),
+        ("target", &["Cargo.toml".to_string()][..])
+    );
+    let maven = rs.by_id("maven-target").unwrap();
+    assert_eq!(maven.name, "target");
+    assert!(!WORK_DIR_ALLOWLIST.contains(&"maven-target"));
+    assert!(!WORK_DIR_ALLOWLIST.contains(&"target"));
+    assert_eq!(rs.legacy_id("target"), None);
+    assert_eq!(rs.legacy_id("node_modules"), Some("node_modules"));
+    // A directory both rules matched cannot be told apart: not allowlisted.
+    let mut both = Node::new("/w/target", Class::Regenerable);
+    both.rule = Some("target".into());
+    both.rule_id = Some("cargo-target".into());
+    assert!(work_dir_allowlisted(&both));
+    both.rule_also = vec!["maven-target".into()];
+    assert!(!work_dir_allowlisted(&both));
+}
+
+/// A scan written before rules had identities records only the rule's name. A name that more
+/// than one built-in rule carries (`target`) cannot be tied to one rule, so it is not on the
+/// allowlist: the directory is held. A name that only one rule carries keeps its exemption.
+#[test]
+fn legacy_rule_name_is_allowlisted_only_when_unambiguous() {
+    let (_t, home) = fixture_home();
+    let pc = resolve(&ctx_for(&home)).unwrap();
+    let base = home.join(".agent-harness/work/s9/clone");
+    let x = node(&base, Class::Repo, all_yes());
+    let mut legacy = node(base.join("target"), Class::Regenerable, all_yes());
+    legacy.parent = Some(0);
+    legacy.rule = Some("target".into());
+    legacy.agent_files = Some(0);
+    let p = plan(&scan_of(pc.clone(), vec![x, legacy]), &opts(300 * DAY));
+    let it = &p.items[1];
+    assert_eq!(it.action, Action::Keep, "{}", it.reason);
+    assert!(it.reason.contains(BUILD_OUTPUT_DETAIL), "{}", it.reason);
+    assert!(!p.items[0].action.removes(), "{}", p.items[0].reason);
+    // In a task dir directly (no checkout above): held as well.
+    let mut legacy = node(
+        home.join(".agent-harness/work/s9/task/target"),
+        Class::Regenerable,
+        all_yes(),
+    );
+    legacy.rule = Some("target".into());
+    legacy.agent_files = Some(0);
+    let p = plan(&scan_of(pc.clone(), vec![legacy]), &opts(300 * DAY));
+    assert_eq!(p.items[0].action, Action::Keep, "{}", p.items[0].reason);
+    assert!(
+        p.items[0].reason.contains(BUILD_OUTPUT_DETAIL),
+        "{}",
+        p.items[0].reason
+    );
+    // Control: an unambiguous legacy name keeps its exemption.
+    let mut nm = node(
+        home.join(".agent-harness/work/s9/task/node_modules"),
+        Class::Regenerable,
+        all_yes(),
+    );
+    nm.agent_files = Some(0);
+    let p = plan(&scan_of(pc, vec![nm]), &opts(300 * DAY));
+    assert_eq!(
+        p.items[0].action,
+        Action::RemoveRegenerable,
+        "{}",
+        p.items[0].reason
+    );
 }
 
 #[test]
@@ -1287,6 +1602,9 @@ fn allowlist_exempts_only_the_harness_hold() {
     let allow = |path: PathBuf, real: Option<PathBuf>, rule: &str| {
         let mut n = node(path, Class::Regenerable, all_yes());
         n.rule = Some(rule.into());
+        if rule == "target" {
+            n.rule_id = Some("cargo-target".into());
+        }
         n.agent_files = Some(0);
         n.real_path = real.map(|r| r.to_string_lossy().into_owned());
         n

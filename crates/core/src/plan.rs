@@ -1860,7 +1860,8 @@ mod tests {
         child.bytes_self = 1_000;
         child.bytes_total = 1_000;
         child.newest_mtime = Some(0);
-        child.rule = Some("cargo-target".into());
+        child.rule = Some("target".into());
+        child.rule_id = Some("cargo-target".into());
         // Control: with no hold the parent is removable and so is the child.
         let free = synthetic(vec![repo("/work/p"), child.clone()], vec![]);
         let p = plan(&free, &PlanOptions::new(7, 300 * 86_400));

@@ -788,11 +788,18 @@ fn marker_beside(dirs: &[(PathBuf, DirAgg)], path: &Path, markers: &[String]) ->
 }
 
 fn match_rule<'a>(dirs: &[(PathBuf, DirAgg)], i: usize, rules: &'a RuleSet) -> Option<&'a Rule> {
+    matching_rules(dirs, i, rules).into_iter().next()
+}
+
+/// Every rule whose name and markers match the directory, in the order of the rules file (the
+/// first is the one that classifies it).
+fn matching_rules<'a>(dirs: &[(PathBuf, DirAgg)], i: usize, rules: &'a RuleSet) -> Vec<&'a Rule> {
     let path = &dirs[i].0;
     rules
         .candidates(path)
         .into_iter()
-        .find(|r| r.markers.is_empty() || marker_beside(dirs, path, &r.markers))
+        .filter(|r| r.markers.is_empty() || marker_beside(dirs, path, &r.markers))
+        .collect()
 }
 
 fn bare_shape(agg: &DirAgg) -> bool {
@@ -890,6 +897,14 @@ fn classify(
                     let mut node = Node::new(path.to_string_lossy().into_owned(), class);
                     node.parent = owner;
                     node.rule = rule.map(|r| r.name.clone());
+                    node.rule_id = rule.map(|r| r.id.clone());
+                    if let Some(r) = rule {
+                        node.rule_also = matching_rules(dirs, i, rules)
+                            .into_iter()
+                            .filter(|o| o.id != r.id)
+                            .map(|o| o.id.clone())
+                            .collect();
+                    }
                     let parent_is_loose = match owner {
                         None => true,
                         Some(o) => builds[o].node.class == Class::LooseCode,
