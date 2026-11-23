@@ -696,6 +696,9 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             if ne.under_work {
                 whys.extend(ctx.ev.work_asks.iter());
             }
+            if ne.under_agent_dir {
+                whys.extend(ctx.ev.agent_asks.iter());
+            }
             if !whys.is_empty() {
                 let list: Vec<&str> = whys.iter().map(|w| w.as_str()).collect();
                 reason = format!("{reason}; but {}", list.join("; and "));
@@ -1149,8 +1152,9 @@ pub fn keep_code(it: &PlanItem) -> &'static str {
 
 /// A short code for the reason an item asks, from its final reason text.
 pub fn ask_code(reason: &str) -> &'static str {
-    const TABLE: [(&str, &str); 16] = [
+    const TABLE: [(&str, &str); 17] = [
         ("the nested ", "nested-veto"),
+        ("agent data unreadable", "agent-data"),
         ("running processes could not be inspected", "process-check"),
         ("could not be inspected (neither", "process-check"),
         ("(fail closed)", "agent-check"),

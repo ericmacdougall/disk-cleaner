@@ -103,14 +103,30 @@ class Oracle:
             self.sessions = []
         self.live = {}  # session -> first source
         self.gaps = {}  # gap class -> count
+        self.recent_gaps = {}  # those modified within the window (or of unknown age)
+        self.agent_dirs = [self.work] + [
+            os.path.join(self.home, d, "worktrees") for d in (".claude", ".codex")
+        ]
 
-    def gap(self, cls):
+    def gap(self, cls, path=None):
         self.gaps[cls] = self.gaps.get(cls, 0) + 1
+        try:
+            fresh = path is None or self.recent(os.lstat(path).st_mtime)
+        except OSError:
+            fresh = True
+        if fresh:
+            self.recent_gaps[cls] = self.recent_gaps.get(cls, 0) + 1
+
+    def in_agent_dir(self, path):
+        p = os.path.normpath(path or "")
+        return any(
+            p.startswith(b + os.sep) for d in self.agent_dirs for b in {d, os.path.realpath(d)}
+        )
 
     def cwd_of(self, path):
         cwd, gap = transcript_cwd(path)
         if gap:
-            self.gap(gap)
+            self.gap(gap, path)
         return cwd
 
     def recent(self, mtime):
@@ -145,10 +161,10 @@ class Oracle:
                 with open(path, "rb") as f:
                     raw = json.loads(f.read(HEAD_BYTES))
             except (OSError, ValueError):
-                self.gap("registry-entry-unknown")
+                self.gap("registry-entry-unknown", path)
                 continue
             if not isinstance(raw, dict) or not isinstance(raw.get("pid"), int):
-                self.gap("registry-entry-unknown")
+                self.gap("registry-entry-unknown", path)
                 continue
             pid, cwd = raw.get("pid"), raw.get("cwd")
             sid = raw.get("sessionId")
@@ -419,6 +435,12 @@ def check(plan, oracle):
         s.get("session") for s in plan.get("totals", {}).get("sessions", []) if s.get("live")
     }
     missed = sorted(s for s in oracle.live if s in owned and s not in tool_live)
+    # Recent agent data that could not be read may record any agent session: no removing item
+    # under an agent directory may be offered then.
+    if oracle.recent_gaps:
+        for it in plan.get("items", []):
+            if it.get("action") in REMOVING and oracle.in_agent_dir(it.get("path")):
+                offered.append(("(recent agent-data gaps)", it.get("path")))
     return offered, missed
 
 
@@ -462,7 +484,11 @@ def main(argv, processes=True):
     mapped = [i for i in plan.get("items", []) if oracle.session_of(i.get("path"))]
     print("plan: %d of %d items lie in a session directory" % (len(mapped), len(plan.get("items", []))))
     for s, p in offered:
-        print("OFFERED: live session %s has a removing item: %s" % (s, p))
+        if s.startswith("("):
+            print("OFFERED: a removing item under an agent directory while recent agent data "
+                  "is unreadable: %s" % p)
+        else:
+            print("OFFERED: live session %s has a removing item: %s" % (s, p))
     for s in missed:
         print("MISSED: the plan lists live session %s as idle" % s)
     if offered or missed:
@@ -584,12 +610,23 @@ def self_test():
             problems.append("the offered checkout of tr was not named")
         if "MISSED: the plan lists live session recent as idle" not in out:
             problems.append("the missed session was not named")
-        if "abcd" in "".join(l for l in out.splitlines() if l.startswith(("OFFERED", "MISSED"))):
+        if "abcd" in "".join(l for l in out.splitlines()
+                             if l.startswith(("OFFERED: live session", "MISSED"))):
             problems.append("abcd was flagged through its prefix abc")
         if canary in out:
             problems.append("the canary reached the output")
-        # A clean plan passes.
-        plan["items"] = [i for i in plan["items"] if i["path"].split("/")[-2] not in want]
+        if o.recent_gaps != gaps:
+            problems.append("recent gaps %s, expected %s" % (o.recent_gaps, gaps))
+        if ("OFFERED: a removing item under an agent directory while recent agent data is "
+                "unreadable: %s/old/wt" % work) not in out:
+            problems.append("an offered work-dir item beside recent gaps was not flagged")
+        # A clean plan passes once the unreadable agent data is older than the window (then it
+        # is only counted).
+        for rel in [".claude/projects/-p/late.jsonl", ".claude/projects/-p/big.jsonl",
+                    ".claude/projects/-p/garbage.jsonl",
+                    ".codex/sessions/2026/01/01/rollout-3.jsonl", ".claude/sessions/77.json"]:
+            os.utime(os.path.join(home, rel), (now - 30 * 86400, now - 30 * 86400))
+        plan["items"] =[i for i in plan["items"] if i["path"].split("/")[-2] not in want]
         plan["totals"]["sessions"].append({"session": "recent", "live": True})
         with open(pf, "w") as f:
             json.dump(plan, f)

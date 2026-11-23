@@ -272,11 +272,15 @@ pub fn plan_summary(p: &Plan) -> String {
         let parts: Vec<String> = g
             .agent_data
             .iter()
-            .map(|(class, n)| format!("{n} {class}"))
+            .map(|(class, n)| match g.agent_data_recent.get(class) {
+                Some(r) => format!("{n} {class} ({r} recent)"),
+                None => format!("{n} {class}"),
+            })
             .collect();
         let _ = writeln!(
             o,
-            "Agent data the live-session check could not use (each may hide a live session): {}",
+            "Agent data the live-session check could not use (recent ones make removals under \
+             the agent directories ask; older ones are listed only): {}",
             esc(&parts.join(", "))
         );
     }

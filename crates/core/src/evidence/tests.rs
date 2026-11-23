@@ -972,11 +972,125 @@ fn transcript_cwd_contract() {
         .evidence_notes
         .iter()
         .any(|n| n.starts_with("transcript-cwd-unknown: ") && n.ends_with("oversized.jsonl")));
+    // They are recent, so the work-dir checkout asks (see recent_agent_data_gap_fails_closed).
+    assert_eq!(action(&p, &l.wt), Action::Ask, "{}", why(&p, &l.wt));
+}
+
+/// goodqa#16711 recent-gap rule (wal:w4178d932654): agent data modified within the active
+/// window that could not be read for a working directory makes every removing item under the
+/// harness work dirs and the agent worktree dirs ask ("agent data unreadable"); the same gap
+/// just outside the window is only counted; items outside the agent dirs are unaffected.
+#[test]
+fn recent_agent_data_gap_fails_closed() {
+    let setup = |ago: i64| {
+        let l = live_fixture();
+        let wt2 = l.fx.repo(".claude/worktrees/w1");
+        l.fx.age_all();
+        l.fx.date(".agent-harness/work/s1/wt/src/lib.rs", 30 * DAY);
+        let rel = ".claude/projects/-proj/garbage.jsonl";
+        l.fx.write(rel, "not json\n");
+        l.fx.date(rel, ago);
+        (l, wt2)
+    };
+    // Control: no gap at all, both checkouts offered.
+    let l = live_fixture();
+    let wt2 = l.fx.repo(".claude/worktrees/w1");
+    l.fx.age_all();
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    assert_eq!(
+        action(&p, &wt2),
+        Action::BackupThenRemove,
+        "{}",
+        why(&p, &wt2)
+    );
     assert_eq!(
         action(&p, &l.wt),
         Action::BackupThenRemove,
         "{}",
         why(&p, &l.wt)
+    );
+
+    // Just inside the window: every removing item under an agent dir asks.
+    let (l, wt2) = setup(7 * DAY - 60);
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    for c in [&l.wt, &wt2] {
+        let it = item(&p, c);
+        assert_eq!(it.action, Action::Ask, "{}", why(&p, c));
+        assert!(
+            it.reason.contains("agent data unreadable: 1 entry"),
+            "{}",
+            it.reason
+        );
+        assert_eq!(it.ask_code.as_deref(), Some("agent-data"));
+    }
+    assert_eq!(
+        action(&p, &l.out),
+        Action::BackupThenRemove,
+        "{}",
+        why(&p, &l.out)
+    );
+    assert_eq!(
+        p.coverage_gaps
+            .agent_data_recent
+            .get(TRANSCRIPT_CWD_UNKNOWN),
+        Some(&1)
+    );
+
+    // Just outside the window: the transcript is not recent and is not read; the normal
+    // actions stand.
+    let (l, wt2) = setup(7 * DAY + 60);
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    for c in [&l.wt, &wt2] {
+        assert_eq!(action(&p, c), Action::BackupThenRemove, "{}", why(&p, c));
+    }
+    assert!(p.coverage_gaps.agent_data_recent.is_empty());
+
+    // An old unreadable transcript an agent holds open is read: counted, not recent.
+    let (l, _) = setup(30 * DAY);
+    let mut a = agent(530, "claude", &l.fx.s(".agent-harness/work/s1/task"));
+    a.open_files = Some(vec![l.fx.s(".claude/projects/-proj/garbage.jsonl")]);
+    let p = l.fx.plan(snap(vec![a]));
+    assert_eq!(
+        p.coverage_gaps.agent_data.get(TRANSCRIPT_CWD_UNKNOWN),
+        Some(&1),
+        "{:?}",
+        p.coverage_gaps
+    );
+    assert!(p.coverage_gaps.agent_data_recent.is_empty());
+
+    // A recent registry file without a pid is a recent gap too.
+    let l = live_fixture();
+    l.fx.write(".claude/sessions/88.json", "{\"cwd\":\"/x\"}");
+    l.fx.date(".claude/sessions/88.json", 3600);
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    assert_eq!(action(&p, &l.wt), Action::Ask, "{}", why(&p, &l.wt));
+}
+
+/// Past the transcript read limit the rest cannot be judged: counted as recent, so removals
+/// under the agent dirs ask (the limit is 8 in tests).
+#[test]
+fn transcript_limit_fails_closed() {
+    let l = live_fixture();
+    for i in 0..MAX_TRANSCRIPTS + 1 {
+        let rel = format!(".claude/projects/-proj/t{i}.jsonl");
+        l.fx.write(&rel, "{\"cwd\":\"/elsewhere\"}\n");
+        l.fx.date(&rel, 3600);
+    }
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    assert_eq!(
+        p.coverage_gaps
+            .agent_data_recent
+            .get("transcripts-not-read"),
+        Some(&1),
+        "{:?}",
+        p.coverage_gaps
+    );
+    assert_eq!(action(&p, &l.wt), Action::Ask, "{}", why(&p, &l.wt));
+    assert_eq!(
+        action(&p, &l.out),
+        Action::BackupThenRemove,
+        "{}",
+        why(&p, &l.out)
     );
 }
 

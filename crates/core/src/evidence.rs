@@ -222,6 +222,10 @@ pub struct GapSummary {
     /// Each may hide a live session; the header lists them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agent_data: BTreeMap<String, u64>,
+    /// Those of `agent_data` modified within the active window (or of unknown age, or past a
+    /// limit): they make every removing item under the agent directories ask.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_data_recent: BTreeMap<String, u64>,
 }
 
 impl GapSummary {
@@ -246,6 +250,8 @@ pub(crate) struct NodeEvidence {
     pub session: Option<usize>,
     /// Below a harness `work/` directory.
     pub under_work: bool,
+    /// Below a harness `work/` directory or an agent home's `worktrees/` directory.
+    pub under_agent_dir: bool,
     pub activity: Option<i64>,
     /// The owning project directory, when the node is judged by it.
     pub project: Option<String>,
@@ -272,6 +278,9 @@ pub(crate) struct Evidence {
     pub global_asks: Vec<String>,
     /// Reasons every removing item under a harness work directory asks (agents with no locus).
     pub work_asks: Vec<String>,
+    /// Reasons every removing item under an agent directory (harness work, agent worktrees)
+    /// asks (recent agent data that could not be read).
+    pub agent_asks: Vec<String>,
     /// The gap record is incomplete: the whole-scan coverage rule applies.
     pub gaps_incomplete: bool,
     /// Short notes for the plan header (an unreadable transcript, by path only).
@@ -545,6 +554,8 @@ struct Host {
     homes: Vec<PathBuf>,
     harness: Vec<PathBuf>,
     work_dirs: Vec<PathBuf>,
+    /// Harness work directories and agent homes' `worktrees/` directories.
+    agent_dirs: Vec<PathBuf>,
     protected: Vec<PathBuf>,
     claude_bases: Vec<PathBuf>,
     codex_bases: Vec<PathBuf>,
@@ -572,6 +583,7 @@ impl Host {
         let mut protected = Vec::new();
         let mut claude_bases = Vec::new();
         let mut codex_bases = Vec::new();
+        let mut worktree_dirs: Vec<PathBuf> = Vec::new();
         for r in pc.roots.iter().filter(|r| r.exists) {
             let mut ids = vec![PathBuf::from(&r.spelled)];
             ids.extend(r.canonical.iter().map(PathBuf::from));
@@ -581,6 +593,9 @@ impl Host {
                 }
                 if r.carve == CarveLayout::AgentHarness {
                     push(&mut harness, &id);
+                }
+                if r.carve == CarveLayout::Worktrees {
+                    push(&mut worktree_dirs, &id.join("worktrees"));
                 }
                 let name = id
                     .file_name()
@@ -600,11 +615,14 @@ impl Host {
         if let Some(c) = &pc.codex_home {
             push(&mut codex_bases, Path::new(c));
         }
-        let work_dirs = harness.iter().map(|h| h.join("work")).collect();
+        let work_dirs: Vec<PathBuf> = harness.iter().map(|h| h.join("work")).collect();
+        let mut agent_dirs = work_dirs.clone();
+        agent_dirs.extend(worktree_dirs);
         Host {
             homes,
             harness,
             work_dirs,
+            agent_dirs,
             protected,
             claude_bases,
             codex_bases,
@@ -625,6 +643,11 @@ impl Host {
     fn under_work(&self, p: &Path) -> bool {
         let n = normalize(p);
         self.work_dirs.iter().any(|w| under(&n, w))
+    }
+
+    fn under_agent_dir(&self, p: &Path) -> bool {
+        let n = normalize(p);
+        self.agent_dirs.iter().any(|w| under(&n, w))
     }
 
     /// `/`, the home, the harness root or `work/` itself: an ancestor of a harness work dir.
@@ -763,7 +786,11 @@ enum Via {
 }
 
 /// Most transcripts read per plan.
+#[cfg(not(test))]
 const MAX_TRANSCRIPTS: usize = 5000;
+/// Small in tests, so the limit can be reached.
+#[cfg(test)]
+const MAX_TRANSCRIPTS: usize = 8;
 
 /// Decide the per-item evidence for every node of `scan`. `parent` is the cleaned parent links.
 pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> Evidence {
@@ -786,8 +813,15 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         }
     };
 
-    let gap = |ev: &mut Evidence, class: &str| {
+    // `fresh`: modified within the active window, of unknown age, or past a limit (unknown).
+    let gap = |ev: &mut Evidence, class: &str, fresh: bool| {
         *ev.gaps.agent_data.entry(class.to_string()).or_insert(0) += 1;
+        if fresh {
+            *ev.gaps
+                .agent_data_recent
+                .entry(class.to_string())
+                .or_insert(0) += 1;
+        }
     };
 
     // ---- node identities: the path as the scan spelled it and its real path.
@@ -816,7 +850,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         if let Some(s) = ids[i].iter().find_map(|id| host.session_of(id)) {
             names.push(s);
         }
-        need |= ids[i].iter().any(|id| host.under_work(id));
+        need |= ids[i].iter().any(|id| host.under_agent_dir(id));
     }
     names.sort();
     names.dedup();
@@ -951,21 +985,22 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                     continue;
                 }
                 let Ok(md) = e.metadata() else { continue };
+                let fresh_md = mtime_of(&md).is_none_or(|m| recent(Some(m)));
                 if !md.is_file() || md.len() > 64 * 1024 {
-                    gap(&mut ev, "registry-entry-unknown");
+                    gap(&mut ev, "registry-entry-unknown", fresh_md);
                     continue;
                 }
                 let Ok(text) = std::fs::read(e.path()) else {
-                    gap(&mut ev, "registry-entry-unknown");
+                    gap(&mut ev, "registry-entry-unknown", fresh_md);
                     continue;
                 };
                 let Ok(entry) = serde_json::from_slice::<RegistryEntry>(&text) else {
-                    gap(&mut ev, "registry-entry-unknown");
+                    gap(&mut ev, "registry-entry-unknown", fresh_md);
                     continue;
                 };
                 drop(text);
                 let Some(pid) = entry.pid else {
-                    gap(&mut ev, "registry-entry-unknown");
+                    gap(&mut ev, "registry-entry-unknown", fresh_md);
                     continue;
                 };
                 let Some(p) = by_pid.get(&pid) else { continue };
@@ -984,14 +1019,15 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
     let mut read_count = 0usize;
     let mut read_cwd = |ev: &mut Evidence, path: &Path| -> Option<String> {
         if read_count >= MAX_TRANSCRIPTS {
-            gap(ev, "transcripts-not-read");
+            gap(ev, "transcripts-not-read", true);
             return None;
         }
         read_count += 1;
         match transcript_cwd(path) {
             Ok(c) => Some(c),
             Err(class) => {
-                gap(ev, class);
+                let m = std::fs::metadata(path).ok().as_ref().and_then(mtime_of);
+                gap(ev, class, m.is_none_or(|m| recent(Some(m))));
                 note(ev, format!("{class}: {}", path.display()));
                 None
             }
@@ -1175,8 +1211,10 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         }
     }
 
-    // ---- recent transcripts whose recorded cwd is in a session (no process needed).
-    if !ev.sessions.is_empty() {
+    // ---- recent transcripts whose recorded cwd is in a session (no process needed). Read
+    // whenever an item lies under an agent directory, so that unreadable recent agent data is
+    // seen even when no session owns an item.
+    if need {
         let mut transcripts: Vec<(PathBuf, Option<i64>)> = Vec::new();
         let mut truncated = false;
         // Claude Code: projects/<project>/<id>.jsonl and, for subagents,
@@ -1205,10 +1243,10 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             }
         }
         if truncated {
-            gap(&mut ev, "transcripts-not-read");
+            gap(&mut ev, "transcripts-not-read", true);
         }
         for _ in transcripts.iter().filter(|(_, m)| m.is_none()) {
-            gap(&mut ev, "transcripts-not-read");
+            gap(&mut ev, "transcripts-not-read", true);
         }
         transcripts.retain(|(_, m)| recent(*m));
         transcripts.sort_by_key(|t| std::cmp::Reverse(t.1));
@@ -1305,6 +1343,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             .find_map(|id| host.session_of(id))
             .and_then(|s| sidx.get(&s).copied());
         e.under_work = ids[i].iter().any(|id| host.under_work(id));
+        e.under_agent_dir = ids[i].iter().any(|id| host.under_agent_dir(id));
         // Enclosing git work trees, nearest first (bounded walk: links may be corrupt).
         let mut gits: Vec<usize> = Vec::new();
         let mut cur = parent[i];
@@ -1433,6 +1472,23 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                 });
             }
         }
+    }
+
+    // ---- recent agent data that could not be read: removals under agent dirs ask.
+    if !ev.gaps.agent_data_recent.is_empty() {
+        let total: u64 = ev.gaps.agent_data_recent.values().sum();
+        let classes: Vec<String> = ev
+            .gaps
+            .agent_data_recent
+            .iter()
+            .map(|(c, n)| format!("{n} {c}"))
+            .collect();
+        ev.agent_asks.push(format!(
+            "agent data unreadable: {} modified within the active window ({}) could not be \
+             read for a working directory, so a live agent session may be using it",
+            count(total, "entry", "entries"),
+            classes.join(", ")
+        ));
     }
 
     // ---- coverage gaps inside each node.

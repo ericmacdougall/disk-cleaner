@@ -1017,8 +1017,11 @@ gap `transcript-cwd-unknown`, a file that cannot be read is `transcript-unreadab
 without an integer `pid` is `registry-entry-unknown`, and transcripts past the listing or read
 limit, or without a modification time, are `transcripts-not-read`. These are counted in
 `coverage_gaps.agent_data`, noted by path only, and printed in the header: each may hide a live
-session, so they are disclosed rather than silently mapping nothing. They do not by themselves make
-an item ask. `scripts/check-live-sessions.py --transcript-cwd FILE...` applies the same contract and
+session, so they are disclosed rather than silently mapping nothing. One modified within the
+active window (or of unknown age, or past a limit) is also counted in
+`coverage_gaps.agent_data_recent` and makes every removing item under a harness `work/` directory or
+an agent home's `worktrees/` directory ask (`agent data unreadable: N entries ...`, ask code
+`agent-data`); items elsewhere are unaffected, and older ones are only counted. `scripts/check-live-sessions.py --transcript-cwd FILE...` applies the same contract and
 a test runs both over the same fixtures.
 
 An agent process whose every locus (working directory, registry `cwd`, recorded transcript `cwd`,
