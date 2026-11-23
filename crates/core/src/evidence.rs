@@ -246,6 +246,8 @@ pub(crate) struct Hit {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NodeEvidence {
     pub in_use: Option<Hit>,
+    /// A recent agent session's working directory equals, contains or lies inside it (rule 5).
+    pub recent_hold: Option<Hit>,
     /// Index into [`Evidence::sessions`].
     pub session: Option<usize>,
     /// Below a harness `work/` directory.
@@ -770,6 +772,14 @@ impl Host {
         self.work_dirs.iter().any(|w| under(w, &n))
     }
 
+    /// The one ancestor-exception list, shared by process and transcript loci: `/`, a home,
+    /// the harness root, `work/` (anything at or above a harness work dir). A working directory
+    /// there names no place, so it holds nothing below it.
+    fn holds_nothing_below(&self, p: &Path) -> bool {
+        let n = normalize(p);
+        self.ancestor_of_work(&n) || self.homes.iter().any(|h| key_of(h) == key_of(&n))
+    }
+
     fn under_home(&self, p: &Path) -> bool {
         let n = normalize(p);
         self.homes
@@ -960,6 +970,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
     // the session sources (registry, transcripts, agents' loci) is read at all.
     let mut names: Vec<String> = Vec::new();
     let mut need = false;
+    let any_item = (0..n).any(is_item);
     for i in (0..n).filter(|&i| is_item(i)) {
         if let Some(s) = ids[i].iter().find_map(|id| host.session_of(id)) {
             names.push(s);
@@ -1088,7 +1099,11 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
     // ---- the Claude Code session registry: live pids (pid reuse checked), their cwd and id.
     let mut registry: Vec<(u32, RegistryEntry)> = Vec::new();
     let mut projects_dirs: Vec<PathBuf> = Vec::new();
-    for base in host.claude_bases.iter().filter(|_| need) {
+    for base in host.claude_bases.iter().filter(|_| any_item) {
+        projects_dirs.extend(named_dirs(base, "projects", 2));
+        if !need {
+            continue;
+        }
         for sessions in named_dirs(base, "sessions", 2) {
             let Ok(rd) = std::fs::read_dir(&sessions) else {
                 continue;
@@ -1128,7 +1143,6 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                 }
             }
         }
-        projects_dirs.extend(named_dirs(base, "projects", 2));
     }
     let mut read_count = 0usize;
     let mut slug_cache: HashMap<String, SlugMatch> = HashMap::new();
@@ -1293,7 +1307,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                 has_locus = true;
                 continue;
             }
-            if host.ancestor_of_work(l) || !host.under_home(l) {
+            if host.holds_nothing_below(l) || !host.under_home(l) {
                 continue;
             }
             if host.install_path(l, &install_dirs) || (!always && host.agent_config(l)) {
@@ -1365,10 +1379,12 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         }
     }
 
-    // ---- recent transcripts whose recorded cwd is in a session (no process needed). Read
-    // whenever an item lies under an agent directory, so that unreadable recent agent data is
-    // seen even when no session owns an item.
-    if need {
+    // ---- recent transcripts: a recorded cwd in a session makes it live (no process needed),
+    // and every recorded cwd outside the ancestor-exception list holds the items it equals,
+    // contains or lies inside (below). Read whenever there is an item, so that unreadable
+    // recent agent data is seen even when no session owns one.
+    let mut recent_cwds: Vec<(PathBuf, String)> = Vec::new();
+    if any_item {
         let mut transcripts: Vec<(PathBuf, Option<i64>)> = Vec::new();
         let mut truncated = false;
         // Claude Code: projects/<project>/<id>.jsonl and, for subagents,
@@ -1408,6 +1424,12 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             for c in read_cwd(&mut ev, &t) {
                 if let Some(s) = host.session_of(Path::new(&c)) {
                     live(&mut ev, &s, "a transcript modified within the active window records its working directory in it".to_string());
+                }
+                if !host.holds_nothing_below(Path::new(&c)) {
+                    recent_cwds.push((
+                        PathBuf::from(&c),
+                        format!("working directory of a transcript modified within the active window ({})", t.display()),
+                    ));
                 }
             }
         }
@@ -1530,10 +1552,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             // A monorepo: the outermost enclosing git work tree also owns it, unless that is
             // the home or an ancestor of a harness work directory.
             if let Some(&outer) = gits.last() {
-                let ok = ids[outer].iter().all(|id| {
-                    !host.ancestor_of_work(id)
-                        && !host.homes.iter().any(|h| key_of(h) == key_of(id))
-                });
+                let ok = ids[outer].iter().all(|id| !host.holds_nothing_below(id));
                 if ok {
                     owners[i].extend(ids[outer].iter().cloned());
                 }
@@ -1624,6 +1643,43 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                     path: b.to_string_lossy().into_owned(),
                     detail: format!("inside a folder bound into running container {cid}"),
                 });
+            }
+        }
+    }
+
+    // ---- rule 5, recent agent sessions: a recent transcript's cwd (or a candidate of its
+    // project directory name) holds every item it equals, contains or lies inside. The plan
+    // applies it at one point to every removing action.
+    let hold5 = |ev: &mut Evidence, i: usize, c: &(PathBuf, String)| {
+        let e = &mut ev.nodes[i];
+        if e.recent_hold.is_none() {
+            e.recent_hold = Some(Hit {
+                rule: 5,
+                path: c.0.to_string_lossy().into_owned(),
+                detail: c.1.clone(),
+            });
+        }
+    };
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    for (k, c) in recent_cwds.iter().enumerate() {
+        for id in ids_of(&c.0) {
+            by_key.entry(key_of(&id)).or_insert(k);
+            // Equal or containing: the cwd's ancestors through the index (owners included).
+            for anc in id.ancestors() {
+                for &(i, _) in index.get(&key_of(anc)).into_iter().flatten() {
+                    hold5(&mut ev, i, c);
+                }
+            }
+        }
+    }
+    if !by_key.is_empty() {
+        // Inside: each item's ancestors.
+        for i in (0..n).filter(|&i| is_item(i)) {
+            let hit = ids[i]
+                .iter()
+                .find_map(|id| id.ancestors().find_map(|a| by_key.get(&key_of(a)).copied()));
+            if let Some(k) = hit {
+                hold5(&mut ev, i, &recent_cwds[k]);
             }
         }
     }

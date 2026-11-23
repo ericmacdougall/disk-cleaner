@@ -872,7 +872,7 @@ Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `s
 item, see "Holds" below), `ask_code` (a short code for why an `ask` item asks) and, on every item
 whose action removes a git node, `preserve` (see "The preserve obligation"), and `evidence`
 (since schema 17, on every item; fields omitted when empty): `rule` (the in-use rule that matched,
-1 to 4) with the `path` that matched and a `detail` in words, `session` (the owning session),
+1 to 5) with the `path` that matched and a `detail` in words, `session` (the owning session),
 `project` (the owning project, when it is not the node itself), `gaps_inside` and, for a
 repository or worktree, `last_commit_days`.
 
@@ -993,10 +993,17 @@ rule in `evidence.rule`) when:
    values and `:`-separated lists are split. `cargo test --manifest-path /abs/wt/Cargo.toml` from
    the home holds `/abs/wt/target`;
 3. a running container's bind source contains the item, or the item contains it;
-4. its owning session (`<harness root>/work/<s>/`) is live.
+4. its owning session (`<harness root>/work/<s>/`) is live;
+5. a transcript modified within the active window records a working directory (or, by the
+   project-name fallback below, a candidate) that equals the item, lies inside it, or contains it.
+   This is applied at one point in the plan, after every other decision about the item: any
+   removing action (`remove-regenerable`, `backup-then-remove`, `recover-backup-then-remove`)
+   becomes `keep`, with the reason `recent agent session: <cwd> (...) [rule 5]`.
 
-A working directory or argument that is an ancestor of the item, or inside a sibling, never holds
-it: a shell at the home holds nothing below the home.
+A process working directory or argument that is an ancestor of the item, or inside a sibling,
+never holds it: a shell at the home holds nothing below the home. One ancestor-exception list
+serves process and transcript working directories alike: `/`, a home, the harness root, `work/`,
+or anything above a harness work directory names no place, so it holds nothing (rule 5 included).
 
 A session is **live** when any of these says so: a Claude Code registry entry
 (`<claude dir>/sessions/<digits>.json`; only `pid`, `sessionId` and `cwd` are read, `.key` files are

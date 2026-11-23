@@ -686,6 +686,18 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
             }
             _ => {}
         }
+        // Rule 5, the one choke point for a recent agent session's working directory: every
+        // removing action becomes keep (wal:w34c987e0ea8).
+        if action.removes() {
+            if let Some(h) = &ctx.ev.nodes[idx].recent_hold {
+                reason = format!(
+                    "recent agent session: {} ({}) [rule 5]; on its own: {reason}",
+                    h.path, h.detail
+                );
+                action = Action::Keep;
+                reclaim = 0;
+            }
+        }
         own_action.push(action);
         if action.removes() {
             // Evidence that cannot be placed on one item (processes nobody could look at, a
@@ -708,20 +720,34 @@ pub fn plan(scan: &ScanResult, opts: &PlanOptions) -> Plan {
         }
         let ne = &ctx.ev.nodes[idx];
         let item_evidence = ItemEvidence {
-            rule: ne.in_use.as_ref().map(|h| h.rule).or_else(|| {
-                ne.session
-                    .filter(|k| ctx.ev.sessions[*k].live.is_some())
-                    .map(|_| 4)
-            }),
-            path: ne.in_use.as_ref().map(|h| h.path.clone()),
-            detail: ne.in_use.as_ref().map(|h| h.detail.clone()).or_else(|| {
-                ne.session.and_then(|k| {
-                    let s = &ctx.ev.sessions[k];
-                    s.live
-                        .as_ref()
-                        .map(|w| format!("session {} is live: {w}", s.name))
+            rule: ne
+                .in_use
+                .as_ref()
+                .map(|h| h.rule)
+                .or_else(|| {
+                    ne.session
+                        .filter(|k| ctx.ev.sessions[*k].live.is_some())
+                        .map(|_| 4)
                 })
-            }),
+                .or_else(|| ne.recent_hold.as_ref().map(|h| h.rule)),
+            path: ne
+                .in_use
+                .as_ref()
+                .or(ne.recent_hold.as_ref())
+                .map(|h| h.path.clone()),
+            detail: ne
+                .in_use
+                .as_ref()
+                .map(|h| h.detail.clone())
+                .or_else(|| {
+                    ne.session.and_then(|k| {
+                        let s = &ctx.ev.sessions[k];
+                        s.live
+                            .as_ref()
+                            .map(|w| format!("session {} is live: {w}", s.name))
+                    })
+                })
+                .or_else(|| ne.recent_hold.as_ref().map(|h| h.detail.clone())),
             session: ne.session.map(|k| ctx.ev.sessions[k].name.clone()),
             project: ne.project.clone(),
             gaps_inside: ne.gaps_inside,

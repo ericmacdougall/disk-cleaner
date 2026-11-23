@@ -1751,7 +1751,9 @@ fn claude_slug_fallback_plan() {
     );
     oracle_agrees(&l, &p, "ambiguous");
 
-    // A candidate under an agent dir but in no session: nothing can hold it, the gap stays.
+    // A candidate under an agent dir but in no session: no session holds it, so the gap stays
+    // (the ruled fail-closed case) and the other agent-dir items ask; rule 5 keeps the
+    // candidate itself.
     let l = live_fixture();
     let w1 = l.fx.repo(".claude/worktrees/w1");
     l.fx.age_all();
@@ -1759,9 +1761,9 @@ fn claude_slug_fallback_plan() {
     l.fx.write(&rel, "");
     l.fx.date(&rel, 3600);
     let p = l.fx.plan(ProcessSnapshot::none_running());
-    for c in [&w1, &l.wt] {
-        assert_eq!(action(&p, c), Action::Ask, "{}", why(&p, c));
-    }
+    assert_eq!(action(&p, &w1), Action::Keep, "{}", why(&p, &w1));
+    assert_eq!(item(&p, &w1).evidence.rule, Some(5));
+    assert_eq!(action(&p, &l.wt), Action::Ask, "{}", why(&p, &l.wt));
     assert_eq!(
         p.coverage_gaps
             .agent_data_recent
@@ -1826,4 +1828,144 @@ fn claude_slug_fallback_plan() {
     );
     assert_eq!(action(&p, &l.wt), Action::Ask, "{}", why(&p, &l.wt));
     oracle_agrees(&l, &p, "incomplete");
+}
+
+/// The fixture for rule 5: one item of each removing kind outside every session, each with a
+/// subdirectory, plus a session checkout. `code/r` has unsaved work (recover first).
+fn rule5_fixture() -> (Fx, Vec<(&'static str, Action)>) {
+    let fx = Fx::new();
+    fx.repo("code/p");
+    fx.write("code/p/package.json", "{}");
+    fx.write("code/p/node_modules/dep/package.json", "{}");
+    fx.repo("code/r");
+    fx.repo("code/b");
+    fx.repo(".agent-harness/work/s1/wt");
+    fx.age_all();
+    let items = vec![
+        ("code/p/node_modules", Action::RemoveRegenerable),
+        ("code/r", Action::RecoverBackupThenRemove),
+        ("code/b", Action::BackupThenRemove),
+        (".agent-harness/work/s1/wt", Action::BackupThenRemove),
+    ];
+    (fx, items)
+}
+
+/// Plan `fx` with `code/r` dirty and `procs` running.
+fn rule5_plan(fx: &Fx, procs: Vec<Proc>) -> Plan {
+    let mut scan = fx.scan();
+    let r = fx.s("code/r");
+    for n in scan.nodes.iter_mut().filter(|n| n.path == r) {
+        if let Some(info) = n.repo.as_mut() {
+            info.facts.tree_clean = Tri::No;
+        }
+    }
+    plan(&scan, &fx.opts(snap(procs)))
+}
+
+/// A recent transcript recording `cwd`.
+fn recent_transcript(fx: &Fx, name: &str, cwd: &Path) {
+    let rel = format!(".claude/projects/-r5-none/{name}.jsonl");
+    fx.write(
+        &rel,
+        &format!("{{\"type\":\"user\",\"cwd\":\"{}\"}}\n", cwd.display()),
+    );
+    fx.date(&rel, 3600);
+}
+
+/// Run the oracle over `plan` on `fx`'s home (no real process read): (exit 0, stdout).
+fn oracle_on(fx: &Fx, plan_json: &str) -> (bool, String) {
+    let plan_file = fx.home.parent().unwrap().join("plan5.json");
+    fs::write(&plan_file, plan_json).unwrap();
+    let out = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-live-sessions.py"))
+        .args(["--plan", &plan_file.to_string_lossy()])
+        .args(["--home", &fx.s("")])
+        .args(["--now", &fx.now.to_string()])
+        .arg("--no-processes")
+        .output()
+        .expect("python3 runs the oracle");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// goodqa#16711 rule 5 (main ruling wal:w34c987e0ea8): a recent transcript's working directory
+/// holds every item it equals, contains or lies inside, whatever the removing action, at one
+/// choke point in the plan; one at /, the home, the harness root or work/ holds nothing, and the
+/// same list governs process working directories. The oracle flags each case the tool would
+/// offer. (Fails at 78d584a: the item inside a recent cwd was offered.)
+#[test]
+fn recent_cwd_holds_every_removing_kind() {
+    // Control: each removing kind is offered.
+    let (fx, items) = rule5_fixture();
+    let p = rule5_plan(&fx, vec![]);
+    for (rel, kind) in &items {
+        let path = fx.p(rel);
+        assert_eq!(action(&p, &path), *kind, "control: {}", why(&p, &path));
+    }
+
+    for (rel, kind) in &items {
+        let below = if *kind == Action::RemoveRegenerable {
+            format!("{rel}/dep")
+        } else {
+            format!("{rel}/src")
+        };
+        let above = rel.rsplit_once('/').unwrap().0.to_string();
+        for (pos, cwd_rel) in [("at", rel.to_string()), ("above", above), ("below", below)] {
+            let (fx, _) = rule5_fixture();
+            recent_transcript(&fx, "t", &fx.p(&cwd_rel));
+            let p = rule5_plan(&fx, vec![]);
+            let target = fx.p(rel);
+            let it = item(&p, &target);
+            assert_eq!(
+                it.action,
+                Action::Keep,
+                "{kind:?} cwd {pos}: {}",
+                why(&p, &target)
+            );
+            assert!(
+                it.reason.starts_with("recent agent session: ") || it.evidence.rule == Some(4),
+                "{kind:?} cwd {pos}: {}",
+                it.reason
+            );
+            let (ok, out) = oracle_on(&fx, &serde_json::to_string(&p).unwrap());
+            assert!(
+                ok,
+                "{kind:?} cwd {pos}: the oracle rejects the tool's plan\n{out}"
+            );
+            // Offer the item anyway: the oracle flags it.
+            let mut v: serde_json::Value = serde_json::to_value(&p).unwrap();
+            for i in v["items"].as_array_mut().unwrap() {
+                if i["path"] == target.to_string_lossy().as_ref() {
+                    i["action"] = serde_json::Value::from(kind.as_str());
+                }
+            }
+            let (ok, out) = oracle_on(&fx, &v.to_string());
+            assert!(
+                !ok,
+                "{kind:?} cwd {pos}: the oracle missed the offered item\n{out}"
+            );
+            assert!(out.contains(&format!(": {}", target.display())), "{out}");
+        }
+    }
+
+    // The ancestor-exception list holds nothing, for transcripts and processes alike.
+    let (fx, items) = rule5_fixture();
+    for cwd in [
+        "/".to_string(),
+        fx.s(""),
+        fx.s(".agent-harness"),
+        fx.s(".agent-harness/work"),
+    ] {
+        recent_transcript(&fx, "anc", Path::new(&cwd));
+        let p = rule5_plan(&fx, vec![proc(600, &cwd, &["bash"])]);
+        for (rel, kind) in &items {
+            let path = fx.p(rel);
+            assert_eq!(action(&p, &path), *kind, "cwd {cwd}: {}", why(&p, &path));
+        }
+        let (ok, out) = oracle_on(&fx, &serde_json::to_string(&p).unwrap());
+        assert!(ok, "cwd {cwd}: {out}");
+    }
 }

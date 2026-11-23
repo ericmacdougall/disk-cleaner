@@ -19,7 +19,8 @@ sources:
   * entries named after a session at depth 3 or less in .claude, .codex or the harness root
     (outside work/) modified within the window (WAL directories and the like);
   * transcripts (.claude/projects/**/*.jsonl, .codex/sessions/**/rollout-*.jsonl) modified
-    within the window, by the cwd they record;
+    within the window, by the cwd they record; that cwd (outside /, the home, the harness root
+    and work/) also holds every item it equals, contains or lies inside, whatever its action;
   * `--ground-truth CMD`: a source the tool does not read (on the harness hosts, the live-owner
     listing). A session name that appears in its output as a whole token is live. If the command
     fails, the check cannot be made: exit 2.
@@ -174,6 +175,7 @@ class Oracle:
         self.live = {}  # session -> first source
         self.gaps = {}  # gap class -> count
         self.recent_gaps = {}  # those modified within the window (or of unknown age)
+        self.recent_cwds = []  # (cwd, transcript) outside the ancestor-exception list
         self.agent_dirs = [self.work] + [
             os.path.join(self.home, d, "worktrees") for d in (".claude", ".codex")
         ]
@@ -186,6 +188,27 @@ class Oracle:
             fresh = True
         if fresh:
             self.recent_gaps[cls] = self.recent_gaps.get(cls, 0) + 1
+
+    def holds_nothing_below(self, path):
+        """The one ancestor-exception list: /, the home, the harness root, work/ (anything at
+        or above the harness work dir) names no place and holds nothing."""
+        p = os.path.normpath(path)
+        for w in {self.work, os.path.realpath(self.work)}:
+            if p == w or p == "/" or w.startswith(p.rstrip(os.sep) + os.sep):
+                return True
+        return p in {self.home, os.path.realpath(self.home)}
+
+    def held_by_recent(self, path):
+        """The recent transcript cwd that equals, contains or lies inside `path`, or None."""
+        p = os.path.normpath(path or "")
+        if not p.startswith("/"):
+            return None
+        for c, _ in self.recent_cwds:
+            for a, b in ((p, c), (os.path.realpath(p), os.path.realpath(c))):
+                if a == b or a.startswith(b.rstrip(os.sep) + os.sep) or \
+                        b.startswith(a.rstrip(os.sep) + os.sep):
+                    return c
+        return None
 
     def in_agent_dir(self, path):
         p = os.path.normpath(path or "")
@@ -356,6 +379,8 @@ class Oracle:
                         s = self.session_of(c)
                         if s:
                             self.mark(s, "recent transcript")
+                        if not self.holds_nothing_below(c):
+                            self.recent_cwds.append((c, p))
 
     def ground_truth(self, cmd):
         out = subprocess.run(
@@ -523,6 +548,13 @@ def check(plan, oracle):
         s.get("session") for s in plan.get("totals", {}).get("sessions", []) if s.get("live")
     }
     missed = sorted(s for s in oracle.live if s in owned and s not in tool_live)
+    # Rule 5: a recent transcript's cwd holds every item it equals, contains or lies inside,
+    # whatever the removing action.
+    for it in plan.get("items", []):
+        if it.get("action") in REMOVING:
+            c = oracle.held_by_recent(it.get("path"))
+            if c:
+                offered.append(("(recent session %s)" % c, it.get("path")))
     # Recent agent data that could not be read may record any agent session: no removing item
     # under an agent directory may be offered then.
     if oracle.recent_gaps:
@@ -587,7 +619,10 @@ def main(argv, processes=True):
     mapped = [i for i in plan.get("items", []) if oracle.session_of(i.get("path"))]
     print("plan: %d of %d items lie in a session directory" % (len(mapped), len(plan.get("items", []))))
     for s, p in offered:
-        if s.startswith("("):
+        if s.startswith("(recent session "):
+            print("OFFERED: a removing item held by a recent agent session's working "
+                  "directory %s: %s" % (s[len("(recent session "):-1], p))
+        elif s.startswith("("):
             print("OFFERED: a removing item under an agent directory while recent agent data "
                   "is unreadable: %s" % p)
         else:
@@ -676,13 +711,20 @@ def self_test():
             json.dumps({"type": "session-owner", "sessionId": "0001"}) + "\n"
             + json.dumps({"pad": "x" * (70 * 1024), "cwd": work + "/so/wt"}) + "\n", ago=3600)
 
+        # Rule 5: a recent transcript's cwd outside the sessions holds what lies inside it; one
+        # at the home (the ancestor-exception list) holds nothing.
+        put(".claude/projects/-q/r5.jsonl", json.dumps({"cwd": home + "/proj"}) + "\n", ago=3600)
+        put(".claude/projects/-q/r5h.jsonl", json.dumps({"cwd": home}) + "\n", ago=3600)
+
         def item(s, action):
             return {"path": work + "/%s/wt" % s, "action": action}
 
         plan = {
             "items": [item("old", "backup-then-remove"), item("reg", "keep"),
                       item("dead", "backup-then-remove"), item("tr", "backup-then-remove"),
-                      item("recent", "keep"), item("abcd", "backup-then-remove")],
+                      item("recent", "keep"), item("abcd", "backup-then-remove"),
+                      {"path": home + "/proj/x/node_modules", "action": "remove-regenerable"},
+                      {"path": home + "/other/y", "action": "backup-then-remove"}],
             "totals": {"sessions": [{"session": "reg", "live": True},
                                     {"session": "recent", "live": False}]},
         }
@@ -728,11 +770,17 @@ def self_test():
         if ("OFFERED: a removing item under an agent directory while recent agent data is "
                 "unreadable: %s/old/wt" % work) not in out:
             problems.append("an offered work-dir item beside recent gaps was not flagged")
+        if ("OFFERED: a removing item held by a recent agent session's working directory "
+                "%s/proj: %s/proj/x/node_modules" % (home, home)) not in out:
+            problems.append("an item inside a recent transcript's cwd was not flagged")
+        if "other/y" in out:
+            problems.append("a transcript cwd at the home held an item below it")
         # A clean plan passes once the unreadable agent data is older than the window (then it
         # is only counted).
         for rel in [".claude/projects/-p/late.jsonl", ".claude/projects/-p/big.jsonl",
                     ".claude/projects/-p/garbage.jsonl",
-                    ".codex/sessions/2026/01/01/rollout-3.jsonl", ".claude/sessions/77.json"]:
+                    ".codex/sessions/2026/01/01/rollout-3.jsonl", ".claude/sessions/77.json",
+                    ".claude/projects/-q/r5.jsonl"]:
             os.utime(os.path.join(home, rel), (now - 30 * 86400, now - 30 * 86400))
         plan["items"] =[i for i in plan["items"] if i["path"].split("/")[-2] not in want]
         plan["totals"]["sessions"].append({"session": "recent", "live": True})
