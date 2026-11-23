@@ -1417,17 +1417,35 @@ fn r15_object_data_is_backed_up_and_no_verification_is_accepted() {
 
     let cfg = tmp.path().join("verify.toml");
     write(&cfg, "verify_objects = true\n");
-    let refused: [&[&str]; 2] = [&["--verify-objects"], &["--config", cfg.to_str().unwrap()]];
-    for extra in refused {
-        let mut c = bin();
-        c.args(["scan", root.to_str().unwrap()]).args(extra);
-        isolate(&mut c, &home);
-        let o = run(&mut c);
-        assert_eq!(o.status.code(), Some(2), "{extra:?} was accepted");
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert!(err.contains("unexpected argument"), "{extra:?}: {err}");
-        assert!(err.contains(extra[0]), "{extra:?}: {err}");
-    }
+    let mut c = bin();
+    c.args(["scan", root.to_str().unwrap(), "--verify-objects"]);
+    isolate(&mut c, &home);
+    let o = run(&mut c);
+    assert_eq!(o.status.code(), Some(2), "--verify-objects was accepted");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("unexpected argument"), "{err}");
+    assert!(err.contains("--verify-objects"), "{err}");
+    // `scan --config FILE` exists again (goodqa#16670: scan and plan read the same
+    // `protected_paths`), but a file that still sets `verify_objects` is refused, never used.
+    let out = tmp.path().join("verify-scan.json");
+    let mut c = bin();
+    c.args([
+        "scan",
+        root.to_str().unwrap(),
+        "--config",
+        cfg.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    isolate(&mut c, &home);
+    let o = run(&mut c);
+    assert!(
+        !o.status.success(),
+        "scan accepted a config with verify_objects"
+    );
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("verify_objects"), "{err}");
+    assert!(!out.exists(), "a scan file was written");
 
     let scan_file = tmp.path().join("scan.json");
     let v = scan_to_file(&root, &scan_file);
