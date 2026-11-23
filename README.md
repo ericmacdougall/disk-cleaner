@@ -34,7 +34,8 @@ path you mark with `--active`, or a folder a running process works in is kept. F
 proposes one action per item: `keep`, `remove-regenerable`, `backup-then-remove`,
 `recover-backup-then-remove` or `ask`, each with a reason in words. Agent homes (`~/.claude`,
 `~/.codex`, `~/.agent-harness` and similar, plus `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and the config's
-`protected_paths`), cloud-sync folders and application packages are never proposed for removal:
+`protected_paths`, which the scan reads: give `scan` and `plan` the same `--config FILE`, and the
+plan refuses entries the scan did not protect), cloud-sync folders and application packages are never proposed for removal:
 they are held, and the summary shows what is held and why, how many bytes each class and action
 would free, and the biggest items. The plan is a proposal only; nothing applies it yet.
 

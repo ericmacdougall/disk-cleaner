@@ -70,6 +70,10 @@ struct ScanArgs {
     /// fixture home); HOME must be set to the same directory. The real home stays protected too.
     #[arg(long, value_name = "DIR")]
     home: Option<PathBuf>,
+    /// Config file whose `protected_paths` add protected roots (default: <platform config
+    /// dir>/disk-cleaner/config.toml). Give `plan` the same file.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -128,8 +132,9 @@ fn run_scan(a: ScanArgs) -> Result<()> {
     let git = Git::new("git", Duration::from_secs(a.git_timeout_secs.max(1)));
     opts.facts = FactsConfig::default().with_git(git);
     // Who is running and where agent data lives: asked of the system here, passed to the core.
-    // The config's `protected_paths` add roots; scan reads the config from its default location.
-    let (cfg, _) = config::load(None).context("invalid configuration")?;
+    // The config's `protected_paths` add roots: from `--config FILE`, or the default location.
+    // `plan` refuses entries this scan did not resolve, so the two must read the same file.
+    let (cfg, _) = config::load(a.config.as_deref()).context("invalid configuration")?;
     let mut ctx = ScanContext::from_env(cfg.protected_paths);
     ctx.euid = sysctx::euid();
     ctx.passwd_home = ctx.euid.and_then(sysctx::passwd_home);
@@ -178,6 +183,9 @@ fn run_plan(a: PlanArgs) -> Result<()> {
     // The config is always loaded and validated, even when a flag overrides it, so a broken
     // file is reported instead of being ignored.
     let (cfg, source) = config::load(a.config.as_deref()).context("invalid configuration")?;
+    // Roots are resolved by the scan: an entry it did not protect is refused, never ignored.
+    protect::check_config_paths(&scan_result, &cfg.protected_paths)
+        .context("configuration not covered by the scan")?;
     let (window, window_source) = match (a.active_window_days, source) {
         (Some(n), _) => (n, "--active-window-days".to_string()),
         (None, ConfigSource::File(p)) => {

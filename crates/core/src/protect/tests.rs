@@ -1007,6 +1007,39 @@ fn work_dir_allowlist() {
 }
 
 #[test]
+fn config_paths_must_be_in_the_scan() {
+    let (_t, home) = fixture_home();
+    let mut ctx = ctx_for(&home);
+    ctx.extra_paths = vec!["~/keep".into()];
+    let s = scan_of(resolve(&ctx).unwrap(), vec![]);
+    // Entries the scan resolved: by `~/`, by absolute path, or equal to a built-in root.
+    let abs = home.join("keep").to_string_lossy().into_owned();
+    for ok in [
+        vec![],
+        vec!["~/keep".to_string()],
+        vec![abs],
+        vec!["~/.claude".into()],
+    ] {
+        assert!(check_config_paths(&s, &ok).is_ok(), "{ok:?}");
+    }
+    // An entry the scan did not resolve is refused, naming every such entry and only those.
+    let e = check_config_paths(&s, &["~/keep".into(), "~/later".into(), "/data/x".into()])
+        .expect_err("unscanned entries");
+    let m = e.to_string();
+    assert!(
+        m.contains("\"~/later\"") && m.contains("\"/data/x\""),
+        "{m}"
+    );
+    assert!(!m.contains("\"~/keep\""), "{m}");
+    assert!(m.contains("scan again"), "{m}");
+    // A sync folder is not a protected root, and a bad entry is refused as in the scan.
+    fs::create_dir_all(home.join("Dropbox")).unwrap();
+    let s = scan_of(resolve(&ctx_for(&home)).unwrap(), vec![]);
+    assert!(check_config_paths(&s, &["~/Dropbox".into()]).is_err());
+    assert!(check_config_paths(&s, &["~/".into()]).is_err());
+}
+
+#[test]
 fn config_paths_are_validated() {
     assert!(validate_config_path("/data/agents").is_ok());
     assert!(validate_config_path("~/agents").is_ok());

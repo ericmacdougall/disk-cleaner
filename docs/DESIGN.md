@@ -132,7 +132,7 @@ Plan never proposes removing anything that is, contains or lies inside an agent 
 (transcripts, WALs, harness state), a cloud-sync folder or an application package. The roots are
 resolved at scan time from the passwd home, the environment overrides and the config's
 `protected_paths` (add-only) and recorded in the scan with the bytes under each; the plan reads
-only the scan. Each node carries its lexical and its canonical path and is compared on both. A
+only the scan, and refuses a config whose `protected_paths` the scan did not resolve. Each node carries its lexical and its canonical path and is compared on both. A
 hold sets the node's own action to `keep` before the nested-veto pass, so a removing parent of a
 held node asks. Inside a protected root the only exceptions are clean, fully pushed checkouts in
 named positions (agent work directories and worktree directories), which may be backed up then

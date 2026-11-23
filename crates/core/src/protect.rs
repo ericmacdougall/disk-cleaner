@@ -870,5 +870,41 @@ pub fn check_plan_scan(scan: &ScanResult, euid: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a plan whose config names `protected_paths` the scan did not protect. The scan resolves
+/// the roots (the plan reads no file system), so an entry added to a config the scan did not read
+/// would protect nothing; it is named instead of ignored. Each entry is expanded against the
+/// scan's home and must be the spelled or canonical path of one of the scan's protected roots.
+pub fn check_config_paths(scan: &ScanResult, paths: &[String]) -> Result<()> {
+    let home = PathBuf::from(&scan.protect.home);
+    let mut missing: Vec<&str> = Vec::new();
+    for entry in paths {
+        let p = validate_path("protected_paths entry", entry, Some(&home), true)?;
+        let found = scan.protect.roots.iter().any(|r| {
+            r.code == HoldCode::Protected
+                && (same_path(&p, Path::new(&r.spelled))
+                    || r.canonical
+                        .as_deref()
+                        .is_some_and(|c| same_path(&p, Path::new(c))))
+        });
+        if !found {
+            missing.push(entry);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = missing.iter().map(|m| format!("{m:?}")).collect();
+    Err(Error::Protect(format!(
+        "the config's protected_paths {} {} not protected in this scan: the scan resolves \
+         protected roots from the config it reads (the default config, or scan --config FILE), \
+         so {} would protect nothing; put {} in the default config (or pass the same --config to \
+         scan) and scan again",
+        names.join(", "),
+        if missing.len() == 1 { "is" } else { "are" },
+        if missing.len() == 1 { "it" } else { "they" },
+        if missing.len() == 1 { "it" } else { "them" },
+    )))
+}
+
 #[cfg(test)]
 mod tests;

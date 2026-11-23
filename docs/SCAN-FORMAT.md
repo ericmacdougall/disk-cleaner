@@ -51,8 +51,8 @@ Paths are strings; a path that is not valid UTF-8 is converted lossily, so it wi
 Such a node therefore gets an `ask_reason` and is never offered for removal (see "File names git
 prints").
 
-Produce a scan with `disk-cleaner scan <path>... --out scan.json` (or `--json` for stdout) and a
-plan with `disk-cleaner plan --scan scan.json [--active-window-days N] [--config FILE] [--active PATH]... [--trust-partial-process-check] [--accept-incomplete-coverage] [--json]`. Both are
+Produce a scan with `disk-cleaner scan <path>... [--config FILE] --out scan.json` (or `--json` for
+stdout) and a plan with `disk-cleaner plan --scan scan.json [--active-window-days N] [--config FILE] [--active PATH]... [--trust-partial-process-check] [--accept-incomplete-coverage] [--json]`. Both are
 read-only. Nothing in this phase deletes, moves or modifies anything; `--out` writes only the file
 you name.
 
@@ -124,7 +124,10 @@ system or git call to protect anything:
 Protected roots: home-relative `.claude`, `.codex`, `.agent-harness`, `.prunedisk`, `.kimi`,
 `.kimi-code`, `.gemini`, `.cursor`, `.config/claude`, `.local/share/claude` and
 `Library/Application Support/Claude`; `$XDG_CONFIG_HOME/claude`; `CLAUDE_CONFIG_DIR`; `CODEX_HOME`;
-and the config's `protected_paths` (add-only). Cloud-sync roots (`synced`): `Library/Mobile
+and the config's `protected_paths` (add-only), read by the scan from `scan --config FILE` or the
+default config. The plan refuses a config (its `--config` or the default) with a `protected_paths`
+entry that is not among the scan's protected roots, naming each such entry: put it in the config
+the scan reads and scan again. Cloud-sync roots (`synced`): `Library/Mobile
 Documents`, `Library/CloudStorage` and the home-level `Dropbox*`, `Google Drive*`, `OneDrive*` and
 `iCloud Drive*` entries. A root absent on the host is recorded with `exists = false` and ignored.
 

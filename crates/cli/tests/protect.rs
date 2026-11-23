@@ -351,3 +351,98 @@ fn plan_refuses_a_scan_without_protected_roots() {
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+/// Where `config::load(None)` looks under `isolate`.
+fn default_config(home: &Path) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/disk-cleaner/config.toml")
+    } else {
+        home.join("xdg/disk-cleaner/config.toml")
+    }
+}
+
+fn err(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stderr).into_owned()
+}
+
+/// Class S: `protected_paths` the scan did not protect are never silently ignored. Plan refuses,
+/// naming each such entry, whether it comes from `--config` or from the default config written
+/// after the scan; `scan --config` reads the same file, after which the plan accepts it and the
+/// path is held.
+#[test]
+fn plan_refuses_config_paths_the_scan_did_not_protect() {
+    let (tmp, home, scan_file) = fixture();
+    let cfg = tmp.path().join("extra.toml");
+    write(&cfg, "protected_paths = [\"~/work/proj\", \"~/.claude\"]\n");
+    let plan_with = |scan: &Path, config: Option<&Path>| {
+        let mut c = bin();
+        c.args([
+            "plan",
+            "--scan",
+            scan.to_str().unwrap(),
+            "--trust-partial-process-check",
+            "--json",
+        ]);
+        if let Some(f) = config {
+            c.args(["--config", f.to_str().unwrap()]);
+        }
+        isolate(&mut c, &home);
+        run(&mut c)
+    };
+    // `--config` naming a path the scan did not protect: refused, naming it (and not the
+    // built-in root the scan does protect).
+    let o = plan_with(&scan_file, Some(&cfg));
+    assert!(
+        !o.status.success(),
+        "plan accepted an unscanned protected_paths entry"
+    );
+    let e = err(&o);
+    assert!(e.contains("~/work/proj") && e.contains("scan"), "{e}");
+    assert!(!e.contains("\"~/.claude\""), "{e}");
+
+    // The same file given to scan: the root is recorded, the plan accepts it, the path is held.
+    let scan2 = tmp.path().join("scan2.json");
+    let mut c = bin();
+    c.args([
+        "scan",
+        home.to_str().unwrap(),
+        "--no-git",
+        "--home",
+        home.to_str().unwrap(),
+        "--config",
+        cfg.to_str().unwrap(),
+        "--out",
+        scan2.to_str().unwrap(),
+    ]);
+    isolate(&mut c, &home);
+    let o = run(&mut c);
+    assert!(o.status.success(), "scan --config: {}", err(&o));
+    let o = plan_with(&scan2, Some(&cfg));
+    assert!(o.status.success(), "{}", err(&o));
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    let nm = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| {
+            i["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/work/proj/node_modules")
+        })
+        .expect("work/proj/node_modules");
+    assert_eq!(nm["action"], "keep", "{nm}");
+    assert_eq!(nm["hold"]["code"], "protected", "{nm}");
+
+    // The default config edited after the scan: plan without --config refuses the first scan too.
+    write(
+        &default_config(&home),
+        "protected_paths = [\"~/work/proj\"]\n",
+    );
+    let o = plan_with(&scan_file, None);
+    assert!(
+        !o.status.success(),
+        "plan accepted the default config's unscanned entry"
+    );
+    assert!(err(&o).contains("~/work/proj"), "{}", err(&o));
+}
