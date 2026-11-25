@@ -246,8 +246,13 @@ pub(crate) struct Hit {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NodeEvidence {
     pub in_use: Option<Hit>,
-    /// A recent agent session's working directory equals, contains or lies inside it (rule 5).
-    pub recent_hold: Option<Hit>,
+    /// A locus holds it at the plan's one choke point: a recent transcript's working directory
+    /// (rule 5) anywhere, or a process locus inside its live session (rule 4), that equals,
+    /// contains or lies inside it.
+    pub locus_hold: Option<Hit>,
+    /// A checkout that asks while its activity is under [`IDLE_ASK_DAYS`] days old: "session
+    /// live" (in a live session) or "agent worktree" (in an agent home's `worktrees/`).
+    pub idle_ask: Option<&'static str>,
     /// Index into [`Evidence::sessions`].
     pub session: Option<usize>,
     /// Below a harness `work/` directory.
@@ -259,6 +264,10 @@ pub(crate) struct NodeEvidence {
     pub project: Option<String>,
     pub gaps_inside: u64,
 }
+
+/// A checkout in a live session or an agent worktree with no locus asks until its own
+/// activity is this many days old (E1b, G1).
+pub(crate) const IDLE_ASK_DAYS: u64 = 14;
 
 /// One session's liveness.
 #[derive(Debug, Clone, Default)]
@@ -576,6 +585,56 @@ fn claude_project_slug(path: &Path) -> Option<String> {
     }
 }
 
+/// The newest mtime of a checkout's git admin files (E1a), metadata only: for a `.git`
+/// directory its `index`, `HEAD` and `FETCH_HEAD`; for a `.git` file (a linked worktree) the
+/// file's ctime and its gitdir's `HEAD`, `index` and `logs/HEAD`, the gitdir taken from the
+/// file's first 4 KiB. `Err` when a `.git` file cannot be read or names no gitdir: the caller
+/// counts the checkout as active.
+fn git_admin_activity(path: &Path) -> Result<Option<i64>, ()> {
+    use std::io::Read;
+    let dot = path.join(".git");
+    let Ok(md) = std::fs::symlink_metadata(&dot) else {
+        return Ok(None);
+    };
+    let newest = |dir: &Path, names: &[&str]| {
+        names
+            .iter()
+            .filter_map(|n| std::fs::metadata(dir.join(n)).ok())
+            .filter_map(|m| mtime_of(&m))
+            .max()
+    };
+    if md.is_dir() {
+        return Ok(newest(&dot, &["index", "HEAD", "FETCH_HEAD"]));
+    }
+    if !md.is_file() {
+        return Err(());
+    }
+    #[cfg(unix)]
+    let ctime = {
+        use std::os::unix::fs::MetadataExt;
+        Some(md.ctime())
+    };
+    #[cfg(not(unix))]
+    let ctime = mtime_of(&md);
+    let mut buf = Vec::new();
+    std::fs::File::open(&dot)
+        .and_then(|f| f.take(4096).read_to_end(&mut buf))
+        .map_err(|_| ())?;
+    let text = String::from_utf8_lossy(&buf);
+    let gitdir = text
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .ok_or(())?;
+    let gd = if Path::new(gitdir).is_absolute() {
+        PathBuf::from(gitdir)
+    } else {
+        path.join(gitdir)
+    };
+    Ok(ctime.max(newest(&gd, &["HEAD", "index", "logs/HEAD"])))
+}
+
 /// The three fields of a Claude Code session registry entry this module reads.
 #[derive(Debug, Clone, Deserialize)]
 struct RegistryEntry {
@@ -672,6 +731,8 @@ struct Host {
     work_dirs: Vec<PathBuf>,
     /// Harness work directories and agent homes' `worktrees/` directories.
     agent_dirs: Vec<PathBuf>,
+    /// Agent homes' `worktrees/` directories.
+    worktree_dirs: Vec<PathBuf>,
     protected: Vec<PathBuf>,
     claude_bases: Vec<PathBuf>,
     codex_bases: Vec<PathBuf>,
@@ -739,7 +800,7 @@ impl Host {
         }
         let work_dirs: Vec<PathBuf> = harness.iter().map(|h| h.join("work")).collect();
         let mut agent_dirs = work_dirs.clone();
-        agent_dirs.extend(worktree_dirs);
+        agent_dirs.extend(worktree_dirs.iter().cloned());
         let mut no_place: HashSet<String> = HashSet::new();
         let mut temps: Vec<PathBuf> = TEMP_ROOTS.iter().map(PathBuf::from).collect();
         if let Some(t) = std::env::var_os("TMPDIR").filter(|t| !t.is_empty()) {
@@ -756,6 +817,7 @@ impl Host {
             }
         }
         Host {
+            worktree_dirs,
             no_place,
             homes,
             harness,
@@ -781,6 +843,13 @@ impl Host {
     fn under_work(&self, p: &Path) -> bool {
         let n = normalize(p);
         self.work_dirs.iter().any(|w| under(&n, w))
+    }
+
+    fn under_worktree_dir(&self, p: &Path) -> bool {
+        let n = normalize(p);
+        self.worktree_dirs
+            .iter()
+            .any(|w| under(&n, w) && key_of(w) != key_of(&n))
     }
 
     fn under_agent_dir(&self, p: &Path) -> bool {
@@ -1175,9 +1244,8 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
     let mut slug_cache: HashMap<String, SlugMatch> = HashMap::new();
     // The working directories a transcript records. A Claude Code transcript with no cwd
     // within the bound falls back to its project directory name: every existing directory
-    // whose encoding equals it is a candidate, and all are held. No match, an incomplete walk,
-    // or a candidate under an agent directory outside every session (nothing can hold it) is
-    // a gap, recent when the transcript is.
+    // whose encoding equals it is a candidate, and all are held (rule 5 and liveness). No
+    // match, or an incomplete walk, is a gap, recent when the transcript is.
     let mut read_cwd = |ev: &mut Evidence, path: &Path| -> Vec<String> {
         if read_count >= MAX_TRANSCRIPTS {
             gap(ev, "transcripts-not-read", true);
@@ -1206,11 +1274,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                 format!("{TRANSCRIPT_SLUG_INCOMPLETE}: {}", path.display()),
             );
         }
-        let unheld = sm
-            .candidates
-            .iter()
-            .any(|c| host.session_of(c).is_none() && host.under_agent_dir(c));
-        if unheld || (sm.candidates.is_empty() && !sm.incomplete) {
+        if sm.candidates.is_empty() && !sm.incomplete {
             gap(ev, class, fresh);
             note(ev, format!("{class}: {}", path.display()));
         } else if !sm.candidates.is_empty() {
@@ -1228,7 +1292,16 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             .map(|c| c.to_string_lossy().into_owned())
             .collect()
     };
+    // Process loci (rule 4 within a live session): live registry entries' and agents' loci,
+    // and every process's working directory, open files and command-line paths.
+    let mut proc_loci: Vec<(PathBuf, String)> = Vec::new();
     for (pid, entry) in &registry {
+        if let Some(c) = &entry.cwd {
+            proc_loci.push((
+                PathBuf::from(c),
+                format!("working directory of Claude Code session {pid} (registry)"),
+            ));
+        }
         let mut via_id = false;
         if let Some(id) = &entry.session_id {
             if sidx.contains_key(id) {
@@ -1331,6 +1404,7 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
                     &s,
                     format!("agent process {} works in it ({})", p.pid, l.display()),
                 );
+                proc_loci.push((l.clone(), format!("a locus of agent process {}", p.pid)));
                 has_locus = true;
                 continue;
             }
@@ -1411,6 +1485,9 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
     // contains or lies inside (below). Read whenever there is an item, so that unreadable
     // recent agent data is seen even when no session owns one.
     let mut recent_cwds: Vec<(PathBuf, String)> = Vec::new();
+    // Every transcript read: (recorded cwd or candidate, mtime), for agent-worktree activity.
+    let mut seen_cwds: Vec<(PathBuf, i64)> = Vec::new();
+    let idle_secs = (IDLE_ASK_DAYS as i64).saturating_mul(86_400).max(window);
     if any_item {
         let mut transcripts: Vec<(PathBuf, Option<i64>)> = Vec::new();
         let mut truncated = false;
@@ -1445,10 +1522,15 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         for _ in transcripts.iter().filter(|(_, m)| m.is_none()) {
             gap(&mut ev, "transcripts-not-read", true);
         }
-        transcripts.retain(|(_, m)| recent(*m));
+        transcripts.retain(|(_, m)| m.is_some_and(|m| o.now.saturating_sub(m) <= idle_secs));
         transcripts.sort_by_key(|t| std::cmp::Reverse(t.1));
-        for (t, _) in transcripts {
+        for (t, m) in transcripts {
+            let m = m.unwrap_or(o.now);
             for c in read_cwd(&mut ev, &t) {
+                seen_cwds.push((PathBuf::from(&c), m));
+                if !recent(Some(m)) {
+                    continue;
+                }
                 if let Some(s) = host.session_of(Path::new(&c)) {
                     live(&mut ev, &s, "a transcript modified within the active window records its working directory in it".to_string());
                 }
@@ -1531,12 +1613,19 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
     let own_activity = |i: usize| {
         let nd = &scan.nodes[i];
         let commit = nd.repo.as_ref().and_then(|r| r.last_commit_time);
-        match (nd.newest_mtime, commit) {
+        let mut t = match (nd.newest_mtime, commit) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, None) => a,
             (None, b) => b,
+        };
+        if is_project_node(i) {
+            // E1a: git's own admin files; unknown ones count as active now (fail safe).
+            let admin = git_admin_activity(Path::new(&nd.path)).unwrap_or(Some(o.now));
+            t = t.max(admin);
         }
+        t
     };
+    let live_set: Vec<bool> = ev.sessions.iter().map(|s| s.live.is_some()).collect();
     let mut owners: Vec<Vec<PathBuf>> = vec![Vec::new(); n];
     for i in 0..n {
         let nd = &scan.nodes[i];
@@ -1547,6 +1636,13 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
             .and_then(|s| sidx.get(&s).copied());
         e.under_work = ids[i].iter().any(|id| host.under_work(id));
         e.under_agent_dir = ids[i].iter().any(|id| host.under_agent_dir(id));
+        if is_project_node(i) {
+            if ids[i].iter().any(|id| host.under_worktree_dir(id)) {
+                e.idle_ask = Some("agent worktree");
+            } else if e.session.is_some_and(|k| live_set[k]) {
+                e.idle_ask = Some("session live");
+            }
+        }
         // Enclosing git work trees, nearest first (bounded walk: links may be corrupt).
         let mut gits: Vec<usize> = Vec::new();
         let mut cur = parent[i];
@@ -1674,39 +1770,89 @@ pub(crate) fn gather(scan: &ScanResult, parent: &[Option<usize>], o: &Opts) -> E
         }
     }
 
-    // ---- rule 5, recent agent sessions: a recent transcript's cwd (or a candidate of its
-    // project directory name) holds every item it equals, contains or lies inside. The plan
-    // applies it at one point to every removing action.
-    let hold5 = |ev: &mut Evidence, i: usize, c: &(PathBuf, String)| {
+    // ---- locus holds, applied by the plan at one choke point to every removing action.
+    // Rule 5: a recent transcript's cwd (or a candidate of its project directory name) holds
+    // every item it equals, contains or lies inside. Rule 4: a process locus (any process's
+    // working directory, open files and command-line paths, and agents' loci in a session)
+    // holds what it equals or contains (rules 1 and 2 already) and, inside a live session,
+    // what lies inside it. One ancestor-exception list applies to both.
+    for p in procs.iter() {
+        if let Some(c) = p.cwd.as_deref() {
+            proc_loci.push((
+                PathBuf::from(c),
+                format!("inside the working directory of process {}", p.pid),
+            ));
+        }
+        for f in p.open_files.iter().flatten() {
+            proc_loci.push((
+                PathBuf::from(f),
+                format!("a file open in process {}", p.pid),
+            ));
+        }
+        if let Some(args) = &p.cmdline {
+            for a in arg_paths(args, p.cwd.as_deref().map(Path::new)) {
+                proc_loci.push((a, format!("named on the command line of process {}", p.pid)));
+            }
+        }
+    }
+    let loci: Vec<(PathBuf, String, u8)> = recent_cwds
+        .into_iter()
+        .map(|(p, d)| (p, d, 5))
+        .chain(proc_loci.into_iter().map(|(p, d)| (p, d, 4)))
+        .filter(|(p, _, _)| !host.holds_nothing_below(p))
+        .collect();
+    let hold = |ev: &mut Evidence, i: usize, c: &(PathBuf, String, u8)| {
         let e = &mut ev.nodes[i];
-        if e.recent_hold.is_none() {
-            e.recent_hold = Some(Hit {
-                rule: 5,
+        if e.locus_hold.is_none() {
+            e.locus_hold = Some(Hit {
+                rule: c.2,
                 path: c.0.to_string_lossy().into_owned(),
                 detail: c.1.clone(),
             });
         }
     };
-    let mut by_key: HashMap<String, usize> = HashMap::new();
-    for (k, c) in recent_cwds.iter().enumerate() {
+    let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+    for (k, c) in loci.iter().enumerate() {
         for id in ids_of(&c.0) {
-            by_key.entry(key_of(&id)).or_insert(k);
-            // Equal or containing: the cwd's ancestors through the index (owners included).
+            by_key.entry(key_of(&id)).or_default().push(k);
+            // Equal or containing: the locus's ancestors through the index (owners included).
             for anc in id.ancestors() {
                 for &(i, _) in index.get(&key_of(anc)).into_iter().flatten() {
-                    hold5(&mut ev, i, c);
+                    hold(&mut ev, i, c);
                 }
             }
         }
     }
     if !by_key.is_empty() {
-        // Inside: each item's ancestors.
+        // Inside: each item's ancestors. A process locus holds below only in a live session.
         for i in (0..n).filter(|&i| is_item(i)) {
-            let hit = ids[i]
-                .iter()
-                .find_map(|id| id.ancestors().find_map(|a| by_key.get(&key_of(a)).copied()));
+            let in_live = ev.nodes[i]
+                .session
+                .is_some_and(|k| ev.sessions[k].live.is_some());
+            let hit = ids[i].iter().find_map(|id| {
+                id.ancestors().find_map(|a| {
+                    by_key
+                        .get(&key_of(a))
+                        .and_then(|ks| ks.iter().copied().find(|&k| loci[k].2 == 5 || in_live))
+                })
+            });
             if let Some(k) = hit {
-                hold5(&mut ev, i, &recent_cwds[k]);
+                hold(&mut ev, i, &loci[k]);
+            }
+        }
+    }
+    // G1: an agent worktree's activity includes the transcripts that record a cwd inside it.
+    let worktrees: Vec<usize> = (0..n)
+        .filter(|&i| ev.nodes[i].idle_ask == Some("agent worktree"))
+        .collect();
+    for i in worktrees {
+        for (c, m) in &seen_cwds {
+            if ids_of(c)
+                .iter()
+                .any(|c| ids[i].iter().any(|id| under(c, id)))
+            {
+                let e = &mut ev.nodes[i];
+                e.activity = e.activity.max(Some(*m));
             }
         }
     }

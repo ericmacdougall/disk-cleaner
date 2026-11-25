@@ -216,8 +216,9 @@ fn snap(procs: Vec<Proc>) -> ProcessSnapshot {
 
 // ------------------------------------------------------------------------------------- AC-1
 
-/// AC-1, NEG-1, NEG-6: a process in another session does not hold a checkout; its own session's
-/// checkouts are kept; a process inside a checkout keeps it; a protected node stays kept.
+/// AC-1, NEG-1, NEG-6: a process in another session does not hold a checkout; in its own
+/// session it holds only what it has a locus in, and an idle sibling is offered (r6); a process
+/// inside a checkout keeps it; a protected node stays kept.
 #[test]
 fn sibling_process_does_not_hold() {
     let fx = Fx::new();
@@ -246,12 +247,11 @@ fn sibling_process_does_not_hold() {
     );
     assert_eq!(action(&p, &x), Action::Keep, "{}", why(&p, &x));
     assert_eq!(item(&p, &x).evidence.rule, Some(1), "{}", why(&p, &x));
-    assert_eq!(action(&p, &y), Action::Keep, "{}", why(&p, &y));
-    assert_eq!(item(&p, &y).evidence.rule, Some(4), "{}", why(&p, &y));
-    assert!(item(&p, &y).state_reason.contains("session s2 is live"));
+    assert_eq!(action(&p, &y), Action::BackupThenRemove, "{}", why(&p, &y));
+    assert_eq!(item(&p, &y).evidence.rule, None, "{}", why(&p, &y));
     assert!(session(&p, "s2").live && !session(&p, "s1").live);
     assert!(session(&p, "s1").bytes_offered > 0);
-    assert_eq!(session(&p, "s2").bytes_offered, 0);
+    assert!(session(&p, "s2").bytes_offered > 0);
     assert_eq!(action(&p, &p_out), Action::BackupThenRemove);
 
     // NEG-1: a process inside the checkout itself keeps it (outside the harness too, where no
@@ -331,11 +331,11 @@ fn ancestor_cwd_does_not_hold() {
     let p = fx.plan(snap(vec![proc(201, &fx.s("projects"), &["bash"])]));
     assert_eq!(action(&p, &top), Action::Keep, "{}", why(&p, &top));
 
-    // Except through a live session: a process working in s3 keeps s3's checkout, and an
-    // ancestor cwd beside it still holds nothing of s1's.
+    // Except through a live session: a process working in s3's directory keeps s3's checkout
+    // (a locus that contains it, r6), and an ancestor cwd beside it still holds nothing of s1's.
     let p = fx.plan(snap(vec![
         proc(202, &fx.s(".agent-harness"), &["bash"]),
-        proc(203, &fx.s(".agent-harness/work/s3/notes"), &["bash"]),
+        proc(203, &fx.s(".agent-harness/work/s3"), &["bash"]),
     ]));
     assert_eq!(action(&p, &live_wt), Action::Keep, "{}", why(&p, &live_wt));
     assert_eq!(
@@ -569,13 +569,26 @@ fn kept(l: &Live, p: &Plan, what: &str) {
     let it = item(p, &l.wt);
     assert_eq!(it.action, Action::Keep, "{what}: {}", why(p, &l.wt));
     assert!(
-        it.state_reason.contains("session s1 is live"),
+        it.evidence.rule.is_some() && it.reason.contains("session s1 is live"),
         "{what}: {}",
         why(p, &l.wt)
     );
     assert_eq!(it.days_since_activity, Some(30), "NEG-2 {what}");
     assert!(session(p, "s1").live, "{what}");
     assert_eq!(action(p, &l.abcd), Action::BackupThenRemove, "{what}: abcd");
+}
+
+/// r6 rule 4 refinement: the session is live, but nothing has a locus in the idle checkout
+/// (30 days old, past the 14-day ask), so it is offered.
+fn live_not_held(l: &Live, p: &Plan, what: &str) {
+    assert!(session(p, "s1").live, "{what}: s1 is not live");
+    assert_eq!(
+        action(p, &l.wt),
+        Action::BackupThenRemove,
+        "{what}: {}",
+        why(p, &l.wt)
+    );
+    assert_eq!(item(p, &l.wt).days_since_activity, Some(30), "NEG-2 {what}");
 }
 
 /// AC-5, NEG-2, NEG-7, NEG-8: each live-session source alone keeps the session's checkouts;
@@ -593,20 +606,27 @@ fn live_session() {
     );
     assert!(!session(&p, "s1").live);
 
-    // A process's working directory inside the session directory.
+    // A process's working directory inside the session directory: s1 is live; the sibling
+    // task dir is no locus in the checkout (r6), the session dir itself is.
     let l = live_fixture();
     let cwd = l.fx.s(".agent-harness/work/s1/task");
-    kept(
+    live_not_held(
         &l,
         &l.fx.plan(snap(vec![proc(500, &cwd, &["bash"])])),
         "cwd",
+    );
+    let cwd = l.fx.s(".agent-harness/work/s1");
+    kept(
+        &l,
+        &l.fx.plan(snap(vec![proc(500, &cwd, &["bash"])])),
+        "cwd at the session dir",
     );
 
     // The session id on an agent's command line.
     let l = live_fixture();
     let mut a = agent(501, "claude", &l.fx.s("projects/foo"));
     a.cmdline = Some(vec!["claude".into(), "--resume".into(), "s1".into()]);
-    kept(
+    live_not_held(
         &l,
         &l.fx.plan(snap(vec![a])),
         "session id on a command line",
@@ -616,7 +636,7 @@ fn live_session() {
         let l = live_fixture();
         let mut a = agent(501, "claude", &l.fx.s("projects/foo"));
         a.cmdline = Some(vec!["claude".into(), arg.into()]);
-        kept(&l, &l.fx.plan(snap(vec![a])), arg);
+        live_not_held(&l, &l.fx.plan(snap(vec![a])), arg);
     }
 
     // Recent files below the session directory.
@@ -624,7 +644,7 @@ fn live_session() {
     l.fx.write(".agent-harness/work/s1/notes.md", "x");
     l.fx.date(".agent-harness/work/s1/notes.md", 3600);
     l.fx.date(".agent-harness/work/s1", 400 * DAY);
-    kept(
+    live_not_held(
         &l,
         &l.fx.plan(ProcessSnapshot::none_running()),
         "recent session files",
@@ -635,7 +655,7 @@ fn live_session() {
     l.fx.dir(".claude/wals/s1");
     l.fx.date(".claude/wals/s1", 3600);
     l.fx.date(".claude/wals", 400 * DAY);
-    kept(
+    live_not_held(
         &l,
         &l.fx.plan(ProcessSnapshot::none_running()),
         "same-named entry",
@@ -715,7 +735,7 @@ fn live_session() {
     let l = live_fixture();
     let a = agent(503, "claude", &l.fx.s(".agent-harness/work/s1/task"));
     let p = l.fx.plan(snap(vec![a, child_of(504, 503)]));
-    kept(&l, &p, "agent in a work dir with a child");
+    live_not_held(&l, &p, "agent in a work dir with a child");
     assert!(p.process_counts.unmapped_agents.is_empty());
 
     // A transcript modified an hour ago records its cwd in s1; no process runs at all.
@@ -850,7 +870,7 @@ fn codex_session_meta_transcript() {
 fn subagent_transcript_layout() {
     let l = live_fixture();
     let rel = ".claude/projects/-proj/0000-aaaa/subagents/agent-1.jsonl";
-    let cwd = l.fx.s(".agent-harness/work/s1/task");
+    let cwd = l.fx.s(".agent-harness/work/s1");
     l.fx.write(rel, &format!("{{\"type\":\"user\",\"cwd\":\"{cwd}\"}}\n"));
     l.fx.date(rel, 3600);
     kept(
@@ -1751,9 +1771,8 @@ fn claude_slug_fallback_plan() {
     );
     oracle_agrees(&l, &p, "ambiguous");
 
-    // A candidate under an agent dir but in no session: no session holds it, so the gap stays
-    // (the ruled fail-closed case) and the other agent-dir items ask; rule 5 keeps the
-    // candidate itself.
+    // A candidate under an agent dir but in no session: rule 5 holds it, and no gap is left
+    // (AC-13: a gap only when no candidate exists), so the other agent-dir items are offered.
     let l = live_fixture();
     let w1 = l.fx.repo(".claude/worktrees/w1");
     l.fx.age_all();
@@ -1763,14 +1782,18 @@ fn claude_slug_fallback_plan() {
     let p = l.fx.plan(ProcessSnapshot::none_running());
     assert_eq!(action(&p, &w1), Action::Keep, "{}", why(&p, &w1));
     assert_eq!(item(&p, &w1).evidence.rule, Some(5));
-    assert_eq!(action(&p, &l.wt), Action::Ask, "{}", why(&p, &l.wt));
     assert_eq!(
-        p.coverage_gaps
-            .agent_data_recent
-            .get(TRANSCRIPT_CWD_UNKNOWN),
-        Some(&1)
+        action(&p, &l.wt),
+        Action::BackupThenRemove,
+        "{}",
+        why(&p, &l.wt)
     );
-    oracle_agrees(&l, &p, "unheld candidate");
+    assert!(
+        p.coverage_gaps.agent_data.is_empty(),
+        "{:?}",
+        p.coverage_gaps
+    );
+    oracle_agrees(&l, &p, "candidate in an agent worktree");
 
     // No match: recent asks, old is counted only.
     for (ago, want) in [(3600, Action::Ask), (30 * DAY, Action::BackupThenRemove)] {
@@ -1926,7 +1949,7 @@ fn recent_cwd_holds_every_removing_kind() {
                 why(&p, &target)
             );
             assert!(
-                it.reason.starts_with("recent agent session: ") || it.evidence.rule == Some(4),
+                it.reason.starts_with("recent agent session: ") && it.evidence.rule == Some(5),
                 "{kind:?} cwd {pos}: {}",
                 it.reason
             );
@@ -1977,7 +2000,7 @@ fn recent_cwd_holds_every_removing_kind() {
 /// `y`. The home lives under the build's target directory and has no harness root, so no list
 /// entry is also an ancestor of a harness work dir. Synthetic paths only.
 #[test]
-fn shared_exception_list() {
+fn locus_choke_point() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/evidence-fixtures");
     fs::create_dir_all(&fixtures).unwrap();
     let tb = tempfile::tempdir_in(&fixtures).unwrap();
@@ -2096,5 +2119,304 @@ fn shared_exception_list() {
     let p = plan_with(&tbase, false);
     for c in [&tx, &ty] {
         expect(&p, c, Action::Keep, "/tmp/<d> by transcript");
+    }
+}
+
+/// Make the scanned repository at `rel` dirty (an untracked file: spec A keeps it).
+fn plan_dirty(fx: &Fx, rel: &str, procs: Vec<Proc>) -> Plan {
+    let mut scan = fx.scan();
+    let r = fx.s(rel);
+    for n in scan.nodes.iter_mut().filter(|n| n.path == r) {
+        if let Some(info) = n.repo.as_mut() {
+            info.facts.tree_clean = Tri::No;
+        }
+    }
+    plan(&scan, &fx.opts(snap(procs)))
+}
+
+/// r6 rule 4 refinement and E1a/E1b (NEG-2, NEG-9, NEG-10, NEG-11): in a live session whose
+/// only recent file is a WAL, a node is held only by its own activity (git admin files
+/// included) or a locus; an idle checkout asks under 14 days and is offered from 14 days; in
+/// an idle session it is offered. (Fails at ac003a2, where the WAL alone held every checkout.)
+#[test]
+fn live_session_r6() {
+    let wal = |l: &Live| {
+        l.fx.write(".agent-harness/work/s1/wal/main.jsonl", "{}\n");
+        l.fx.date(".agent-harness/work/s1/wal/main.jsonl", 3600);
+    };
+    // NEG-2: a 30-day-old clean pushed checkout is offered; dirty, it is kept (spec A); a live
+    // process using it as cwd keeps it; touched today, it is kept.
+    let l = live_fixture();
+    wal(&l);
+    live_not_held(&l, &l.fx.plan(ProcessSnapshot::none_running()), "WAL only");
+    let p = plan_dirty(&l.fx, ".agent-harness/work/s1/wt", vec![]);
+    assert_eq!(action(&p, &l.wt), Action::Keep, "dirty: {}", why(&p, &l.wt));
+    let p = l.fx.plan(snap(vec![proc(
+        800,
+        &l.fx.s(".agent-harness/work/s1/wt"),
+        &["bash"],
+    )]));
+    assert_eq!(action(&p, &l.wt), Action::Keep, "cwd: {}", why(&p, &l.wt));
+    l.fx.date(".agent-harness/work/s1/wt/src/lib.rs", 600);
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    assert_eq!(action(&p, &l.wt), Action::Keep, "today: {}", why(&p, &l.wt));
+
+    // NEG-10: only git's admin files are recent (git fetch, git status): kept.
+    for f in ["FETCH_HEAD", "index"] {
+        let l = live_fixture();
+        wal(&l);
+        let rel = format!(".agent-harness/work/s1/wt/.git/{f}");
+        l.fx.write(&rel, "x");
+        l.fx.date(&rel, 600);
+        let p = l.fx.plan(ProcessSnapshot::none_running());
+        assert_eq!(action(&p, &l.wt), Action::Keep, "{f}: {}", why(&p, &l.wt));
+    }
+
+    // NEG-9: a linked worktree created today at a 60-day-old commit: its gitdir HEAD and
+    // index are new, everything else is old; kept with no locus.
+    let l = live_fixture();
+    let main = l.fx.repo("code/main");
+    let wt = l.fx.dir(".agent-harness/work/s1/w9");
+    l.fx.write(".agent-harness/work/s1/w9/src/lib.rs", "fn x() {}\n");
+    l.fx.write(
+        ".agent-harness/work/s1/w9/.git",
+        &format!("gitdir: {}/.git/worktrees/w9\n", main.display()),
+    );
+    l.fx.write("code/main/.git/worktrees/w9/HEAD", "ref: refs/heads/w9\n");
+    l.fx.write("code/main/.git/worktrees/w9/index", "x");
+    l.fx.write(
+        "code/main/.git/worktrees/w9/gitdir",
+        &format!("{}/.git\n", wt.display()),
+    );
+    l.fx.age_all();
+    wal(&l);
+    l.fx.date("code/main/.git/worktrees/w9/HEAD", 600);
+    l.fx.date("code/main/.git/worktrees/w9/index", 600);
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    let it = item(&p, &wt);
+    assert!(!it.action.removes(), "new worktree: {}", why(&p, &wt));
+    assert_eq!(
+        it.days_since_activity,
+        Some(0),
+        "new worktree: {}",
+        why(&p, &wt)
+    );
+
+    // NEG-11 (E1b): 10 days of own activity in a live session asks; 15 days is offered; in an
+    // idle session the 10-day one is offered.
+    for (days, live, want) in [
+        (10, true, Action::Ask),
+        (15, true, Action::BackupThenRemove),
+        (10, false, Action::BackupThenRemove),
+    ] {
+        let l = live_fixture();
+        l.fx.date(".agent-harness/work/s1/wt/src/lib.rs", days * DAY);
+        if live {
+            wal(&l);
+        }
+        let p = l.fx.plan(ProcessSnapshot::none_running());
+        let it = item(&p, &l.wt);
+        assert_eq!(
+            it.action,
+            want,
+            "{days} days, live {live}: {}",
+            why(&p, &l.wt)
+        );
+        if want == Action::Ask {
+            assert!(
+                it.reason
+                    .starts_with(&format!("session live; idle {days} days")),
+                "{}",
+                it.reason
+            );
+            assert_eq!(it.ask_code.as_deref(), Some("session-idle"));
+        }
+    }
+}
+
+/// G1, NEG-12: a clean pushed checkout in an agent home's `worktrees/` with no locus: its
+/// activity includes the transcripts that record a cwd inside it. 3 days: kept (the transcript
+/// is a rule-5 locus); 10 days: ask "agent worktree; idle 10 days"; 15 days: offered; a future
+/// mtime counts as active. The same for `.codex/worktrees`. (Fails at ac003a2.)
+#[test]
+fn agent_worktree_idle() {
+    for home in [".claude", ".codex"] {
+        for (ago, want) in [
+            (3 * DAY, Action::Keep),
+            (10 * DAY, Action::Ask),
+            (15 * DAY, Action::BackupThenRemove),
+            (-3600, Action::Keep),
+        ] {
+            let fx = Fx::new();
+            let x = fx.repo(&format!("{home}/worktrees/x"));
+            fx.age_all();
+            let rel = ".claude/projects/-wt-none/t.jsonl";
+            fx.write(rel, &format!("{{\"cwd\":\"{}/src\"}}\n", x.display()));
+            fx.date(rel, ago);
+            let p = fx.plan(ProcessSnapshot::none_running());
+            let it = item(&p, &x);
+            assert_eq!(it.action, want, "{home} {ago}: {}", why(&p, &x));
+            if want == Action::Ask {
+                assert!(
+                    it.reason.starts_with("agent worktree; idle 10 days"),
+                    "{}",
+                    it.reason
+                );
+                assert_eq!(it.ask_code.as_deref(), Some("worktree-idle"));
+            }
+        }
+    }
+}
+
+/// AC-14: each agent-data gap kind modified within the window makes every removing item under
+/// the agent dirs ask ("agent data unreadable"); the same gap just outside the window, or no
+/// gap, leaves the checkout offered.
+#[test]
+fn recent_gap_rule() {
+    type Make = Box<dyn Fn(&Live, i64)>;
+    let kinds: Vec<(&str, Make)> = vec![
+        (
+            TRANSCRIPT_CWD_UNKNOWN,
+            Box::new(|l: &Live, ago: i64| {
+                l.fx.write(".claude/projects/-proj/g.jsonl", "not json\n");
+                l.fx.date(".claude/projects/-proj/g.jsonl", ago);
+            }),
+        ),
+        (
+            TRANSCRIPT_UNREADABLE,
+            Box::new(|l: &Live, ago: i64| {
+                let p = l.fx.write(".claude/projects/-proj/u.jsonl", "{}\n");
+                l.fx.date(".claude/projects/-proj/u.jsonl", ago);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&p, fs::Permissions::from_mode(0o000)).unwrap();
+                }
+            }),
+        ),
+        (
+            "registry-entry-unknown",
+            Box::new(|l: &Live, ago: i64| {
+                l.fx.write(".claude/sessions/88.json", "{\"cwd\":\"/x\"}");
+                l.fx.date(".claude/sessions/88.json", ago);
+            }),
+        ),
+        (
+            TRANSCRIPT_SLUG_INCOMPLETE,
+            Box::new(|l: &Live, ago: i64| {
+                let ways = ["a.b", "a_b", "a b", "a-b"];
+                let mut lvl = vec![l.fx.p("deep")];
+                for _ in 0..3 {
+                    lvl = lvl
+                        .iter()
+                        .flat_map(|d| ways.iter().map(move |n| d.join(n)))
+                        .collect();
+                }
+                for d in &lvl {
+                    fs::create_dir_all(d.join("end")).unwrap();
+                }
+                let rel = format!(
+                    ".claude/projects/{}/w.jsonl",
+                    slug_of(&l.fx.p("deep/a-b/a-b/a-b/end"))
+                );
+                l.fx.write(&rel, "");
+                l.fx.date(&rel, ago);
+            }),
+        ),
+    ];
+    for (kind, make) in &kinds {
+        // Root cannot be denied a read: skip that one kind there.
+        #[cfg(unix)]
+        if *kind == TRANSCRIPT_UNREADABLE && fs::File::open("/root").is_ok() {
+            continue;
+        }
+        for (ago, want) in [
+            (7 * DAY - 60, Action::Ask),
+            (7 * DAY + 60, Action::BackupThenRemove),
+        ] {
+            let l = live_fixture();
+            make(&l, ago);
+            let p = l.fx.plan(ProcessSnapshot::none_running());
+            let it = item(&p, &l.wt);
+            assert_eq!(it.action, want, "{kind} {ago}: {}", why(&p, &l.wt));
+            if want == Action::Ask {
+                assert!(it.reason.contains("agent data unreadable"), "{}", it.reason);
+                assert!(
+                    p.coverage_gaps.agent_data_recent.contains_key(*kind),
+                    "{kind}"
+                );
+            }
+            assert_eq!(action(&p, &l.out), Action::BackupThenRemove, "{kind}");
+        }
+    }
+    // The mirror with no gap at all.
+    let l = live_fixture();
+    let p = l.fx.plan(ProcessSnapshot::none_running());
+    assert_eq!(
+        action(&p, &l.wt),
+        Action::BackupThenRemove,
+        "{}",
+        why(&p, &l.wt)
+    );
+}
+
+/// AC-12: a locus at `work/s/a`, through a process cwd and a recent transcript cwd alike,
+/// holds `work/s/a`, its descendant `work/s/a/node_modules` and (from there) its removing
+/// ancestor,
+/// and not the idle sibling `work/s/b`. Every hold below a locus carries the one choke point's
+/// reason, so a second hold path that bypassed it would show here.
+#[test]
+fn locus_choke_point_session() {
+    for by_process in [false, true] {
+        for at in ["a", "a/node_modules"] {
+            let fx = Fx::new();
+            let a = fx.repo(".agent-harness/work/s/a");
+            fx.write(".agent-harness/work/s/a/package.json", "{}");
+            fx.write(
+                ".agent-harness/work/s/a/node_modules/dep/package.json",
+                "{}",
+            );
+            let inner = fx.p(".agent-harness/work/s/a/node_modules");
+            let b = fx.repo(".agent-harness/work/s/b");
+            fx.age_all();
+            let locus = fx.p(&format!(".agent-harness/work/s/{at}"));
+            let procs = if by_process {
+                vec![proc(900, &locus.to_string_lossy(), &["bash"])]
+            } else {
+                let rel = ".claude/projects/-cp-none/t.jsonl";
+                fx.write(rel, &format!("{{\"cwd\":\"{}\"}}\n", locus.display()));
+                fx.date(rel, 3600);
+                vec![]
+            };
+            let p = fx.plan(snap(procs));
+            let what = format!(
+                "{at} by {}",
+                if by_process { "process" } else { "transcript" }
+            );
+            for c in [&a, &inner] {
+                let it = item(&p, c);
+                assert_eq!(it.action, Action::Keep, "{what}: {}", why(&p, c));
+                // A locus hold (rule 4 or 5) is always the choke point's; a transcript locus
+                // is always rule 5. (A rule 1 in-use hold, a cwd in the item or its project,
+                // is decided before.)
+                if !by_process {
+                    assert_eq!(it.evidence.rule, Some(5), "{what}: {}", it.reason);
+                }
+                if matches!(it.evidence.rule, Some(4) | Some(5)) {
+                    assert!(
+                        it.reason.starts_with("recent agent session: ")
+                            || it.reason.starts_with("live session locus: "),
+                        "{what}: not through the choke point: {}",
+                        it.reason
+                    );
+                }
+            }
+            assert_eq!(
+                action(&p, &b),
+                Action::BackupThenRemove,
+                "{what}: {}",
+                why(&p, &b)
+            );
+        }
     }
 }

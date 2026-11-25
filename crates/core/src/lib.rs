@@ -1,10 +1,17 @@
-//! disk-cleaner core: scan, classify, repo safety facts and dry-run planning.
+//! disk-cleaner core: scan, classify, repo safety facts, dry-run planning and the guarded apply.
 //!
-//! This crate is read-only. It has no UI and no network code, and it contains no code path
-//! that deletes, moves or writes files (the only write is [`write_json`], used by the CLI for
-//! its own output file) or runs a mutating git command.
+//! Everything here is read-only except the [`apply`] module (Unix only), which removes
+//! regenerable directories of a reviewed plan under a journal and is reached only through the
+//! CLI's `apply` command. Outside it the crate contains no code path that deletes, moves or
+//! writes files (the only other write is [`write_json`], used by the CLI for its own output
+//! file) or runs a mutating git command. It has no UI and no network code.
 
-#![forbid(unsafe_code)]
+// Unsafe code is denied everywhere; the one module that needs it (the macOS mount-table read)
+// opts in on its own and says why.
+#![deny(unsafe_code)]
+
+#[cfg(unix)]
+pub mod apply;
 
 pub mod config;
 pub mod error;
@@ -32,8 +39,8 @@ pub use facts::{is_network_url, FactsConfig};
 pub use git::{Git, GitError};
 pub use model::*;
 pub use plan::{
-    plan, resolve_active, Action, AskTotal, HeldTotal, Plan, PlanItem, PlanOptions, Preserve,
-    PreserveGitAdmin, PreserveObjectStore, ProjectState,
+    plan, resolve_active, Action, AskTotal, HeldTotal, Plan, PlanItem, PlanOptions,
+    PlanOptionsRecord, Preserve, PreserveGitAdmin, PreserveObjectStore, ProjectState,
 };
 pub use preserve::{git_admin_files, object_store_files};
 pub use procs::{Probe, Proc, ProcKind, ProcessSnapshot};
@@ -61,6 +68,32 @@ pub fn read_scan(path: &Path) -> Result<ScanResult> {
         source,
     })?;
     scan_from_json(&text)
+}
+
+/// Read a plan file written by `plan --json`, checking its schema version first (the plan that
+/// `apply` is given, reviewed by a person).
+pub fn read_plan(path: &Path) -> Result<Plan> {
+    let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    plan_from_json(&text)
+}
+
+/// Parse plan JSON, checking its schema version first.
+pub fn plan_from_json(text: &str) -> Result<Plan> {
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    let found = value
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    if found != SCHEMA_VERSION {
+        return Err(Error::Schema {
+            found,
+            expected: SCHEMA_VERSION,
+        });
+    }
+    Ok(serde_json::from_value(value)?)
 }
 
 /// Parse scan JSON, checking its schema version first.

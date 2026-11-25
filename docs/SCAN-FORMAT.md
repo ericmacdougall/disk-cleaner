@@ -1,6 +1,6 @@
 # Scan and plan JSON format
 
-Schema version: **17** (`schema_version` in every file). Any incompatible change bumps it; `plan`
+Schema version: **18** (`schema_version` in every file). Any incompatible change bumps it; `plan`
 refuses a scan with a different version. Version 2 added the facts `reflog_saved` and
 `no_pending_state` to `repo.facts` (a version 1 scan has neither, and a plan built from it would
 have read a repo as saved without them, so it is refused: scan again). Version 4 added the fact
@@ -863,15 +863,19 @@ live-session rule could not use, by class: `transcript-cwd-unknown`, `transcript
 `transcript-cwd-from-project-name (2 candidates): <path>`), `trusted_partial_process_check`, `remote_facts_verified` (always `false` in this phase) and
 `remote_facts_note`, `enclosing_repos`, `scope`, `coverage_complete`, `coverage_note` (only when
 coverage is incomplete), `accepted_incomplete_coverage` (see "Incomplete coverage" and
-"Accepting incomplete coverage"), `active`, `totals` and `items`.
+"Accepting incomplete coverage"), `active`, `scan_roots`, `scan_options`, `plan_options` and
+`protect` (since schema 18: the scan roots and options and the plan options the plan was made
+with, and the protected roots the scan resolved; `disk-cleaner apply` scans and plans again from
+them and protects the union of those roots and a fresh resolution), `totals` and `items`.
 
 Each item: `node` (index into the scan's `nodes`), `path`, `class`, `action`, `state` (`active`,
 `idle` or `unknown`), `state_reason` (why it was judged so), `reason` (plain language),
 `reclaimable_bytes`, `bytes_total`, `days_since_activity` (if there is any evidence), `facts`
+`rule_id` (since schema 18: the identity of the rule that matched a regenerable or cache item),
 `hold` (`code`: `protected`, `synced` or `package`, and the `root` responsible; present on a held
 item, see "Holds" below), `ask_code` (a short code for why an `ask` item asks) and, on every item
 whose action removes a git node, `preserve` (see "The preserve obligation"), and `evidence`
-(since schema 17, on every item; fields omitted when empty): `rule` (the in-use rule that matched,
+(since schema 17, on every item; fields omitted when empty): `rule` (the in-use or locus rule that matched,
 1 to 5) with the `path` that matched and a `detail` in words, `session` (the owning session),
 `project` (the owning project, when it is not the node itself), `gaps_inside` and, for a
 repository or worktree, `last_commit_days`.
@@ -993,12 +997,31 @@ rule in `evidence.rule`) when:
    values and `:`-separated lists are split. `cargo test --manifest-path /abs/wt/Cargo.toml` from
    the home holds `/abs/wt/target`;
 3. a running container's bind source contains the item, or the item contains it;
-4. its owning session (`<harness root>/work/<s>/`) is live;
+4. its owning session (`<harness root>/work/<s>/`) is live and a process locus in it (any
+   process's working directory, open file or command-line path, a live registry entry's `cwd`,
+   an agent's locus) equals the item, contains it or lies inside it (`live session locus: ...
+   [rule 4]`). A live session alone holds nothing (r6): a WAL or other file in the session dir,
+   a same-named entry, a registry `sessionId` or a session id on a command line makes the
+   session live but holds no idle sibling;
 5. a transcript modified within the active window records a working directory (or, by the
-   project-name fallback below, a candidate) that equals the item, lies inside it, or contains it.
-   This is applied at one point in the plan, after every other decision about the item: any
-   removing action (`remove-regenerable`, `backup-then-remove`, `recover-backup-then-remove`)
-   becomes `keep`, with the reason `recent agent session: <cwd> (...) [rule 5]`.
+   project-name fallback below, a candidate) that equals the item, lies inside it, or contains it
+   (`recent agent session: <cwd> (...) [rule 5]`).
+
+Rules 4 and 5 are applied at one point in the plan, after every other decision about the item:
+any removing action (`remove-regenerable`, `backup-then-remove`, `recover-backup-then-remove`)
+becomes `keep`. Then a checkout with no locus asks while its activity is under 14 days old: in a
+live session `session live; idle N days` (ask code `session-idle`), and in an agent home's
+`worktrees/` directory, live or not, `agent worktree; idle N days` (ask code `worktree-idle`),
+where its activity also counts the mtime of every transcript (read up to 14 days back) that
+records a working directory or candidate inside it. A future mtime counts as active. At 14 days
+or more the normal rules apply.
+
+A checkout's own activity includes its git admin files, metadata only: `.git/index`, `.git/HEAD`
+and `.git/FETCH_HEAD`, or for a linked worktree the `.git` file's ctime and its gitdir's `HEAD`,
+`index` and `logs/HEAD` (the gitdir taken from the `.git` file's first 4 KiB; a `.git` file that
+cannot be read counts as active). So `git fetch`, `git status` or a fresh `git worktree add` keep
+a checkout active; so do index refreshes by other tools (statuslines, IDE git panels), the safe
+direction.
 
 A process working directory or argument that is an ancestor of the item, or inside a sibling,
 never holds it: a shell at the home holds nothing below the home. One ancestor-exception list
@@ -1034,8 +1057,8 @@ by turning each character that is not an ASCII letter or digit into `-`, so `/`,
 spaces are indistinguishable. Every existing directory whose encoding equals the name is a
 candidate, found by a walk from `/` that reads directory names only (at most 2048 directories
 listed and 4,000,000 entries looked at), and every candidate is held as the transcript's working
-directory. A name no directory matches stays `transcript-cwd-unknown`; so does a candidate under an
-agent directory in no session, which nothing could hold. A walk that hits its bound, or a matching
+directory. A name no directory matches stays `transcript-cwd-unknown` (only then: a candidate
+anywhere, inside an agent worktree too, is held by rule 5). A walk that hits its bound, or a matching
 directory that cannot be listed, is `transcript-slug-incomplete` (any candidates found are still
 held). No transcript content beyond the bound above is read for this. These are counted in
 `coverage_gaps.agent_data`, noted by path only, and printed in the header: each may hide a live

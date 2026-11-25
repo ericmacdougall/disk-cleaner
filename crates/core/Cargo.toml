@@ -1,6 +1,6 @@
 [package]
 name = "disk-cleaner-core"
-description = "Read-only scan, classification, repo safety facts and dry-run planning for disk-cleaner"
+description = "Scan, classification, repo safety facts and dry-run planning for disk-cleaner, and the guarded, journalled apply"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,7 @@ jwalk = "0.9"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 thiserror = "1"
 toml = "0.8"
@@ -21,6 +22,9 @@ toml = "0.8"
 # Only the O_NONBLOCK and O_NOFOLLOW constants (no unsafe code): see src/regular.rs.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
+# Directory-fd file operations (openat, statat, unlinkat, no-replace renameat) of the apply
+# engine, so that only the macOS mount-table read needs unsafe code (see src/apply/mounts.rs).
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"

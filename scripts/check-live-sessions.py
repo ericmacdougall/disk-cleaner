@@ -31,8 +31,8 @@ also in .codex/archived_sessions). Any other shape is counted and printed as a g
 (`transcript-cwd-unknown`, like an unreadable file or a registry file without a pid); nothing else
 of it is kept or printed. A Claude Code transcript with no cwd within the bound is placed by its
 project directory name: every existing directory whose encoding (each non-alphanumeric character
-to `-`) equals it, found by a walk from / that reads names only; no match, a candidate under an
-agent dir in no session, or an incomplete walk (`transcript-slug-incomplete`) is a gap.
+to `-`) equals it, found by a walk from / that reads names only; no match, or an incomplete walk
+(`transcript-slug-incomplete`), is a gap.
 `--slug-candidates -- NAME...` prints that decoding. Output names sessions, gap counts and item
 paths only.
 `--transcript-cwd FILE...` prints each file's result under that contract (the tool's tests compare).
@@ -177,6 +177,7 @@ class Oracle:
         self.gaps = {}  # gap class -> count
         self.recent_gaps = {}  # those modified within the window (or of unknown age)
         self.recent_cwds = []  # (cwd, transcript) outside the ancestor-exception list
+        self.loci = []  # (path, source) of processes and registry entries inside a session
         self.agent_dirs = [self.work] + [
             os.path.join(self.home, d, "worktrees") for d in (".claude", ".codex")
         ]
@@ -223,6 +224,54 @@ class Oracle:
                     return c
         return None
 
+    def related(self, a, b):
+        """Does path a equal, contain or lie inside path b?"""
+        for x, y in ((os.path.normpath(a), os.path.normpath(b)),
+                     (os.path.realpath(a), os.path.realpath(b))):
+            if x == y or x.startswith(y.rstrip(os.sep) + os.sep) or \
+                    y.startswith(x.rstrip(os.sep) + os.sep):
+                return True
+        return False
+
+    def own_activity(self, path):
+        """The newest mtime of a node's own files (its .git directory left out), its git admin
+        files and its .git file's ctime; bounded."""
+        newest, seen = None, 0
+        for root, dirs, files in os.walk(path):
+            if ".git" in dirs:
+                dirs.remove(".git")
+            for n in files + dirs:
+                seen += 1
+                if seen > WALK_BUDGET:
+                    return self.now  # too big to judge: active (fail safe)
+                try:
+                    m = os.lstat(os.path.join(root, n)).st_mtime
+                except OSError:
+                    continue
+                newest = m if newest is None else max(newest, m)
+        dot = os.path.join(path, ".git")
+        admin = []
+        if os.path.isdir(dot) and not os.path.islink(dot):
+            admin = [os.path.join(dot, n) for n in ("index", "HEAD", "FETCH_HEAD")]
+        elif os.path.isfile(dot):
+            try:
+                st = os.lstat(dot)
+                newest = st.st_ctime if newest is None else max(newest, st.st_ctime)
+                with open(dot, "rb") as f:
+                    line = f.read(4096).decode("utf-8", "replace").splitlines()[0]
+                gd = line.split("gitdir:", 1)[1].strip()
+                gd = gd if os.path.isabs(gd) else os.path.join(path, gd)
+                admin = [os.path.join(gd, n) for n in ("HEAD", "index", "logs/HEAD")]
+            except (OSError, IndexError):
+                return self.now  # unknown admin files: active (fail safe)
+        for a in admin:
+            try:
+                m = os.stat(a).st_mtime
+            except OSError:
+                continue
+            newest = m if newest is None else max(newest, m)
+        return newest
+
     def in_agent_dir(self, path):
         p = os.path.normpath(path or "")
         return any(
@@ -232,8 +281,7 @@ class Oracle:
     def cwds_of(self, path):
         """The working directories a transcript records: its cwd, or, for a Claude Code
         transcript with none within the bound, every candidate of its project directory name.
-        No match, an incomplete walk, or a candidate under an agent dir in no session is a
-        gap."""
+        No match, or an incomplete walk, is a gap."""
         cwd, gap = transcript_cwd(path)
         if not gap:
             return [cwd]
@@ -246,8 +294,7 @@ class Oracle:
         cands, incomplete = self.slugs[slug]
         if incomplete:
             self.gap(SLUG_INCOMPLETE, path)
-        unheld = any(self.session_of(c) is None and self.in_agent_dir(c) for c in cands)
-        if unheld or (not cands and not incomplete):
+        if not cands and not incomplete:
             self.gap(gap, path)
         return cands
 
@@ -299,6 +346,7 @@ class Oracle:
             s = self.session_of(cwd if isinstance(cwd, str) else None)
             if s:
                 self.mark(s, "registry pid %d" % pid)
+                self.loci.append((cwd, "registry pid %d" % pid))
             if isinstance(sid, str):
                 self.mark(sid, "registry pid %d" % pid)
 
@@ -313,11 +361,13 @@ class Oracle:
                 s = self.session_of(p)
                 if s:
                     self.mark(s, "agent pid %d works in it" % pid)
+                    self.loci.append((p, "agent pid %d" % pid))
                 elif p and p.endswith(".jsonl"):
                     for c in self.cwds_of(p):
                         s = self.session_of(c)
                         if s:
                             self.mark(s, "agent pid %d holds a transcript" % pid)
+                            self.loci.append((c, "agent pid %d's transcript" % pid))
 
     # -- recent files below session dirs
     def session_files(self):
@@ -555,8 +605,21 @@ def check(plan, oracle):
         if not s:
             continue
         owned.add(s)
+        # r6, per node: in a live session an item is held by a locus or its own activity
+        # within the window, and a checkout asks under 14 days of own activity.
         if s in oracle.live and it.get("action") in REMOVING:
-            offered.append((s, it.get("path")))
+            path = it.get("path")
+            locus = next((l for l, _ in oracle.loci
+                          if oracle.session_of(l) == s and not oracle.holds_nothing_below(l)
+                          and oracle.related(path, l)), None)
+            act = oracle.own_activity(path)
+            if locus:
+                offered.append((s, path))
+            elif act is not None and act >= oracle.now - oracle.window:
+                offered.append((s, path))
+            elif os.path.exists(os.path.join(path, ".git")) and act is not None and \
+                    act >= oracle.now - 14 * 86400:
+                offered.append((s, path))
     tool_live = {
         s.get("session") for s in plan.get("totals", {}).get("sessions", []) if s.get("live")
     }
@@ -630,6 +693,11 @@ def main(argv, processes=True):
         print("  gap   %d %s (each may hide a live session)" % (oracle.gaps[g], g))
     offered, missed = check(plan, oracle)
     mapped = [i for i in plan.get("items", []) if oracle.session_of(i.get("path"))]
+    for label in ("session live; idle", "agent worktree; idle"):
+        asks = [i for i in plan.get("items", [])
+                if i.get("action") == "ask" and (i.get("reason") or "").startswith(label)]
+        print("idle asks: %d \"%s N days\" (%d bytes)"
+              % (len(asks), label, sum(i.get("bytes_total") or 0 for i in asks)))
     print("plan: %d of %d items lie in a session directory" % (len(mapped), len(plan.get("items", []))))
     for s, p in offered:
         if s.startswith("(recent session "):
@@ -693,6 +761,12 @@ def self_test():
         put(".claude/projects/-p/t.jsonl",
             json.dumps({"cwd": work + "/tr/wt", "secret": canary}) + "\n", ago=3600)
         put(".agent-harness/work/recent/notes.md", ago=3600)
+        # r6 per node: in live sessions, an idle sibling with no locus may be offered; a
+        # checkout with 10 days of own activity may not (it asks under 14 days).
+        put(".agent-harness/work/reg/old/src/lib.rs", ago=400 * 86400)
+        put(".agent-harness/work/recent/ten/.git/HEAD", "ref: refs/heads/main\n",
+            ago=400 * 86400)
+        put(".agent-harness/work/recent/ten/src/lib.rs", ago=10 * 86400)
         put(".claude/wals/wal/main.jsonl", ago=400 * 86400)
         os.utime(os.path.join(home, ".claude/wals/wal"), (now - 3600, now - 3600))
         # A transcript recording `old` but read past the bound: line 21.
@@ -737,7 +811,9 @@ def self_test():
                       item("dead", "backup-then-remove"), item("tr", "backup-then-remove"),
                       item("recent", "keep"), item("abcd", "backup-then-remove"),
                       {"path": home + "/proj/x/node_modules", "action": "remove-regenerable"},
-                      {"path": home + "/other/y", "action": "backup-then-remove"}],
+                      {"path": home + "/other/y", "action": "backup-then-remove"},
+                      {"path": work + "/reg/old", "action": "backup-then-remove"},
+                      {"path": work + "/recent/ten", "action": "backup-then-remove"}],
             "totals": {"sessions": [{"session": "reg", "live": True},
                                     {"session": "recent", "live": False}]},
         }
@@ -769,8 +845,13 @@ def self_test():
             problems.append("the transcript gaps were not printed")
         if code != 1:
             problems.append("exit %d, expected 1" % code)
-        if "OFFERED: live session tr" not in out:
+        if ("OFFERED: a removing item held by a recent agent session's working directory "
+                "%s/tr/wt: %s/tr/wt" % (work, work)) not in out:
             problems.append("the offered checkout of tr was not named")
+        if "OFFERED: live session reg has a removing item: %s/reg/old" % work in out:
+            problems.append("an idle sibling in a live session with no locus was flagged")
+        if "OFFERED: live session recent has a removing item: %s/recent/ten" % work not in out:
+            problems.append("a 10-day-old checkout of a live session was not flagged")
         if "MISSED: the plan lists live session recent as idle" not in out:
             problems.append("the missed session was not named")
         if "abcd" in "".join(l for l in out.splitlines()
@@ -803,7 +884,8 @@ def self_test():
                     ".codex/sessions/2026/01/01/rollout-3.jsonl", ".claude/sessions/77.json",
                     ".claude/projects/-q/r5.jsonl"]:
             os.utime(os.path.join(home, rel), (now - 30 * 86400, now - 30 * 86400))
-        plan["items"] =[i for i in plan["items"] if i["path"].split("/")[-2] not in want]
+        plan["items"] = [i for i in plan["items"] if i["path"].split("/")[-2] not in want
+                         or i["path"].endswith("/reg/old")]
         plan["totals"]["sessions"].append({"session": "recent", "live": True})
         with open(pf, "w") as f:
             json.dump(plan, f)

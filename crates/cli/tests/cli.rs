@@ -109,7 +109,7 @@ fn scan_then_plan_end_to_end_without_leaking_the_remote_token() {
 
     let json = fs::read_to_string(&out_file).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["schema_version"], 17);
+    assert_eq!(v["schema_version"], 18);
 
     let o = run(bin()
         .args([
@@ -1416,7 +1416,7 @@ fn y5_a_removal_of_a_repository_says_what_it_backs_up_first() {
     let now = far_future();
 
     let pv = plan_value(&plan_json(&scan_file, &home, &["--now", &now]));
-    assert_eq!(pv["schema_version"], 17);
+    assert_eq!(pv["schema_version"], 18);
     let it = item_of(&pv, &a);
     assert_eq!(it["action"], "backup-then-remove", "{it}");
     let pre = &it["preserve"]["git_admin"];
@@ -1673,14 +1673,15 @@ fn plan_evidence_report() {
         );
     }
     let pv: serde_json::Value = serde_json::from_str(&stdout(&oj)).unwrap();
-    assert_eq!(pv["schema_version"], 17);
+    assert_eq!(pv["schema_version"], 18);
     // Evidence per item.
     let i1 = item_of(&pv, &s1);
     assert_eq!(i1["action"], "backup-then-remove", "{i1}");
     assert_eq!(i1["evidence"]["session"], "s1", "{i1}");
     let i2 = item_of(&pv, &s2);
     assert_eq!(i2["action"], "keep", "{i2}");
-    assert_eq!(i2["evidence"]["rule"], 4, "{i2}");
+    // Held by the recent transcript's cwd (rule 5, r6), not by the session being live.
+    assert_eq!(i2["evidence"]["rule"], 5, "{i2}");
     assert_eq!(i2["evidence"]["session"], "s2", "{i2}");
     let io = item_of(&pv, &out);
     assert_eq!(io["action"], "keep", "{io}");
